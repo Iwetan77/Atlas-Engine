@@ -1,0 +1,10 @@
+[workspace]
+members = ["crates/engine-core", "crates/engine-discovery", "crates/engine-execution", "crates/engine-service", "crates/engine-types"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
