@@ -53,7 +53,8 @@ pub struct RelayerBalance {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SolanaDestination {
-    pub destination_recipient: String,
+    pub ubk_recipient_address: String,
+    pub gateway_destination_recipient: String,
     pub ata_creation_signature: Option<String>,
     pub relayer: RelayerBalance,
 }
@@ -109,8 +110,9 @@ impl SolanaAtaPreflight {
         })
     }
 
-    /// Run before *every* UBK spend whose destination is Solana. Use the returned
-    /// ATA as UBK's recipientAddress / Gateway's destinationRecipient.
+    /// Run before *every* UBK spend whose destination is Solana. Pass the
+    /// on-curve owner as UBK's recipientAddress. UBK derives this ATA for
+    /// Gateway's destinationRecipient; verify that mapping at the spend boundary.
     pub async fn ensure_usdc_ata(
         &self,
         owner_address: &str,
@@ -128,7 +130,8 @@ impl SolanaAtaPreflight {
         if let Some(account) = self.account(&ata).await? {
             verify_token_account(&account, &owner, &mint, &token_program)?;
             return Ok(SolanaDestination {
-                destination_recipient: ata.to_string(),
+                ubk_recipient_address: owner.to_string(),
+                gateway_destination_recipient: ata.to_string(),
                 ata_creation_signature: None,
                 relayer: before,
             });
@@ -200,7 +203,8 @@ impl SolanaAtaPreflight {
                         .ok_or(SolanaPreflightError::WrongTokenAccount)?;
                     verify_token_account(&account, &owner, &mint, &token_program)?;
                     return Ok(SolanaDestination {
-                        destination_recipient: ata.to_string(),
+                        ubk_recipient_address: owner.to_string(),
+                        gateway_destination_recipient: ata.to_string(),
                         ata_creation_signature: Some(signature),
                         relayer: self.relayer_balance().await?,
                     });

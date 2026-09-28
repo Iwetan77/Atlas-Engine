@@ -15,7 +15,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or_else(|_| "https://api.devnet.solana.com".to_owned());
     let preflight = SolanaAtaPreflight::new(SolanaNetwork::Devnet, rpc_url, key_path)?;
     let result = preflight.ensure_usdc_ata(&owner).await?;
-    println!("destinationRecipient={}", result.destination_recipient);
+    println!("ubkRecipientAddress={}", result.ubk_recipient_address);
+    println!(
+        "gatewayDestinationRecipient={}",
+        result.gateway_destination_recipient
+    );
     if let Some(signature) = result.ata_creation_signature {
         println!("ataCreationSignature={signature}");
     }
