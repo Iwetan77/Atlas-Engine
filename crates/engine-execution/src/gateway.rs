@@ -83,7 +83,7 @@ pub struct GatewayDeposit {
     pub amount: String,
     pub status: String,
     #[serde(default)]
-    pub block_height: Option<u64>,
+    pub block_height: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -104,6 +104,10 @@ pub struct GatewayTransfer {
     pub transaction_hash: Option<String>,
     #[serde(default)]
     pub transfer_id: Option<String>,
+    #[serde(default)]
+    pub success: Option<bool>,
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 impl GatewayClient {
@@ -171,10 +175,11 @@ impl GatewayClient {
             .get(self.base.join(&format!("/v1/transfer/{transfer_id}"))?)
             .send()
             .await?;
-        accepted(response)?
-            .json()
-            .await
-            .map_err(GatewayError::Transport)
+        let body: GatewayTransfer = accepted(response)?.json().await?;
+        if body.success == Some(false) {
+            return Err(GatewayError::Unsuccessful);
+        }
+        Ok(body)
     }
 }
 
@@ -189,6 +194,16 @@ fn accepted(response: reqwest::Response) -> Result<reqwest::Response, GatewayErr
 mod tests {
     use super::*;
 
+    #[test]
+    fn live_pending_deposit_shape_keeps_block_height_as_string() {
+        let body = r#"{"token":"USDC","deposits":[{"depositor":"0x123","domain":6,"transactionHash":"0xabc","amount":"5000000","status":"pending","blockHeight":"47415771"}]}"#;
+        let response: GatewayDeposits = serde_json::from_str(body).unwrap();
+        assert_eq!(response.deposits[0].amount, "5000000");
+        assert_eq!(
+            response.deposits[0].block_height.as_deref(),
+            Some("47415771")
+        );
+    }
     #[test]
     fn balance_query_uses_circle_gateway_sources_shape() {
         let source = GatewaySource {
