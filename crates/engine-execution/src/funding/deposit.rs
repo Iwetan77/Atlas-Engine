@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use thiserror::Error;
 
 const TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-const MAX_BLOCK_SPAN: u64 = 2_000;
+const MAX_BLOCK_SPAN: u64 = 100;
 
 #[derive(Clone, Debug)]
 pub struct DepositTarget {
@@ -39,7 +39,7 @@ pub enum DepositError {
     InsecureRpc,
     #[error("invalid EVM address: {0}")]
     InvalidAddress(&'static str),
-    #[error("block scan range is invalid or exceeds 2000 blocks")]
+    #[error("block scan range is invalid or exceeds 100 blocks")]
     InvalidRange,
     #[error("RPC is connected to chain {actual}, expected {expected}")]
     WrongChain { expected: u64, actual: u64 },
@@ -106,6 +106,21 @@ impl EvmDepositScanner {
         envelope.result.ok_or(DepositError::InvalidResponse)
     }
 
+    /// Scan the most recent bounded window. This is useful for a live deposit
+    /// gate; a hosted service should persist a cursor and use scan instead.
+    pub async fn scan_recent(
+        &self,
+        target: &DepositTarget,
+    ) -> Result<Vec<VerifiedDeposit>, DepositError> {
+        let latest = parse_hex_u64(
+            self.rpc("eth_blockNumber", json!([]))
+                .await?
+                .as_str()
+                .ok_or(DepositError::InvalidResponse)?,
+        )?;
+        self.scan(target, latest.saturating_sub(MAX_BLOCK_SPAN - 1), latest)
+            .await
+    }
     /// Scan a bounded block range for confirmed deposits to a stored user wallet.
     /// The caller persists (chain ID, transaction hash, log index) as an
     /// idempotency key so rescans cannot credit the same transfer twice.

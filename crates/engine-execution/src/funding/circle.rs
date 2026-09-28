@@ -169,7 +169,7 @@ impl CircleOnrampClient {
         widget_url.query_pairs_mut().append_pair("tokens", "USDC");
         widget_url
             .query_pairs_mut()
-            .append_pair("chains", input.destination_chain);
+            .append_pair("chains", &input.destination_chain.to_ascii_lowercase());
         Ok(CircleSession {
             session_token: session.session_token,
             session_id: session.session_id,
