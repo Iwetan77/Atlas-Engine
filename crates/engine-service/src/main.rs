@@ -1,6 +1,8 @@
 //! Balance API with Privy identity checks. The Phase 2 test account remains
 //! available only when the operator explicitly enables local demo mode.
 
+mod app_balance;
+
 use std::{
     env,
     net::SocketAddr,
@@ -76,10 +78,10 @@ struct BalanceResponse {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let user_id = env::var("ATLAS_TEST_USER_ID")?;
-    let base_wallet = env::var("ATLAS_TEST_WALLET_ADDRESS")?;
-    let solana_owner = env::var("ATLAS_SOLANA_OWNER_ADDRESS")?;
-    let internal_token = env::var("ATLAS_INTERNAL_TOKEN")?;
+    let user_id = env::var("ATLAS_TEST_USER_ID").unwrap_or_default();
+    let base_wallet = env::var("ATLAS_TEST_WALLET_ADDRESS").unwrap_or_default();
+    let solana_owner = env::var("ATLAS_SOLANA_OWNER_ADDRESS").unwrap_or_default();
+    let internal_token = env::var("ATLAS_INTERNAL_TOKEN").unwrap_or_default();
     let movement_path = PathBuf::from(
         env::var("ATLAS_MOVEMENT_LEDGER_PATH")
             .unwrap_or_else(|_| ".env.gateway-movement.json".into()),
@@ -93,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env::var("ATLAS_BASE_RPC_URL").unwrap_or_else(|_| "https://sepolia.base.org".into());
     let solana_rpc =
         env::var("ATLAS_SOLANA_RPC_URL").unwrap_or_else(|_| "https://api.devnet.solana.com".into());
-    let relayer_path = env::var("ATLAS_SOLANA_RELAYER_KEYPAIR_PATH")?;
+    let relayer_path = env::var("ATLAS_SOLANA_RELAYER_KEYPAIR_PATH").unwrap_or_default();
     let auth = if env::var("ATLAS_DEMO_AUTH_BYPASS").as_deref() == Ok("1") {
         AuthMode::LocalDemo
     } else {
@@ -134,6 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("demo auth bypass requires a loopback bind address".into());
     }
     let app = Router::new()
+        .route("/v1/balance", get(app_balance::balance))
         .route("/balance/{user}", get(balance))
         .route("/balance/{user}/movement", post(register_movement))
         .with_state(state);
@@ -267,10 +270,11 @@ async fn register_movement(
     if user != state.user_id {
         return Err((StatusCode::NOT_FOUND, "unknown user".into()));
     }
-    if headers
-        .get("x-atlas-internal-token")
-        .and_then(|v| v.to_str().ok())
-        != Some(state.internal_token.as_str())
+    if state.internal_token.is_empty()
+        || headers
+            .get("x-atlas-internal-token")
+            .and_then(|v| v.to_str().ok())
+            != Some(state.internal_token.as_str())
     {
         return Err((StatusCode::UNAUTHORIZED, "internal token required".into()));
     }

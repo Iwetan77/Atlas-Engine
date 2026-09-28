@@ -21,13 +21,35 @@ const server = createServer(async (request, response) => {
     }
     const {accessToken} = JSON.parse(body);
     if (typeof accessToken !== 'string' || !accessToken) throw new Error('token required');
-    const claims = await privy.utils().auth().verifyAccessToken(accessToken);
+    let claims;
+    try {
+      claims = await privy.utils().auth().verifyAccessToken(accessToken);
+    } catch {
+      response.writeHead(401, {'content-type': 'application/json'});
+      response.end(JSON.stringify({error: 'invalid or expired Privy access token'}));
+      return;
+    }
     const userId = claims.userId ?? claims.user_id;
     if (typeof userId !== 'string' || !userId.startsWith('did:privy:')) {
       throw new Error('invalid identity');
     }
+    let user;
+    try {
+      user = await privy.users()._get(userId);
+    } catch {
+      response.writeHead(503, {'content-type': 'application/json'});
+      response.end(JSON.stringify({error: 'Privy user lookup unavailable'}));
+      return;
+    }
+    const wallets = user.linked_accounts.filter((account) =>
+      account.type === 'wallet' &&
+      account.wallet_client_type === 'privy' &&
+      account.connector_type === 'embedded'
+    );
+    const evmWallet = wallets.find((account) => account.chain_type === 'ethereum')?.address ?? null;
+    const solanaWallet = wallets.find((account) => account.chain_type === 'solana')?.address ?? null;
     response.writeHead(200, {'content-type': 'application/json'});
-    response.end(JSON.stringify({userId}));
+    response.end(JSON.stringify({userId, evmWallet, solanaWallet}));
   } catch {
     response.writeHead(401, {'content-type': 'application/json'});
     response.end(JSON.stringify({error: 'invalid or expired Privy access token'}));
