@@ -1,5 +1,5 @@
-//! Local Phase 2 balance API. The demo user and internal movement recorder are
-//! configured by the host; the app's production authentication is a later gate.
+//! Balance API with Privy identity checks. The Phase 2 test account remains
+//! available only when the operator explicitly enables local demo mode.
 
 use std::{
     env,
@@ -35,6 +35,16 @@ struct AppState {
     scanner: EvmDepositScanner,
     gateway: GatewayClient,
     solana: SolanaAtaPreflight,
+    auth: AuthMode,
+}
+
+#[derive(Clone)]
+enum AuthMode {
+    Privy {
+        bridge_url: String,
+        http: reqwest::Client,
+    },
+    LocalDemo,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -84,6 +94,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let solana_rpc =
         env::var("ATLAS_SOLANA_RPC_URL").unwrap_or_else(|_| "https://api.devnet.solana.com".into());
     let relayer_path = env::var("ATLAS_SOLANA_RELAYER_KEYPAIR_PATH")?;
+    let auth = if env::var("ATLAS_DEMO_AUTH_BYPASS").as_deref() == Ok("1") {
+        AuthMode::LocalDemo
+    } else {
+        let bridge_url = env::var("PRIVY_BRIDGE_URL")?;
+        let parsed = reqwest::Url::parse(&bridge_url)?;
+        if parsed.scheme() != "http"
+            || parsed.host_str() != Some("127.0.0.1")
+            || parsed.port().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.path() != "/"
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err("PRIVY_BRIDGE_URL must be a bare loopback HTTP origin".into());
+        }
+        AuthMode::Privy {
+            bridge_url,
+            http: reqwest::Client::new(),
+        }
+    };
     let state = AppState {
         user_id,
         base_wallet,
@@ -94,14 +125,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         scanner: EvmDepositScanner::new(base_rpc.parse()?, 2)?,
         gateway: GatewayClient::new(GatewayEnvironment::Testnet)?,
         solana: SolanaAtaPreflight::new(SolanaNetwork::Devnet, solana_rpc, relayer_path)?,
+        auth,
     };
+    let bind: SocketAddr = env::var("ATLAS_BALANCE_BIND")
+        .unwrap_or_else(|_| "127.0.0.1:3000".into())
+        .parse()?;
+    if matches!(state.auth, AuthMode::LocalDemo) && !bind.ip().is_loopback() {
+        return Err("demo auth bypass requires a loopback bind address".into());
+    }
     let app = Router::new()
         .route("/balance/{user}", get(balance))
         .route("/balance/{user}/movement", post(register_movement))
         .with_state(state);
-    let bind: SocketAddr = env::var("ATLAS_BALANCE_BIND")
-        .unwrap_or_else(|_| "127.0.0.1:3000".into())
-        .parse()?;
     let listener = tokio::net::TcpListener::bind(bind).await?;
     println!("Atlas balance API listening on {bind}");
     axum::serve(listener, app).await?;
@@ -111,7 +146,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn balance(
     State(state): State<AppState>,
     Path(user): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<BalanceResponse>, ApiError> {
+    authorize_balance(&state.auth, &headers, &user).await?;
     if user != state.user_id {
         return Err((StatusCode::NOT_FOUND, "unknown user".into()));
     }
@@ -166,6 +203,61 @@ async fn balance(
     }))
 }
 
+async fn authorize_balance(
+    auth: &AuthMode,
+    headers: &HeaderMap,
+    user: &str,
+) -> Result<(), ApiError> {
+    let AuthMode::Privy { bridge_url, http } = auth else {
+        return Ok(());
+    };
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| !value.is_empty())
+        .ok_or((
+            StatusCode::UNAUTHORIZED,
+            "Privy access token required".into(),
+        ))?;
+    let response = http
+        .post(format!("{bridge_url}/verify"))
+        .json(&serde_json::json!({"accessToken": token}))
+        .send()
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Privy verification unavailable".into(),
+            )
+        })?;
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "invalid or expired Privy access token".into(),
+        ));
+    }
+    let response = response.error_for_status().map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Privy verification unavailable".into(),
+        )
+    })?;
+    let verified: serde_json::Value = response.json().await.map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Privy verification unavailable".into(),
+        )
+    })?;
+    if verified["userId"].as_str() != Some(user) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "balance belongs to another user".into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn register_movement(
     State(state): State<AppState>,
     Path(user): Path<String>,
@@ -199,4 +291,48 @@ fn usd(base_units: u128) -> String {
 
 fn internal(error: impl std::fmt::Display) -> ApiError {
     (StatusCode::BAD_GATEWAY, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn balance_auth_rejects_missing_token() {
+        let auth = AuthMode::Privy {
+            bridge_url: "http://127.0.0.1:3101".into(),
+            http: reqwest::Client::new(),
+        };
+        let error = authorize_balance(&auth, &HeaderMap::new(), "did:privy:alice")
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn balance_auth_rejects_another_verified_user() {
+        let bridge = Router::new().route(
+            "/verify",
+            post(|| async { Json(serde_json::json!({"userId":"did:privy:alice"})) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, bridge).await.unwrap() });
+        let auth = AuthMode::Privy {
+            bridge_url: format!("http://{address}"),
+            http: reqwest::Client::new(),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer token".parse().unwrap(),
+        );
+        let error = authorize_balance(&auth, &headers, "did:privy:bob")
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::FORBIDDEN);
+        authorize_balance(&auth, &headers, "did:privy:alice")
+            .await
+            .unwrap();
+    }
 }

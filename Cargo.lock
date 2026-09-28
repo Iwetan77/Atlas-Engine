@@ -633,6 +633,7 @@ dependencies = [
  "engine-discovery",
  "engine-execution",
  "engine-types",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

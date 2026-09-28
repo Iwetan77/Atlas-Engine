@@ -1,0 +1,13 @@
+{
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "@privy-io/node": "0.22.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
