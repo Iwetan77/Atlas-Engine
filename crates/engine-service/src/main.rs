@@ -12,7 +12,7 @@ use std::{
 
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     routing::{get, post},
     Json, Router,
 };
@@ -23,6 +23,7 @@ use engine_execution::{
     solana::{SolanaAtaPreflight, SolanaNetwork},
 };
 use serde::{Deserialize, Serialize};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 type ApiError = (StatusCode, String);
 
@@ -135,15 +136,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if matches!(state.auth, AuthMode::LocalDemo) && !bind.ip().is_loopback() {
         return Err("demo auth bypass requires a loopback bind address".into());
     }
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/v1/balance", get(app_balance::balance))
         .route("/balance/{user}", get(balance))
         .route("/balance/{user}/movement", post(register_movement))
         .with_state(state);
+    if let Some(cors) = configured_cors()? {
+        app = app.layer(cors);
+    }
     let listener = tokio::net::TcpListener::bind(bind).await?;
     println!("Atlas balance API listening on {bind}");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn configured_cors() -> Result<Option<CorsLayer>, Box<dyn std::error::Error>> {
+    let configured = env::var("ATLAS_ALLOWED_ORIGINS").unwrap_or_default();
+    if configured.trim().is_empty() {
+        return Ok(None);
+    }
+    let mut origins = Vec::new();
+    for raw in configured.split(',') {
+        let origin = raw.trim().trim_end_matches('/');
+        let parsed = reqwest::Url::parse(origin)?;
+        let is_local = matches!(parsed.host_str(), Some("localhost" | "127.0.0.1"));
+        if (parsed.scheme() != "https" && !(is_local && parsed.scheme() == "http"))
+            || parsed.host_str().is_none()
+            || parsed.path() != "/"
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+        {
+            return Err("ATLAS_ALLOWED_ORIGINS must contain exact HTTPS origins (HTTP is allowed only for localhost)".into());
+        }
+        origins.push(HeaderValue::from_str(origin)?);
+    }
+    Ok(Some(
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(origins))
+            .allow_methods([Method::GET, Method::POST])
+            .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]),
+    ))
 }
 
 async fn balance(
