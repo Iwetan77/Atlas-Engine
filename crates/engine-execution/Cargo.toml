@@ -13,3 +13,8 @@ thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 url = "2"
 tokio.workspace = true
+solana-sdk = "3.0.0"
+spl-associated-token-account = "8.0.0"
+spl-token = "9.0.0"
+base64 = "0.22"
+bincode = "1"
