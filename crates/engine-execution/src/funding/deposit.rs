@@ -106,6 +106,38 @@ impl EvmDepositScanner {
         envelope.result.ok_or(DepositError::InvalidResponse)
     }
 
+    /// Read current ERC-20 units in a stored user's wallet. This is separate
+    /// from Circle Gateway's deposited balance until a real deposit confirms.
+    pub async fn wallet_token_balance(&self, target: &DepositTarget) -> Result<u128, DepositError> {
+        let wallet = normalize_address(&target.wallet_address)
+            .ok_or(DepositError::InvalidAddress("wallet_address"))?;
+        let token = normalize_address(&target.token_contract)
+            .ok_or(DepositError::InvalidAddress("token_contract"))?;
+        let actual_chain = parse_hex_u64(
+            self.rpc("eth_chainId", json!([]))
+                .await?
+                .as_str()
+                .ok_or(DepositError::InvalidResponse)?,
+        )?;
+        if actual_chain != target.chain_id {
+            return Err(DepositError::WrongChain {
+                expected: target.chain_id,
+                actual: actual_chain,
+            });
+        }
+        let data = format!("0x70a08231{:0>64}", &wallet[2..]);
+        let result = self
+            .rpc("eth_call", json!([{"to": token, "data": data}, "latest"]))
+            .await?;
+        u128::from_str_radix(
+            result
+                .as_str()
+                .and_then(|s| s.strip_prefix("0x"))
+                .ok_or(DepositError::InvalidResponse)?,
+            16,
+        )
+        .map_err(|_| DepositError::InvalidResponse)
+    }
     /// Scan the most recent bounded window. This is useful for a live deposit
     /// gate; a hosted service should persist a cursor and use scan instead.
     pub async fn scan_recent(
