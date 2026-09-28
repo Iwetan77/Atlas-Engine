@@ -1,6 +1,6 @@
-//! Venue adapters belong here. No live adapter is wired in Phase 0.
+//! Real venue clients live here. No simulated settlement paths.
 
-pub mod funding {}
+pub mod funding;
 pub mod swaps {}
 pub mod perps {}
 pub mod yield_positions {}

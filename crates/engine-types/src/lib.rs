@@ -2,24 +2,51 @@
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Chain {
-    Solana, Base, Arc, Ethereum, Arbitrum, Optimism, Polygon,
-    Unichain, Aptos, Near, Monad, Sui,
+    Solana,
+    Base,
+    Arc,
+    Ethereum,
+    Arbitrum,
+    Optimism,
+    Polygon,
+    Unichain,
+    Aptos,
+    Near,
+    Monad,
+    Sui,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Venue {
-    Daya, Circle, Jupiter, OneInch, Paradex, Jito, Marinade,
-    Aave, Moonwell, NearIntents,
+    Daya,
+    Circle,
+    Jupiter,
+    OneInch,
+    Paradex,
+    Jito,
+    Marinade,
+    Aave,
+    Moonwell,
+    NearIntents,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IntentKind {
-    Buy, Sell, Send, OffRamp, PerpOpen, PerpClose, YieldDeposit,
+    Buy,
+    Sell,
+    Send,
+    OffRamp,
+    PerpOpen,
+    PerpClose,
+    YieldDeposit,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IntentStage {
-    Discover, Validate, Execute, Settle,
+    Discover,
+    Validate,
+    Execute,
+    Settle,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
