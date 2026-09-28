@@ -1,3 +1,4 @@
+use engine_execution::balance::usdc_buckets;
 use engine_execution::funding::deposit::{DepositTarget, EvmDepositScanner};
 use engine_execution::gateway::{GatewayClient, GatewayEnvironment, GatewaySource};
 
@@ -22,6 +23,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }];
     let balances = gateway.balances(&sources).await?;
     let deposits = gateway.deposits(&sources).await?;
+    let buckets = usdc_buckets(wallet_units, &sources[0].depositor, &balances, &deposits)?;
+    println!("USDC buckets: {buckets:?}");
     println!("{}", serde_json::to_string_pretty(&balances)?);
     println!("{}", serde_json::to_string_pretty(&deposits)?);
     Ok(())

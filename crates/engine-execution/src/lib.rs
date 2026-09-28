@@ -1,5 +1,6 @@
 //! Real venue clients live here. No simulated settlement paths.
 
+pub mod balance;
 pub mod funding;
 pub mod gateway;
 pub mod swaps {}
