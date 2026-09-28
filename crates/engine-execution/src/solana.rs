@@ -95,6 +95,37 @@ impl SolanaAtaPreflight {
         })
     }
 
+    pub async fn owner_usdc_balance(
+        &self,
+        owner_address: &str,
+    ) -> Result<u128, SolanaPreflightError> {
+        let owner =
+            Pubkey::from_str(owner_address).map_err(|_| SolanaPreflightError::InvalidAddress)?;
+        let mint = Pubkey::from_str(self.network.mint())
+            .map_err(|_| SolanaPreflightError::InvalidAddress)?;
+        let ata = get_associated_token_address_with_program_id(&owner, &mint, &spl_token::id());
+        let Some(account) = self.account(&ata).await? else {
+            return Ok(0);
+        };
+        verify_token_account(&account, &owner, &mint, &spl_token::id())?;
+        let response = self
+            .rpc(
+                "getTokenAccountBalance",
+                json!([
+                    ata.to_string(), {"commitment":"confirmed"}
+                ]),
+            )
+            .await?;
+        if response["value"]["decimals"].as_u64() != Some(6) {
+            return Err(SolanaPreflightError::InvalidResponse);
+        }
+        response["value"]["amount"]
+            .as_str()
+            .ok_or(SolanaPreflightError::InvalidResponse)?
+            .parse()
+            .map_err(|_| SolanaPreflightError::InvalidResponse)
+    }
+
     pub async fn relayer_balance(&self) -> Result<RelayerBalance, SolanaPreflightError> {
         let relayer = read_keypair_file(&self.relayer_keypair_path)
             .map_err(|_| SolanaPreflightError::RelayerKey)?;

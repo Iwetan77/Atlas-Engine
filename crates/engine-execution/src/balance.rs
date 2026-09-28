@@ -74,6 +74,66 @@ pub fn usdc_buckets(
     })
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutgoingGatewayMovement {
+    pub amount_base_units: u128,
+    pub gateway_before_base_units: u128,
+    pub solana_before_base_units: u128,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnifiedUsdcBalance {
+    pub solana_wallet_base_units: u128,
+    pub spendable_base_units: u128,
+    pub outgoing_in_flight_base_units: u128,
+    /// None means the two chain snapshots are inconsistent; never show a false total.
+    pub total_accounted_base_units: Option<u128>,
+}
+
+pub fn include_solana_and_outgoing(
+    buckets: &UsdcBalanceBuckets,
+    solana_wallet_base_units: u128,
+    movement: Option<&OutgoingGatewayMovement>,
+) -> Result<UnifiedUsdcBalance, BalanceError> {
+    let mut outgoing_in_flight = 0;
+    let mut consistent = true;
+    if let Some(movement) = movement {
+        let gateway_debit = movement
+            .gateway_before_base_units
+            .saturating_sub(buckets.gateway_confirmed_base_units);
+        let received = solana_wallet_base_units.saturating_sub(movement.solana_before_base_units);
+        if received > movement.amount_base_units
+            || (received > 0 && gateway_debit < movement.amount_base_units)
+            || (gateway_debit > 0 && gateway_debit < movement.amount_base_units)
+        {
+            consistent = false;
+        } else if gateway_debit >= movement.amount_base_units {
+            outgoing_in_flight = movement.amount_base_units.saturating_sub(received);
+        }
+    }
+    let spendable_base_units = buckets
+        .spendable_base_units
+        .checked_add(solana_wallet_base_units)
+        .ok_or(BalanceError::Overflow)?;
+    let total = if consistent {
+        Some(
+            buckets
+                .total_accounted_base_units
+                .checked_add(solana_wallet_base_units)
+                .and_then(|v| v.checked_add(outgoing_in_flight))
+                .ok_or(BalanceError::Overflow)?,
+        )
+    } else {
+        None
+    };
+    Ok(UnifiedUsdcBalance {
+        solana_wallet_base_units,
+        spendable_base_units,
+        outgoing_in_flight_base_units: outgoing_in_flight,
+        total_accounted_base_units: total,
+    })
+}
+
 fn decimal_usdc_to_base_units(amount: &str) -> Result<u128, BalanceError> {
     let (whole, fractional) = amount.split_once('.').unwrap_or((amount, ""));
     if whole.is_empty() || !whole.bytes().all(|b| b.is_ascii_digit()) {
@@ -126,6 +186,55 @@ mod tests {
         assert_eq!(b.spendable_base_units, 15_000_000);
         assert_eq!(b.gateway_pending_base_units, 5_000_000);
         assert_eq!(b.total_accounted_base_units, 20_000_000);
+    }
+
+    #[test]
+    fn outgoing_transfer_keeps_value_visible_until_solana_credit() {
+        let movement = OutgoingGatewayMovement {
+            amount_base_units: 1_000_000,
+            gateway_before_base_units: 5_000_000,
+            solana_before_base_units: 0,
+        };
+        let mut buckets = UsdcBalanceBuckets {
+            wallet_base_units: 15_000_000,
+            gateway_confirmed_base_units: 5_000_000,
+            gateway_pending_base_units: 0,
+            spendable_base_units: 20_000_000,
+            total_accounted_base_units: 20_000_000,
+        };
+        let before = include_solana_and_outgoing(&buckets, 0, Some(&movement)).unwrap();
+        assert_eq!(before.outgoing_in_flight_base_units, 0);
+        assert_eq!(before.total_accounted_base_units, Some(20_000_000));
+
+        buckets.gateway_confirmed_base_units = 3_858_398;
+        buckets.spendable_base_units = 18_858_398;
+        buckets.total_accounted_base_units = 18_858_398;
+        let during = include_solana_and_outgoing(&buckets, 0, Some(&movement)).unwrap();
+        assert_eq!(during.outgoing_in_flight_base_units, 1_000_000);
+        assert_eq!(during.total_accounted_base_units, Some(19_858_398));
+
+        let after = include_solana_and_outgoing(&buckets, 1_000_000, Some(&movement)).unwrap();
+        assert_eq!(after.outgoing_in_flight_base_units, 0);
+        assert_eq!(after.spendable_base_units, 19_858_398);
+        assert_eq!(after.total_accounted_base_units, Some(19_858_398));
+    }
+
+    #[test]
+    fn inconsistent_chain_snapshots_hide_the_total() {
+        let buckets = UsdcBalanceBuckets {
+            wallet_base_units: 15_000_000,
+            gateway_confirmed_base_units: 5_000_000,
+            gateway_pending_base_units: 0,
+            spendable_base_units: 20_000_000,
+            total_accounted_base_units: 20_000_000,
+        };
+        let movement = OutgoingGatewayMovement {
+            amount_base_units: 1_000_000,
+            gateway_before_base_units: 5_000_000,
+            solana_before_base_units: 0,
+        };
+        let result = include_solana_and_outgoing(&buckets, 1_000_000, Some(&movement)).unwrap();
+        assert_eq!(result.total_accounted_base_units, None);
     }
 
     #[test]
