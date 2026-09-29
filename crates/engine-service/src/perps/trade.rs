@@ -635,7 +635,18 @@ pub(crate) async fn execute_close(
             StatusCode::CONFLICT,
             "Paradex position is no longer open".into(),
         ))?;
-    if existing["size"].as_str().map(|s| s.trim_start_matches('-')) != Some(&quote.size) {
+    let expected_side = if quote.side == "sell" {
+        "LONG"
+    } else {
+        "SHORT"
+    };
+    if existing["side"].as_str() != Some(expected_side)
+        || existing["size"]
+            .as_str()
+            .map(|s| units(s.trim_start_matches('-')))
+            .transpose()?
+            != Some(units(&quote.size)?)
+    {
         return Err((
             StatusCode::CONFLICT,
             "Paradex position size changed; request a new close quote".into(),
@@ -772,7 +783,16 @@ async fn submit_confirmed(
         let still_open = positions.iter().any(|p| {
             p["id"].as_str() == quote.position_id.as_deref()
                 && p["status"].as_str() == Some("OPEN")
-                && p["size"].as_str().map(|s| s.trim_start_matches('-')) == Some(&quote.size)
+                && p["side"].as_str()
+                    == Some(if quote.side == "sell" {
+                        "LONG"
+                    } else {
+                        "SHORT"
+                    })
+                && p["size"]
+                    .as_str()
+                    .and_then(|s| units(s.trim_start_matches('-')).ok())
+                    == units(&quote.size).ok()
         });
         if !still_open {
             return Err((
