@@ -21,16 +21,16 @@ const AAPLC: &str = "0xb200000000000000000000C2e324d24d7eEcd1fb";
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy)]
-struct Asset {
-    id: &'static str,
-    symbol: &'static str,
-    name: &'static str,
-    kind: &'static str,
-    chain: &'static str,
-    token: &'static str,
-    decimals: u32,
+pub(super) struct Asset {
+    pub(super) id: &'static str,
+    pub(super) symbol: &'static str,
+    pub(super) name: &'static str,
+    pub(super) kind: &'static str,
+    pub(super) chain: &'static str,
+    pub(super) token: &'static str,
+    pub(super) decimals: u32,
 }
-const ASSETS: [Asset; 6] = [
+pub(super) const ASSETS: [Asset; 6] = [
     Asset {
         id: "weth-base",
         symbol: "WETH",
@@ -259,7 +259,7 @@ fn parse_micros(s: &str) -> Result<u128, ApiError> {
         .filter(|v| *v > 0)
         .ok_or_else(|| bad("amount must be positive"))
 }
-fn format_units(units: u128, decimals: u32) -> String {
+pub(super) fn format_units(units: u128, decimals: u32) -> String {
     let scale = 10u128.pow(decimals);
     let mut result = format!(
         "{}.{:0width$}",
@@ -354,7 +354,7 @@ async fn ensure_stock_units(state: &MarketState, a: Asset) -> Result<(), ApiErro
     }
     Ok(())
 }
-async fn venue_quote(
+pub(super) async fn venue_quote(
     state: &MarketState,
     a: Asset,
     side: &str,
@@ -593,7 +593,7 @@ pub(super) async fn execute_quote(
                 approval.data.to_ascii_lowercase(),
             ));
             transactions
-                .push(json!({"chain":"base","to":approval.to,"data":approval.data,"value":"0"}));
+                .push(json!({"chain":"base","chainId":8453,"to":approval.to,"data":approval.data,"value":"0"}));
         }
         let swap = state
             .markets
@@ -601,7 +601,8 @@ pub(super) async fn execute_quote(
             .swap_transaction(&fresh, &wallet, 100)
             .map_err(unavailable)?;
         expected.push((swap.to.to_ascii_lowercase(), swap.data.to_ascii_lowercase()));
-        transactions.push(json!({"chain":"base","to":swap.to,"data":swap.data,"value":"0"}));
+        transactions
+            .push(json!({"chain":"base","chainId":8453,"to":swap.to,"data":swap.data,"value":"0"}));
         output = fresh.amount_out;
     } else {
         let order = state

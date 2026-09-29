@@ -69,77 +69,88 @@ pub(super) async fn balance(
         StatusCode::CONFLICT,
         "Privy Solana wallet is not ready".into(),
     ))?;
-    let target = DepositTarget {
-        user_id: user.user_id.clone(),
-        wallet_address: evm.clone(),
-        token_contract: "0x036CbD53842c5426634e7929541eC2318f3dCF7e".into(),
-        chain_id: 84532,
-    };
-    let sources = [GatewaySource {
-        depositor: evm.clone(),
-        domain: Some(6),
-    }];
-    let (wallet, gateway, deposits, solana) = tokio::join!(
-        state.scanner.wallet_token_balance(&target),
-        state.gateway.balances(&sources),
-        state.gateway.deposits(&sources),
-        state.solana.owner_usdc_balance(&solana_owner),
+    state
+        .solana_mainnet
+        .assert_network()
+        .await
+        .map_err(internal)?;
+    let (base_usdc, solana_usdc) = tokio::join!(
+        state
+            .markets
+            .base
+            .balance_of(engine_execution::swaps::uniswap::BASE_USDC, &evm),
+        state.solana_mainnet.owner_mint_balance(
+            &solana_owner,
+            engine_execution::solana::MAINNET_USDC_MINT,
+            6,
+        ),
     );
-    let wallet = wallet.map_err(internal)?;
-    let gateway = gateway.map_err(internal)?;
-    let deposits = deposits.map_err(internal)?;
-    let solana = solana.map_err(internal)?;
-    let buckets = usdc_buckets(wallet, &evm, &gateway, &deposits).map_err(internal)?;
-
-    // Only the original single-user test runner writes this movement ledger.
-    let movement = if user.user_id == state.user_id {
-        state.movement.lock().map_err(internal)?.clone()
-    } else {
-        None
-    };
-    let outgoing = movement.as_ref().map(|m| OutgoingGatewayMovement {
-        amount_base_units: m.amount_base_units,
-        gateway_before_base_units: m.gateway_before_base_units,
-        solana_before_base_units: m.solana_before_base_units,
-    });
-    let unified =
-        include_solana_and_outgoing(&buckets, solana, outgoing.as_ref()).map_err(internal)?;
-    let total = unified.total_accounted_base_units.ok_or((
-        StatusCode::BAD_GATEWAY,
-        "balance sources are temporarily inconsistent".into(),
-    ))?;
-    let pending = buckets
-        .gateway_pending_base_units
-        .checked_add(unified.outgoing_in_flight_base_units)
-        .ok_or((StatusCode::BAD_GATEWAY, "balance overflow".into()))?;
+    let base_usdc = base_usdc.map_err(internal)?;
+    let solana_usdc = solana_usdc.map_err(internal)?;
     let rate = fx_rate(&currency).await?;
     let mut holdings = Vec::new();
-    add_holding(&mut holdings, "base", "wallet", wallet, &currency, rate)?;
-    add_holding(
-        &mut holdings,
-        "base",
-        "gateway",
-        buckets.gateway_confirmed_base_units,
-        &currency,
-        rate,
-    )?;
-    add_holding(
-        &mut holdings,
-        "base",
-        "gateway_pending",
-        buckets.gateway_pending_base_units,
-        &currency,
-        rate,
-    )?;
-    add_holding(&mut holdings, "solana", "wallet", solana, &currency, rate)?;
+    add_holding(&mut holdings, "base", "wallet", base_usdc, &currency, rate)?;
     add_holding(
         &mut holdings,
         "solana",
-        "gateway_pending",
-        unified.outgoing_in_flight_base_units,
+        "wallet",
+        solana_usdc,
         &currency,
         rate,
     )?;
+    let mut total = base_usdc
+        .checked_add(solana_usdc)
+        .ok_or((StatusCode::BAD_GATEWAY, "balance overflow".into()))?;
+
+    for asset in markets::ASSETS {
+        let units = if asset.chain == "base" {
+            state
+                .markets
+                .base
+                .balance_of(asset.token, &evm)
+                .await
+                .map_err(internal)?
+        } else if asset.symbol == "SOL" {
+            let (native, wrapped) = tokio::join!(
+                state.solana_mainnet.owner_sol_balance(&solana_owner),
+                state
+                    .solana_mainnet
+                    .owner_mint_balance(&solana_owner, asset.token, 9),
+            );
+            native
+                .map_err(internal)?
+                .checked_add(wrapped.map_err(internal)?)
+                .ok_or((StatusCode::BAD_GATEWAY, "SOL balance overflow".into()))?
+        } else {
+            state
+                .solana_mainnet
+                .owner_mint_balance(&solana_owner, asset.token, u64::from(asset.decimals))
+                .await
+                .map_err(internal)?
+        };
+        if units == 0 {
+            continue;
+        }
+        // Use the same live venue route as the trade preview. Valuation is indicative;
+        // a missing route fails explicitly instead of displaying an incomplete total.
+        let (_, one_dollar_units, _) =
+            markets::venue_quote(&state.markets, asset, "buy", 1_000_000).await?;
+        let value_usdc = indicative_usdc_value(units, one_dollar_units)?;
+        total = total
+            .checked_add(value_usdc)
+            .ok_or((StatusCode::BAD_GATEWAY, "portfolio value overflow".into()))?;
+        holdings.push(Holding {
+            asset_id: asset.id,
+            symbol: asset.symbol,
+            name: asset.name,
+            kind: asset.kind,
+            chain: asset.chain,
+            amount: markets::format_units(units, asset.decimals),
+            value: money(value_usdc, &currency, rate)?,
+            value_usd: usd(value_usdc),
+            location: "wallet",
+        });
+    }
     let as_of_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(internal)?
@@ -147,16 +158,27 @@ pub(super) async fn balance(
     Ok(Json(AppBalanceResponse {
         total: money(total, &currency, rate)?,
         total_usd: usd(total),
-        pending: if pending == 0 {
-            None
-        } else {
-            Some(money(pending, &currency, rate)?)
-        },
+        pending: None,
         holdings,
         as_of_unix_ms,
     }))
 }
 
+fn indicative_usdc_value(units: u128, one_dollar_units: u128) -> Result<u128, ApiError> {
+    if one_dollar_units == 0 {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "venue returned zero-priced asset".into(),
+        ));
+    }
+    units
+        .checked_mul(1_000_000)
+        .map(|n| n / one_dollar_units)
+        .ok_or((
+            StatusCode::BAD_GATEWAY,
+            "portfolio valuation overflow".into(),
+        ))
+}
 pub(super) async fn verified_wallets(
     state: &AppState,
     headers: &HeaderMap,
@@ -296,6 +318,15 @@ fn money(base_units: u128, currency: &str, rate_micros: u128) -> Result<Money, A
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn portfolio_value_uses_raw_token_units() {
+        // A $1 quote buys 0.0005 WETH. Half a WETH is therefore $1,000.
+        assert_eq!(
+            indicative_usdc_value(500_000_000_000_000_000, 500_000_000_000_000).unwrap(),
+            1_000_000_000
+        );
+        assert!(indicative_usdc_value(1, 0).is_err());
+    }
     #[test]
     fn rates_and_money_use_integer_arithmetic() {
         assert_eq!(decimal_micros("1328.44"), Some(1_328_440_000));

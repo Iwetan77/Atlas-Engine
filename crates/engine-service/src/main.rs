@@ -40,6 +40,7 @@ struct AppState {
     scanner: EvmDepositScanner,
     gateway: GatewayClient,
     solana: SolanaAtaPreflight,
+    solana_mainnet: SolanaAtaPreflight,
     auth: AuthMode,
     markets: markets::MarketState,
     social: social::SocialState,
@@ -132,6 +133,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         scanner: EvmDepositScanner::new(base_rpc.parse()?, 2)?,
         gateway: GatewayClient::new(GatewayEnvironment::Testnet)?,
         solana: SolanaAtaPreflight::new(SolanaNetwork::Devnet, solana_rpc, relayer_path)?,
+        solana_mainnet: SolanaAtaPreflight::new(
+            SolanaNetwork::Mainnet,
+            env::var("ATLAS_SOLANA_MAINNET_RPC_URL")
+                .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".into()),
+            "",
+        )?,
         auth,
         markets: markets::MarketState::new()?,
         social: social::SocialState::new().await?,

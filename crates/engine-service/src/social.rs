@@ -537,7 +537,7 @@ pub(super) async fn execute_send(
         tx.to.clone(),
         tx.data.clone(),
     )?;
-    let plan = json!({"intentId":intent_id,"kind":"send","summary":[{"label":"Send to","value":quote.label},{"label":"Amount","value":format!("{} USDC",format_usdc(quote.usdc_units))},{"label":"Display value","value":format!("{} {}",amount["amount"].as_str().unwrap_or(""),quote.currency)}],"transactions":[{"chain":"base","to":tx.to,"data":tx.data,"value":"0"}],"expiresAtUnixMs":now()+120_000});
+    let plan = json!({"intentId":intent_id,"kind":"send","summary":[{"label":"Send to","value":quote.label},{"label":"Amount","value":format!("{} USDC",format_usdc(quote.usdc_units))},{"label":"Display value","value":format!("{} {}",amount["amount"].as_str().unwrap_or(""),quote.currency)}],"transactions":[{"chain":"base","chainId":8453,"to":tx.to,"data":tx.data,"value":"0"}],"expiresAtUnixMs":now()+120_000});
     stored.plan = Some(plan.clone());
     Ok(Json(plan))
 }

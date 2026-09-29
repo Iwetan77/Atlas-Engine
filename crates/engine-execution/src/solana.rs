@@ -126,6 +126,76 @@ impl SolanaAtaPreflight {
             .map_err(|_| SolanaPreflightError::InvalidResponse)
     }
 
+    /// Refuse an RPC configured for a different cluster before reading balances.
+    pub async fn assert_network(&self) -> Result<(), SolanaPreflightError> {
+        let expected = match self.network {
+            SolanaNetwork::Mainnet => "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d",
+            SolanaNetwork::Devnet => "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG",
+        };
+        let actual = self.rpc("getGenesisHash", json!([])).await?;
+        if actual.as_str() == Some(expected) {
+            Ok(())
+        } else {
+            Err(SolanaPreflightError::Rpc(
+                "Solana RPC is connected to the wrong network".into(),
+            ))
+        }
+    }
+    /// Sum all standard token accounts for a mint owned by this wallet.
+    pub async fn owner_mint_balance(
+        &self,
+        owner_address: &str,
+        mint_address: &str,
+        decimals: u64,
+    ) -> Result<u128, SolanaPreflightError> {
+        Pubkey::from_str(owner_address).map_err(|_| SolanaPreflightError::InvalidAddress)?;
+        Pubkey::from_str(mint_address).map_err(|_| SolanaPreflightError::InvalidAddress)?;
+        let response = self
+            .rpc(
+                "getTokenAccountsByOwner",
+                json!([owner_address, {"mint": mint_address}, {"encoding": "jsonParsed", "commitment": "confirmed"}]),
+            )
+            .await?;
+        let accounts = response["value"]
+            .as_array()
+            .ok_or(SolanaPreflightError::InvalidResponse)?;
+        let mut total = 0u128;
+        for account in accounts {
+            let info = &account["account"]["data"]["parsed"]["info"];
+            if info["owner"].as_str() != Some(owner_address)
+                || info["mint"].as_str() != Some(mint_address)
+                || info["tokenAmount"]["decimals"].as_u64() != Some(decimals)
+            {
+                return Err(SolanaPreflightError::InvalidResponse);
+            }
+            let units: u128 = info["tokenAmount"]["amount"]
+                .as_str()
+                .ok_or(SolanaPreflightError::InvalidResponse)?
+                .parse()
+                .map_err(|_| SolanaPreflightError::InvalidResponse)?;
+            total = total
+                .checked_add(units)
+                .ok_or(SolanaPreflightError::InvalidResponse)?;
+        }
+        Ok(total)
+    }
+
+    /// Read native SOL, including Jupiter outputs that unwrap wrapped SOL.
+    pub async fn owner_sol_balance(
+        &self,
+        owner_address: &str,
+    ) -> Result<u128, SolanaPreflightError> {
+        Pubkey::from_str(owner_address).map_err(|_| SolanaPreflightError::InvalidAddress)?;
+        let response = self
+            .rpc(
+                "getBalance",
+                json!([owner_address, {"commitment": "confirmed"}]),
+            )
+            .await?;
+        Ok(response["value"]
+            .as_u64()
+            .ok_or(SolanaPreflightError::InvalidResponse)? as u128)
+    }
     pub async fn relayer_balance(&self) -> Result<RelayerBalance, SolanaPreflightError> {
         let relayer = read_keypair_file(&self.relayer_keypair_path)
             .map_err(|_| SolanaPreflightError::RelayerKey)?;
