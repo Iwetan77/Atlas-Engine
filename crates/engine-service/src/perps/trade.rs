@@ -334,23 +334,222 @@ pub(crate) async fn execute_quote(
     ],"transactions":[],"expiresAtUnixMs":now()+QUOTE_MS}),
     ))
 }
+fn signed_number(value: &str) -> Result<i128, ApiError> {
+    if let Some(rest) = value.strip_prefix('-') {
+        let v = units(rest)?;
+        Ok(-i128::try_from(v).map_err(internal)?)
+    } else {
+        i128::try_from(units(value)?).map_err(internal)
+    }
+}
+fn signed_money(value: i128, currency: &str, rate: u128) -> Result<Value, ApiError> {
+    let negative = value < 0;
+    let magnitude = value
+        .unsigned_abs()
+        .checked_mul(rate)
+        .ok_or((StatusCode::BAD_REQUEST, "amount too large".into()))?
+        / 1_000_000;
+    let amount = format!(
+        "{}{}",
+        if negative { "-" } else { "" },
+        format_units(magnitude)
+    );
+    Ok(money(&amount, currency))
+}
 pub(crate) async fn close_quote(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(_id): Path<String>,
+    Path(position_id): Path<String>,
     Json(_body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    app_balance::verified_wallets(&state, &headers).await?;
-    Err(unavailable("Paradex close quotes are not enabled yet"))
+    if env::var("PARADEX_ENV").as_deref() != Ok("testnet") {
+        return Err(unavailable("Paradex trading is enabled on testnet only"));
+    }
+    let (user_id, wallet, account) = owner(&state, &headers).await?;
+    let jwt = evm_jwt(&state, &headers, &user_id, &wallet, &account).await?;
+    let positions = state.paradex.positions(&jwt).await.map_err(internal)?;
+    let position = positions
+        .into_iter()
+        .find(|p| p["id"].as_str() == Some(&position_id) && p["status"].as_str() == Some("OPEN"))
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "open Paradex position not found".into(),
+        ))?;
+    let market = venue_str(&position, "market")?;
+    if !MARKET_IDS.iter().any(|(m, _, _)| *m == market) {
+        return Err(bad("unsupported Paradex market"));
+    }
+    let close_side = match venue_str(&position, "side")? {
+        "LONG" => "sell",
+        "SHORT" => "buy",
+        _ => {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                "invalid Paradex position side".into(),
+            ))
+        }
+    };
+    let size = venue_str(&position, "size")?.trim_start_matches('-');
+    let size_units = units(size)?;
+    if size_units == 0 {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "Paradex position size is zero".into(),
+        ));
+    }
+    let venue_leverage = units(venue_str(&position, "leverage")?)?;
+    if venue_leverage == 0 {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "Paradex position leverage is zero".into(),
+        ));
+    }
+    let (metadata, bbo) = tokio::try_join!(state.paradex.market(market), state.paradex.bbo(market))
+        .map_err(internal)?;
+    let (price, liquidity) = fresh_bbo(&bbo, market, close_side)?;
+    if liquidity < size_units {
+        return Err(unavailable(
+            "Paradex order book cannot fill the full close now",
+        ));
+    }
+    let fee_rate = units(venue_str(
+        &metadata["fee_config"]["api_fee"]["taker_fee"],
+        "fee",
+    )?)?;
+    let fee = mul(mul(size_units, price)?, fee_rate)?;
+    let entry = units(venue_str(&position, "average_entry_price")?)?;
+    let pnl_per_unit = if close_side == "sell" {
+        i128::try_from(price).map_err(internal)? - i128::try_from(entry).map_err(internal)?
+    } else {
+        i128::try_from(entry).map_err(internal)? - i128::try_from(price).map_err(internal)?
+    };
+    let pnl = pnl_per_unit
+        .checked_mul(i128::try_from(size_units).map_err(internal)?)
+        .ok_or((StatusCode::BAD_REQUEST, "PnL overflow".into()))?
+        / i128::try_from(SCALE).map_err(internal)?;
+    let basis = signed_number(venue_str(&position, "cost_usd")?)?
+        .unsigned_abs()
+        .checked_mul(SCALE)
+        .ok_or((
+            StatusCode::BAD_GATEWAY,
+            "Paradex position cost overflow".into(),
+        ))?
+        / venue_leverage;
+    let receive = i128::try_from(basis)
+        .map_err(internal)?
+        .saturating_add(pnl)
+        .saturating_sub(i128::try_from(fee).map_err(internal)?)
+        .max(0);
+    let currency = "USD";
+    let quote_id = new_id("close-quote");
+    let expires = now() + QUOTE_MS;
+    state.perps_trade.quotes.lock().map_err(internal)?.insert(
+        quote_id.clone(),
+        Quote {
+            owner: user_id,
+            wallet,
+            account,
+            market: market.into(),
+            side: close_side.into(),
+            size: size.into(),
+            price: format_units(price),
+            leverage: 1,
+            expires,
+            kind: "perp_close",
+            position_id: Some(position_id.clone()),
+            currency: currency.into(),
+            margin: format_units(basis),
+        },
+    );
+    Ok(Json(json!({"quoteId":quote_id,"positionId":position_id,
+        "receive":money(&format_units(receive as u128),currency),
+        "realizedPnl":signed_money(pnl,currency,1_000_000)?,
+        "exitPrice":money(&format_units(price),currency),
+        "fee":money(&format_units(fee),currency),"expiresAtUnixMs":expires
+    })))
 }
 pub(crate) async fn execute_close(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(_id): Path<String>,
+    Path(id): Path<String>,
     Json(_body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    app_balance::verified_wallets(&state, &headers).await?;
-    Err(unavailable("Paradex close execution is not enabled yet"))
+    let (user_id, wallet, account) = owner(&state, &headers).await?;
+    let quote = state
+        .perps_trade
+        .quotes
+        .lock()
+        .map_err(internal)?
+        .get(&id)
+        .cloned()
+        .ok_or((StatusCode::NOT_FOUND, "perps close quote not found".into()))?;
+    if quote.kind != "perp_close" {
+        return Err(bad("not a close quote"));
+    }
+    if quote.owner != user_id
+        || !quote.wallet.eq_ignore_ascii_case(&wallet)
+        || quote.account != account
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "quote belongs to another wallet".into(),
+        ));
+    }
+    if now() >= quote.expires {
+        return Err((StatusCode::GONE, "perps close quote expired".into()));
+    }
+    let jwt = evm_jwt(&state, &headers, &user_id, &wallet, &account).await?;
+    let positions = state.paradex.positions(&jwt).await.map_err(internal)?;
+    let existing = positions
+        .into_iter()
+        .find(|p| {
+            p["id"].as_str() == quote.position_id.as_deref() && p["status"].as_str() == Some("OPEN")
+        })
+        .ok_or((
+            StatusCode::CONFLICT,
+            "Paradex position is no longer open".into(),
+        ))?;
+    if existing["size"].as_str().map(|s| s.trim_start_matches('-')) != Some(&quote.size) {
+        return Err((
+            StatusCode::CONFLICT,
+            "Paradex position size changed; request a new close quote".into(),
+        ));
+    }
+    let bbo = state.paradex.bbo(&quote.market).await.map_err(internal)?;
+    let (price, liquidity) = fresh_bbo(&bbo, &quote.market, &quote.side)?;
+    if price.abs_diff(units(&quote.price)?) > units(&quote.price)? / 100
+        || liquidity < units(&quote.size)?
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "Paradex close price or liquidity changed; request a new quote".into(),
+        ));
+    }
+    let intent_id = new_id("close");
+    let expires = now() + QUOTE_MS;
+    let status = markets::IntentStatus {
+        intent_id: intent_id.clone(),
+        stage: "validate",
+        state: "pending",
+        tx_ids: vec![],
+        error: None,
+    };
+    state.perps_trade.intents.lock().map_err(internal)?.insert(
+        intent_id.clone(),
+        Intent {
+            quote: quote.clone(),
+            client_id: intent_id.clone(),
+            order_id: None,
+            status,
+            expires,
+        },
+    );
+    Ok(Json(
+        json!({"intentId":intent_id,"kind":"perp_close","summary":[
+        {"label":"Market","value":quote.market},{"label":"Action","value":"Close position"},
+        {"label":"Size","value":quote.size},{"label":"Estimated exit price","value":format!("{} USD",quote.price)}
+    ],"transactions":[],"expiresAtUnixMs":expires}),
+    ))
 }
 fn access_token(headers: &HeaderMap) -> Result<&str, ApiError> {
     headers
@@ -413,21 +612,45 @@ async fn submit_confirmed(
     intent: &Intent,
 ) -> Result<Value, ApiError> {
     let quote = &intent.quote;
+    let bbo = state.paradex.bbo(&quote.market).await.map_err(internal)?;
+    let (latest, liquidity) = fresh_bbo(&bbo, &quote.market, &quote.side)?;
+    let quoted = units(&quote.price)?;
+    if latest.abs_diff(quoted) > quoted / 100 || liquidity < units(&quote.size)? {
+        return Err((
+            StatusCode::CONFLICT,
+            "Paradex price or liquidity changed before submission".into(),
+        ));
+    }
     let evm = evm_jwt(state, headers, &quote.owner, &quote.wallet, &quote.account).await?;
     let config = state.paradex.system_config().await.map_err(internal)?;
     let chain = venue_str(&config, "starknet_chain_id")?;
-    let margin = state
-        .paradex
-        .set_cross_margin(&evm, &quote.market, quote.leverage)
-        .await
-        .map_err(internal)?;
-    if margin["leverage"].as_u64() != Some(quote.leverage)
-        || margin["market"].as_str() != Some(&quote.market)
-    {
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            "Paradex did not confirm leverage".into(),
-        ));
+    if quote.kind == "perp_open" {
+        let margin = state
+            .paradex
+            .set_cross_margin(&evm, &quote.market, quote.leverage)
+            .await
+            .map_err(internal)?;
+        if margin["leverage"].as_u64() != Some(quote.leverage)
+            || margin["market"].as_str() != Some(&quote.market)
+        {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                "Paradex did not confirm leverage".into(),
+            ));
+        }
+    } else {
+        let positions = state.paradex.positions(&evm).await.map_err(internal)?;
+        let still_open = positions.iter().any(|p| {
+            p["id"].as_str() == quote.position_id.as_deref()
+                && p["status"].as_str() == Some("OPEN")
+                && p["size"].as_str().map(|s| s.trim_start_matches('-')) == Some(&quote.size)
+        });
+        if !still_open {
+            return Err((
+                StatusCode::CONFLICT,
+                "Paradex position changed before close submission".into(),
+            ));
+        }
     }
     let registration = signed_bridge(
         state,
@@ -680,7 +903,27 @@ pub(crate) async fn status(
             }
             let expected = units(&current.quote.size)?;
             if executed >= expected {
-                next.state = "filled";
+                let positions = state.paradex.positions(&jwt).await.map_err(internal)?;
+                let settled = if current.quote.kind == "perp_close" {
+                    !positions.iter().any(|p| {
+                        p["id"].as_str() == current.quote.position_id.as_deref()
+                            && p["status"].as_str() == Some("OPEN")
+                    })
+                } else {
+                    positions.iter().any(|p| {
+                        p["market"].as_str() == Some(&current.quote.market)
+                            && p["status"].as_str() == Some("OPEN")
+                            && p["liquidation_price"]
+                                .as_str()
+                                .is_some_and(|value| !value.is_empty())
+                    })
+                };
+                if settled {
+                    next.state = "filled";
+                } else if now() > current.expires + 60_000 {
+                    next.state = "failed";
+                    next.error=Some("Paradex filled the order but position settlement is not visible yet; check positions".into());
+                }
             } else if executed > 0 || now() > current.expires + 60_000 {
                 next.state = "failed";
                 next.error = Some(if executed > 0 {
