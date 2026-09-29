@@ -115,7 +115,6 @@ struct StoredIntent {
     chain: String,
     expected: Vec<(String, String)>,
     request_id: Option<String>,
-    expires: u64,
     status: IntentStatus,
 }
 #[derive(Clone, Serialize)]
@@ -640,7 +639,6 @@ pub(super) async fn execute_quote(
             chain: a.chain.into(),
             expected,
             request_id,
-            expires,
             status,
         },
     );
@@ -697,9 +695,6 @@ pub(super) async fn signed(
     }
     if current.status.state != "pending" || current.status.stage != "validate" {
         return Ok(Json(current.status));
-    }
-    if current.expires < now() {
-        return Err((StatusCode::CONFLICT, "execution plan expired".into()));
     }
     let mut status = current.status.clone();
     if current.chain == "base" {
