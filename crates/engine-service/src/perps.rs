@@ -117,6 +117,11 @@ pub(super) async fn onboard(
     headers: HeaderMap,
     Json(_body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
+    if env::var("PARADEX_ENV").as_deref() != Ok("testnet") {
+        return Err(unavailable(
+            "Paradex testnet onboarding is not enabled on this service",
+        ));
+    }
     let user = app_balance::verified_wallets(&state, &headers).await?;
     let wallet = user.evm_wallet.filter(|wallet| !wallet.is_empty()).ok_or((
         StatusCode::CONFLICT,
