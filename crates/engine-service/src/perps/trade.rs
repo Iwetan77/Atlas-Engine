@@ -352,15 +352,265 @@ pub(crate) async fn execute_close(
     app_balance::verified_wallets(&state, &headers).await?;
     Err(unavailable("Paradex close execution is not enabled yet"))
 }
+fn access_token(headers: &HeaderMap) -> Result<&str, ApiError> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or((
+            StatusCode::UNAUTHORIZED,
+            "Privy access token required".into(),
+        ))
+}
+async fn signed_bridge(
+    state: &AppState,
+    headers: &HeaderMap,
+    user: &str,
+    wallet: &str,
+    route: &str,
+    details: Value,
+) -> Result<Value, ApiError> {
+    let AuthMode::Privy { bridge_url, http } = &state.auth else {
+        return Err(unavailable("Privy signer unavailable"));
+    };
+    let mut input = json!({"accessToken":access_token(headers)?,"walletAddress":wallet});
+    if let (Some(to), Some(from)) = (input.as_object_mut(), details.as_object()) {
+        for (k, v) in from {
+            to.insert(k.clone(), v.clone());
+        }
+    }
+    let response = http
+        .post(format!("{bridge_url}/paradex/{route}"))
+        .json(&input)
+        .send()
+        .await
+        .map_err(|_| unavailable("Privy signing bridge unavailable"))?;
+    if response.status() == reqwest::StatusCode::CONFLICT {
+        return Err((
+            StatusCode::CONFLICT,
+            "Approve Atlas perps signer in the app".into(),
+        ));
+    }
+    if !response.status().is_success() {
+        return Err(unavailable("Privy could not sign Paradex request"));
+    }
+    let proof: Value = response.json().await.map_err(internal)?;
+    if proof["userId"].as_str() != Some(user)
+        || proof["walletAddress"]
+            .as_str()
+            .is_none_or(|v| !v.eq_ignore_ascii_case(wallet))
+    {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "Privy signing proof wallet mismatch".into(),
+        ));
+    }
+    Ok(proof)
+}
+async fn submit_confirmed(
+    state: &AppState,
+    headers: &HeaderMap,
+    intent: &Intent,
+) -> Result<Value, ApiError> {
+    let quote = &intent.quote;
+    let evm = evm_jwt(state, headers, &quote.owner, &quote.wallet, &quote.account).await?;
+    let config = state.paradex.system_config().await.map_err(internal)?;
+    let chain = venue_str(&config, "starknet_chain_id")?;
+    let margin = state
+        .paradex
+        .set_cross_margin(&evm, &quote.market, quote.leverage)
+        .await
+        .map_err(internal)?;
+    if margin["leverage"].as_u64() != Some(quote.leverage)
+        || margin["market"].as_str() != Some(&quote.market)
+    {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "Paradex did not confirm leverage".into(),
+        ));
+    }
+    let registration = signed_bridge(
+        state,
+        headers,
+        &quote.owner,
+        &quote.wallet,
+        "subkey-registration-signature",
+        json!({}),
+    )
+    .await?;
+    let key = venue_str(&registration, "publicKey")?;
+    if !state
+        .paradex
+        .subkey_exists(&evm, key)
+        .await
+        .map_err(internal)?
+    {
+        state
+            .paradex
+            .register_subkey(
+                &evm,
+                key,
+                venue_str(&registration, "signature")?,
+                venue_str(&registration, "siweMessage")?,
+            )
+            .await
+            .map_err(internal)?;
+    }
+    let auth = signed_bridge(
+        state,
+        headers,
+        &quote.owner,
+        &quote.wallet,
+        "subkey-auth-signature",
+        json!({
+            "accountAddress":quote.account,"chainId":chain
+        }),
+    )
+    .await?;
+    if auth["publicKey"].as_str() != Some(key) {
+        return Err((StatusCode::BAD_GATEWAY, "Paradex subkey mismatch".into()));
+    }
+    let timestamp = auth["timestamp"].as_u64().ok_or((
+        StatusCode::BAD_GATEWAY,
+        "Subkey auth timestamp missing".into(),
+    ))?;
+    let expiration = auth["expiration"]
+        .as_u64()
+        .ok_or((StatusCode::BAD_GATEWAY, "Subkey auth expiry missing".into()))?;
+    let trade_jwt = state
+        .paradex
+        .authenticate_subkey(
+            &quote.account,
+            key,
+            venue_str(&auth, "signature")?,
+            timestamp,
+            expiration,
+        )
+        .await
+        .map_err(internal)?;
+    // A stable client ID lets us reconcile a timed-out submit without placing another order.
+    let existing = state
+        .paradex
+        .order_history(&trade_jwt, &intent.client_id)
+        .await
+        .map_err(internal)?;
+    if let Some(order) = existing
+        .into_iter()
+        .find(|order| order["client_id"].as_str() == Some(&intent.client_id))
+    {
+        return Ok(order);
+    }
+    let side = if quote.side == "long" || quote.side == "buy" {
+        "BUY"
+    } else {
+        "SELL"
+    };
+    let order =
+        json!({"market":quote.market,"side":side,"type":"MARKET","size":quote.size,"price":"0"});
+    let signature = signed_bridge(
+        state,
+        headers,
+        &quote.owner,
+        &quote.wallet,
+        "order-signature",
+        json!({
+            "accountAddress":quote.account,"chainId":chain,"order":order
+        }),
+    )
+    .await?;
+    if signature["publicKey"].as_str() != Some(key) {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "Paradex order signer mismatch".into(),
+        ));
+    }
+    let body = json!({"client_id":intent.client_id,"instruction":"IOC","market":quote.market,
+        "price":"0","side":side,"size":quote.size,"type":"MARKET",
+        "signature":venue_str(&signature,"signature")?,
+        "signature_timestamp":signature["timestamp"].as_u64().ok_or((StatusCode::BAD_GATEWAY,"Order timestamp missing".into()))?,
+        "flags":if quote.kind=="perp_close" {vec!["REDUCE_ONLY"]} else {vec![]}
+    });
+    match state.paradex.submit_order(&trade_jwt, &body).await {
+        Ok(order) => Ok(order),
+        Err(engine_execution::perps::ParadexError::Transport(_)) => {
+            // The venue may have accepted the order before our HTTP connection failed.
+            // Never submit a second order for this confirmed intent.
+            let history = state
+                .paradex
+                .order_history(&trade_jwt, &intent.client_id)
+                .await
+                .map_err(internal)?;
+            history
+                .into_iter()
+                .find(|order| order["client_id"].as_str() == Some(&intent.client_id))
+                .ok_or((
+                    StatusCode::ACCEPTED,
+                    "Paradex submission outcome is pending reconciliation".into(),
+                ))
+        }
+        Err(error) => Err(internal(error)),
+    }
+}
 pub(crate) async fn signed(
     state: AppState,
     intent_id: String,
     headers: HeaderMap,
     body: markets::Submission,
 ) -> Result<Json<markets::IntentStatus>, ApiError> {
-    app_balance::verified_wallets(&state, &headers).await?;
-    let _ = (intent_id, body);
-    Err(unavailable("Paradex order submission is not enabled yet"))
+    let user = app_balance::verified_wallets(&state, &headers).await?;
+    if !body.sent.is_empty() || !body.signed.is_empty() {
+        return Err(bad("Paradex confirmation plan has no app transactions"));
+    }
+    let current = {
+        let mut intents = state.perps_trade.intents.lock().map_err(internal)?;
+        let intent = intents
+            .get_mut(&intent_id)
+            .ok_or((StatusCode::NOT_FOUND, "perps intent not found".into()))?;
+        if intent.quote.owner != user.user_id {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "intent belongs to another user".into(),
+            ));
+        }
+        if intent.status.stage != "validate" {
+            return Ok(Json(intent.status.clone()));
+        }
+        if now() >= intent.expires {
+            return Err((StatusCode::GONE, "perps execution plan expired".into()));
+        }
+        intent.status.stage = "execute";
+        intent.clone()
+    };
+    let result = submit_confirmed(&state, &headers, &current).await;
+    let mut intents = state.perps_trade.intents.lock().map_err(internal)?;
+    let stored = intents
+        .get_mut(&intent_id)
+        .ok_or((StatusCode::NOT_FOUND, "perps intent not found".into()))?;
+    match result {
+        Ok(order) => {
+            if order["client_id"].as_str() != Some(&stored.client_id)
+                || order["market"].as_str() != Some(&stored.quote.market)
+            {
+                stored.status.stage = "settle";
+                stored.status.state = "failed";
+                stored.status.error = Some("Paradex order identity mismatch".into());
+            } else {
+                stored.order_id = order["id"].as_str().map(str::to_owned);
+                if let Some(id) = &stored.order_id {
+                    stored.status.tx_ids = vec![id.clone()];
+                }
+                stored.status.stage = "settle";
+            }
+        }
+        Err(error) => {
+            stored.status.stage = "settle";
+            if error.0 != StatusCode::ACCEPTED {
+                stored.status.state = "failed";
+                stored.status.error = Some(error.1);
+            }
+        }
+    }
+    Ok(Json(stored.status.clone()))
 }
 pub(crate) async fn status(
     state: AppState,
@@ -368,7 +618,7 @@ pub(crate) async fn status(
     headers: HeaderMap,
 ) -> Result<Json<markets::IntentStatus>, ApiError> {
     let user = app_balance::verified_wallets(&state, &headers).await?;
-    let stored = state
+    let current = state
         .perps_trade
         .intents
         .lock()
@@ -376,13 +626,91 @@ pub(crate) async fn status(
         .get(&intent_id)
         .cloned()
         .ok_or((StatusCode::NOT_FOUND, "perps intent not found".into()))?;
-    if stored.quote.owner != user.user_id {
+    if current.quote.owner != user.user_id {
         return Err((
             StatusCode::FORBIDDEN,
             "intent belongs to another user".into(),
         ));
     }
-    Ok(Json(stored.status))
+    if current.status.stage != "settle" || current.status.state != "pending" {
+        return Ok(Json(current.status));
+    }
+    let jwt = evm_jwt(
+        &state,
+        &headers,
+        &current.quote.owner,
+        &current.quote.wallet,
+        &current.quote.account,
+    )
+    .await?;
+    let history = state
+        .paradex
+        .order_history(&jwt, &current.client_id)
+        .await
+        .map_err(internal)?;
+    let mut next = current.status.clone();
+    if let Some(order) = history
+        .into_iter()
+        .find(|v| v["client_id"].as_str() == Some(&current.client_id))
+    {
+        if order["market"].as_str() != Some(&current.quote.market)
+            || order["size"].as_str().map(units).transpose()? != Some(units(&current.quote.size)?)
+        {
+            next.state = "failed";
+            next.error = Some("Paradex order did not match the confirmed plan".into());
+        } else if order["status"].as_str() == Some("CLOSED") {
+            let order_id = venue_str(&order, "id")?;
+            let fills = state
+                .paradex
+                .fills(
+                    &jwt,
+                    &current.quote.market,
+                    current.expires.saturating_sub(QUOTE_MS + 60_000),
+                )
+                .await
+                .map_err(internal)?;
+            let mut executed = 0u128;
+            for fill in fills
+                .iter()
+                .filter(|fill| fill["order_id"].as_str() == Some(order_id))
+            {
+                executed = executed
+                    .checked_add(units(venue_str(fill, "size")?)?)
+                    .ok_or((StatusCode::BAD_GATEWAY, "Paradex fill size overflow".into()))?;
+            }
+            let expected = units(&current.quote.size)?;
+            if executed >= expected {
+                next.state = "filled";
+            } else if executed > 0 || now() > current.expires + 60_000 {
+                next.state = "failed";
+                next.error = Some(if executed > 0 {
+                    format!("Paradex partially filled {} of {}; check your position before another order",format_units(executed),current.quote.size)
+                } else {
+                    format!(
+                        "Paradex order closed without a fill: {}",
+                        order["cancel_reason"].as_str().unwrap_or("unfilled")
+                    )
+                });
+            }
+        }
+        if next.tx_ids.is_empty() {
+            if let Some(id) = order["id"].as_str() {
+                next.tx_ids.push(id.to_owned());
+            }
+        }
+    } else if now() > current.expires + 60_000 {
+        next.state = "failed";
+        next.error = Some("Paradex did not report the submitted order within two minutes".into());
+    }
+    state
+        .perps_trade
+        .intents
+        .lock()
+        .map_err(internal)?
+        .get_mut(&intent_id)
+        .ok_or((StatusCode::NOT_FOUND, "perps intent not found".into()))?
+        .status = next.clone();
+    Ok(Json(next))
 }
 #[cfg(test)]
 mod tests {

@@ -223,6 +223,30 @@ impl ParadexClient {
         self.get("account", Some(jwt)).await
     }
 
+    pub async fn fills(
+        &self,
+        jwt: &str,
+        market: &str,
+        start_at: u64,
+    ) -> Result<Vec<Value>, ParadexError> {
+        if !market
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err(ParadexError::InvalidResponse);
+        }
+        let data = self
+            .get(
+                &format!("fills?market={market}&start_at={start_at}&page_size=100"),
+                Some(jwt),
+            )
+            .await?;
+        data["results"]
+            .as_array()
+            .cloned()
+            .ok_or(ParadexError::InvalidResponse)
+    }
+
     pub async fn order_history(
         &self,
         jwt: &str,

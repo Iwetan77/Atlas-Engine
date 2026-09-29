@@ -157,12 +157,12 @@ pub(super) struct Submission {
     pub(super) signed: Vec<Signed>,
 }
 #[derive(Deserialize)]
-struct Sent {
+pub(super) struct Sent {
     chain: String,
     id: String,
 }
 #[derive(Deserialize)]
-struct Signed {
+pub(super) struct Signed {
     index: usize,
     transaction: String,
 }
