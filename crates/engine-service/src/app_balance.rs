@@ -12,10 +12,10 @@ pub(super) struct BalanceQuery {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct VerifiedWallets {
-    user_id: String,
-    evm_wallet: Option<String>,
-    solana_wallet: Option<String>,
+pub(super) struct VerifiedWallets {
+    pub(super) user_id: String,
+    pub(super) evm_wallet: Option<String>,
+    pub(super) solana_wallet: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -157,7 +157,7 @@ pub(super) async fn balance(
     }))
 }
 
-async fn verified_wallets(
+pub(super) async fn verified_wallets(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<VerifiedWallets, ApiError> {
@@ -244,7 +244,7 @@ fn add_holding(
 }
 
 // Rate is represented as destination-currency micros per USD.
-async fn fx_rate(currency: &str) -> Result<u128, ApiError> {
+pub(super) async fn fx_rate(currency: &str) -> Result<u128, ApiError> {
     if currency == "USD" {
         return Ok(1_000_000);
     }

@@ -2,6 +2,7 @@
 //! available only when the operator explicitly enables local demo mode.
 
 mod app_balance;
+mod markets;
 
 use std::{
     env,
@@ -39,6 +40,7 @@ struct AppState {
     gateway: GatewayClient,
     solana: SolanaAtaPreflight,
     auth: AuthMode,
+    markets: markets::MarketState,
 }
 
 #[derive(Clone)]
@@ -129,6 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         gateway: GatewayClient::new(GatewayEnvironment::Testnet)?,
         solana: SolanaAtaPreflight::new(SolanaNetwork::Devnet, solana_rpc, relayer_path)?,
         auth,
+        markets: markets::MarketState::new()?,
     };
     let bind: SocketAddr = env::var("ATLAS_BALANCE_BIND")
         .unwrap_or_else(|_| "127.0.0.1:3000".into())
@@ -138,6 +141,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut app = Router::new()
         .route("/v1/balance", get(app_balance::balance))
+        .route("/v1/assets", get(markets::assets))
+        .route("/v1/quotes", post(markets::quote))
+        .route(
+            "/v1/quotes/{quote_id}/execute",
+            post(markets::execute_quote),
+        )
+        .route("/v1/intents/{intent_id}/signed", post(markets::signed))
+        .route("/v1/intents/{intent_id}", get(markets::intent_status))
         .route("/balance/{user}", get(balance))
         .route("/balance/{user}/movement", post(register_movement))
         .with_state(state);
