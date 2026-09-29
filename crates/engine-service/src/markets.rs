@@ -598,7 +598,7 @@ pub(super) async fn execute_quote(
         request_id = Some(order.request_id);
     }
     let intent_id = id("intent");
-    let expires = now() + 25_000;
+    let expires = now() + if a.chain == "base" { 120_000 } else { 45_000 };
     let receive = if stored.side == "buy" {
         format!("{} {}", format_units(output, a.decimals), a.symbol)
     } else {
