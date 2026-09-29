@@ -258,7 +258,15 @@ pub(super) async fn markets(
             state.paradex.summary(market_id),
             state.paradex.funding(market_id),
         );
-        let metadata = metadata.map_err(internal)?;
+        let metadata = match metadata {
+            Ok(metadata) => metadata,
+            Err(engine_execution::perps::ParadexError::Rejected(
+                reqwest::StatusCode::NOT_FOUND,
+            )) => {
+                continue;
+            }
+            Err(error) => return Err(internal(error)),
+        };
         let summary = summary.map_err(internal)?;
         let funding = funding.map_err(internal)?;
         if venue_str(&metadata, "symbol")? != market_id
