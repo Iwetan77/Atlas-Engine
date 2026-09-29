@@ -9,6 +9,7 @@ use thiserror::Error;
 pub struct ParadexClient {
     http: Client,
     base: Url,
+    v2_base: Url,
 }
 
 #[derive(Debug, Error)]
@@ -40,9 +41,11 @@ impl ParadexClient {
             "testnet" => "https://api.testnet.paradex.trade/v1/",
             _ => return Err(ParadexError::InvalidEnvironment),
         };
+        let v2_url = url.replace("/v1/", "/v2/");
         Ok(Self {
             http: Client::builder().timeout(Duration::from_secs(15)).build()?,
             base: Url::parse(url).map_err(|_| ParadexError::InvalidEnvironment)?,
+            v2_base: Url::parse(&v2_url).map_err(|_| ParadexError::InvalidEnvironment)?,
         })
     }
 
@@ -120,8 +123,8 @@ impl ParadexClient {
             return Err(ParadexError::InvalidResponse);
         }
         let url = self
-            .base
-            .join("v2/onboarding")
+            .v2_base
+            .join("onboarding")
             .map_err(|_| ParadexError::InvalidResponse)?;
         let response = self
             .http
@@ -151,8 +154,8 @@ impl ParadexClient {
             return Err(ParadexError::InvalidResponse);
         }
         let url = self
-            .base
-            .join("v2/auth")
+            .v2_base
+            .join("auth")
             .map_err(|_| ParadexError::InvalidResponse)?;
         let response = self
             .http
@@ -210,5 +213,24 @@ impl ParadexClient {
             .as_array()
             .cloned()
             .ok_or(ParadexError::InvalidResponse)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evm_endpoints_use_v2_root() {
+        for environment in ["testnet", "prod"] {
+            let client = ParadexClient::new(environment).unwrap();
+            assert_eq!(client.base.path(), "/v1/");
+            assert_eq!(client.v2_base.path(), "/v2/");
+            assert_eq!(
+                client.v2_base.join("onboarding").unwrap().path(),
+                "/v2/onboarding"
+            );
+            assert_eq!(client.v2_base.join("auth").unwrap().path(), "/v2/auth");
+        }
     }
 }
