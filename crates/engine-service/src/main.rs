@@ -3,6 +3,7 @@
 
 mod app_balance;
 mod markets;
+mod perps;
 mod social;
 
 use std::{
@@ -43,6 +44,7 @@ struct AppState {
     solana_mainnet: SolanaAtaPreflight,
     auth: AuthMode,
     markets: markets::MarketState,
+    paradex: engine_execution::perps::ParadexClient,
     social: social::SocialState,
 }
 
@@ -141,6 +143,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?,
         auth,
         markets: markets::MarketState::new()?,
+        paradex: engine_execution::perps::ParadexClient::new(
+            &env::var("PARADEX_ENV").unwrap_or_else(|_| "prod".into()),
+        )?,
         social: social::SocialState::new().await?,
     };
     let bind: SocketAddr = env::var("ATLAS_BALANCE_BIND")
@@ -152,6 +157,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = Router::new()
         .route("/v1/balance", get(app_balance::balance))
         .route("/v1/assets", get(markets::assets))
+        .route("/v1/perps/markets", get(perps::markets))
+        .route("/v1/perps/positions", get(perps::positions))
+        .route("/v1/perps/quotes", post(perps::quotes))
+        .route(
+            "/v1/perps/quotes/{quote_id}/execute",
+            post(perps::execute_quote),
+        )
+        .route(
+            "/v1/perps/positions/{position_id}/close-quote",
+            post(perps::close_quote),
+        )
+        .route(
+            "/v1/perps/close-quotes/{quote_id}/execute",
+            post(perps::execute_close),
+        )
         .route("/v1/me", get(social::me))
         .route("/v1/me/handle", post(social::set_handle))
         .route("/v1/users/resolve", get(social::resolve_user))

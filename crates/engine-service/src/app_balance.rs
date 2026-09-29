@@ -270,10 +270,31 @@ pub(super) async fn fx_rate(currency: &str) -> Result<u128, ApiError> {
     if currency == "USD" {
         return Ok(1_000_000);
     }
-    let response: Value = reqwest::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(8))
         .build()
-        .map_err(internal)?
+        .map_err(internal)?;
+    let frankfurter = client
+        .get(format!(
+            "https://api.frankfurter.dev/v2/rate/USD/{currency}"
+        ))
+        .send()
+        .await;
+    if let Ok(response) = frankfurter {
+        if let Ok(response) = response.error_for_status() {
+            if let Ok(data) = response.json::<Value>().await {
+                if data["base"] == "USD" && data["quote"] == currency {
+                    if let Some(rate) = data["rate"]
+                        .as_number()
+                        .and_then(|v| decimal_micros(&v.to_string()))
+                    {
+                        return Ok(rate);
+                    }
+                }
+            }
+        }
+    }
+    let response: Value = client
         .get("https://api.coinbase.com/v2/exchange-rates?currency=USD")
         .send()
         .await
@@ -288,7 +309,6 @@ pub(super) async fn fx_rate(currency: &str) -> Result<u128, ApiError> {
         .ok_or((StatusCode::BAD_GATEWAY, "FX rate unavailable".into()))?;
     decimal_micros(rate).ok_or((StatusCode::BAD_GATEWAY, "FX rate invalid".into()))
 }
-
 fn decimal_micros(value: &str) -> Option<u128> {
     let (whole, frac) = value.split_once('.').unwrap_or((value, ""));
     if whole.is_empty()
