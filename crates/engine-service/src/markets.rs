@@ -89,7 +89,7 @@ const ASSETS: [Asset; 6] = [
 
 #[derive(Clone)]
 pub(super) struct MarketState {
-    base: UniswapV3Client,
+    pub(super) base: UniswapV3Client,
     jupiter: JupiterClient,
     rpc: reqwest::Url,
     http: reqwest::Client,
@@ -176,6 +176,36 @@ impl MarketState {
     }
 }
 
+impl MarketState {
+    pub(super) fn register_base_transfer(
+        &self,
+        owner: String,
+        wallet: String,
+        to: String,
+        data: String,
+    ) -> Result<String, ApiError> {
+        let intent_id = id("intent");
+        let status = IntentStatus {
+            intent_id: intent_id.clone(),
+            stage: "validate",
+            state: "pending",
+            tx_ids: Vec::new(),
+            error: None,
+        };
+        self.intents.lock().map_err(internal)?.insert(
+            intent_id.clone(),
+            StoredIntent {
+                owner,
+                wallet,
+                chain: "base".into(),
+                expected: vec![(to.to_ascii_lowercase(), data.to_ascii_lowercase())],
+                request_id: None,
+                status,
+            },
+        );
+        Ok(intent_id)
+    }
+}
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

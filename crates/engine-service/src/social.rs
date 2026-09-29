@@ -1,0 +1,580 @@
+//! Privy-backed handles and direct Base USDC sends. Durable handle storage
+//! uses Postgres or ATLAS_SOCIAL_STATE_PATH on a persistent volume.
+use super::*;
+use axum::extract::Query;
+use engine_execution::swaps::uniswap::BASE_USDC;
+use serde_json::{json, Value};
+use std::{
+    collections::HashMap,
+    fs,
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
+static NEXT_SEND_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone)]
+pub(super) struct SocialState {
+    path: Option<PathBuf>,
+    postgres: Option<Arc<tokio_postgres::Client>>,
+    ledger: Arc<Mutex<Ledger>>,
+    quotes: Arc<Mutex<HashMap<String, SendQuote>>>,
+}
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct Ledger {
+    handles: HashMap<String, HandleRecord>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HandleRecord {
+    user_id: String,
+    handle: String,
+    display_name: Option<String>,
+    evm_wallet: String,
+}
+#[derive(Clone)]
+struct SendQuote {
+    owner: String,
+    sender_wallet: String,
+    recipient_wallet: String,
+    label: String,
+    currency: String,
+    usdc_units: u128,
+    expires: u64,
+    plan: Option<Value>,
+}
+#[derive(Deserialize)]
+pub(super) struct HandleBody {
+    handle: String,
+}
+#[derive(Deserialize)]
+pub(super) struct HandleQuery {
+    handle: String,
+}
+#[derive(Deserialize)]
+pub(super) struct BanksQuery {
+    country: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct BankResolve {
+    bank_code: String,
+    account_number: String,
+}
+#[derive(Deserialize)]
+pub(super) struct SendRequest {
+    destination: Destination,
+    amount: Money,
+}
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum Destination {
+    Atlas {
+        handle: String,
+    },
+    Bank {
+        #[serde(rename = "bankCode")]
+        bank_code: String,
+        #[serde(rename = "accountNumber")]
+        account_number: String,
+    },
+    Cashlink {
+        message: Option<String>,
+    },
+}
+#[derive(Deserialize)]
+pub(super) struct ClaimBody {
+    secret: String,
+}
+#[derive(Deserialize)]
+struct Money {
+    amount: String,
+    currency: String,
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+fn format_usdc(units: u128) -> String {
+    let mut amount = format!("{}.{:06}", units / 1_000_000, units % 1_000_000);
+    while amount.ends_with('0') {
+        amount.pop();
+    }
+    if amount.ends_with('.') {
+        amount.pop();
+    }
+    amount
+}
+fn invalid_handle(handle: &str) -> bool {
+    !(3..=20).contains(&handle.len())
+        || !handle
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+fn bad(message: &str) -> ApiError {
+    (StatusCode::BAD_REQUEST, message.into())
+}
+fn unavailable(message: &str) -> ApiError {
+    (StatusCode::SERVICE_UNAVAILABLE, message.into())
+}
+fn money_usdc(units: u128, currency: &str, rate: u128) -> Result<Value, ApiError> {
+    let value = units
+        .checked_mul(rate)
+        .ok_or_else(|| bad("amount too large"))?
+        / 1_000_000;
+    let mut amount = format!("{}.{:06}", value / 1_000_000, value % 1_000_000);
+    while amount.ends_with('0') {
+        amount.pop();
+    }
+    if amount.ends_with('.') {
+        amount.pop();
+    }
+    Ok(json!({"amount":amount,"currency":currency}))
+}
+fn parse_micros(value: &str) -> Result<u128, ApiError> {
+    let (whole, frac) = value.split_once('.').unwrap_or((value, ""));
+    if whole.is_empty()
+        || frac.len() > 6
+        || !whole.bytes().all(|b| b.is_ascii_digit())
+        || !frac.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(bad(
+            "amount must be a positive decimal with at most six places",
+        ));
+    }
+    let w: u128 = whole.parse().map_err(|_| bad("amount too large"))?;
+    let f: u128 = format!("{:0<6}", frac)
+        .parse()
+        .map_err(|_| bad("invalid amount"))?;
+    w.checked_mul(1_000_000)
+        .and_then(|x| x.checked_add(f))
+        .filter(|x| *x > 0)
+        .ok_or_else(|| bad("amount must be positive"))
+}
+impl SocialState {
+    pub(super) async fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let postgres = if let Ok(url) = env::var("DATABASE_URL") {
+            let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
+            tokio::spawn(async move {
+                if let Err(error) = connection.await {
+                    eprintln!("social database connection ended: {error}");
+                }
+            });
+            client
+                .batch_execute(
+                    "CREATE TABLE IF NOT EXISTS atlas_handles (
+                handle TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL UNIQUE,
+                display_name TEXT,
+                evm_wallet TEXT NOT NULL
+            )",
+                )
+                .await?;
+            Some(Arc::new(client))
+        } else {
+            None
+        };
+        let path = if postgres.is_none() {
+            env::var_os("ATLAS_SOCIAL_STATE_PATH").map(PathBuf::from)
+        } else {
+            None
+        };
+        let ledger = if let Some(path) = &path {
+            if path.exists() {
+                serde_json::from_slice(&fs::read(path)?)?
+            } else {
+                Ledger::default()
+            }
+        } else {
+            Ledger::default()
+        };
+        Ok(Self {
+            path,
+            postgres,
+            ledger: Arc::new(Mutex::new(ledger)),
+            quotes: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+    fn require_storage(&self) -> Result<(), ApiError> {
+        if self.path.is_some() || self.postgres.is_some() {
+            Ok(())
+        } else {
+            Err(unavailable("permanent handle storage is not configured"))
+        }
+    }
+    async fn find_user(&self, user_id: &str) -> Result<Option<HandleRecord>, ApiError> {
+        if let Some(pg) = &self.postgres {
+            let row = pg.query_opt("SELECT user_id, handle, display_name, evm_wallet FROM atlas_handles WHERE user_id=$1", &[&user_id]).await.map_err(internal)?;
+            return Ok(row.map(record_from_row));
+        }
+        Ok(self
+            .ledger
+            .lock()
+            .map_err(internal)?
+            .handles
+            .values()
+            .find(|r| r.user_id == user_id)
+            .cloned())
+    }
+    async fn find_handle(&self, handle: &str) -> Result<Option<HandleRecord>, ApiError> {
+        if let Some(pg) = &self.postgres {
+            let row = pg.query_opt("SELECT user_id, handle, display_name, evm_wallet FROM atlas_handles WHERE handle=$1", &[&handle]).await.map_err(internal)?;
+            return Ok(row.map(record_from_row));
+        }
+        Ok(self
+            .ledger
+            .lock()
+            .map_err(internal)?
+            .handles
+            .get(handle)
+            .cloned())
+    }
+    async fn register_postgres(&self, record: &HandleRecord) -> Result<(), ApiError> {
+        let pg = self
+            .postgres
+            .as_ref()
+            .ok_or_else(|| unavailable("database not configured"))?;
+        let result = pg.execute("INSERT INTO atlas_handles (handle,user_id,display_name,evm_wallet) VALUES ($1,$2,$3,$4)",
+            &[&record.handle,&record.user_id,&record.display_name,&record.evm_wallet]).await;
+        match result {
+            Ok(1) => Ok(()),
+            Ok(_) => Err(internal("handle insert affected no rows")),
+            Err(error)
+                if error.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) =>
+            {
+                Err((
+                    StatusCode::CONFLICT,
+                    "handle already taken or user already registered".into(),
+                ))
+            }
+            Err(error) => Err(internal(error)),
+        }
+    }
+    fn save(&self, ledger: &Ledger) -> Result<(), ApiError> {
+        let path = self
+            .path
+            .as_ref()
+            .ok_or_else(|| unavailable("permanent handle storage is not configured"))?;
+        let temporary = path.with_extension("tmp");
+        let bytes = serde_json::to_vec(ledger).map_err(internal)?;
+        let mut file = fs::File::create(&temporary).map_err(internal)?;
+        use std::io::Write;
+        file.write_all(&bytes).map_err(internal)?;
+        file.sync_all().map_err(internal)?;
+        fs::rename(temporary, path).map_err(internal)
+    }
+}
+
+fn record_from_row(row: tokio_postgres::Row) -> HandleRecord {
+    HandleRecord {
+        user_id: row.get("user_id"),
+        handle: row.get("handle"),
+        display_name: row.get("display_name"),
+        evm_wallet: row.get("evm_wallet"),
+    }
+}
+pub(super) async fn me(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let user = app_balance::verified_wallets(&state, &headers).await?;
+    state.social.require_storage()?;
+    let record = state.social.find_user(&user.user_id).await?;
+
+    Ok(Json(
+        json!({"userId":user.user_id,"handle":record.as_ref().map(|r|&r.handle),"displayName":record.and_then(|r|r.display_name)}),
+    ))
+}
+pub(super) async fn set_handle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<HandleBody>,
+) -> Result<Json<Value>, ApiError> {
+    let user = app_balance::verified_wallets(&state, &headers).await?;
+    if invalid_handle(&body.handle) {
+        return Err(bad(
+            "handle must be 3–20 lowercase letters, digits, or underscores",
+        ));
+    }
+    state.social.require_storage()?;
+    let wallet = user.evm_wallet.filter(|w| !w.is_empty()).ok_or((
+        StatusCode::CONFLICT,
+        "Privy Ethereum wallet is not ready".into(),
+    ))?;
+    if state.social.postgres.is_some() {
+        if let Some(existing) = state.social.find_user(&user.user_id).await? {
+            if existing.handle == body.handle {
+                return Ok(Json(
+                    json!({"userId":user.user_id,"handle":existing.handle,"displayName":existing.display_name}),
+                ));
+            }
+            return Err((StatusCode::CONFLICT, "handle is permanent".into()));
+        }
+        if state.social.find_handle(&body.handle).await?.is_some() {
+            return Err((StatusCode::CONFLICT, "handle already taken".into()));
+        }
+        let record = HandleRecord {
+            user_id: user.user_id.clone(),
+            handle: body.handle.clone(),
+            display_name: None,
+            evm_wallet: wallet,
+        };
+        state.social.register_postgres(&record).await?;
+        return Ok(Json(
+            json!({"userId":user.user_id,"handle":body.handle,"displayName":null}),
+        ));
+    }
+    let mut ledger = state.social.ledger.lock().map_err(internal)?;
+    if let Some(existing) = ledger.handles.values().find(|r| r.user_id == user.user_id) {
+        if existing.handle == body.handle {
+            return Ok(Json(
+                json!({"userId":user.user_id,"handle":existing.handle,"displayName":existing.display_name}),
+            ));
+        }
+        return Err((StatusCode::CONFLICT, "handle is permanent".into()));
+    }
+    if ledger.handles.contains_key(&body.handle) {
+        return Err((StatusCode::CONFLICT, "handle already taken".into()));
+    }
+    let record = HandleRecord {
+        user_id: user.user_id.clone(),
+        handle: body.handle.clone(),
+        display_name: None,
+        evm_wallet: wallet,
+    };
+    let mut next = ledger.clone();
+    next.handles.insert(body.handle.clone(), record);
+    state.social.save(&next)?;
+    *ledger = next;
+    Ok(Json(
+        json!({"userId":user.user_id,"handle":body.handle,"displayName":null}),
+    ))
+}
+pub(super) async fn resolve_user(
+    State(state): State<AppState>,
+    Query(q): Query<HandleQuery>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    app_balance::verified_wallets(&state, &headers).await?;
+    state.social.require_storage()?;
+    let record = state
+        .social
+        .find_handle(&q.handle)
+        .await?
+        .ok_or((StatusCode::NOT_FOUND, "unknown handle".into()))?;
+
+    Ok(Json(
+        json!({"handle":record.handle,"displayName":record.display_name}),
+    ))
+}
+pub(super) async fn banks(
+    State(state): State<AppState>,
+    Query(q): Query<BanksQuery>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    app_balance::verified_wallets(&state, &headers).await?;
+    if q.country.as_deref() != Some("NG") {
+        return Err(bad("only NG banks are supported"));
+    }
+    Err(unavailable("Daya bank directory is not configured"))
+}
+pub(super) async fn resolve_bank(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<BankResolve>,
+) -> Result<Json<Value>, ApiError> {
+    app_balance::verified_wallets(&state, &headers).await?;
+    if body.bank_code.is_empty()
+        || body.account_number.len() != 10
+        || !body.account_number.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(bad("invalid Nigerian bank details"));
+    }
+    Err(unavailable("Daya account resolution is not configured"))
+}
+pub(super) async fn send_quote(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<SendRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let user = app_balance::verified_wallets(&state, &headers).await?;
+    state.social.require_storage()?;
+    let wallet = user.evm_wallet.filter(|w| !w.is_empty()).ok_or((
+        StatusCode::CONFLICT,
+        "Privy Ethereum wallet is not ready".into(),
+    ))?;
+    let (recipient, label) = match req.destination {
+        Destination::Atlas { handle } => {
+            let record = state
+                .social
+                .find_handle(&handle)
+                .await?
+                .ok_or((StatusCode::NOT_FOUND, "unknown handle".into()))?;
+
+            if record.user_id == user.user_id {
+                return Err(bad("cannot send to yourself"));
+            }
+            (record.evm_wallet.clone(), format!("@{}", record.handle))
+        }
+        Destination::Bank {
+            bank_code,
+            account_number,
+        } => {
+            let _ = (bank_code, account_number);
+            return Err(unavailable("Daya off-ramp is not configured"));
+        }
+        Destination::Cashlink { message } => {
+            let _ = message;
+            return Err(unavailable("cash-link escrow is not configured"));
+        }
+    };
+    if !matches!(
+        req.amount.currency.as_str(),
+        "USD" | "NGN" | "KES" | "GHS" | "ZAR"
+    ) {
+        return Err(bad("unsupported display currency"));
+    }
+    let rate = app_balance::fx_rate(&req.amount.currency).await?;
+    let amount = parse_micros(&req.amount.amount)?;
+    let usdc_units = amount
+        .checked_mul(1_000_000)
+        .ok_or_else(|| bad("amount too large"))?
+        / rate;
+    if usdc_units < 100_000 || usdc_units > 10_000_000_000 {
+        return Err(bad("send amount must be between 0.10 and 10000 USD"));
+    }
+    let quote_id = format!(
+        "send-{:x}-{:x}",
+        now(),
+        NEXT_SEND_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let expires = now() + 30_000;
+    state.social.quotes.lock().map_err(internal)?.insert(
+        quote_id.clone(),
+        SendQuote {
+            owner: user.user_id,
+            sender_wallet: wallet,
+            recipient_wallet: recipient,
+            label: label.clone(),
+            currency: req.amount.currency.clone(),
+            usdc_units,
+            expires,
+            plan: None,
+        },
+    );
+    let actual = money_usdc(usdc_units, &req.amount.currency, rate)?;
+    Ok(Json(
+        json!({"quoteId":quote_id,"destinationLabel":label,"send":actual,"receive":actual,"fee":{"amount":"0","currency":req.amount.currency},"eta":"After confirmation","expiresAtUnixMs":expires}),
+    ))
+}
+pub(super) async fn execute_send(
+    State(state): State<AppState>,
+    Path(quote_id): Path<String>,
+    headers: HeaderMap,
+    Json(_): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let user = app_balance::verified_wallets(&state, &headers).await?;
+    let quote = state
+        .social
+        .quotes
+        .lock()
+        .map_err(internal)?
+        .get(&quote_id)
+        .cloned()
+        .ok_or((StatusCode::NOT_FOUND, "send quote not found".into()))?;
+    if quote.owner != user.user_id {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "send quote belongs to another user".into(),
+        ));
+    }
+    if let Some(plan) = &quote.plan {
+        return Ok(Json(plan.clone()));
+    }
+    if quote.expires < now() {
+        return Err((StatusCode::CONFLICT, "send quote expired".into()));
+    }
+    if user.evm_wallet.as_deref() != Some(quote.sender_wallet.as_str()) {
+        return Err((StatusCode::CONFLICT, "Privy wallet changed".into()));
+    }
+    let balance = state
+        .markets
+        .base
+        .balance_of(BASE_USDC, &quote.sender_wallet)
+        .await
+        .map_err(internal)?;
+    if balance < quote.usdc_units {
+        return Err((
+            StatusCode::CONFLICT,
+            "insufficient Base mainnet USDC".into(),
+        ));
+    }
+    let tx = state
+        .markets
+        .base
+        .transfer_transaction(
+            BASE_USDC,
+            &quote.sender_wallet,
+            &quote.recipient_wallet,
+            quote.usdc_units,
+        )
+        .map_err(internal)?;
+    let rate = app_balance::fx_rate(&quote.currency).await?;
+    let amount = money_usdc(quote.usdc_units, &quote.currency, rate)?;
+    let mut quotes = state.social.quotes.lock().map_err(internal)?;
+    let stored = quotes
+        .get_mut(&quote_id)
+        .ok_or((StatusCode::NOT_FOUND, "send quote not found".into()))?;
+    if let Some(plan) = &stored.plan {
+        return Ok(Json(plan.clone()));
+    }
+    let intent_id = state.markets.register_base_transfer(
+        user.user_id,
+        quote.sender_wallet,
+        tx.to.clone(),
+        tx.data.clone(),
+    )?;
+    let plan = json!({"intentId":intent_id,"kind":"send","summary":[{"label":"Send to","value":quote.label},{"label":"Amount","value":format!("{} USDC",format_usdc(quote.usdc_units))},{"label":"Display value","value":format!("{} {}",amount["amount"].as_str().unwrap_or(""),quote.currency)}],"transactions":[{"chain":"base","to":tx.to,"data":tx.data,"value":"0"}],"expiresAtUnixMs":now()+120_000});
+    stored.plan = Some(plan.clone());
+    Ok(Json(plan))
+}
+pub(super) async fn cashlink(
+    State(_state): State<AppState>,
+    Path(_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Err(unavailable("cash-link escrow is not configured"))
+}
+pub(super) async fn claim(
+    State(state): State<AppState>,
+    Path(_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<ClaimBody>,
+) -> Result<Json<Value>, ApiError> {
+    app_balance::verified_wallets(&state, &headers).await?;
+    if body.secret.is_empty() {
+        return Err((StatusCode::FORBIDDEN, "invalid cash-link secret".into()));
+    }
+    Err(unavailable("cash-link escrow is not configured"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn handle_validation() {
+        for valid in ["ade", "a_3", "abc12345678901234567"] {
+            assert!(!invalid_handle(valid));
+        }
+        for invalid in ["ab", "ABC", "a-b", "abc12345678901234567890"] {
+            assert!(invalid_handle(invalid));
+        }
+    }
+    #[test]
+    fn send_amounts_are_exact_decimal() {
+        assert_eq!(parse_micros("0.123456").unwrap(), 123456);
+        assert!(parse_micros("0.1234567").is_err());
+    }
+}

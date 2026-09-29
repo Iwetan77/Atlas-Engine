@@ -3,6 +3,7 @@
 
 mod app_balance;
 mod markets;
+mod social;
 
 use std::{
     env,
@@ -41,6 +42,7 @@ struct AppState {
     solana: SolanaAtaPreflight,
     auth: AuthMode,
     markets: markets::MarketState,
+    social: social::SocialState,
 }
 
 #[derive(Clone)]
@@ -132,6 +134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         solana: SolanaAtaPreflight::new(SolanaNetwork::Devnet, solana_rpc, relayer_path)?,
         auth,
         markets: markets::MarketState::new()?,
+        social: social::SocialState::new().await?,
     };
     let bind: SocketAddr = env::var("ATLAS_BALANCE_BIND")
         .unwrap_or_else(|_| "127.0.0.1:3000".into())
@@ -142,6 +145,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = Router::new()
         .route("/v1/balance", get(app_balance::balance))
         .route("/v1/assets", get(markets::assets))
+        .route("/v1/me", get(social::me))
+        .route("/v1/me/handle", post(social::set_handle))
+        .route("/v1/users/resolve", get(social::resolve_user))
+        .route("/v1/offramp/banks", get(social::banks))
+        .route("/v1/offramp/resolve", post(social::resolve_bank))
+        .route("/v1/sends/quote", post(social::send_quote))
+        .route(
+            "/v1/sends/quote/{quote_id}/execute",
+            post(social::execute_send),
+        )
+        .route("/v1/cashlinks/{link_id}", get(social::cashlink))
+        .route("/v1/cashlinks/{link_id}/claim", post(social::claim))
         .route("/v1/quotes", post(markets::quote))
         .route(
             "/v1/quotes/{quote_id}/execute",

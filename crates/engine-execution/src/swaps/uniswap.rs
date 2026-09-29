@@ -184,6 +184,33 @@ impl UniswapV3Client {
         decode_first_u128(&result)
     }
 
+    /// Build a direct ERC-20 transfer; the user wallet signs and sends it.
+    pub fn transfer_transaction(
+        &self,
+        token: &str,
+        sender: &str,
+        recipient: &str,
+        amount: u128,
+    ) -> Result<EvmUnsignedTransaction, UniswapV3Error> {
+        if amount == 0 {
+            return Err(UniswapV3Error::InvalidRequest);
+        }
+        let token = address_bytes(token)?;
+        let from = address_bytes(sender)?;
+        let to = address_bytes(recipient)?;
+        if from == to {
+            return Err(UniswapV3Error::InvalidRequest);
+        }
+        let mut data = selector("transfer(address,uint256)").to_vec();
+        data.extend_from_slice(&address_word(to));
+        data.extend_from_slice(&uint_word(amount));
+        Ok(EvmUnsignedTransaction {
+            from: hex_prefixed(&from),
+            to: hex_prefixed(&token),
+            data: hex_prefixed(&data),
+            value: "0x0".into(),
+        })
+    }
     /// Approval is a separate on-chain transaction if the existing allowance
     /// is below the swap amount. It must be completed before submitting swap.
     pub fn approval_transaction(
@@ -371,6 +398,10 @@ mod tests {
     #[test]
     fn abi_selectors_match_known_contract_methods() {
         assert_eq!(
+            hex_prefixed(&selector("transfer(address,uint256)")),
+            "0xa9059cbb"
+        );
+        assert_eq!(
             hex_prefixed(&selector("approve(address,uint256)")),
             "0x095ea7b3"
         );
@@ -412,6 +443,24 @@ mod tests {
         assert!(client.swap_transaction(&quote, sender, 0).is_err());
     }
 
+    #[test]
+    fn transfer_binds_recipient_and_exact_amount() {
+        let client = UniswapV3Client::new(Url::parse("https://mainnet.base.org").unwrap()).unwrap();
+        let sender = "0x1111111111111111111111111111111111111111";
+        let recipient = "0x2222222222222222222222222222222222222222";
+        let tx = client
+            .transfer_transaction(BASE_USDC, sender, recipient, 1_250_000)
+            .unwrap();
+        assert_eq!(tx.from, sender);
+        assert_eq!(tx.to.to_ascii_lowercase(), BASE_USDC.to_ascii_lowercase());
+        assert_eq!(&tx.data[..10], "0xa9059cbb");
+        let bytes = from_hex(&tx.data).unwrap();
+        assert_eq!(&bytes[4 + 12..4 + 32], &address_bytes(recipient).unwrap());
+        assert_eq!(decode_word(&bytes[4 + 32..4 + 64]).unwrap(), 1_250_000);
+        assert!(client
+            .transfer_transaction(BASE_USDC, sender, sender, 1)
+            .is_err());
+    }
     #[tokio::test]
     async fn invalid_inputs_fail_before_rpc() {
         let client = UniswapV3Client::new(Url::parse("https://mainnet.base.org").unwrap()).unwrap();
