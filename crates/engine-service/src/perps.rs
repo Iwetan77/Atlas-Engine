@@ -106,10 +106,50 @@ pub(super) async fn onboarding(
         .onboarding_status(&wallet)
         .await
         .map_err(internal)?;
+    let signer_status = match &state.auth {
+        AuthMode::Privy { bridge_url, http } => {
+            let token = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .ok_or((
+                    StatusCode::UNAUTHORIZED,
+                    "Privy access token required".into(),
+                ))?;
+            let response = http
+                .post(format!("{bridge_url}/paradex/signer-status"))
+                .json(&json!({"accessToken":token,"walletAddress":wallet}))
+                .send()
+                .await
+                .map_err(|_| unavailable("Privy signer check unavailable"))?;
+            if !response.status().is_success() {
+                return Err(unavailable("Privy signer check unavailable"));
+            }
+            let signer_status: Value = response.json().await.map_err(internal)?;
+            if signer_status["userId"].as_str() != Some(&user.user_id)
+                || signer_status["walletAddress"]
+                    .as_str()
+                    .is_none_or(|address| !address.eq_ignore_ascii_case(&wallet))
+                || !signer_status["signerAuthorized"].is_boolean()
+                || !(signer_status["signer"].is_null()
+                    || (signer_status["signer"]["signerId"].is_string()
+                        && signer_status["signer"]["policyIds"].is_array()))
+            {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    "Privy signer status did not match the verified wallet".into(),
+                ));
+            }
+            signer_status
+        }
+        AuthMode::LocalDemo => json!({"signer":null,"signerAuthorized":false}),
+    };
     Ok(Json(json!({
         "walletAddress": status.wallet_address,
         "accountAddress": status.account_address,
         "onboarded": status.exists,
+        "signer": signer_status["signer"],
+        "signerAuthorized": signer_status["signerAuthorized"],
     })))
 }
 pub(super) async fn onboard(

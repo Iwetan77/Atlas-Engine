@@ -1,11 +1,13 @@
 import {createServer} from 'node:http';
 import {PrivyClient} from '@privy-io/node';
 import {authMessage, onboardingMessage, recoverOnboardingPublicKey} from './paradex-onboarding.mjs';
+import {parseSignerConfig, walletHasSigner} from './signer-config.mjs';
 
 const appId = process.env.PRIVY_APP_ID;
 const appSecret = process.env.PRIVY_APP_SECRET;
 if (!appId || !appSecret) throw new Error('PRIVY_APP_ID and PRIVY_APP_SECRET are required');
 const privy = new PrivyClient({appId, appSecret});
+const signer = parseSignerConfig(process.env);
 const port = Number(process.env.PRIVY_BRIDGE_PORT ?? 3101);
 if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('invalid bridge port');
 
@@ -14,12 +16,40 @@ function send(response, status, body) {
   response.end(JSON.stringify(body));
 }
 
+let verifiedSigner = false;
+async function serverSigner() {
+  if (!signer) return null;
+  if (!verifiedSigner) {
+    const quorum = await privy.keyQuorums().get(signer.signerId);
+    if (quorum.authorization_threshold !== 1 ||
+        !quorum.authorization_keys?.some((key) => key.public_key === signer.publicKey)) {
+      throw new Error('Privy signer quorum does not match the authorization key');
+    }
+    verifiedSigner = true;
+  }
+  return signer;
+}
+
+async function signerStatus(evm, address) {
+  const configured = await serverSigner();
+  if (!configured) return {signer: null, signerAuthorized: false};
+  if (typeof evm.id !== 'string' || !evm.id) {
+    throw new Error('Privy embedded wallet ID unavailable');
+  }
+  const wallet = await privy.wallets().get(evm.id);
+  return {
+    signer: {signerId: configured.signerId, policyIds: configured.policyIds},
+    signerAuthorized: walletHasSigner(wallet, address, configured.signerId),
+  };
+}
+
 const server = createServer(async (request, response) => {
   const verifyOnly = request.method === 'POST' && request.url === '/verify';
   const signOnboarding = request.method === 'POST' &&
     request.url === '/paradex/onboarding-signature';
   const signAuth = request.method === 'POST' && request.url === '/paradex/auth-signature';
-  if (!verifyOnly && !signOnboarding && !signAuth) {
+  const checkSigner = request.method === 'POST' && request.url === '/paradex/signer-status';
+  if (!verifyOnly && !signOnboarding && !signAuth && !checkSigner) {
     response.writeHead(404).end();
     return;
   }
@@ -67,7 +97,18 @@ const server = createServer(async (request, response) => {
       send(response, 403, {error: 'wallet does not belong to the signed-in user'});
       return;
     }
-    if (!evm.delegated || typeof evm.id !== 'string' || !evm.id) {
+    let status;
+    try {
+      status = await signerStatus(evm, evmWallet);
+    } catch {
+      send(response, 503, {error: 'Privy signer check unavailable'});
+      return;
+    }
+    if (checkSigner) {
+      send(response, 200, {userId, walletAddress: evmWallet, ...status});
+      return;
+    }
+    if (!status.signerAuthorized) {
       send(response, 409, {error: 'embedded wallet has not granted server signing permission'});
       return;
     }
@@ -77,7 +118,10 @@ const server = createServer(async (request, response) => {
       : authMessage(environment, evmWallet);
     let signed;
     try {
-      signed = await privy.wallets().ethereum().signMessage(evm.id, {message});
+      signed = await privy.wallets().ethereum().signMessage(evm.id, {
+        message,
+        authorization_context: {authorization_private_keys: [signer.privateKey]},
+      });
     } catch {
       send(response, 409, {error: 'Privy could not sign with this wallet and policy'});
       return;
