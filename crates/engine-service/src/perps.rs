@@ -185,6 +185,7 @@ pub(super) async fn positions(
         // the current Paradex liquidation_price field; the app must not recompute it.
         result.push(json!({
             "positionId":venue_str(&position,"id")?,
+            "openedAtUnixMs":position["created_at"].as_u64().filter(|value| *value > 0).ok_or((StatusCode::BAD_GATEWAY, "Paradex omitted created_at".into()))?,
             "marketId":market_id,
             "symbol":symbol,
             "side":side,

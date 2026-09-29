@@ -29,6 +29,7 @@ pub(super) struct Asset {
     pub(super) chain: &'static str,
     pub(super) token: &'static str,
     pub(super) decimals: u32,
+    pub(super) icon_url: Option<&'static str>,
 }
 pub(super) const ASSETS: [Asset; 6] = [
     Asset {
@@ -39,6 +40,7 @@ pub(super) const ASSETS: [Asset; 6] = [
         chain: "base",
         token: BASE_WETH,
         decimals: 18,
+        icon_url: None,
     },
     Asset {
         id: "brett-base",
@@ -48,6 +50,7 @@ pub(super) const ASSETS: [Asset; 6] = [
         chain: "base",
         token: BRETT,
         decimals: 18,
+        icon_url: None,
     },
     Asset {
         id: "aaplc-base",
@@ -57,6 +60,7 @@ pub(super) const ASSETS: [Asset; 6] = [
         chain: "base",
         token: AAPLC,
         decimals: 8,
+        icon_url: None,
     },
     Asset {
         id: "sol-solana",
@@ -66,6 +70,7 @@ pub(super) const ASSETS: [Asset; 6] = [
         chain: "solana",
         token: SOL_MINT,
         decimals: 9,
+        icon_url: None,
     },
     Asset {
         id: "tslax-solana",
@@ -75,6 +80,7 @@ pub(super) const ASSETS: [Asset; 6] = [
         chain: "solana",
         token: TSLAX_MINT,
         decimals: 8,
+        icon_url: None,
     },
     Asset {
         id: "bonk-solana",
@@ -84,6 +90,7 @@ pub(super) const ASSETS: [Asset; 6] = [
         chain: "solana",
         token: BONK_MINT,
         decimals: 5,
+        icon_url: None,
     },
 ];
 
@@ -416,7 +423,7 @@ pub(super) async fn assets(
             continue;
         }
         let (_, out, _) = venue_quote(&state.markets, a, "buy", 1_000_000).await?;
-        result.push(json!({"assetId":a.id,"symbol":a.symbol,"name":a.name,"kind":a.kind,"price":unit_price(1_000_000,out,a.decimals,&currency,rate)?,"change24hPct":null,"iconUrl":null}));
+        result.push(json!({"assetId":a.id,"symbol":a.symbol,"name":a.name,"kind":a.kind,"price":unit_price(1_000_000,out,a.decimals,&currency,rate)?,"change24hPct":null,"iconUrl":a.icon_url}));
     }
     Ok(Json(json!({"assets":result})))
 }
@@ -861,6 +868,32 @@ pub(super) async fn intent_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn assets_without_bundled_logos_supply_an_icon_url() {
+        const BUNDLED: [&str; 10] = [
+            "AAPL", "BONK", "BRETT", "BTC", "ETH", "NVDA", "SOL", "TSLA", "USDC", "WIF",
+        ];
+        for asset in ASSETS {
+            let base = asset
+                .symbol
+                .strip_suffix('c')
+                .or_else(|| asset.symbol.strip_suffix('x'))
+                .unwrap_or(asset.symbol);
+            let base = match base {
+                "WETH" => "ETH",
+                "WBTC" => "BTC",
+                _ => base,
+            };
+            assert!(
+                BUNDLED.contains(&base)
+                    || asset
+                        .icon_url
+                        .is_some_and(|url| url.starts_with("https://")),
+                "{} needs a verified HTTPS icon URL",
+                asset.id
+            );
+        }
+    }
     #[test]
     fn money_and_price_keep_small_unit_precision() {
         assert_eq!(parse_micros("20.123456").unwrap(), 20_123_456);
