@@ -92,6 +92,26 @@ fn max_leverage(imf: &str) -> Result<u64, ApiError> {
     (SCALE / fraction).try_into().map_err(internal)
 }
 
+pub(super) async fn onboarding(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let user = app_balance::verified_wallets(&state, &headers).await?;
+    let wallet = user.evm_wallet.filter(|wallet| !wallet.is_empty()).ok_or((
+        StatusCode::CONFLICT,
+        "Privy Ethereum wallet is not ready".into(),
+    ))?;
+    let status = state
+        .paradex
+        .onboarding_status(&wallet)
+        .await
+        .map_err(internal)?;
+    Ok(Json(json!({
+        "walletAddress": status.wallet_address,
+        "accountAddress": status.account_address,
+        "onboarded": status.exists,
+    })))
+}
 pub(super) async fn markets(
     State(state): State<AppState>,
     Query(q): Query<CurrencyQuery>,

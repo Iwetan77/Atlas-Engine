@@ -1,5 +1,6 @@
 //! Paradex venue reads. Orders require an account-scoped trade-only signer.
 use reqwest::{Client, Url};
+use serde::Serialize;
 use serde_json::Value;
 use std::time::Duration;
 use thiserror::Error;
@@ -20,6 +21,16 @@ pub enum ParadexError {
     Rejected(reqwest::StatusCode),
     #[error("Paradex returned malformed venue data")]
     InvalidResponse,
+    #[error("invalid Ethereum wallet address")]
+    InvalidWalletAddress,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OnboardingStatus {
+    pub wallet_address: String,
+    pub account_address: String,
+    pub exists: bool,
 }
 
 impl ParadexClient {
@@ -51,6 +62,48 @@ impl ParadexClient {
         response.json().await.map_err(ParadexError::Transport)
     }
 
+    pub async fn onboarding_status(
+        &self,
+        wallet_address: &str,
+    ) -> Result<OnboardingStatus, ParadexError> {
+        if wallet_address.len() != 42
+            || !wallet_address.starts_with("0x")
+            || !wallet_address[2..]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(ParadexError::InvalidWalletAddress);
+        }
+        let mut url = self
+            .base
+            .join("onboarding")
+            .map_err(|_| ParadexError::InvalidResponse)?;
+        url.query_pairs_mut()
+            .append_pair("account_signer_type", "eip191")
+            .append_pair("eth_address", wallet_address);
+        let response = self
+            .http
+            .get(url)
+            .header("accept", "application/json")
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(ParadexError::Rejected(response.status()));
+        }
+        let body: Value = response.json().await?;
+        let account_address = body["address"]
+            .as_str()
+            .filter(|address| address.starts_with("0x") && address.len() > 2)
+            .ok_or(ParadexError::InvalidResponse)?;
+        let exists = body["exists"]
+            .as_bool()
+            .ok_or(ParadexError::InvalidResponse)?;
+        Ok(OnboardingStatus {
+            wallet_address: wallet_address.to_owned(),
+            account_address: account_address.to_owned(),
+            exists,
+        })
+    }
     pub async fn market(&self, market: &str) -> Result<Value, ParadexError> {
         let data = self.get(&format!("markets?market={market}"), None).await?;
         data["results"]

@@ -157,6 +157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = Router::new()
         .route("/v1/balance", get(app_balance::balance))
         .route("/v1/assets", get(markets::assets))
+        .route("/v1/perps/onboarding", get(perps::onboarding))
         .route("/v1/perps/markets", get(perps::markets))
         .route("/v1/perps/positions", get(perps::positions))
         .route("/v1/perps/quotes", post(perps::quotes))
