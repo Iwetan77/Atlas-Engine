@@ -15,6 +15,7 @@ use std::{
 const SOL_USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const BONK_MINT: &str = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263";
+const TSLAX_MINT: &str = "XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB";
 const BRETT: &str = "0x532f27101965dd16442E59d40670FaF5eBB142E4";
 const AAPLC: &str = "0xb200000000000000000000C2e324d24d7eEcd1fb";
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -29,7 +30,7 @@ struct Asset {
     token: &'static str,
     decimals: u32,
 }
-const ASSETS: [Asset; 5] = [
+const ASSETS: [Asset; 6] = [
     Asset {
         id: "weth-base",
         symbol: "WETH",
@@ -65,6 +66,15 @@ const ASSETS: [Asset; 5] = [
         chain: "solana",
         token: SOL_MINT,
         decimals: 9,
+    },
+    Asset {
+        id: "tslax-solana",
+        symbol: "TSLAx",
+        name: "Tesla xStock",
+        kind: "stock",
+        chain: "solana",
+        token: TSLAX_MINT,
+        decimals: 8,
     },
     Asset {
         id: "bonk-solana",
@@ -292,12 +302,36 @@ fn quote_request(a: Asset, side: &str, input: u128) -> BaseSwapRequest {
         amount_base_units: input,
     }
 }
+async fn ensure_stock_units(state: &MarketState, a: Asset) -> Result<(), ApiError> {
+    if a.id != "tslax-solana" {
+        return Ok(());
+    }
+    let response: Value = state
+        .http
+        .get("https://api.xstocks.fi/api/v2/public/assets/TSLAx/multiplier?network=Solana")
+        .send()
+        .await
+        .map_err(unavailable)?
+        .error_for_status()
+        .map_err(unavailable)?
+        .json()
+        .await
+        .map_err(unavailable)?;
+    if response["currentMultiplier"] != 1 {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "TSLAx display multiplier changed; quotes are paused until adjusted".into(),
+        ));
+    }
+    Ok(())
+}
 async fn venue_quote(
     state: &MarketState,
     a: Asset,
     side: &str,
     input: u128,
 ) -> Result<(u128, u128, u32), ApiError> {
+    ensure_stock_units(state, a).await?;
     if a.chain == "base" {
         let q = state
             .base
@@ -474,6 +508,7 @@ pub(super) async fn execute_quote(
         ));
     }
     let a = stored.asset;
+    ensure_stock_units(&state.markets, a).await?;
     let wallet = if a.chain == "base" {
         user.evm_wallet
     } else {

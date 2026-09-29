@@ -68,8 +68,8 @@ pub enum JupiterError {
     InvalidRequest,
     #[error("signed transaction is not base64")]
     InvalidTransaction,
-    #[error("Jupiter returned a quote that cannot be executed")]
-    NotExecutable,
+    #[error("Jupiter returned a quote that cannot be executed: {0}")]
+    NotExecutable(String),
     #[error("Jupiter request failed: {0}")]
     Transport(#[from] reqwest::Error),
     #[error("Jupiter returned HTTP {0}")]
@@ -112,7 +112,11 @@ impl JupiterClient {
         }
         let order: JupiterOrder = response.json().await?;
         if request.taker.is_some() && order.transaction.as_deref().unwrap_or("").is_empty() {
-            return Err(JupiterError::NotExecutable);
+            return Err(JupiterError::NotExecutable(
+                order
+                    .error_message
+                    .unwrap_or_else(|| format!("code {:?}", order.error_code)),
+            ));
         }
         Ok(order)
     }
