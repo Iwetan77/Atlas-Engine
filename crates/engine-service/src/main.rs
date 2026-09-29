@@ -12,7 +12,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -143,9 +143,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             return Err("PRIVY_BRIDGE_URL must be a bare loopback HTTP origin".into());
         }
+        // Every signing and verification step goes through this bridge, and a stalled call used to
+        // hold an app request open with no end. Bound each one so callers get an answer.
         AuthMode::Privy {
             bridge_url,
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(20))
+                .build()?,
         }
     };
     let state = AppState {
@@ -181,6 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("demo auth bypass requires a loopback bind address".into());
     }
     let mut app = Router::new()
+        .route("/health", get(health))
         .route("/v1/balance", get(app_balance::balance))
         .route("/v1/assets", get(markets::assets))
         .route(
@@ -231,6 +236,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Atlas balance API listening on {bind}");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+// Public and secret-free: lets anyone check which commit Render is actually serving.
+async fn health() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "ok": true,
+        "commit": env::var("RENDER_GIT_COMMIT").unwrap_or_else(|_| "unknown".into()),
+    }))
 }
 
 fn configured_cors() -> Result<Option<CorsLayer>, Box<dyn std::error::Error>> {

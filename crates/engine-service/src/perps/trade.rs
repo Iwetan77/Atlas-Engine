@@ -11,6 +11,12 @@ use std::{
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
 const QUOTE_MS: u64 = 45_000;
+// The confirmed submission runs after /signed has answered. It is a chain of venue and signer
+// calls, each with its own timeout, so the whole chain gets one bound too.
+const SUBMIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
+// Status only gives up on a submission once it cannot still be running: past the plan's expiry
+// (the latest it could have been claimed) plus the submission bound, with a margin.
+const SUBMIT_GRACE_MS: u64 = 180_000;
 
 #[derive(Clone, Default)]
 pub(crate) struct TradeState {
@@ -992,6 +998,32 @@ async fn submit_confirmed(
         Err(error) => Err(internal(error)),
     }
 }
+// What a finished submission means for the stored intent.
+fn record_submission(mut stored: Intent, result: Result<Value, ApiError>) -> Intent {
+    stored.status.stage = "settle".into();
+    match result {
+        Ok(order) => {
+            if order["client_id"].as_str() != Some(&stored.client_id)
+                || order["market"].as_str() != Some(&stored.quote.market)
+            {
+                stored.status.state = "failed".into();
+                stored.status.error = Some("Paradex order identity mismatch".into());
+            } else {
+                stored.order_id = order["id"].as_str().map(str::to_owned);
+                if let Some(id) = &stored.order_id {
+                    stored.status.tx_ids = vec![id.clone()];
+                }
+            }
+        }
+        // ACCEPTED means the outcome is unknown: settlement reconciles it by client ID.
+        Err(error) if error.0 == StatusCode::ACCEPTED => {}
+        Err(error) => {
+            stored.status.state = "failed".into();
+            stored.status.error = Some(error.1);
+        }
+    }
+    stored
+}
 pub(crate) async fn signed(
     state: AppState,
     intent_id: String,
@@ -1009,37 +1041,26 @@ pub(crate) async fn signed(
     if !claimed {
         return Ok(Json(current.status));
     }
-    let result = submit_confirmed(&state, &headers, &current).await;
-    let mut stored = current;
-    match result {
-        Ok(order) => {
-            if order["client_id"].as_str() != Some(&stored.client_id)
-                || order["market"].as_str() != Some(&stored.quote.market)
+    // Submitting takes a dozen venue and signer calls. Answer once the intent is claimed and let the
+    // app poll GET /v1/intents/{id}; the stable client ID keeps the order single however this ends.
+    let answer = current.status.clone();
+    tokio::spawn(async move {
+        let result =
+            match tokio::time::timeout(SUBMIT_LIMIT, submit_confirmed(&state, &headers, &current))
+                .await
             {
-                stored.status.stage = "settle".into();
-                stored.status.state = "failed".into();
-                stored.status.error = Some("Paradex order identity mismatch".into());
-            } else {
-                stored.order_id = order["id"].as_str().map(str::to_owned);
-                if let Some(id) = &stored.order_id {
-                    stored.status.tx_ids = vec![id.clone()];
-                }
-                stored.status.stage = "settle".into();
-            }
+                Ok(result) => result,
+                Err(_) => Err((
+                    StatusCode::ACCEPTED,
+                    "Paradex submission outcome is pending reconciliation".into(),
+                )),
+            };
+        let stored = record_submission(current, result);
+        if let Err(error) = state.perps_trade.save_intent(&intent_id, stored).await {
+            eprintln!("perps intent {intent_id} could not be saved: {}", error.1);
         }
-        Err(error) => {
-            stored.status.stage = "settle".into();
-            if error.0 != StatusCode::ACCEPTED {
-                stored.status.state = "failed".into();
-                stored.status.error = Some(error.1);
-            }
-        }
-    }
-    state
-        .perps_trade
-        .save_intent(&intent_id, stored.clone())
-        .await?;
-    Ok(Json(stored.status.clone()))
+    });
+    Ok(Json(answer))
 }
 pub(crate) async fn status(
     state: AppState,
@@ -1057,6 +1078,18 @@ pub(crate) async fn status(
             StatusCode::FORBIDDEN,
             "intent belongs to another user".into(),
         ));
+    }
+    // Never claimed before its plan expired, so it can never be submitted.
+    if current.status.stage == "validate" && now() >= current.expires {
+        current.status.stage = "settle".into();
+        current.status.state = "failed".into();
+        current.status.error =
+            Some("The confirmation didn't reach Atlas in time; nothing was ordered".into());
+        state
+            .perps_trade
+            .save_intent(&intent_id, current.clone())
+            .await?;
+        return Ok(Json(current.status));
     }
     if current.status.stage == "execute" && current.status.state == "pending" {
         let jwt = evm_jwt(
@@ -1094,7 +1127,7 @@ pub(crate) async fn status(
                 .perps_trade
                 .save_intent(&intent_id, current.clone())
                 .await?;
-        } else if now() > current.expires + 60_000 {
+        } else if now() > current.expires + SUBMIT_GRACE_MS {
             current.status.stage = "settle".into();
             current.status.state = "failed".into();
             current.status.error =
@@ -1188,14 +1221,26 @@ pub(crate) async fn status(
                 });
             }
         }
+        if order["status"].as_str() != Some("CLOSED")
+            && next.state == "pending"
+            && now() > current.expires + SUBMIT_GRACE_MS
+        {
+            next.state = "failed".into();
+            next.error = Some(format!(
+                "Paradex still shows the order as {}; check positions before retrying",
+                order["status"].as_str().unwrap_or("open")
+            ));
+        }
         if next.tx_ids.is_empty() {
             if let Some(id) = order["id"].as_str() {
                 next.tx_ids.push(id.to_owned());
             }
         }
-    } else if now() > current.expires + 60_000 {
+    } else if now() > current.expires + SUBMIT_GRACE_MS {
         next.state = "failed".into();
-        next.error = Some("Paradex did not report the submitted order within two minutes".into());
+        next.error = Some(
+            "Paradex did not report the submitted order; check positions before retrying".into(),
+        );
     }
     let mut updated = current;
     updated.status = next.clone();
@@ -1205,6 +1250,73 @@ pub(crate) async fn status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn sample_intent() -> Intent {
+        Intent {
+            quote: Quote {
+                owner: "did:privy:alice".into(),
+                wallet: "0x0000000000000000000000000000000000000001".into(),
+                account: "0x1".into(),
+                market: "BTC-USD-PERP".into(),
+                side: "long".into(),
+                size: "0.001".into(),
+                price: "83000".into(),
+                leverage: 5,
+                expires: 0,
+                kind: "perp_open".into(),
+                position_id: None,
+                currency: "USD".into(),
+                margin: "20".into(),
+            },
+            client_id: "perp-open-1".into(),
+            order_id: None,
+            status: markets::IntentStatus {
+                intent_id: "perp-open-1".into(),
+                stage: "execute".into(),
+                state: "pending".into(),
+                tx_ids: vec![],
+                error: None,
+            },
+            expires: 0,
+        }
+    }
+    #[test]
+    fn submission_results_map_to_settlement_states() {
+        let placed = record_submission(
+            sample_intent(),
+            Ok(json!({"client_id":"perp-open-1","market":"BTC-USD-PERP","id":"ord-9"})),
+        );
+        assert_eq!(
+            (placed.status.stage.as_str(), placed.status.state.as_str()),
+            ("settle", "pending")
+        );
+        assert_eq!(placed.status.tx_ids, vec!["ord-9".to_string()]);
+
+        let unknown = record_submission(
+            sample_intent(),
+            Err((StatusCode::ACCEPTED, "pending reconciliation".into())),
+        );
+        assert_eq!(
+            (unknown.status.stage.as_str(), unknown.status.state.as_str()),
+            ("settle", "pending")
+        );
+        assert!(unknown.status.error.is_none());
+
+        let rejected = record_submission(
+            sample_intent(),
+            Err((StatusCode::BAD_GATEWAY, "Paradex rejected the order".into())),
+        );
+        assert_eq!(rejected.status.state, "failed");
+        assert_eq!(
+            rejected.status.error.as_deref(),
+            Some("Paradex rejected the order")
+        );
+
+        let wrong = record_submission(
+            sample_intent(),
+            Ok(json!({"client_id":"someone-else","market":"BTC-USD-PERP","id":"ord-1"})),
+        );
+        assert_eq!(wrong.status.state, "failed");
+    }
     #[test]
     fn market_order_omits_price_for_open_and_close() {
         let open = market_order_request(
