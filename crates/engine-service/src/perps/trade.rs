@@ -207,7 +207,12 @@ fn rate_money(usd_units: u128, currency: &str, rate: u128) -> Result<Value, ApiE
         / 1_000_000;
     Ok(money(&format_units(value), currency))
 }
-fn fresh_bbo(bbo: &Value, market: &str, side: &str) -> Result<(u128, u128), ApiError> {
+fn fresh_bbo(
+    bbo: &Value,
+    summary: &Value,
+    market: &str,
+    side: &str,
+) -> Result<(u128, u128), ApiError> {
     if bbo["market"].as_str() != Some(market) {
         return Err((
             StatusCode::BAD_GATEWAY,
@@ -218,8 +223,13 @@ fn fresh_bbo(bbo: &Value, market: &str, side: &str) -> Result<(u128, u128), ApiE
         StatusCode::BAD_GATEWAY,
         "Paradex BBO timestamp missing".into(),
     ))?;
-    if now().abs_diff(updated) > 30_000 {
-        return Err(unavailable("Paradex market price is stale"));
+    // This is the last order-book change, not the time the HTTP snapshot was served.
+    // A resting executable order can remain unchanged for longer than 30 seconds.
+    if updated > now().saturating_add(30_000) {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "Paradex BBO timestamp is in the future".into(),
+        ));
     }
     let (price, size) = if side == "long" || side == "buy" {
         ("ask", "ask_size")
@@ -230,6 +240,20 @@ fn fresh_bbo(bbo: &Value, market: &str, side: &str) -> Result<(u128, u128), ApiE
     let s = units(venue_str(bbo, size)?)?;
     if p == 0 || s == 0 {
         return Err(unavailable("Paradex market has no fillable liquidity"));
+    }
+    let mark = units(venue_str(summary, "mark_price")?)?;
+    let deviation = p
+        .abs_diff(mark)
+        .checked_mul(100)
+        .ok_or((StatusCode::BAD_GATEWAY, "Paradex price overflow".into()))?;
+    let limit = mark.checked_mul(3).ok_or((
+        StatusCode::BAD_GATEWAY,
+        "Paradex mark price overflow".into(),
+    ))?;
+    if mark == 0 || deviation > limit {
+        return Err(unavailable(
+            "Paradex executable price is too far from mark price",
+        ));
     }
     Ok((p, s))
 }
@@ -335,14 +359,15 @@ pub(crate) async fn quotes(
         return Err(bad("margin must be positive"));
     }
     let jwt = evm_jwt(&state, &headers, &user_id, &wallet, &account).await?;
-    let (metadata, bbo, account_data) = tokio::try_join!(
+    let (metadata, bbo, summary, account_data) = tokio::try_join!(
         state.paradex.market(&body.market_id),
         state.paradex.bbo(&body.market_id),
+        state.paradex.summary(&body.market_id),
         state.paradex.account(&jwt),
     )
     .map_err(internal)?;
     let (increment, min, fee_rate) = market_constraints(&metadata, &body.market_id, body.leverage)?;
-    let (price, liquidity) = fresh_bbo(&bbo, &body.market_id, &body.side)?;
+    let (price, liquidity) = fresh_bbo(&bbo, &summary, &body.market_id, &body.side)?;
     let notional = margin
         .checked_mul(body.leverage as u128)
         .ok_or((StatusCode::BAD_REQUEST, "notional too large".into()))?;
@@ -419,8 +444,12 @@ pub(crate) async fn execute_quote(
     if quote.kind != "perp_open" {
         return Err(bad("not an open quote"));
     }
-    let bbo = state.paradex.bbo(&quote.market).await.map_err(internal)?;
-    let (price, liquidity) = fresh_bbo(&bbo, &quote.market, &quote.side)?;
+    let (bbo, summary) = tokio::try_join!(
+        state.paradex.bbo(&quote.market),
+        state.paradex.summary(&quote.market),
+    )
+    .map_err(internal)?;
+    let (price, liquidity) = fresh_bbo(&bbo, &summary, &quote.market, &quote.side)?;
     let previous = units(&quote.price)?;
     let tolerance = previous / 100;
     if price.abs_diff(previous) > tolerance || units(&quote.size)? > liquidity {
@@ -530,9 +559,13 @@ pub(crate) async fn close_quote(
             "Paradex position leverage is zero".into(),
         ));
     }
-    let (metadata, bbo) = tokio::try_join!(state.paradex.market(market), state.paradex.bbo(market))
-        .map_err(internal)?;
-    let (price, liquidity) = fresh_bbo(&bbo, market, close_side)?;
+    let (metadata, bbo, summary) = tokio::try_join!(
+        state.paradex.market(market),
+        state.paradex.bbo(market),
+        state.paradex.summary(market),
+    )
+    .map_err(internal)?;
+    let (price, liquidity) = fresh_bbo(&bbo, &summary, market, close_side)?;
     if liquidity < size_units {
         return Err(unavailable(
             "Paradex order book cannot fill the full close now",
@@ -652,8 +685,12 @@ pub(crate) async fn execute_close(
             "Paradex position size changed; request a new close quote".into(),
         ));
     }
-    let bbo = state.paradex.bbo(&quote.market).await.map_err(internal)?;
-    let (price, liquidity) = fresh_bbo(&bbo, &quote.market, &quote.side)?;
+    let (bbo, summary) = tokio::try_join!(
+        state.paradex.bbo(&quote.market),
+        state.paradex.summary(&quote.market),
+    )
+    .map_err(internal)?;
+    let (price, liquidity) = fresh_bbo(&bbo, &summary, &quote.market, &quote.side)?;
     if price.abs_diff(units(&quote.price)?) > units(&quote.price)? / 100
         || liquidity < units(&quote.size)?
     {
@@ -752,8 +789,12 @@ async fn submit_confirmed(
     intent: &Intent,
 ) -> Result<Value, ApiError> {
     let quote = &intent.quote;
-    let bbo = state.paradex.bbo(&quote.market).await.map_err(internal)?;
-    let (latest, liquidity) = fresh_bbo(&bbo, &quote.market, &quote.side)?;
+    let (bbo, summary) = tokio::try_join!(
+        state.paradex.bbo(&quote.market),
+        state.paradex.summary(&quote.market),
+    )
+    .map_err(internal)?;
+    let (latest, liquidity) = fresh_bbo(&bbo, &summary, &quote.market, &quote.side)?;
     let quoted = units(&quote.price)?;
     if latest.abs_diff(quoted) > quoted / 100 || liquidity < units(&quote.size)? {
         return Err((
@@ -1136,6 +1177,28 @@ pub(crate) async fn status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unchanged_resting_book_is_quoted_only_at_sensible_venue_price() {
+        let old_timestamp = now().saturating_sub(90 * 60 * 1_000);
+        let bbo = json!({
+            "market":"BTC-USD-PERP","last_updated_at":old_timestamp,
+            "ask":"83000","ask_size":"0.00241","bid":"39593.8","bid_size":"0.00016"
+        });
+        let summary = json!({"mark_price":"83650.43441918"});
+        assert_eq!(
+            fresh_bbo(&bbo, &summary, "BTC-USD-PERP", "long").unwrap(),
+            (units("83000").unwrap(), units("0.00241").unwrap())
+        );
+        assert!(fresh_bbo(&bbo, &summary, "BTC-USD-PERP", "short").is_err());
+        assert!(fresh_bbo(
+            &json!({"market":"ETH-USD-PERP","last_updated_at":old_timestamp,
+                "ask":"0","ask_size":"0","bid":"777","bid_size":"12"}),
+            &json!({"mark_price":"2100"}),
+            "ETH-USD-PERP",
+            "long"
+        )
+        .is_err());
+    }
     #[test]
     fn size_respects_venue_minimum_and_depth() {
         assert_eq!(
