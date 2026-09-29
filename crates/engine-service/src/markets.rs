@@ -535,6 +535,18 @@ pub(super) async fn execute_quote(
                 "market price changed; request a fresh quote".into(),
             ));
         }
+        let balance = state
+            .markets
+            .base
+            .balance_of(&request.source_token, &wallet)
+            .await
+            .map_err(unavailable)?;
+        if balance < fresh.amount_in {
+            return Err((
+                StatusCode::CONFLICT,
+                "insufficient Base mainnet token balance".into(),
+            ));
+        }
         let allowance = state
             .markets
             .base

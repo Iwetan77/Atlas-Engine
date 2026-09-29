@@ -154,6 +154,18 @@ impl UniswapV3Client {
         best.ok_or(UniswapV3Error::NoQuotedPool)
     }
 
+    /// Read a mainnet ERC-20 balance before returning a user-signable plan.
+    pub async fn balance_of(&self, token: &str, owner: &str) -> Result<u128, UniswapV3Error> {
+        let token = address_bytes(token)?;
+        let owner = address_bytes(owner)?;
+        self.check_chain().await?;
+        let mut data = selector("balanceOf(address)").to_vec();
+        data.extend_from_slice(&address_word(owner));
+        let result = self
+            .eth_call(&hex_prefixed(&token), &hex_prefixed(&data))
+            .await?;
+        decode_first_u128(&result)
+    }
     /// Read the sender's ERC-20 allowance to Uniswap's Base SwapRouter02.
     pub async fn allowance(
         &self,
