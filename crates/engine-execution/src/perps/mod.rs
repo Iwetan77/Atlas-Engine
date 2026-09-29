@@ -20,6 +20,12 @@ pub enum ParadexError {
     Transport(#[from] reqwest::Error),
     #[error("Paradex returned HTTP {0}")]
     Rejected(reqwest::StatusCode),
+    #[error("Paradex {operation} returned HTTP {status}: {reason}")]
+    RejectedOperation {
+        operation: &'static str,
+        status: reqwest::StatusCode,
+        reason: String,
+    },
     #[error("Paradex returned malformed venue data")]
     InvalidResponse,
     #[error("invalid Ethereum wallet address")]
@@ -32,6 +38,43 @@ pub struct OnboardingStatus {
     pub wallet_address: String,
     pub account_address: String,
     pub exists: bool,
+}
+
+async fn rejected_operation(response: reqwest::Response, operation: &'static str) -> ParadexError {
+    let status = response.status();
+    let body = response.json::<Value>().await.ok();
+    let code = body.as_ref().and_then(|body| {
+        body["error"]
+            .as_str()
+            .or_else(|| body["error"]["code"].as_str())
+            .or_else(|| body["code"].as_str())
+    });
+    let message = body.as_ref().and_then(|body| {
+        body["message"]
+            .as_str()
+            .or_else(|| body["error"]["message"].as_str())
+    });
+    let reason = [code, message]
+        .into_iter()
+        .flatten()
+        .map(|part| {
+            part.chars()
+                .filter(|c| c.is_ascii_graphic() || *c == ' ')
+                .take(120)
+                .collect::<String>()
+        })
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(": ");
+    ParadexError::RejectedOperation {
+        operation,
+        status,
+        reason: if reason.is_empty() {
+            "request rejected".into()
+        } else {
+            reason
+        },
+    }
 }
 
 impl ParadexClient {
@@ -298,7 +341,7 @@ impl ParadexClient {
             .send()
             .await?;
         if !response.status().is_success() {
-            return Err(ParadexError::Rejected(response.status()));
+            return Err(rejected_operation(response, "margin setup").await);
         }
         response.json().await.map_err(ParadexError::Transport)
     }
@@ -324,7 +367,7 @@ impl ParadexClient {
             return Ok(false);
         }
         if !response.status().is_success() {
-            return Err(ParadexError::Rejected(response.status()));
+            return Err(rejected_operation(response, "subkey lookup").await);
         }
         Ok(true)
     }
@@ -359,7 +402,7 @@ impl ParadexClient {
             .send()
             .await?;
         if !response.status().is_success() {
-            return Err(ParadexError::Rejected(response.status()));
+            return Err(rejected_operation(response, "subkey registration").await);
         }
         Ok(())
     }
@@ -393,7 +436,7 @@ impl ParadexClient {
             .send()
             .await?;
         if !response.status().is_success() {
-            return Err(ParadexError::Rejected(response.status()));
+            return Err(rejected_operation(response, "subkey authentication").await);
         }
         let body: Value = response.json().await?;
         body["jwt_token"]
@@ -416,7 +459,7 @@ impl ParadexClient {
             .send()
             .await?;
         if !response.status().is_success() {
-            return Err(ParadexError::Rejected(response.status()));
+            return Err(rejected_operation(response, "order submission").await);
         }
         response.json().await.map_err(ParadexError::Transport)
     }
