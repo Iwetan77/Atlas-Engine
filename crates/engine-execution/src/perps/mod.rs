@@ -104,6 +104,40 @@ impl ParadexClient {
             exists,
         })
     }
+    pub async fn onboard_evm(
+        &self,
+        account_address: &str,
+        signature: &str,
+        siwe_message_base64: &str,
+        public_key: &str,
+    ) -> Result<(), ParadexError> {
+        if !account_address.starts_with("0x")
+            || !signature.starts_with("0x")
+            || !public_key.starts_with("0x04")
+            || public_key.len() != 132
+            || siwe_message_base64.is_empty()
+        {
+            return Err(ParadexError::InvalidResponse);
+        }
+        let url = self
+            .base
+            .join("v2/onboarding")
+            .map_err(|_| ParadexError::InvalidResponse)?;
+        let response = self
+            .http
+            .post(url)
+            .header("accept", "application/json")
+            .header("PARADEX-STARKNET-ACCOUNT", account_address)
+            .header("PARADEX-EVM-SIGNATURE", signature)
+            .header("PARADEX-SIWE-MESSAGE", siwe_message_base64)
+            .json(&serde_json::json!({"public_key": public_key}))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(ParadexError::Rejected(response.status()));
+        }
+        Ok(())
+    }
     pub async fn market(&self, market: &str) -> Result<Value, ParadexError> {
         let data = self.get(&format!("markets?market={market}"), None).await?;
         data["results"]

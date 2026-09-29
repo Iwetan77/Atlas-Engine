@@ -112,6 +112,92 @@ pub(super) async fn onboarding(
         "onboarded": status.exists,
     })))
 }
+pub(super) async fn onboard(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(_body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let user = app_balance::verified_wallets(&state, &headers).await?;
+    let wallet = user.evm_wallet.filter(|wallet| !wallet.is_empty()).ok_or((
+        StatusCode::CONFLICT,
+        "Privy Ethereum wallet is not ready".into(),
+    ))?;
+    let current = state
+        .paradex
+        .onboarding_status(&wallet)
+        .await
+        .map_err(internal)?;
+    if current.exists {
+        return Ok(Json(json!({
+            "walletAddress": current.wallet_address,
+            "accountAddress": current.account_address,
+            "onboarded": true,
+        })));
+    }
+    let AuthMode::Privy { bridge_url, http } = &state.auth else {
+        return Err(unavailable(
+            "Privy server signing is unavailable in demo mode",
+        ));
+    };
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or((
+            StatusCode::UNAUTHORIZED,
+            "Privy access token required".into(),
+        ))?;
+    let signed_response = http
+        .post(format!("{bridge_url}/paradex/onboarding-signature"))
+        .json(&json!({"accessToken": token, "walletAddress": wallet}))
+        .send()
+        .await
+        .map_err(|_| unavailable("Privy signing bridge is unavailable"))?;
+    if signed_response.status() == reqwest::StatusCode::CONFLICT {
+        return Err((
+            StatusCode::CONFLICT,
+            "Approve Atlas perps access for this wallet in the app".into(),
+        ));
+    }
+    if !signed_response.status().is_success() {
+        return Err(unavailable("Privy could not authorize Paradex onboarding"));
+    }
+    let proof: Value = signed_response.json().await.map_err(internal)?;
+    if proof["userId"].as_str() != Some(&user.user_id)
+        || proof["walletAddress"]
+            .as_str()
+            .is_none_or(|address| !address.eq_ignore_ascii_case(&wallet))
+    {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "Privy signing response did not match the verified wallet".into(),
+        ));
+    }
+    let signature = venue_str(&proof, "signature")?;
+    let message = venue_str(&proof, "siweMessageBase64")?;
+    let public_key = venue_str(&proof, "publicKey")?;
+    state
+        .paradex
+        .onboard_evm(&current.account_address, signature, message, public_key)
+        .await
+        .map_err(internal)?;
+    let confirmed = state
+        .paradex
+        .onboarding_status(&wallet)
+        .await
+        .map_err(internal)?;
+    if !confirmed.exists || confirmed.account_address != current.account_address {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "Paradex has not confirmed the new account yet".into(),
+        ));
+    }
+    Ok(Json(json!({
+        "walletAddress": confirmed.wallet_address,
+        "accountAddress": confirmed.account_address,
+        "onboarded": true,
+    })))
+}
 pub(super) async fn markets(
     State(state): State<AppState>,
     Query(q): Query<CurrencyQuery>,
