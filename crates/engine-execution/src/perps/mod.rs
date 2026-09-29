@@ -215,6 +215,70 @@ impl ParadexClient {
             .ok_or(ParadexError::InvalidResponse)
     }
 
+    pub async fn bbo(&self, market: &str) -> Result<Value, ParadexError> {
+        self.get(&format!("bbo/{market}"), None).await
+    }
+
+    pub async fn account(&self, jwt: &str) -> Result<Value, ParadexError> {
+        self.get("account", Some(jwt)).await
+    }
+
+    pub async fn order_history(
+        &self,
+        jwt: &str,
+        client_id: &str,
+    ) -> Result<Vec<Value>, ParadexError> {
+        if client_id.is_empty()
+            || client_id.len() > 64
+            || !client_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err(ParadexError::InvalidResponse);
+        }
+        let data = self
+            .get(
+                &format!("orders-history?client_id={client_id}&page_size=10"),
+                Some(jwt),
+            )
+            .await?;
+        data["results"]
+            .as_array()
+            .cloned()
+            .ok_or(ParadexError::InvalidResponse)
+    }
+
+    pub async fn set_cross_margin(
+        &self,
+        jwt: &str,
+        market: &str,
+        leverage: u64,
+    ) -> Result<Value, ParadexError> {
+        if leverage == 0
+            || leverage > 100
+            || !market
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err(ParadexError::InvalidResponse);
+        }
+        let url = self
+            .base
+            .join(&format!("account/margin/{market}"))
+            .map_err(|_| ParadexError::InvalidResponse)?;
+        let response = self
+            .http
+            .post(url)
+            .bearer_auth(jwt)
+            .json(&serde_json::json!({"leverage":leverage,"margin_type":"CROSS"}))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(ParadexError::Rejected(response.status()));
+        }
+        response.json().await.map_err(ParadexError::Transport)
+    }
+
     pub async fn system_config(&self) -> Result<Value, ParadexError> {
         self.get("system/config", None).await
     }

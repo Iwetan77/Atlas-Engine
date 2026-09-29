@@ -48,6 +48,7 @@ struct AppState {
     markets: markets::MarketState,
     paradex: engine_execution::perps::ParadexClient,
     paradex_tokens: Arc<Mutex<HashMap<String, (String, Instant)>>>,
+    perps_trade: perps::TradeState,
     social: social::SocialState,
 }
 
@@ -150,6 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &env::var("PARADEX_ENV").unwrap_or_else(|_| "prod".into()),
         )?,
         paradex_tokens: Arc::new(Mutex::new(HashMap::new())),
+        perps_trade: perps::TradeState::default(),
         social: social::SocialState::new().await?,
     };
     let bind: SocketAddr = env::var("ATLAS_BALANCE_BIND")

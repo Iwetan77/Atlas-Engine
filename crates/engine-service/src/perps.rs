@@ -1,8 +1,10 @@
 //! Paradex-backed app perps reads. No paper orders or estimated liquidation prices.
 use super::*;
+pub(super) mod trade;
 use axum::extract::Query;
 use serde_json::{json, Value};
 use std::{str::FromStr, time::Duration};
+pub(super) use trade::TradeState;
 
 const MARKET_IDS: [(&str, &str, &str); 3] = [
     ("BTC-USD-PERP", "BTC", "Bitcoin Perpetual"),
@@ -294,26 +296,14 @@ pub(super) async fn markets(
     Ok(Json(json!({"markets":result})))
 }
 
-pub(super) async fn positions(
-    State(state): State<AppState>,
-    Query(q): Query<CurrencyQuery>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
-    let user = app_balance::verified_wallets(&state, &headers).await?;
-    checked_currency(q)?;
-    let wallet = user.evm_wallet.filter(|wallet| !wallet.is_empty()).ok_or((
-        StatusCode::CONFLICT,
-        "Privy Ethereum wallet is not ready".into(),
-    ))?;
-    let current = state
-        .paradex
-        .onboarding_status(&wallet)
-        .await
-        .map_err(internal)?;
-    if !current.exists {
-        return Ok(Json(json!({"positions": []})));
-    }
-    let cache_key = format!("{}:{}", user.user_id, wallet.to_ascii_lowercase());
+async fn evm_jwt(
+    state: &AppState,
+    headers: &HeaderMap,
+    user_id: &str,
+    wallet: &str,
+    account_address: &str,
+) -> Result<String, ApiError> {
+    let cache_key = format!("{}:{}", user_id, wallet.to_ascii_lowercase());
     let cached = state
         .paradex_tokens
         .lock()
@@ -355,7 +345,7 @@ pub(super) async fn positions(
             ));
         }
         let proof: Value = signed_response.json().await.map_err(internal)?;
-        if proof["userId"].as_str() != Some(&user.user_id)
+        if proof["userId"].as_str() != Some(&user_id)
             || proof["walletAddress"]
                 .as_str()
                 .is_none_or(|address| !address.eq_ignore_ascii_case(&wallet))
@@ -368,7 +358,7 @@ pub(super) async fn positions(
         let jwt = state
             .paradex
             .authenticate_evm(
-                &current.account_address,
+                &account_address,
                 venue_str(&proof, "signature")?,
                 venue_str(&proof, "siweMessageBase64")?,
             )
@@ -380,6 +370,36 @@ pub(super) async fn positions(
         );
         jwt
     };
+    Ok(jwt)
+}
+
+pub(super) async fn positions(
+    State(state): State<AppState>,
+    Query(q): Query<CurrencyQuery>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let user = app_balance::verified_wallets(&state, &headers).await?;
+    checked_currency(q)?;
+    let wallet = user.evm_wallet.filter(|wallet| !wallet.is_empty()).ok_or((
+        StatusCode::CONFLICT,
+        "Privy Ethereum wallet is not ready".into(),
+    ))?;
+    let current = state
+        .paradex
+        .onboarding_status(&wallet)
+        .await
+        .map_err(internal)?;
+    if !current.exists {
+        return Ok(Json(json!({"positions": []})));
+    }
+    let jwt = evm_jwt(
+        &state,
+        &headers,
+        &user.user_id,
+        &wallet,
+        &current.account_address,
+    )
+    .await?;
     let venue_positions = state.paradex.positions(&jwt).await.map_err(internal)?;
     let mut result = Vec::new();
     for position in venue_positions {
@@ -423,49 +443,7 @@ pub(super) async fn positions(
     Ok(Json(json!({"positions":result})))
 }
 
-pub(super) async fn quotes(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(_body): Json<Value>,
-) -> Result<Json<Value>, ApiError> {
-    app_balance::verified_wallets(&state, &headers).await?;
-    Err(unavailable(
-        "Paradex trade-only signer and venue-sourced pretrade risk quote are not configured",
-    ))
-}
-pub(super) async fn execute_quote(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(_id): Path<String>,
-    Json(_body): Json<Value>,
-) -> Result<Json<Value>, ApiError> {
-    app_balance::verified_wallets(&state, &headers).await?;
-    Err(unavailable(
-        "Paradex trade-only order signer is not configured",
-    ))
-}
-pub(super) async fn close_quote(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(_id): Path<String>,
-    Json(_body): Json<Value>,
-) -> Result<Json<Value>, ApiError> {
-    app_balance::verified_wallets(&state, &headers).await?;
-    Err(unavailable(
-        "Paradex trade-only order signer is not configured",
-    ))
-}
-pub(super) async fn execute_close(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(_id): Path<String>,
-    Json(_body): Json<Value>,
-) -> Result<Json<Value>, ApiError> {
-    app_balance::verified_wallets(&state, &headers).await?;
-    Err(unavailable(
-        "Paradex trade-only order signer is not configured",
-    ))
-}
+pub(super) use trade::{close_quote, execute_close, execute_quote, quotes};
 
 #[cfg(test)]
 mod tests {

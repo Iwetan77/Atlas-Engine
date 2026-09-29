@@ -127,11 +127,11 @@ struct StoredIntent {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct IntentStatus {
-    intent_id: String,
-    stage: &'static str,
-    state: &'static str,
-    tx_ids: Vec<String>,
-    error: Option<String>,
+    pub(super) intent_id: String,
+    pub(super) stage: &'static str,
+    pub(super) state: &'static str,
+    pub(super) tx_ids: Vec<String>,
+    pub(super) error: Option<String>,
 }
 #[derive(Deserialize)]
 pub(super) struct AssetsQuery {
@@ -153,8 +153,8 @@ struct Money {
 }
 #[derive(Deserialize)]
 pub(super) struct Submission {
-    sent: Vec<Sent>,
-    signed: Vec<Signed>,
+    pub(super) sent: Vec<Sent>,
+    pub(super) signed: Vec<Signed>,
 }
 #[derive(Deserialize)]
 struct Sent {
@@ -716,6 +716,9 @@ pub(super) async fn signed(
     headers: HeaderMap,
     Json(body): Json<Submission>,
 ) -> Result<Json<IntentStatus>, ApiError> {
+    if intent_id.starts_with("perp-") {
+        return perps::trade::signed(state, intent_id, headers, body).await;
+    }
     let user = app_balance::verified_wallets(&state, &headers).await?;
     let current = state
         .markets
@@ -799,6 +802,9 @@ pub(super) async fn intent_status(
     Path(intent_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<IntentStatus>, ApiError> {
+    if intent_id.starts_with("perp-") {
+        return perps::trade::status(state, intent_id, headers).await;
+    }
     let user = app_balance::verified_wallets(&state, &headers).await?;
     let current = state
         .markets
