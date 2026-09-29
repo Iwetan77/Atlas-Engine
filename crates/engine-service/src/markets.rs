@@ -124,12 +124,12 @@ struct StoredIntent {
     request_id: Option<String>,
     status: IntentStatus,
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct IntentStatus {
     pub(super) intent_id: String,
-    pub(super) stage: &'static str,
-    pub(super) state: &'static str,
+    pub(super) stage: String,
+    pub(super) state: String,
     pub(super) tx_ids: Vec<String>,
     pub(super) error: Option<String>,
 }
@@ -194,8 +194,8 @@ impl MarketState {
         let intent_id = id("intent");
         let status = IntentStatus {
             intent_id: intent_id.clone(),
-            stage: "validate",
-            state: "pending",
+            stage: "validate".into(),
+            state: "pending".into(),
             tx_ids: Vec::new(),
             error: None,
         };
@@ -664,8 +664,8 @@ pub(super) async fn execute_quote(
     };
     let status = IntentStatus {
         intent_id: intent_id.clone(),
-        stage: "validate",
-        state: "pending",
+        stage: "validate".into(),
+        state: "pending".into(),
         tx_ids: Vec::new(),
         error: None,
     };
@@ -749,7 +749,7 @@ pub(super) async fn signed(
             return Err(bad("signed report does not match Base execution plan"));
         }
         status.tx_ids = body.sent.iter().map(|s| s.id.clone()).collect();
-        status.stage = "settle";
+        status.stage = "settle".into();
     } else {
         if !body.sent.is_empty() || body.signed.len() != 1 || body.signed[0].index != 0 {
             return Err(bad("signed report does not match Jupiter execution plan"));
@@ -762,7 +762,7 @@ pub(super) async fn signed(
             if stored.status.stage != "validate" {
                 return Ok(Json(stored.status.clone()));
             }
-            stored.status.stage = "execute";
+            stored.status.stage = "execute".into();
         }
         let request_id = current
             .request_id
@@ -776,12 +776,12 @@ pub(super) async fn signed(
         {
             Ok(result) => {
                 status.tx_ids.push(result.signature);
-                status.stage = "settle";
-                status.state = "filled";
+                status.stage = "settle".into();
+                status.state = "filled".into();
             }
             Err(error) => {
-                status.stage = "settle";
-                status.state = "failed";
+                status.stage = "settle".into();
+                status.state = "failed".into();
                 status.error = Some(error.to_string());
             }
         }
@@ -843,7 +843,7 @@ pub(super) async fn intent_status(
             || to != *expected_to
             || input != *expected_input
         {
-            status.state = "failed";
+            status.state = "failed".into();
             status.error = Some("reported transaction does not match the signed plan".into());
             break;
         }
@@ -852,13 +852,13 @@ pub(super) async fn intent_status(
             return Ok(Json(status));
         }
         if receipt["status"].as_str() != Some("0x1") {
-            status.state = "failed";
+            status.state = "failed".into();
             status.error = Some("Base transaction reverted".into());
             break;
         }
     }
     if status.state == "pending" {
-        status.state = "filled";
+        status.state = "filled".into();
     }
     state
         .markets

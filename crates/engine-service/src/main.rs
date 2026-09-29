@@ -151,7 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &env::var("PARADEX_ENV").unwrap_or_else(|_| "prod".into()),
         )?,
         paradex_tokens: Arc::new(Mutex::new(HashMap::new())),
-        perps_trade: perps::TradeState::default(),
+        perps_trade: perps::TradeState::new().await?,
         social: social::SocialState::new().await?,
     };
     let bind: SocketAddr = env::var("ATLAS_BALANCE_BIND")

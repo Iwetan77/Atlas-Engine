@@ -1,6 +1,6 @@
 use super::*;
 use axum::extract::Path;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -16,8 +16,129 @@ const QUOTE_MS: u64 = 45_000;
 pub(crate) struct TradeState {
     quotes: Arc<Mutex<HashMap<String, Quote>>>,
     intents: Arc<Mutex<HashMap<String, Intent>>>,
+    postgres: Option<Arc<tokio_postgres::Client>>,
 }
-#[derive(Clone)]
+impl TradeState {
+    pub(crate) async fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let mut state = Self::default();
+        if let Ok(url) = env::var("DATABASE_URL") {
+            let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
+            tokio::spawn(async move {
+                if let Err(error) = connection.await {
+                    eprintln!("perps database connection ended: {error}");
+                }
+            });
+            client
+                .batch_execute(
+                    "CREATE TABLE IF NOT EXISTS atlas_perp_intents (
+                    intent_id TEXT PRIMARY KEY,
+                    owner TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    expires_at_ms BIGINT NOT NULL
+                )",
+                )
+                .await?;
+            state.postgres = Some(Arc::new(client));
+        }
+        Ok(state)
+    }
+    async fn insert_intent(&self, id: &str, intent: Intent) -> Result<(), ApiError> {
+        if let Some(pg) = &self.postgres {
+            let payload = serde_json::to_string(&intent).map_err(internal)?;
+            pg.execute("INSERT INTO atlas_perp_intents (intent_id,owner,payload,stage,expires_at_ms) VALUES ($1,$2,$3,$4,$5)",
+                &[&id,&intent.quote.owner,&payload,&intent.status.stage,&i64::try_from(intent.expires).map_err(internal)?])
+                .await.map_err(internal)?;
+        } else {
+            self.intents
+                .lock()
+                .map_err(internal)?
+                .insert(id.to_owned(), intent);
+        }
+        Ok(())
+    }
+    async fn get_intent(&self, id: &str) -> Result<Option<Intent>, ApiError> {
+        if let Some(pg) = &self.postgres {
+            let row = pg
+                .query_opt(
+                    "SELECT payload FROM atlas_perp_intents WHERE intent_id=$1",
+                    &[&id],
+                )
+                .await
+                .map_err(internal)?;
+            return row
+                .map(|r| serde_json::from_str::<Intent>(r.get::<_, &str>(0)).map_err(internal))
+                .transpose();
+        }
+        Ok(self.intents.lock().map_err(internal)?.get(id).cloned())
+    }
+    async fn save_intent(&self, id: &str, intent: Intent) -> Result<(), ApiError> {
+        if let Some(pg) = &self.postgres {
+            let payload = serde_json::to_string(&intent).map_err(internal)?;
+            let changed = pg
+                .execute(
+                    "UPDATE atlas_perp_intents SET payload=$2,stage=$3 WHERE intent_id=$1",
+                    &[&id, &payload, &intent.status.stage],
+                )
+                .await
+                .map_err(internal)?;
+            if changed != 1 {
+                return Err((StatusCode::NOT_FOUND, "perps intent not found".into()));
+            }
+        } else {
+            let mut intents = self.intents.lock().map_err(internal)?;
+            if !intents.contains_key(id) {
+                return Err((StatusCode::NOT_FOUND, "perps intent not found".into()));
+            }
+            intents.insert(id.to_owned(), intent);
+        }
+        Ok(())
+    }
+    async fn claim_intent(&self, id: &str, owner: &str) -> Result<(Intent, bool), ApiError> {
+        let mut current = self
+            .get_intent(id)
+            .await?
+            .ok_or((StatusCode::NOT_FOUND, "perps intent not found".into()))?;
+        if current.quote.owner != owner {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "intent belongs to another user".into(),
+            ));
+        }
+        if current.status.stage != "validate" {
+            return Ok((current, false));
+        }
+        if now() >= current.expires {
+            return Err((StatusCode::GONE, "perps execution plan expired".into()));
+        }
+        current.status.stage = "execute".into();
+        if let Some(pg) = &self.postgres {
+            let payload = serde_json::to_string(&current).map_err(internal)?;
+            let changed=pg.execute(
+                "UPDATE atlas_perp_intents SET payload=$2,stage='execute' WHERE intent_id=$1 AND owner=$3 AND stage='validate' AND expires_at_ms>$4",
+                &[&id,&payload,&owner,&i64::try_from(now()).map_err(internal)?]
+            ).await.map_err(internal)?;
+            if changed == 1 {
+                return Ok((current, true));
+            }
+            let latest = self
+                .get_intent(id)
+                .await?
+                .ok_or((StatusCode::NOT_FOUND, "perps intent not found".into()))?;
+            return Ok((latest, false));
+        }
+        let mut intents = self.intents.lock().map_err(internal)?;
+        let stored = intents
+            .get_mut(id)
+            .ok_or((StatusCode::NOT_FOUND, "perps intent not found".into()))?;
+        if stored.status.stage != "validate" {
+            return Ok((stored.clone(), false));
+        }
+        stored.status.stage = "execute".into();
+        Ok((stored.clone(), true))
+    }
+}
+#[derive(Clone, Serialize, Deserialize)]
 struct Quote {
     owner: String,
     wallet: String,
@@ -28,12 +149,12 @@ struct Quote {
     price: String,
     leverage: u64,
     expires: u64,
-    kind: &'static str,
+    kind: String,
     position_id: Option<String>,
     currency: String,
     margin: String,
 }
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Intent {
     quote: Quote,
     client_id: String,
@@ -252,7 +373,7 @@ pub(crate) async fn quotes(
             price: format_units(price),
             leverage: body.leverage,
             expires,
-            kind: "perp_open",
+            kind: "perp_open".into(),
             position_id: None,
             currency: currency.clone(),
             margin: body.margin.amount.clone(),
@@ -311,28 +432,32 @@ pub(crate) async fn execute_quote(
     let intent_id = new_id("open");
     let status = markets::IntentStatus {
         intent_id: intent_id.clone(),
-        stage: "validate",
-        state: "pending",
+        stage: "validate".into(),
+        state: "pending".into(),
         tx_ids: vec![],
         error: None,
     };
-    state.perps_trade.intents.lock().map_err(internal)?.insert(
-        intent_id.clone(),
-        Intent {
-            quote: quote.clone(),
-            client_id: intent_id.clone(),
-            order_id: None,
-            status,
-            expires: now() + QUOTE_MS,
-        },
-    );
+    let expires = now() + QUOTE_MS;
+    state
+        .perps_trade
+        .insert_intent(
+            &intent_id,
+            Intent {
+                quote: quote.clone(),
+                client_id: intent_id.clone(),
+                order_id: None,
+                status,
+                expires,
+            },
+        )
+        .await?;
     Ok(Json(
         json!({"intentId":intent_id,"kind":"perp_open","summary":[
         {"label":"Market","value":quote.market},{"label":"Side","value":quote.side},
         {"label":"Size","value":quote.size},{"label":"Leverage","value":format!("{}x",quote.leverage)},
         {"label":"Margin","value":format!("{} {}",quote.margin,quote.currency)},
         {"label":"Liquidation price","value":"Shown once open"}
-    ],"transactions":[],"expiresAtUnixMs":now()+QUOTE_MS}),
+    ],"transactions":[],"expiresAtUnixMs":expires}),
     ))
 }
 fn signed_number(value: &str) -> Result<i128, ApiError> {
@@ -456,7 +581,7 @@ pub(crate) async fn close_quote(
             price: format_units(price),
             leverage: 1,
             expires,
-            kind: "perp_close",
+            kind: "perp_close".into(),
             position_id: Some(position_id.clone()),
             currency: currency.into(),
             margin: format_units(basis),
@@ -530,21 +655,24 @@ pub(crate) async fn execute_close(
     let expires = now() + QUOTE_MS;
     let status = markets::IntentStatus {
         intent_id: intent_id.clone(),
-        stage: "validate",
-        state: "pending",
+        stage: "validate".into(),
+        state: "pending".into(),
         tx_ids: vec![],
         error: None,
     };
-    state.perps_trade.intents.lock().map_err(internal)?.insert(
-        intent_id.clone(),
-        Intent {
-            quote: quote.clone(),
-            client_id: intent_id.clone(),
-            order_id: None,
-            status,
-            expires,
-        },
-    );
+    state
+        .perps_trade
+        .insert_intent(
+            &intent_id,
+            Intent {
+                quote: quote.clone(),
+                client_id: intent_id.clone(),
+                order_id: None,
+                status,
+                expires,
+            },
+        )
+        .await?;
     Ok(Json(
         json!({"intentId":intent_id,"kind":"perp_close","summary":[
         {"label":"Market","value":quote.market},{"label":"Action","value":"Close position"},
@@ -785,55 +913,43 @@ pub(crate) async fn signed(
     if !body.sent.is_empty() || !body.signed.is_empty() {
         return Err(bad("Paradex confirmation plan has no app transactions"));
     }
-    let current = {
-        let mut intents = state.perps_trade.intents.lock().map_err(internal)?;
-        let intent = intents
-            .get_mut(&intent_id)
-            .ok_or((StatusCode::NOT_FOUND, "perps intent not found".into()))?;
-        if intent.quote.owner != user.user_id {
-            return Err((
-                StatusCode::FORBIDDEN,
-                "intent belongs to another user".into(),
-            ));
-        }
-        if intent.status.stage != "validate" {
-            return Ok(Json(intent.status.clone()));
-        }
-        if now() >= intent.expires {
-            return Err((StatusCode::GONE, "perps execution plan expired".into()));
-        }
-        intent.status.stage = "execute";
-        intent.clone()
-    };
+    let (current, claimed) = state
+        .perps_trade
+        .claim_intent(&intent_id, &user.user_id)
+        .await?;
+    if !claimed {
+        return Ok(Json(current.status));
+    }
     let result = submit_confirmed(&state, &headers, &current).await;
-    let mut intents = state.perps_trade.intents.lock().map_err(internal)?;
-    let stored = intents
-        .get_mut(&intent_id)
-        .ok_or((StatusCode::NOT_FOUND, "perps intent not found".into()))?;
+    let mut stored = current;
     match result {
         Ok(order) => {
             if order["client_id"].as_str() != Some(&stored.client_id)
                 || order["market"].as_str() != Some(&stored.quote.market)
             {
-                stored.status.stage = "settle";
-                stored.status.state = "failed";
+                stored.status.stage = "settle".into();
+                stored.status.state = "failed".into();
                 stored.status.error = Some("Paradex order identity mismatch".into());
             } else {
                 stored.order_id = order["id"].as_str().map(str::to_owned);
                 if let Some(id) = &stored.order_id {
                     stored.status.tx_ids = vec![id.clone()];
                 }
-                stored.status.stage = "settle";
+                stored.status.stage = "settle".into();
             }
         }
         Err(error) => {
-            stored.status.stage = "settle";
+            stored.status.stage = "settle".into();
             if error.0 != StatusCode::ACCEPTED {
-                stored.status.state = "failed";
+                stored.status.state = "failed".into();
                 stored.status.error = Some(error.1);
             }
         }
     }
+    state
+        .perps_trade
+        .save_intent(&intent_id, stored.clone())
+        .await?;
     Ok(Json(stored.status.clone()))
 }
 pub(crate) async fn status(
@@ -842,19 +958,65 @@ pub(crate) async fn status(
     headers: HeaderMap,
 ) -> Result<Json<markets::IntentStatus>, ApiError> {
     let user = app_balance::verified_wallets(&state, &headers).await?;
-    let current = state
+    let mut current = state
         .perps_trade
-        .intents
-        .lock()
-        .map_err(internal)?
-        .get(&intent_id)
-        .cloned()
+        .get_intent(&intent_id)
+        .await?
         .ok_or((StatusCode::NOT_FOUND, "perps intent not found".into()))?;
     if current.quote.owner != user.user_id {
         return Err((
             StatusCode::FORBIDDEN,
             "intent belongs to another user".into(),
         ));
+    }
+    if current.status.stage == "execute" && current.status.state == "pending" {
+        let jwt = evm_jwt(
+            &state,
+            &headers,
+            &current.quote.owner,
+            &current.quote.wallet,
+            &current.quote.account,
+        )
+        .await?;
+        let history = state
+            .paradex
+            .order_history(&jwt, &current.client_id)
+            .await
+            .map_err(internal)?;
+        if let Some(order) = history
+            .into_iter()
+            .find(|v| v["client_id"].as_str() == Some(&current.client_id))
+        {
+            if order["market"].as_str() != Some(&current.quote.market)
+                || order["size"].as_str().map(units).transpose()?
+                    != Some(units(&current.quote.size)?)
+            {
+                current.status.state = "failed".into();
+                current.status.error =
+                    Some("Paradex order did not match the confirmed plan".into());
+            } else {
+                current.status.stage = "settle".into();
+                current.order_id = order["id"].as_str().map(str::to_owned);
+                if let Some(id) = &current.order_id {
+                    current.status.tx_ids = vec![id.clone()];
+                }
+            }
+            state
+                .perps_trade
+                .save_intent(&intent_id, current.clone())
+                .await?;
+        } else if now() > current.expires + 60_000 {
+            current.status.stage = "settle".into();
+            current.status.state = "failed".into();
+            current.status.error =
+                Some("Paradex has not reported the order; check positions before retrying".into());
+            state
+                .perps_trade
+                .save_intent(&intent_id, current.clone())
+                .await?;
+        } else {
+            return Ok(Json(current.status));
+        }
     }
     if current.status.stage != "settle" || current.status.state != "pending" {
         return Ok(Json(current.status));
@@ -880,7 +1042,7 @@ pub(crate) async fn status(
         if order["market"].as_str() != Some(&current.quote.market)
             || order["size"].as_str().map(units).transpose()? != Some(units(&current.quote.size)?)
         {
-            next.state = "failed";
+            next.state = "failed".into();
             next.error = Some("Paradex order did not match the confirmed plan".into());
         } else if order["status"].as_str() == Some("CLOSED") {
             let order_id = venue_str(&order, "id")?;
@@ -920,13 +1082,13 @@ pub(crate) async fn status(
                     })
                 };
                 if settled {
-                    next.state = "filled";
+                    next.state = "filled".into();
                 } else if now() > current.expires + 60_000 {
-                    next.state = "failed";
+                    next.state = "failed".into();
                     next.error=Some("Paradex filled the order but position settlement is not visible yet; check positions".into());
                 }
             } else if executed > 0 || now() > current.expires + 60_000 {
-                next.state = "failed";
+                next.state = "failed".into();
                 next.error = Some(if executed > 0 {
                     format!("Paradex partially filled {} of {}; check your position before another order",format_units(executed),current.quote.size)
                 } else {
@@ -943,17 +1105,12 @@ pub(crate) async fn status(
             }
         }
     } else if now() > current.expires + 60_000 {
-        next.state = "failed";
+        next.state = "failed".into();
         next.error = Some("Paradex did not report the submitted order within two minutes".into());
     }
-    state
-        .perps_trade
-        .intents
-        .lock()
-        .map_err(internal)?
-        .get_mut(&intent_id)
-        .ok_or((StatusCode::NOT_FOUND, "perps intent not found".into()))?
-        .status = next.clone();
+    let mut updated = current;
+    updated.status = next.clone();
+    state.perps_trade.save_intent(&intent_id, updated).await?;
     Ok(Json(next))
 }
 #[cfg(test)]
