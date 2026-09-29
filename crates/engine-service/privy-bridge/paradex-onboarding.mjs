@@ -70,3 +70,10 @@ export function recoverOnboardingPublicKey(message, signature, expectedAddress) 
   }
   return '0x' + hex(publicKey);
 }
+
+export function subkeyRegistrationMessage(environment, address, publicKey,
+  nonce = randomBytes(16).toString('hex')) {
+  if (!/^0x[0-9a-fA-F]{1,64}$/.test(publicKey)) throw new Error('invalid Stark public key');
+  const statement = 'Paradex Subkey Registration: ' + publicKey.toLowerCase();
+  return siweMessage(environment, address, statement, nonce, 300);
+}

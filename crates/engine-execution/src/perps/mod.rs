@@ -214,6 +214,136 @@ impl ParadexClient {
             .cloned()
             .ok_or(ParadexError::InvalidResponse)
     }
+
+    pub async fn system_config(&self) -> Result<Value, ParadexError> {
+        self.get("system/config", None).await
+    }
+
+    pub async fn account_balance(&self, jwt: &str) -> Result<Value, ParadexError> {
+        self.get("balance", Some(jwt)).await
+    }
+
+    pub async fn subkey_exists(&self, jwt: &str, public_key: &str) -> Result<bool, ParadexError> {
+        if !public_key.starts_with("0x") || public_key.len() > 66 {
+            return Err(ParadexError::InvalidResponse);
+        }
+        let url = self
+            .base
+            .join(&format!("account/keys/subkeys/{public_key}"))
+            .map_err(|_| ParadexError::InvalidResponse)?;
+        let response = self.http.get(url).bearer_auth(jwt).send().await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        if !response.status().is_success() {
+            return Err(ParadexError::Rejected(response.status()));
+        }
+        Ok(true)
+    }
+
+    pub async fn register_subkey(
+        &self,
+        jwt: &str,
+        public_key: &str,
+        evm_signature: &str,
+        siwe_message: &str,
+    ) -> Result<(), ParadexError> {
+        if !public_key.starts_with("0x")
+            || !evm_signature.starts_with("0x")
+            || siwe_message.is_empty()
+        {
+            return Err(ParadexError::InvalidResponse);
+        }
+        let url = self
+            .base
+            .join("account/keys/subkeys")
+            .map_err(|_| ParadexError::InvalidResponse)?;
+        let response = self
+            .http
+            .post(url)
+            .bearer_auth(jwt)
+            .json(&serde_json::json!({
+                "name":"Atlas trade-only",
+                "public_key":public_key,
+                "evm_signature":evm_signature,
+                "siwe_message":siwe_message
+            }))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(ParadexError::Rejected(response.status()));
+        }
+        Ok(())
+    }
+
+    pub async fn authenticate_subkey(
+        &self,
+        account_address: &str,
+        public_key: &str,
+        signature: &str,
+        timestamp: u64,
+        expiration: u64,
+    ) -> Result<String, ParadexError> {
+        if !account_address.starts_with("0x")
+            || !public_key.starts_with("0x")
+            || !signature.starts_with('[')
+            || expiration <= timestamp
+        {
+            return Err(ParadexError::InvalidResponse);
+        }
+        let url = self
+            .base
+            .join(&format!("auth/{public_key}"))
+            .map_err(|_| ParadexError::InvalidResponse)?;
+        let response = self
+            .http
+            .post(url)
+            .header("PARADEX-STARKNET-ACCOUNT", account_address)
+            .header("PARADEX-STARKNET-SIGNATURE", signature)
+            .header("PARADEX-TIMESTAMP", timestamp.to_string())
+            .header("PARADEX-SIGNATURE-EXPIRATION", expiration.to_string())
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(ParadexError::Rejected(response.status()));
+        }
+        let body: Value = response.json().await?;
+        body["jwt_token"]
+            .as_str()
+            .filter(|token| !token.is_empty())
+            .map(str::to_owned)
+            .ok_or(ParadexError::InvalidResponse)
+    }
+
+    pub async fn submit_order(&self, jwt: &str, order: &Value) -> Result<Value, ParadexError> {
+        let url = self
+            .base
+            .join("orders")
+            .map_err(|_| ParadexError::InvalidResponse)?;
+        let response = self
+            .http
+            .post(url)
+            .bearer_auth(jwt)
+            .json(order)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(ParadexError::Rejected(response.status()));
+        }
+        response.json().await.map_err(ParadexError::Transport)
+    }
+
+    pub async fn order(&self, jwt: &str, order_id: &str) -> Result<Value, ParadexError> {
+        if order_id.is_empty()
+            || order_id.len() > 128
+            || !order_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(ParadexError::InvalidResponse);
+        }
+        self.get(&format!("orders/{order_id}"), Some(jwt)).await
+    }
 }
 
 #[cfg(test)]

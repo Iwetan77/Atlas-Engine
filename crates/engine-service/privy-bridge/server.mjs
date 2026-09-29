@@ -1,6 +1,7 @@
 import {createServer} from 'node:http';
 import {PrivyClient} from '@privy-io/node';
-import {authMessage, onboardingMessage, recoverOnboardingPublicKey} from './paradex-onboarding.mjs';
+import {authMessage, onboardingMessage, subkeyRegistrationMessage, recoverOnboardingPublicKey} from './paradex-onboarding.mjs';
+import {deriveTradeSubkey, signSubkeyAuth, signParadexOrder} from './trade-subkey.mjs';
 import {parseSignerConfig, walletHasSigner} from './signer-config.mjs';
 
 const appId = process.env.PRIVY_APP_ID;
@@ -49,7 +50,12 @@ const server = createServer(async (request, response) => {
     request.url === '/paradex/onboarding-signature';
   const signAuth = request.method === 'POST' && request.url === '/paradex/auth-signature';
   const checkSigner = request.method === 'POST' && request.url === '/paradex/signer-status';
-  if (!verifyOnly && !signOnboarding && !signAuth && !checkSigner) {
+  const registerSubkey = request.method === 'POST' &&
+    request.url === '/paradex/subkey-registration-signature';
+  const authSubkey = request.method === 'POST' && request.url === '/paradex/subkey-auth-signature';
+  const signOrder = request.method === 'POST' && request.url === '/paradex/order-signature';
+  if (!verifyOnly && !signOnboarding && !signAuth && !checkSigner &&
+      !registerSubkey && !authSubkey && !signOrder) {
     response.writeHead(404).end();
     return;
   }
@@ -113,6 +119,34 @@ const server = createServer(async (request, response) => {
       return;
     }
     const environment = process.env.PARADEX_ENV ?? 'prod';
+    if (registerSubkey || authSubkey || signOrder) {
+      const subkey = deriveTradeSubkey(signer.privateKey, environment, userId, evmWallet);
+      if (registerSubkey) {
+        const message = subkeyRegistrationMessage(environment, evmWallet, subkey.publicKey);
+        const signed = await privy.wallets().ethereum().signMessage(evm.id, {
+          message,
+          authorization_context: {authorization_private_keys: [signer.privateKey]},
+        });
+        recoverOnboardingPublicKey(message, signed.signature, evmWallet);
+        send(response, 200, {userId, walletAddress: evmWallet, publicKey: subkey.publicKey,
+          signature: signed.signature, siweMessage: message});
+        return;
+      }
+      const accountAddress = input.accountAddress;
+      const chainId = input.chainId;
+      if (authSubkey) {
+        const proof = signSubkeyAuth(subkey, accountAddress, chainId,
+          Math.floor(Date.now() / 1000));
+        send(response, 200, {userId, walletAddress: evmWallet, publicKey: subkey.publicKey,
+          ...proof});
+        return;
+      }
+      const timestamp = Date.now();
+      const signature = signParadexOrder(subkey, accountAddress, chainId, input.order, timestamp);
+      send(response, 200, {userId, walletAddress: evmWallet, publicKey: subkey.publicKey,
+        signature, timestamp});
+      return;
+    }
     const message = signOnboarding
       ? onboardingMessage(environment, evmWallet)
       : authMessage(environment, evmWallet);
