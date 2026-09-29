@@ -204,7 +204,8 @@ pub(crate) async fn quotes(
         currency: Some(body.margin.currency.clone()),
     })?;
     let rate = app_balance::fx_rate(&currency).await?;
-    let display = units(&body.margin.amount)?;
+    let display = units(&body.margin.amount)
+        .map_err(|_| bad("margin must be a positive decimal with at most twelve places"))?;
     let margin = display
         .checked_mul(1_000_000)
         .ok_or((StatusCode::BAD_REQUEST, "margin too large".into()))?
