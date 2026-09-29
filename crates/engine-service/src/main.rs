@@ -32,6 +32,24 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 
 type ApiError = (StatusCode, String);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AtlasNetwork {
+    Mainnet,
+    Testnet,
+}
+impl AtlasNetwork {
+    fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
+        match env::var("ATLAS_NETWORK")
+            .unwrap_or_else(|_| "mainnet".into())
+            .as_str()
+        {
+            "mainnet" => Ok(Self::Mainnet),
+            "testnet" => Ok(Self::Testnet),
+            _ => Err("ATLAS_NETWORK must be mainnet or testnet".into()),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     user_id: String,
@@ -45,6 +63,7 @@ struct AppState {
     solana: SolanaAtaPreflight,
     solana_mainnet: SolanaAtaPreflight,
     auth: AuthMode,
+    network: AtlasNetwork,
     markets: markets::MarketState,
     paradex: engine_execution::perps::ParadexClient,
     paradex_tokens: Arc<Mutex<HashMap<String, (String, Instant)>>>,
@@ -146,6 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "",
         )?,
         auth,
+        network: AtlasNetwork::from_env()?,
         markets: markets::MarketState::new()?,
         paradex: engine_execution::perps::ParadexClient::new(
             &env::var("PARADEX_ENV").unwrap_or_else(|_| "prod".into()),

@@ -69,24 +69,45 @@ pub(super) async fn balance(
         StatusCode::CONFLICT,
         "Privy Solana wallet is not ready".into(),
     ))?;
-    state
-        .solana_mainnet
-        .assert_network()
-        .await
-        .map_err(internal)?;
-    let (base_usdc, solana_usdc) = tokio::join!(
-        state
-            .markets
-            .base
-            .balance_of(engine_execution::swaps::uniswap::BASE_USDC, &evm),
-        state.solana_mainnet.owner_mint_balance(
-            &solana_owner,
-            engine_execution::solana::MAINNET_USDC_MINT,
-            6,
-        ),
-    );
-    let base_usdc = base_usdc.map_err(internal)?;
-    let solana_usdc = solana_usdc.map_err(internal)?;
+    let (base_usdc, solana_usdc) = match state.network {
+        AtlasNetwork::Mainnet => {
+            state
+                .solana_mainnet
+                .assert_network()
+                .await
+                .map_err(internal)?;
+            let (base, solana) = tokio::join!(
+                state
+                    .markets
+                    .base
+                    .balance_of(engine_execution::swaps::uniswap::BASE_USDC, &evm),
+                state.solana_mainnet.owner_mint_balance(
+                    &solana_owner,
+                    engine_execution::solana::MAINNET_USDC_MINT,
+                    6,
+                ),
+            );
+            (base.map_err(internal)?, solana.map_err(internal)?)
+        }
+        AtlasNetwork::Testnet => {
+            state.solana.assert_network().await.map_err(internal)?;
+            let target = DepositTarget {
+                user_id: user.user_id.clone(),
+                wallet_address: evm.clone(),
+                token_contract: "0x036CbD53842c5426634e7929541eC2318f3dCF7e".into(),
+                chain_id: 84532,
+            };
+            let (base, solana) = tokio::join!(
+                state.scanner.wallet_token_balance(&target),
+                state.solana.owner_mint_balance(
+                    &solana_owner,
+                    engine_execution::solana::DEVNET_USDC_MINT,
+                    6,
+                ),
+            );
+            (base.map_err(internal)?, solana.map_err(internal)?)
+        }
+    };
     let rate = fx_rate(&currency).await?;
     let mut holdings = Vec::new();
     add_holding(&mut holdings, "base", "wallet", base_usdc, &currency, rate)?;
@@ -101,6 +122,20 @@ pub(super) async fn balance(
     let mut total = base_usdc
         .checked_add(solana_usdc)
         .ok_or((StatusCode::BAD_GATEWAY, "balance overflow".into()))?;
+
+    if state.network == AtlasNetwork::Testnet {
+        let as_of_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(internal)?
+            .as_millis();
+        return Ok(Json(AppBalanceResponse {
+            total: money(total, &currency, rate)?,
+            total_usd: usd(total),
+            pending: None,
+            holdings,
+            as_of_unix_ms,
+        }));
+    }
 
     for asset in markets::ASSETS {
         let units = if asset.chain == "base" {
