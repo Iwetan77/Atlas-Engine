@@ -783,6 +783,29 @@ async fn signed_bridge(
     }
     Ok(proof)
 }
+fn market_order_request(
+    client_id: &str,
+    market: &str,
+    side: &str,
+    size: &str,
+    signature: &str,
+    timestamp: u64,
+    reduce_only: bool,
+) -> Value {
+    // Paradex's live API rejects price on MARKET orders. The signer still signs
+    // price=0, but the submitted JSON must omit that field entirely.
+    json!({
+        "client_id":client_id,
+        "instruction":"IOC",
+        "market":market,
+        "side":side,
+        "size":size,
+        "type":"MARKET",
+        "signature":signature,
+        "signature_timestamp":timestamp,
+        "flags":if reduce_only {vec!["REDUCE_ONLY"]} else {vec![]}
+    })
+}
 async fn submit_confirmed(
     state: &AppState,
     headers: &HeaderMap,
@@ -937,12 +960,17 @@ async fn submit_confirmed(
             "Paradex order signer mismatch".into(),
         ));
     }
-    let body = json!({"client_id":intent.client_id,"instruction":"IOC","market":quote.market,
-        "price":"0","side":side,"size":quote.size,"type":"MARKET",
-        "signature":venue_str(&signature,"signature")?,
-        "signature_timestamp":signature["timestamp"].as_u64().ok_or((StatusCode::BAD_GATEWAY,"Order timestamp missing".into()))?,
-        "flags":if quote.kind=="perp_close" {vec!["REDUCE_ONLY"]} else {vec![]}
-    });
+    let body = market_order_request(
+        &intent.client_id,
+        &quote.market,
+        side,
+        &quote.size,
+        venue_str(&signature, "signature")?,
+        signature["timestamp"]
+            .as_u64()
+            .ok_or((StatusCode::BAD_GATEWAY, "Order timestamp missing".into()))?,
+        quote.kind == "perp_close",
+    );
     match state.paradex.submit_order(&trade_jwt, &body).await {
         Ok(order) => Ok(order),
         Err(engine_execution::perps::ParadexError::Transport(_)) => {
@@ -1177,6 +1205,32 @@ pub(crate) async fn status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn market_order_omits_price_for_open_and_close() {
+        let open = market_order_request(
+            "open-1",
+            "BTC-USD-PERP",
+            "BUY",
+            "0.001",
+            "[1,2]",
+            123,
+            false,
+        );
+        assert!(open.get("price").is_none());
+        assert_eq!(open["type"], "MARKET");
+        assert_eq!(open["flags"], json!([]));
+        let close = market_order_request(
+            "close-1",
+            "BTC-USD-PERP",
+            "SELL",
+            "0.001",
+            "[1,2]",
+            124,
+            true,
+        );
+        assert!(close.get("price").is_none());
+        assert_eq!(close["flags"], json!(["REDUCE_ONLY"]));
+    }
     #[test]
     fn unchanged_resting_book_is_quoted_only_at_sensible_venue_price() {
         let old_timestamp = now().saturating_sub(90 * 60 * 1_000);
