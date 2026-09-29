@@ -7,10 +7,12 @@ mod perps;
 mod social;
 
 use std::{
+    collections::HashMap,
     env,
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use axum::{
@@ -45,6 +47,7 @@ struct AppState {
     auth: AuthMode,
     markets: markets::MarketState,
     paradex: engine_execution::perps::ParadexClient,
+    paradex_tokens: Arc<Mutex<HashMap<String, (String, Instant)>>>,
     social: social::SocialState,
 }
 
@@ -146,6 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         paradex: engine_execution::perps::ParadexClient::new(
             &env::var("PARADEX_ENV").unwrap_or_else(|_| "prod".into()),
         )?,
+        paradex_tokens: Arc::new(Mutex::new(HashMap::new())),
         social: social::SocialState::new().await?,
     };
     let bind: SocketAddr = env::var("ATLAS_BALANCE_BIND")

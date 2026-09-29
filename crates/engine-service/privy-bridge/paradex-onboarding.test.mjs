@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {secp256k1} from '@noble/curves/secp256k1';
 import {keccak_256} from '@noble/hashes/sha3';
-import {onboardingMessage, recoverOnboardingPublicKey} from './paradex-onboarding.mjs';
+import {authMessage, onboardingMessage, recoverOnboardingPublicKey} from './paradex-onboarding.mjs';
 
 test('testnet onboarding signs only the fixed Paradex SIWE message', () => {
   const key = new Uint8Array(32);
@@ -25,6 +25,13 @@ test('testnet onboarding signs only the fixed Paradex SIWE message', () => {
     '0x0000000000000000000000000000000000000001'));
 });
 
+test('Paradex account authentication expires and is wallet bound', () => {
+  const address = '0x0000000000000000000000000000000000000001';
+  const message = authMessage('testnet', address, '0123456789abcdef0123456789abcdef');
+  assert.match(message, /\nParadex Auth\n/);
+  assert.match(message, /\nIssued At: .+\nExpiration Time: .+$/);
+  assert.match(message, /\nChain ID: 11155111\n/);
+});
 test('invalid inputs fail before any wallet signature', () => {
   assert.throws(() => onboardingMessage('unknown', '0x0000000000000000000000000000000000000001'));
   assert.throws(() => onboardingMessage('prod', 'not-an-address'));

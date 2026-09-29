@@ -1,6 +1,6 @@
 import {createServer} from 'node:http';
 import {PrivyClient} from '@privy-io/node';
-import {onboardingMessage, recoverOnboardingPublicKey} from './paradex-onboarding.mjs';
+import {authMessage, onboardingMessage, recoverOnboardingPublicKey} from './paradex-onboarding.mjs';
 
 const appId = process.env.PRIVY_APP_ID;
 const appSecret = process.env.PRIVY_APP_SECRET;
@@ -18,7 +18,8 @@ const server = createServer(async (request, response) => {
   const verifyOnly = request.method === 'POST' && request.url === '/verify';
   const signOnboarding = request.method === 'POST' &&
     request.url === '/paradex/onboarding-signature';
-  if (!verifyOnly && !signOnboarding) {
+  const signAuth = request.method === 'POST' && request.url === '/paradex/auth-signature';
+  if (!verifyOnly && !signOnboarding && !signAuth) {
     response.writeHead(404).end();
     return;
   }
@@ -71,7 +72,9 @@ const server = createServer(async (request, response) => {
       return;
     }
     const environment = process.env.PARADEX_ENV ?? 'prod';
-    const message = onboardingMessage(environment, evmWallet);
+    const message = signOnboarding
+      ? onboardingMessage(environment, evmWallet)
+      : authMessage(environment, evmWallet);
     let signed;
     try {
       signed = await privy.wallets().ethereum().signMessage(evm.id, {message});

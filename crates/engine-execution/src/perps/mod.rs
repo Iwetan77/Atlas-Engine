@@ -138,6 +138,42 @@ impl ParadexClient {
         }
         Ok(())
     }
+    pub async fn authenticate_evm(
+        &self,
+        account_address: &str,
+        signature: &str,
+        siwe_message_base64: &str,
+    ) -> Result<String, ParadexError> {
+        if !account_address.starts_with("0x")
+            || !signature.starts_with("0x")
+            || siwe_message_base64.is_empty()
+        {
+            return Err(ParadexError::InvalidResponse);
+        }
+        let url = self
+            .base
+            .join("v2/auth")
+            .map_err(|_| ParadexError::InvalidResponse)?;
+        let response = self
+            .http
+            .post(url)
+            .header("accept", "application/json")
+            .header("PARADEX-STARKNET-ACCOUNT", account_address)
+            .header("PARADEX-EVM-SIGNATURE", signature)
+            .header("PARADEX-SIWE-MESSAGE", siwe_message_base64)
+            .json(&serde_json::json!({}))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(ParadexError::Rejected(response.status()));
+        }
+        let body: Value = response.json().await?;
+        body["jwt_token"]
+            .as_str()
+            .filter(|token| !token.is_empty())
+            .map(str::to_owned)
+            .ok_or(ParadexError::InvalidResponse)
+    }
     pub async fn market(&self, market: &str) -> Result<Value, ParadexError> {
         let data = self.get(&format!("markets?market={market}"), None).await?;
         data["results"]

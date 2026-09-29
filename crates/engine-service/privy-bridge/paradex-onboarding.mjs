@@ -17,7 +17,7 @@ function checksumAddress(address) {
   return checksummed;
 }
 
-export function onboardingMessage(environment, address, nonce = randomBytes(16).toString('hex')) {
+function siweMessage(environment, address, statement, nonce, expiresInSeconds) {
   const domain = environment === 'testnet'
     ? 'app.testnet.paradex.trade'
     : environment === 'prod' ? 'app.paradex.trade' : null;
@@ -25,21 +25,34 @@ export function onboardingMessage(environment, address, nonce = randomBytes(16).
   if (!/^[0-9a-fA-F]{16,64}$/.test(nonce)) throw new Error('invalid SIWE nonce');
   const chainId = environment === 'testnet' ? 11155111 : 1;
   const wallet = checksumAddress(address);
-  const issuedAt = new Date().toISOString().replace(/\.\d{3}Z$/, '+00:00');
-  return [
+  const issuedAt = new Date();
+  const formatted = (date) => date.toISOString().replace(/\.\d{3}Z$/, '+00:00');
+  const lines = [
     domain + ' wants you to sign in with your Ethereum account:',
     wallet,
     '',
-    'Paradex Onboarding',
+    statement,
     '',
     'URI: https://' + domain,
     'Version: 1',
     'Chain ID: ' + chainId,
     'Nonce: ' + nonce,
-    'Issued At: ' + issuedAt,
-  ].join('\n');
+    'Issued At: ' + formatted(issuedAt),
+  ];
+  if (expiresInSeconds !== null) {
+    lines.push('Expiration Time: ' + formatted(new Date(issuedAt.getTime() +
+      expiresInSeconds * 1000)));
+  }
+  return lines.join('\n');
 }
 
+export function onboardingMessage(environment, address, nonce = randomBytes(16).toString('hex')) {
+  return siweMessage(environment, address, 'Paradex Onboarding', nonce, null);
+}
+
+export function authMessage(environment, address, nonce = randomBytes(16).toString('hex')) {
+  return siweMessage(environment, address, 'Paradex Auth', nonce, 60);
+}
 export function recoverOnboardingPublicKey(message, signature, expectedAddress) {
   if (!/^0x[0-9a-fA-F]{130}$/.test(signature)) throw new Error('invalid EVM signature');
   const sig = Buffer.from(signature.slice(2), 'hex');
