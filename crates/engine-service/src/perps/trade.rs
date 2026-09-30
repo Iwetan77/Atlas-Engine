@@ -341,9 +341,7 @@ pub(crate) async fn quotes(
     headers: HeaderMap,
     Json(body): Json<OpenRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    if env::var("PARADEX_ENV").as_deref() != Ok("testnet") {
-        return Err(unavailable("Paradex trading is enabled on testnet only"));
-    }
+    trading_env()?;
     let (user_id, wallet, account) = owner(&state, &headers).await?;
     if !MARKET_IDS.iter().any(|(m, _, _)| *m == body.market_id) {
         return Err(bad("unsupported Paradex market"));
@@ -523,9 +521,7 @@ pub(crate) async fn close_quote(
     Path(position_id): Path<String>,
     Json(_body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    if env::var("PARADEX_ENV").as_deref() != Ok("testnet") {
-        return Err(unavailable("Paradex trading is enabled on testnet only"));
-    }
+    trading_env()?;
     let (user_id, wallet, account) = owner(&state, &headers).await?;
     let jwt = evm_jwt(&state, &headers, &user_id, &wallet, &account).await?;
     let positions = state.paradex.positions(&jwt).await.map_err(internal)?;

@@ -18,6 +18,17 @@ pub(super) struct CurrencyQuery {
     currency: Option<String>,
 }
 
+// Trading and onboarding run on whichever Paradex network PARADEX_ENV names. It must be set
+// explicitly: market reads default to prod, but nothing places or registers anything by default.
+pub(super) fn trading_env() -> Result<&'static str, ApiError> {
+    match env::var("PARADEX_ENV").as_deref() {
+        Ok("testnet") => Ok("testnet"),
+        Ok("prod") => Ok("prod"),
+        _ => Err(unavailable(
+            "Paradex trading needs PARADEX_ENV set to testnet or prod",
+        )),
+    }
+}
 fn bad(message: &str) -> ApiError {
     (StatusCode::BAD_REQUEST, message.into())
 }
@@ -159,11 +170,7 @@ pub(super) async fn onboard(
     headers: HeaderMap,
     Json(_body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    if env::var("PARADEX_ENV").as_deref() != Ok("testnet") {
-        return Err(unavailable(
-            "Paradex testnet onboarding is not enabled on this service",
-        ));
-    }
+    trading_env()?;
     let user = app_balance::verified_wallets(&state, &headers).await?;
     let wallet = user.evm_wallet.filter(|wallet| !wallet.is_empty()).ok_or((
         StatusCode::CONFLICT,
