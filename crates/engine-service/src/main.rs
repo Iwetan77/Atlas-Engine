@@ -1,5 +1,5 @@
-//! Balance API with Privy identity checks. The Phase 2 test account remains
-//! available only when the operator explicitly enables local demo mode.
+//! The Atlas Engine HTTP API. Every route checks the caller's Privy identity; a fixed local test
+//! account is available only when the operator explicitly enables local demo mode.
 
 mod app_balance;
 mod earn;
@@ -15,7 +15,6 @@ use std::{
     collections::HashMap,
     env,
     net::SocketAddr,
-    path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -26,12 +25,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use engine_execution::{
-    balance::{include_solana_and_outgoing, usdc_buckets, OutgoingGatewayMovement},
-    funding::deposit::{DepositTarget, EvmDepositScanner},
-    gateway::{GatewayClient, GatewayEnvironment, GatewaySource},
-    solana::{SolanaAtaPreflight, SolanaNetwork},
-};
+use engine_execution::solana::{SolanaAtaPreflight, SolanaNetwork};
 use serde::{Deserialize, Serialize};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
@@ -42,12 +36,6 @@ struct AppState {
     user_id: String,
     base_wallet: String,
     solana_owner: String,
-    internal_token: String,
-    movement_path: PathBuf,
-    movement: Arc<Mutex<Option<MovementRecord>>>,
-    scanner: EvmDepositScanner,
-    gateway: GatewayClient,
-    solana: SolanaAtaPreflight,
     solana_mainnet: SolanaAtaPreflight,
     auth: AuthMode,
     markets: markets::MarketState,
@@ -72,53 +60,11 @@ enum AuthMode {
     LocalDemo,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MovementRecord {
-    amount_base_units: u128,
-    gateway_before_base_units: u128,
-    solana_before_base_units: u128,
-    #[serde(default)]
-    transfer_id: Option<String>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BalanceResponse {
-    user: String,
-    asset: &'static str,
-    wallet_base_units: String,
-    gateway_confirmed_base_units: String,
-    gateway_pending_deposit_base_units: String,
-    solana_wallet_base_units: String,
-    outgoing_in_flight_base_units: String,
-    spendable_base_units: String,
-    total_base_units: Option<String>,
-    display_usd: Option<String>,
-    integrity: &'static str,
-    active_transfer_id: Option<String>,
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let user_id = env::var("ATLAS_TEST_USER_ID").unwrap_or_default();
     let base_wallet = env::var("ATLAS_TEST_WALLET_ADDRESS").unwrap_or_default();
     let solana_owner = env::var("ATLAS_SOLANA_OWNER_ADDRESS").unwrap_or_default();
-    let internal_token = env::var("ATLAS_INTERNAL_TOKEN").unwrap_or_default();
-    let movement_path = PathBuf::from(
-        env::var("ATLAS_MOVEMENT_LEDGER_PATH")
-            .unwrap_or_else(|_| ".env.gateway-movement.json".into()),
-    );
-    let movement = if movement_path.exists() {
-        Some(serde_json::from_slice(&std::fs::read(&movement_path)?)?)
-    } else {
-        None
-    };
-    let base_rpc =
-        env::var("ATLAS_BASE_RPC_URL").unwrap_or_else(|_| "https://sepolia.base.org".into());
-    let solana_rpc =
-        env::var("ATLAS_SOLANA_RPC_URL").unwrap_or_else(|_| "https://api.devnet.solana.com".into());
-    let relayer_path = env::var("ATLAS_SOLANA_RELAYER_KEYPAIR_PATH").unwrap_or_default();
     let auth = if env::var("ATLAS_DEMO_AUTH_BYPASS").as_deref() == Ok("1") {
         AuthMode::LocalDemo
     } else {
@@ -148,12 +94,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         user_id,
         base_wallet,
         solana_owner,
-        internal_token,
-        movement_path,
-        movement: Arc::new(Mutex::new(movement)),
-        scanner: EvmDepositScanner::new(base_rpc.parse()?, 2)?,
-        gateway: GatewayClient::new(GatewayEnvironment::Testnet)?,
-        solana: SolanaAtaPreflight::new(SolanaNetwork::Devnet, solana_rpc, relayer_path)?,
         solana_mainnet: SolanaAtaPreflight::new(
             SolanaNetwork::Mainnet,
             env::var("ATLAS_SOLANA_MAINNET_RPC_URL")
@@ -238,8 +178,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/earn/quotes", post(earn::quote))
         .route("/v1/earn/quotes/{quote_id}/execute", post(earn::execute))
         .route("/v1/intents/{intent_id}", get(markets::intent_status))
-        .route("/balance/{user}", get(balance))
-        .route("/balance/{user}/movement", post(register_movement))
         .with_state(state);
     if let Some(cors) = configured_cors()? {
         app = app.layer(cors);
@@ -288,149 +226,6 @@ fn configured_cors() -> Result<Option<CorsLayer>, Box<dyn std::error::Error>> {
     ))
 }
 
-async fn balance(
-    State(state): State<AppState>,
-    Path(user): Path<String>,
-    headers: HeaderMap,
-) -> Result<Json<BalanceResponse>, ApiError> {
-    authorize_balance(&state.auth, &headers, &user).await?;
-    if user != state.user_id {
-        return Err((StatusCode::NOT_FOUND, "unknown user".into()));
-    }
-    let target = DepositTarget {
-        user_id: user.clone(),
-        wallet_address: state.base_wallet.clone(),
-        token_contract: "0x036CbD53842c5426634e7929541eC2318f3dCF7e".into(),
-        chain_id: 84532,
-    };
-    let sources = [GatewaySource {
-        depositor: state.base_wallet.clone(),
-        domain: None,
-    }];
-    let (wallet, gateway, deposits, solana) = tokio::join!(
-        state.scanner.wallet_token_balance(&target),
-        state.gateway.balances(&sources),
-        state.gateway.deposits(&sources),
-        state.solana.owner_usdc_balance(&state.solana_owner),
-    );
-    let wallet = wallet.map_err(internal)?;
-    let gateway = gateway.map_err(internal)?;
-    let deposits = deposits.map_err(internal)?;
-    let solana = solana.map_err(internal)?;
-    let buckets =
-        usdc_buckets(wallet, &state.base_wallet, &gateway, &deposits).map_err(internal)?;
-    let movement = state.movement.lock().map_err(internal)?.clone();
-    let outgoing = movement.as_ref().map(|m| OutgoingGatewayMovement {
-        amount_base_units: m.amount_base_units,
-        gateway_before_base_units: m.gateway_before_base_units,
-        solana_before_base_units: m.solana_before_base_units,
-    });
-    let unified =
-        include_solana_and_outgoing(&buckets, solana, outgoing.as_ref()).map_err(internal)?;
-    let total = unified.total_accounted_base_units;
-    Ok(Json(BalanceResponse {
-        user,
-        asset: "USDC",
-        wallet_base_units: wallet.to_string(),
-        gateway_confirmed_base_units: buckets.gateway_confirmed_base_units.to_string(),
-        gateway_pending_deposit_base_units: buckets.gateway_pending_base_units.to_string(),
-        solana_wallet_base_units: solana.to_string(),
-        outgoing_in_flight_base_units: unified.outgoing_in_flight_base_units.to_string(),
-        spendable_base_units: unified.spendable_base_units.to_string(),
-        total_base_units: total.map(|v| v.to_string()),
-        display_usd: total.map(usd),
-        integrity: if total.is_some() {
-            "accounted"
-        } else {
-            "inconsistent_snapshots"
-        },
-        active_transfer_id: movement.and_then(|m| m.transfer_id),
-    }))
-}
-
-async fn authorize_balance(
-    auth: &AuthMode,
-    headers: &HeaderMap,
-    user: &str,
-) -> Result<(), ApiError> {
-    let AuthMode::Privy { bridge_url, http } = auth else {
-        return Ok(());
-    };
-    let token = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .filter(|value| !value.is_empty())
-        .ok_or((
-            StatusCode::UNAUTHORIZED,
-            "Privy access token required".into(),
-        ))?;
-    let response = http
-        .post(format!("{bridge_url}/verify"))
-        .json(&serde_json::json!({"accessToken": token}))
-        .send()
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Privy verification unavailable".into(),
-            )
-        })?;
-    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            "invalid or expired Privy access token".into(),
-        ));
-    }
-    let response = response.error_for_status().map_err(|_| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Privy verification unavailable".into(),
-        )
-    })?;
-    let verified: serde_json::Value = response.json().await.map_err(|_| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Privy verification unavailable".into(),
-        )
-    })?;
-    if verified["userId"].as_str() != Some(user) {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "balance belongs to another user".into(),
-        ));
-    }
-    Ok(())
-}
-
-async fn register_movement(
-    State(state): State<AppState>,
-    Path(user): Path<String>,
-    headers: HeaderMap,
-    Json(record): Json<MovementRecord>,
-) -> Result<StatusCode, ApiError> {
-    if user != state.user_id {
-        return Err((StatusCode::NOT_FOUND, "unknown user".into()));
-    }
-    if state.internal_token.is_empty()
-        || headers
-            .get("x-atlas-internal-token")
-            .and_then(|v| v.to_str().ok())
-            != Some(state.internal_token.as_str())
-    {
-        return Err((StatusCode::UNAUTHORIZED, "internal token required".into()));
-    }
-    if record.amount_base_units == 0 {
-        return Err((StatusCode::BAD_REQUEST, "amount must be positive".into()));
-    }
-    let bytes = serde_json::to_vec(&record).map_err(internal)?;
-    let temporary_path = state.movement_path.with_extension("tmp");
-    std::fs::write(&temporary_path, bytes).map_err(internal)?;
-    std::fs::rename(&temporary_path, &state.movement_path).map_err(internal)?;
-    *state.movement.lock().map_err(internal)? = Some(record);
-    Ok(StatusCode::NO_CONTENT)
-}
-
 // Display currencies Atlas prices in. FX comes from Frankfurter with Coinbase as the fallback.
 pub(crate) const DISPLAY_CURRENCIES: [&str; 7] = ["USD", "NGN", "EUR", "GBP", "ZAR", "KES", "GHS"];
 
@@ -440,48 +235,4 @@ fn usd(base_units: u128) -> String {
 
 fn internal(error: impl std::fmt::Display) -> ApiError {
     (StatusCode::BAD_GATEWAY, error.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn balance_auth_rejects_missing_token() {
-        let auth = AuthMode::Privy {
-            bridge_url: "http://127.0.0.1:3101".into(),
-            http: reqwest::Client::new(),
-        };
-        let error = authorize_balance(&auth, &HeaderMap::new(), "did:privy:alice")
-            .await
-            .unwrap_err();
-        assert_eq!(error.0, StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn balance_auth_rejects_another_verified_user() {
-        let bridge = Router::new().route(
-            "/verify",
-            post(|| async { Json(serde_json::json!({"userId":"did:privy:alice"})) }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, bridge).await.unwrap() });
-        let auth = AuthMode::Privy {
-            bridge_url: format!("http://{address}"),
-            http: reqwest::Client::new(),
-        };
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            "Bearer token".parse().unwrap(),
-        );
-        let error = authorize_balance(&auth, &headers, "did:privy:bob")
-            .await
-            .unwrap_err();
-        assert_eq!(error.0, StatusCode::FORBIDDEN);
-        authorize_balance(&auth, &headers, "did:privy:alice")
-            .await
-            .unwrap();
-    }
 }
