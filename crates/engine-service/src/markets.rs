@@ -374,6 +374,18 @@ struct StoredIntent {
     expected: Vec<(String, String)>,
     request_id: Option<String>,
     status: IntentStatus,
+    // Set for spot buys and sells, so the fill can be kept as a trade.
+    trade: Option<PlannedTrade>,
+}
+#[derive(Clone)]
+struct PlannedTrade {
+    asset_id: String,
+    side: String,
+    pay_units: u128,
+    // What the quote expects back; the fill's real amount replaces it when the venue reports one.
+    get_units: u128,
+    // Base: the token the wallet receives (lowercase), read from the swap receipt.
+    receive_token: String,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -398,7 +410,7 @@ pub(super) struct QuoteRequest {
     amount: Money,
 }
 #[derive(Clone, Deserialize, Serialize)]
-struct Money {
+pub(super) struct Money {
     amount: String,
     currency: String,
 }
@@ -495,6 +507,7 @@ impl MarketState {
                     .collect(),
                 request_id: None,
                 status,
+                trade: None,
             },
         );
         Ok(intent_id)
@@ -519,7 +532,7 @@ fn bad(message: &str) -> ApiError {
 fn unavailable(error: impl std::fmt::Display) -> ApiError {
     (StatusCode::BAD_GATEWAY, error.to_string())
 }
-fn checked_currency(currency: &str) -> Result<(), ApiError> {
+pub(super) fn checked_currency(currency: &str) -> Result<(), ApiError> {
     if DISPLAY_CURRENCIES.contains(&currency) {
         Ok(())
     } else {
@@ -572,7 +585,7 @@ fn money_from_usdc(units: u128, currency: &str, rate: u128) -> Result<Money, Api
         currency: currency.into(),
     })
 }
-fn unit_price(
+pub(super) fn unit_price(
     input_units: u128,
     output_units: u128,
     token_decimals: u32,
@@ -1007,7 +1020,7 @@ fn ohlcv_closes(body: &Value) -> Vec<(u64, f64)> {
 }
 
 // An indicative unit price from a floating USD price (display only; trades use venue quotes).
-fn money_from_usd(usd: f64, currency: &str, rate: u128) -> Result<Value, ApiError> {
+pub(super) fn money_from_usd(usd: f64, currency: &str, rate: u128) -> Result<Value, ApiError> {
     if !usd.is_finite() || usd <= 0.0 {
         return Err(unavailable("invalid venue price"));
     }
@@ -1272,6 +1285,17 @@ pub(super) async fn execute_quote(
             expected,
             request_id,
             status,
+            trade: Some(PlannedTrade {
+                asset_id: a.id.clone(),
+                side: stored.side.clone(),
+                pay_units: stored.input_units,
+                get_units: output,
+                receive_token: if stored.side == "buy" {
+                    a.token.to_ascii_lowercase()
+                } else {
+                    BASE_USDC.to_ascii_lowercase()
+                },
+            }),
         },
     );
     Ok(Json(
@@ -1373,9 +1397,16 @@ pub(super) async fn signed(
             .await
         {
             Ok(result) => {
+                let filled =
+                    |amount: &Option<String>| amount.as_deref().and_then(|a| a.parse().ok());
+                let (paid, got) = (
+                    filled(&result.total_input_amount),
+                    filled(&result.total_output_amount),
+                );
                 status.tx_ids.push(result.signature);
                 status.stage = "settle".into();
                 status.state = "filled".into();
+                keep_trade(&state, &intent_id, &current, &status, paid, got).await;
             }
             Err(error) => {
                 status.stage = "settle".into();
@@ -1425,6 +1456,7 @@ pub(super) async fn intent_status(
         return Ok(Json(current.status));
     }
     let mut status = current.status.clone();
+    let mut last_receipt = Value::Null;
     for (index, hash) in status.tx_ids.iter().enumerate() {
         let tx = base_rpc(&state.markets, "eth_getTransactionByHash", json!([hash])).await?;
         if tx.is_null() {
@@ -1454,9 +1486,15 @@ pub(super) async fn intent_status(
             status.error = Some("Base transaction reverted".into());
             break;
         }
+        last_receipt = receipt;
     }
     if status.state == "pending" {
         status.state = "filled".into();
+        // The swap is the last transaction; what reached the wallet is in its Transfer logs.
+        if let Some(trade) = &current.trade {
+            let got = received_units(&last_receipt, &trade.receive_token, &current.wallet);
+            keep_trade(&state, &intent_id, &current, &status, None, got).await;
+        }
     }
     state
         .markets
@@ -1469,9 +1507,93 @@ pub(super) async fn intent_status(
     Ok(Json(status))
 }
 
+// A filled spot trade goes into the trade book (the spot positions). Failing to keep it never
+// fails the trade the user already made.
+async fn keep_trade(
+    state: &AppState,
+    intent_id: &str,
+    intent: &StoredIntent,
+    status: &IntentStatus,
+    paid: Option<u128>,
+    got: Option<u128>,
+) {
+    let Some(plan) = &intent.trade else {
+        return;
+    };
+    let paid = paid.unwrap_or(plan.pay_units);
+    let got = got.unwrap_or(plan.get_units);
+    let (token_units, usdc_units) = if plan.side == "buy" {
+        (got, paid)
+    } else {
+        (paid, got)
+    };
+    let trade = positions::Trade {
+        intent_id: intent_id.into(),
+        user_id: intent.owner.clone(),
+        asset_id: plan.asset_id.clone(),
+        side: plan.side.clone(),
+        token_units,
+        usdc_units,
+        tx_id: status.tx_ids.last().cloned(),
+        filled_at_ms: now(),
+    };
+    if let Err((_, error)) = state.trades.record(&trade).await {
+        eprintln!("could not keep trade {intent_id}: {error}");
+    }
+}
+
+const TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+
+// Sum of `token` Transfer events into `wallet` in a receipt.
+fn received_units(receipt: &Value, token: &str, wallet: &str) -> Option<u128> {
+    let wallet = wallet.trim_start_matches("0x").to_ascii_lowercase();
+    let mut total: Option<u128> = None;
+    for log in receipt["logs"].as_array()? {
+        let topics = log["topics"].as_array()?;
+        let to = topics
+            .get(2)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !log["address"]
+            .as_str()
+            .is_some_and(|a| a.eq_ignore_ascii_case(token))
+            || topics.first().and_then(Value::as_str) != Some(TRANSFER_TOPIC)
+            || !to.ends_with(&wallet)
+        {
+            continue;
+        }
+        let data = log["data"].as_str()?.trim_start_matches("0x");
+        let (high, low) = data.split_at(data.len().checked_sub(32)?);
+        if high.bytes().any(|b| b != b'0') {
+            return None;
+        }
+        let amount = u128::from_str_radix(low, 16).ok()?;
+        total = Some(total.unwrap_or(0).checked_add(amount)?);
+    }
+    total
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn received_units_reads_transfers_into_the_wallet() {
+        let wallet = "0x1111111111111111111111111111111111111111";
+        let token = "0x532f27101965dd16442e59d40670faf5ebb142e4";
+        let pad = |a: &str| format!("0x{:0>64}", a.trim_start_matches("0x"));
+        let transfer = |address: &str, to: &str, amount: u128| json!({"address": address, "topics": [TRANSFER_TOPIC, pad("0x22"), pad(to)], "data": format!("0x{amount:064x}")});
+        let receipt = json!({"logs": [
+            transfer("0x532F27101965dd16442E59d40670FaF5eBB142E4", wallet, 700),
+            // Other tokens and other recipients don't count.
+            transfer(BASE_USDC, wallet, 5),
+            transfer(token, "0x3333333333333333333333333333333333333333", 9),
+            transfer(token, wallet, 300),
+        ]});
+        assert_eq!(received_units(&receipt, token, wallet), Some(1_000));
+        assert_eq!(received_units(&json!({"logs": []}), token, wallet), None);
+        assert_eq!(received_units(&Value::Null, token, wallet), None);
+    }
     #[test]
     fn catalog_lists_only_verified_liquid_tradable_tokens() {
         let token = |mint: &str,

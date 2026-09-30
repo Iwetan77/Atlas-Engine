@@ -5,6 +5,7 @@ mod app_balance;
 mod earn;
 mod markets;
 mod perps;
+mod positions;
 mod relay;
 mod social;
 
@@ -74,6 +75,7 @@ struct AppState {
     layerswap: engine_execution::layerswap::LayerswapClient,
     earn: earn::EarnState,
     social: social::SocialState,
+    trades: positions::TradeBook,
 }
 
 #[derive(Clone)]
@@ -185,6 +187,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         layerswap: engine_execution::layerswap::LayerswapClient::new()?,
         earn: earn::EarnState::default(),
         social: social::SocialState::new().await?,
+        trades: positions::TradeBook::new().await?,
     };
     let bind: SocketAddr = env::var("ATLAS_BALANCE_BIND")
         .unwrap_or_else(|_| "127.0.0.1:3000".into())
@@ -203,6 +206,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/v1/perps/markets", get(perps::markets))
         .route("/v1/perps/positions", get(perps::positions))
+        .route("/v1/positions/spot", get(positions::spot))
         .route("/v1/perps/quotes", post(perps::quotes))
         .route(
             "/v1/perps/quotes/{quote_id}/execute",
