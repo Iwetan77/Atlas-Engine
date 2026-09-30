@@ -1,6 +1,7 @@
 //! Card top-ups through Circle's Onramp Kit: a short-lived hosted widget that delivers USDC straight
 //! to the user's own Base wallet, which is their Atlas balance. Needs CIRCLE_ONRAMP_API_KEY on the
-//! server (CIRCLE_ONRAMP_ENV=sandbox for Circle's test widget; production otherwise).
+//! server (CIRCLE_ONRAMP_ENV=sandbox for Circle's test widget; production otherwise), and
+//! CIRCLE_ONRAMP_REFERRER_DOMAIN (the domain registered in the Circle Console) for cards.
 use super::*;
 use engine_execution::funding::circle::{CircleEnvironment, CircleOnrampClient, CreateSession};
 use serde_json::{json, Value};
@@ -52,11 +53,15 @@ pub(super) async fn session(
         "Your wallet is still being set up. Try again in a moment.".into(),
     ))?;
     // The widget URL carries a session token: never logged, never cached.
+    let referrer = env::var("CIRCLE_ONRAMP_REFERRER_DOMAIN")
+        .ok()
+        .filter(|d| !d.trim().is_empty());
     let session = client
         .create_session(CreateSession {
             app_user_id: &user.user_id,
             destination_address: &wallet,
             destination_chain: "BASE",
+            referrer_domain: referrer.as_deref(),
         })
         .await
         .map_err(|e| {

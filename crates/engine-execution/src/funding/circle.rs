@@ -61,6 +61,9 @@ pub struct CreateSession<'a> {
     /// Circle validates this against its current catalog. "BASE" requests
     /// direct delivery to Base, with no bridge prescribed by this engine.
     pub destination_chain: &'a str,
+    /// The web domain registered for the app in the Circle Console. Circle needs it before it
+    /// offers debit cards, Apple Pay and Google Pay.
+    pub referrer_domain: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -70,6 +73,8 @@ struct SessionRequest<'a> {
     wallet_address: &'a str,
     destination_chain: &'a str,
     trace_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    referrer_domain: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
@@ -133,6 +138,7 @@ impl CircleOnrampClient {
             wallet_address: input.destination_address,
             destination_chain: input.destination_chain,
             trace_id: trace_id.clone(),
+            referrer_domain: input.referrer_domain,
         };
         let url = self.api_base.join(SESSION_PATH)?;
         let response = self
@@ -192,11 +198,13 @@ mod tests {
             wallet_address: "0x123",
             destination_chain: "BASE",
             trace_id: "trace-1".into(),
+            referrer_domain: Some("atlas.example"),
         };
         let value = serde_json::to_value(body).unwrap();
         assert_eq!(value["destinationChain"], "BASE");
         assert_eq!(value["walletAddress"], "0x123");
         assert!(value.get("destinationAddress").is_none());
+        assert_eq!(value["referrerDomain"], "atlas.example");
     }
 
     #[test]
