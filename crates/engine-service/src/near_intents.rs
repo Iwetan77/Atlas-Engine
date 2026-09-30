@@ -704,66 +704,191 @@ pub(super) async fn sui_holdings(
     Ok(out)
 }
 
-// Networks people can deposit from besides Base and Solana (which use their own wallets): each is a
-// 1Click asset that becomes USDC in the user's Solana wallet, their balance.
-// (id, label, network, asset, 1Click asset id)
-const DEPOSIT_NETWORKS: &[(&str, &str, &str, &str, &str)] = &[
-    (
-        "tron-usdt",
-        "USDT on Tron (TRC20)",
-        "Tron",
-        "USDT",
-        "nep141:tron-d28a265909efecdcee7c5028585214ea0b96f015.omft.near",
-    ),
-    (
-        "eth-usdt",
-        "USDT on Ethereum (ERC20)",
-        "Ethereum",
-        "USDT",
-        "nep141:eth-0xdac17f958d2ee523a2206206994597c13d831ec7.omft.near",
-    ),
-    (
-        "eth-usdc",
-        "USDC on Ethereum",
-        "Ethereum",
-        "USDC",
-        "nep141:eth-0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.omft.near",
-    ),
-    (
-        "arb-usdc",
-        "USDC on Arbitrum",
-        "Arbitrum",
-        "USDC",
-        "nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near",
-    ),
-    (
-        "bsc-usdt",
-        "USDT on BNB Chain (BEP20)",
-        "BNB Chain",
-        "USDT",
-        "nep245:v2_1.omni.hot.tg:56_2CMMyVTGZkeyNZTSvS5sarzfir6g",
-    ),
-    (
-        "pol-usdt",
-        "USDT on Polygon",
-        "Polygon",
-        "USDT",
-        "nep245:v2_1.omni.hot.tg:137_3hpYoaLtt8MP1Z2GH1U473DMRKgr",
-    ),
-    (
-        "ton-usdt",
-        "USDT on TON",
-        "TON",
-        "USDT",
-        "nep245:v2_1.omni.hot.tg:1117_3tsdfyziyc7EJbP2aULWSKU4toBaAcN4FdTgfm5W1mC4ouR",
-    ),
-    (
-        "sol-usdt",
-        "USDT on Solana",
-        "Solana",
-        "USDT",
-        "nep141:sol-c800a4bd850783ccb82c2b2c7e84175443606352.omft.near",
-    ),
+// What people can deposit besides USDC to their own Base or Solana address: each is a 1Click asset
+// that becomes USDC in the user's Solana wallet (dollar coins one for one, other coins at the
+// market). Logos: the coin, and the chain it's on.
+struct DepositOption {
+    id: &'static str,
+    label: &'static str,
+    network: &'static str,
+    asset: &'static str,
+    asset_id: &'static str,
+    dollar: bool,
+    asset_icon: &'static str,
+    chain_icon: Option<&'static str>,
+}
+const DEPOSIT_NETWORKS: &[DepositOption] = &[
+    DepositOption {
+        id: "tron-usdt",
+        label: "USDT on Tron (TRC20)",
+        network: "Tron",
+        asset: "USDT",
+        asset_id: "nep141:tron-d28a265909efecdcee7c5028585214ea0b96f015.omft.near",
+        dollar: true,
+        asset_icon: "https://cdn.layerswap.io/layerswap/currencies/usdt.png",
+        chain_icon: Some("https://cdn.layerswap.io/layerswap/networks/tron_mainnet.png"),
+    },
+    DepositOption {
+        id: "bsc-usdt",
+        label: "USDT on BNB Chain (BEP20)",
+        network: "BNB Chain",
+        asset: "USDT",
+        asset_id: "nep245:v2_1.omni.hot.tg:56_2CMMyVTGZkeyNZTSvS5sarzfir6g",
+        dollar: true,
+        asset_icon: "https://cdn.layerswap.io/layerswap/currencies/usdt.png",
+        chain_icon: Some("https://cdn.layerswap.io/layerswap/networks/bsc_mainnet.png"),
+    },
+    DepositOption {
+        id: "eth-usdt",
+        label: "USDT on Ethereum (ERC20)",
+        network: "Ethereum",
+        asset: "USDT",
+        asset_id: "nep141:eth-0xdac17f958d2ee523a2206206994597c13d831ec7.omft.near",
+        dollar: true,
+        asset_icon: "https://cdn.layerswap.io/layerswap/currencies/usdt.png",
+        chain_icon: Some("https://cdn.layerswap.io/layerswap/networks/ethereum_mainnet.png"),
+    },
+    DepositOption {
+        id: "eth-usdc",
+        label: "USDC on Ethereum",
+        network: "Ethereum",
+        asset: "USDC",
+        asset_id: "nep141:eth-0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.omft.near",
+        dollar: true,
+        asset_icon: "https://cdn.layerswap.io/layerswap/currencies/usdc.png",
+        chain_icon: Some("https://cdn.layerswap.io/layerswap/networks/ethereum_mainnet.png"),
+    },
+    DepositOption {
+        id: "arb-usdc",
+        label: "USDC on Arbitrum",
+        network: "Arbitrum",
+        asset: "USDC",
+        asset_id: "nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near",
+        dollar: true,
+        asset_icon: "https://cdn.layerswap.io/layerswap/currencies/usdc.png",
+        chain_icon: Some("https://cdn.layerswap.io/layerswap/networks/arbitrum_mainnet.png"),
+    },
+    DepositOption {
+        id: "pol-usdt",
+        label: "USDT on Polygon",
+        network: "Polygon",
+        asset: "USDT",
+        asset_id: "nep245:v2_1.omni.hot.tg:137_3hpYoaLtt8MP1Z2GH1U473DMRKgr",
+        dollar: true,
+        asset_icon: "https://cdn.layerswap.io/layerswap/currencies/usdt.png",
+        chain_icon: Some("https://cdn.layerswap.io/layerswap/networks/polygon_mainnet.png"),
+    },
+    DepositOption {
+        id: "ton-usdt",
+        label: "USDT on TON",
+        network: "TON",
+        asset: "USDT",
+        asset_id: "nep245:v2_1.omni.hot.tg:1117_3tsdfyziyc7EJbP2aULWSKU4toBaAcN4FdTgfm5W1mC4ouR",
+        dollar: true,
+        asset_icon: "https://cdn.layerswap.io/layerswap/currencies/usdt.png",
+        chain_icon: Some("https://cdn.layerswap.io/layerswap/networks/ton_mainnet.png"),
+    },
+    DepositOption {
+        id: "sol-usdt",
+        label: "USDT on Solana",
+        network: "Solana",
+        asset: "USDT",
+        asset_id: "nep141:sol-c800a4bd850783ccb82c2b2c7e84175443606352.omft.near",
+        dollar: true,
+        asset_icon: "https://cdn.layerswap.io/layerswap/currencies/usdt.png",
+        chain_icon: Some("https://cdn.layerswap.io/layerswap/networks/solana_mainnet.png"),
+    },
+    DepositOption {
+        id: "sol",
+        label: "SOL",
+        network: "Solana",
+        asset: "SOL",
+        asset_id: "nep141:sol.omft.near",
+        dollar: false,
+        asset_icon: "https://cdn.layerswap.io/layerswap/currencies/sol.png",
+        chain_icon: None,
+    },
+    DepositOption {
+        id: "eth",
+        label: "ETH on Ethereum",
+        network: "Ethereum",
+        asset: "ETH",
+        asset_id: "nep141:eth.omft.near",
+        dollar: false,
+        asset_icon: "https://cdn.layerswap.io/layerswap/currencies/eth.png",
+        chain_icon: Some("https://cdn.layerswap.io/layerswap/networks/ethereum_mainnet.png"),
+    },
+    DepositOption {
+        id: "base-eth",
+        label: "ETH on Base",
+        network: "Base",
+        asset: "ETH",
+        asset_id: "nep141:base.omft.near",
+        dollar: false,
+        asset_icon: "https://cdn.layerswap.io/layerswap/currencies/eth.png",
+        chain_icon: Some("https://cdn.layerswap.io/layerswap/networks/base_mainnet.png"),
+    },
+    DepositOption {
+        id: "arb-eth",
+        label: "ETH on Arbitrum",
+        network: "Arbitrum",
+        asset: "ETH",
+        asset_id: "nep141:arb.omft.near",
+        dollar: false,
+        asset_icon: "https://cdn.layerswap.io/layerswap/currencies/eth.png",
+        chain_icon: Some("https://cdn.layerswap.io/layerswap/networks/arbitrum_mainnet.png"),
+    },
+    DepositOption {
+        id: "btc",
+        label: "BTC",
+        network: "Bitcoin",
+        asset: "BTC",
+        asset_id: "nep141:btc.omft.near",
+        dollar: false,
+        asset_icon: "https://cdn.layerswap.io/layerswap/currencies/btc.png",
+        chain_icon: None,
+    },
+    DepositOption {
+        id: "bnb",
+        label: "BNB",
+        network: "BNB Chain",
+        asset: "BNB",
+        asset_id: "nep245:v2_1.omni.hot.tg:56_11111111111111111111",
+        dollar: false,
+        asset_icon: "https://cdn.layerswap.io/layerswap/currencies/bnb.png",
+        chain_icon: None,
+    },
+    DepositOption {
+        id: "trx",
+        label: "TRX",
+        network: "Tron",
+        asset: "TRX",
+        asset_id: "nep141:tron.omft.near",
+        dollar: false,
+        asset_icon: "https://cdn.layerswap.io/layerswap/currencies/trx.png",
+        chain_icon: None,
+    },
+    DepositOption {
+        id: "xrp",
+        label: "XRP",
+        network: "XRP Ledger",
+        asset: "XRP",
+        asset_id: "nep141:xrp.omft.near",
+        dollar: false,
+        asset_icon:
+            "https://coin-images.coingecko.com/coins/images/44/large/xrp-symbol-white-128.png",
+        chain_icon: None,
+    },
+    DepositOption {
+        id: "doge",
+        label: "DOGE",
+        network: "Dogecoin",
+        asset: "DOGE",
+        asset_id: "nep141:doge.omft.near",
+        dollar: false,
+        asset_icon: "https://coin-images.coingecko.com/coins/images/5/large/dogecoin.png",
+        chain_icon: None,
+    },
 ];
 // How long a deposit address waits for the money.
 const DEPOSIT_WINDOW_SECS: u64 = 2 * 60 * 60;
@@ -771,11 +896,10 @@ const DEPOSIT_WINDOW_SECS: u64 = 2 * 60 * 60;
 const SOLANA_USDC_1CLICK: &str = "nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near";
 
 pub(super) async fn deposit_networks() -> Json<Value> {
-    Json(
-        json!({"networks": DEPOSIT_NETWORKS.iter().map(|(id, label, network, asset, _)| {
-        json!({"id":id,"label":label,"network":network,"asset":asset})
-    }).collect::<Vec<_>>()}),
-    )
+    Json(json!({"networks": DEPOSIT_NETWORKS.iter().map(|o| {
+        json!({"id":o.id,"label":o.label,"network":o.network,"asset":o.asset,
+            "assetIcon":o.asset_icon,"chainIcon":o.chain_icon})
+    }).collect::<Vec<_>>()}))
 }
 
 #[derive(Deserialize)]
@@ -802,10 +926,12 @@ pub(super) async fn deposit_quote(
     Json(req): Json<DepositRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let user = app_balance::verified_wallets(&state, &headers).await?;
-    let (_, label, network, asset, asset_id) = DEPOSIT_NETWORKS
+    let option = DEPOSIT_NETWORKS
         .iter()
-        .find(|(id, ..)| *id == req.network_id)
+        .find(|o| o.id == req.network_id)
         .ok_or((StatusCode::NOT_FOUND, "unknown deposit network".into()))?;
+    let (label, network, asset, asset_id) =
+        (option.label, option.network, option.asset, option.asset_id);
     let wallet = user
         .solana_wallet
         .clone()
@@ -830,11 +956,23 @@ pub(super) async fn deposit_quote(
         .ok_or_else(|| bad("amount too large"))?
         / rate;
     markets::check_limits(usd, &currency, rate)?;
-    // Dollar coins: the amount to send is the dollar amount in the coin's own decimals.
-    let units = if origin.decimals >= 6 {
-        usd.checked_mul(10u128.pow(origin.decimals - 6))
+    // Dollar coins: the dollar amount in the coin's own decimals. Other coins: at 1Click's price.
+    let units = if option.dollar {
+        if origin.decimals >= 6 {
+            usd.checked_mul(10u128.pow(origin.decimals - 6))
+        } else {
+            Some(usd / 10u128.pow(6 - origin.decimals))
+        }
     } else {
-        Some(usd / 10u128.pow(6 - origin.decimals))
+        let price = origin
+            .price
+            .as_ref()
+            .and_then(|v| v.as_f64().or_else(|| v.as_str()?.parse().ok()))
+            .filter(|p: &f64| p.is_finite() && *p > 0.0)
+            .ok_or_else(|| venue(format!("No price for {asset} right now")))?;
+        let whole = usd as f64 / 1_000_000.0 / price;
+        let units = whole * 10f64.powi(origin.decimals as i32);
+        (units.is_finite() && units >= 1.0).then_some(units as u128)
     }
     .ok_or_else(|| bad("amount too large"))?;
     let deadline = deadline_utc(DEPOSIT_WINDOW_SECS);
