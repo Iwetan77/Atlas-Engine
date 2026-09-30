@@ -647,7 +647,7 @@ pub(super) async fn execute(
         .filter(|w| !w.is_empty());
     // A deposit may need Solana cash moved over first; a withdrawal only needs gas, which Atlas covers.
     let needed = if quote.deposit { quote.units } else { 0 };
-    let (intent_id, transactions, moved) = markets::plan_base_with_cash(
+    let (intent_id, transactions, fee) = markets::plan_base_with_cash(
         &state,
         owner,
         wallet,
@@ -668,8 +668,8 @@ pub(super) async fn execute(
         json!({"label":"Where","value":"Aave, on Base"}),
         json!({"label":"Rate","value":"Variable, set by Aave"}),
     ];
-    if let Some(moved) = moved {
-        summary.push(json!({"label":"Moved from your Solana cash first","value":markets::say_money(moved, &quote.currency, quote.rate)}));
+    if let Some(fee) = fee {
+        summary.push(json!({"label":"Network fee","value":markets::say_money(fee, &quote.currency, quote.rate)}));
     }
     Ok(Json(json!({
         "intentId":intent_id,
@@ -705,7 +705,7 @@ async fn execute_lend(
             .await?
             .evm_wallet
             .filter(|w| !w.is_empty());
-        if let Some(send) = markets::cash_for_solana(
+        if let Some((send, fee)) = markets::cash_for_solana(
             state,
             evm.as_deref(),
             held,
@@ -734,7 +734,7 @@ async fn execute_lend(
                 "summary":[
                     {"label":"Put in savings","value":markets::say_money(quote.units, &quote.currency, quote.rate)},
                     {"label":"Where","value":"Jupiter Lend, on Solana"},
-                    {"label":"Moved from your Base cash first","value":markets::say_money(send, &quote.currency, quote.rate)}
+                    {"label":"Network fee","value":markets::say_money(fee, &quote.currency, quote.rate)}
                 ],
                 "transactions":[tx],
                 "expiresAtUnixMs":now() + 120_000

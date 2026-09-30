@@ -625,7 +625,7 @@ pub(super) async fn execute_send(
     {
         return Ok(Json(plan));
     }
-    let (intent_id, transactions, moved) = markets::plan_base_with_cash(
+    let (intent_id, transactions, fee) = markets::plan_base_with_cash(
         &state,
         user.user_id,
         quote.sender_wallet.clone(),
@@ -648,8 +648,10 @@ pub(super) async fn execute_send(
         json!({"label":"Send to","value":quote.label}),
         json!({"label":"Amount","value":markets::say_money(quote.usdc_units,&quote.currency,rate)}),
     ];
-    if let Some(moved) = moved {
-        summary.push(json!({"label":"Moved from your Solana cash first","value":markets::say_money(moved,&quote.currency,rate)}));
+    if let Some(fee) = fee {
+        summary.push(
+            json!({"label":"Network fee","value":markets::say_money(fee,&quote.currency,rate)}),
+        );
     }
     let plan = json!({"intentId":intent_id,"kind":"send","summary":summary,"transactions":transactions,"expiresAtUnixMs":now()+120_000});
     stored.plan = Some(plan.clone());

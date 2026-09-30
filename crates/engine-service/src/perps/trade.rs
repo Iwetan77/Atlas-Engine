@@ -426,7 +426,7 @@ pub(crate) async fn quotes(
             .await
             .map_err(internal)?;
         if available < usdc_units {
-            return Err(markets::short_of_cash(available, "Base", &currency, rate));
+            return Err(markets::short_of_cash());
         }
         usdc_units
     } else {

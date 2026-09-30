@@ -473,6 +473,8 @@ struct StoredQuote {
     output_units: u128,
     // USDC (6 decimals) to move from Base to Solana before a Solana buy; 0 when Solana cash covers it.
     funding_units: u128,
+    // Layerswap's fee inside funding_units, shown as the network fee.
+    funding_fee: u128,
     expires: u64,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -911,13 +913,20 @@ pub(super) fn check_limits(usdc_units: u128, currency: &str, rate: u128) -> Resu
     }
     Ok(())
 }
-// Short of cash on a chain: say how much they do have there.
-pub(super) fn short_of_cash(available: u128, chain: &str, currency: &str, rate: u128) -> ApiError {
+// Short of cash: the balance is one balance, so say so plainly and point to adding money.
+pub(super) fn short_of_cash() -> ApiError {
+    (
+        StatusCode::CONFLICT,
+        "Not enough in your balance for this. Add money to continue.".into(),
+    )
+}
+// The same, with the cash they do have across every chain.
+pub(super) fn not_enough_cash(cash: u128, currency: &str, rate: u128) -> ApiError {
     (
         StatusCode::CONFLICT,
         format!(
-            "Not enough cash on {chain} for this. You have {} there.",
-            say_money(available, currency, rate)
+            "Not enough in your balance for this. You have {} to spend. Add money to continue.",
+            say_money(cash, currency, rate)
         ),
     )
 }
@@ -1469,21 +1478,17 @@ pub(super) async fn quote(
             };
             let (send, fee) = funding_for(&state, actual_in - held).await?;
             if base_cash < send {
-                return Err((
-                    StatusCode::CONFLICT,
-                    format!(
-                        "Not enough cash for this. You have {} on Solana and {} on Base.",
-                        say_money(held, &req.amount.currency, rate),
-                        say_money(base_cash, &req.amount.currency, rate)
-                    ),
+                return Err(not_enough_cash(
+                    held + base_cash,
+                    &req.amount.currency,
+                    rate,
                 ));
             }
             funding_units = send;
             funding_fee = fee;
         } else if held < actual_in {
-            let chain = if a.chain == "base" { "Base" } else { "Solana" };
             return Err(if req.side == "buy" {
-                short_of_cash(held, chain, &req.amount.currency, rate)
+                short_of_cash()
             } else {
                 let worth = mul_div_units(held, stable_units, asset_units);
                 (
@@ -1539,6 +1544,7 @@ pub(super) async fn quote(
             input_units: actual_in,
             output_units: actual_out,
             funding_units,
+            funding_fee,
             expires,
         },
     );
@@ -1587,7 +1593,7 @@ pub(super) async fn cash_for_base(
     needed: u128,
     currency: &str,
     rate: u128,
-) -> Result<Option<u128>, ApiError> {
+) -> Result<Option<(u128, u128)>, ApiError> {
     let base_cash = state
         .markets
         .base
@@ -1609,16 +1615,9 @@ pub(super) async fn cash_for_base(
         .map_err(|_| unavailable("Couldn't move cash from Solana right now; try again shortly"))?;
     let send = shortfall + fee + shortfall / 100 + 50_000;
     if sol_cash < send {
-        return Err((
-            StatusCode::CONFLICT,
-            format!(
-                "Not enough cash for this. You have {} on Base and {} on Solana.",
-                say_money(base_cash, currency, rate),
-                say_money(sol_cash, currency, rate)
-            ),
-        ));
+        return Err(not_enough_cash(base_cash + sol_cash, currency, rate));
     }
-    Ok(Some(send))
+    Ok(Some((send, fee)))
 }
 
 // Base USDC to send so at least `needed` is on Solana (see funding_for); None when Solana already
@@ -1630,7 +1629,7 @@ pub(super) async fn cash_for_solana(
     needed: u128,
     currency: &str,
     rate: u128,
-) -> Result<Option<u128>, ApiError> {
+) -> Result<Option<(u128, u128)>, ApiError> {
     if held_on_solana >= needed {
         return Ok(None);
     }
@@ -1643,24 +1642,17 @@ pub(super) async fn cash_for_solana(
             .unwrap_or(0),
         None => 0,
     };
-    let (send, _) = funding_for(state, needed - held_on_solana).await?;
+    let (send, fee) = funding_for(state, needed - held_on_solana).await?;
     if base_cash < send {
-        return Err((
-            StatusCode::CONFLICT,
-            format!(
-                "Not enough cash for this. You have {} on Solana and {} on Base.",
-                say_money(held_on_solana, currency, rate),
-                say_money(base_cash, currency, rate)
-            ),
-        ));
+        return Err(not_enough_cash(held_on_solana + base_cash, currency, rate));
     }
-    Ok(Some(send))
+    Ok(Some((send, fee)))
 }
 
 // Plans Base transactions paid from the unified balance. With enough on Base they go out as they
 // are. Otherwise the plan is one Solana transaction moving the shortfall over (Layerswap) and the
 // Base transactions are sent once it lands (GET /v1/intents/{id}/next), still one confirm.
-// Returns the intent, what the app signs now, and how much moves from Solana.
+// Returns the intent, what the app signs now, and the fee for moving cash (None when none moves).
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn plan_base_with_cash(
     state: &AppState,
@@ -1679,7 +1671,8 @@ pub(super) async fn plan_base_with_cash(
             )
             .collect()
     };
-    let Some(send) = cash_for_base(state, &evm, solana.as_deref(), needed, currency, rate).await?
+    let Some((send, fee)) =
+        cash_for_base(state, &evm, solana.as_deref(), needed, currency, rate).await?
     else {
         let transactions = as_base(&txs);
         let intent_id = state.markets.register_base_txs(owner, evm, txs).await?;
@@ -1727,7 +1720,7 @@ pub(super) async fn plan_base_with_cash(
         .await?;
     let transactions =
         vec![json!({"chain":"solana","transaction":deposit.transaction,"submit":"engine"})];
-    Ok((intent_id, transactions, Some(send)))
+    Ok((intent_id, transactions, Some(fee)))
 }
 
 // A Solana swap from USDC into `buy_mint` (Earn into Jupiter Lend) paid with Base cash: the plan is
@@ -1902,9 +1895,8 @@ pub(super) async fn execute_quote(
             .await
             .map_err(unavailable)?;
         if balance < fresh.amount_in {
-            let rate = app_balance::fx_rate(&stored.currency).await?;
             return Err(if stored.side == "buy" {
-                short_of_cash(balance, "Base", &stored.currency, rate)
+                short_of_cash()
             } else {
                 (
                     StatusCode::CONFLICT,
@@ -1958,8 +1950,7 @@ pub(super) async fn execute_quote(
             .await
             .map_err(unavailable)?;
         if base_cash < stored.funding_units {
-            let rate = app_balance::fx_rate(&stored.currency).await?;
-            return Err(short_of_cash(base_cash, "Base", &stored.currency, rate));
+            return Err(short_of_cash());
         }
         let deposit = state
             .layerswap
@@ -2022,11 +2013,11 @@ pub(super) async fn execute_quote(
         };
     // The confirm sheet speaks their currency: cash as money, the asset as tokens.
     let rate = app_balance::fx_rate(&stored.currency).await?;
-    let summary = if let Some(cash) = &funding {
+    let summary = if funding.is_some() {
         json!([
             {"label":"You pay","value":say_money(stored.input_units, &stored.currency, rate)},
             {"label":"You get (about)","value":format!("{} {}", format_units(output, a.decimals), a.symbol)},
-            {"label":"Moved from your Base cash first","value":say_money(cash.amount_units, &stored.currency, rate)},
+            {"label":"Network fee","value":say_money(stored.funding_fee.max(1), &stored.currency, rate)},
         ])
     } else if stored.side == "buy" {
         json!([
@@ -3012,10 +3003,14 @@ mod tests {
             check_limits(MIN_USDC - 1, "USD", 1_000_000).unwrap_err().1,
             "The smallest amount is $1"
         );
-        let short = short_of_cash(2_500_000, "Solana", "KES", 129_000_000);
+        let short = not_enough_cash(2_500_000, "KES", 129_000_000);
         assert_eq!(
             short.1,
-            "Not enough cash on Solana for this. You have KSh 322.50 there."
+            "Not enough in your balance for this. You have KSh 322.50 to spend. Add money to continue."
+        );
+        assert_eq!(
+            short_of_cash().1,
+            "Not enough in your balance for this. Add money to continue."
         );
     }
     #[test]

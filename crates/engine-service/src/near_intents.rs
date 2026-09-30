@@ -662,12 +662,7 @@ pub(super) async fn quote(
     // More than the cash on Base: say so at the quote, in their currency.
     if let Ok(held) = state.markets.base.balance_of(BASE_USDC, wallet).await {
         if held < amount {
-            return Err(markets::short_of_cash(
-                held,
-                "Base",
-                &req.amount.currency,
-                rate,
-            ));
+            return Err(markets::short_of_cash());
         }
     }
     let deadline = deadline_utc(180);
@@ -766,13 +761,7 @@ pub(super) async fn execute(
         .await
         .map_err(venue)?;
     if balance < stored.amount {
-        let rate = app_balance::fx_rate(&stored.currency).await?;
-        return Err(markets::short_of_cash(
-            balance,
-            "Base",
-            &stored.currency,
-            rate,
-        ));
+        return Err(markets::short_of_cash());
     }
     let deadline = deadline_utc(240);
     let amount = stored.amount.to_string();
