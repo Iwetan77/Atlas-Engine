@@ -63,14 +63,18 @@ pub(super) async fn balance(
         ));
     }
     let user = verified_wallets(&state, &headers).await?;
-    let evm = user.evm_wallet.filter(|v| !v.is_empty()).ok_or((
+    let evm = user.evm_wallet.clone().filter(|v| !v.is_empty()).ok_or((
         StatusCode::CONFLICT,
         "Privy Ethereum wallet is not ready".into(),
     ))?;
-    let solana_owner = user.solana_wallet.filter(|v| !v.is_empty()).ok_or((
-        StatusCode::CONFLICT,
-        "Privy Solana wallet is not ready".into(),
-    ))?;
+    let solana_owner = user
+        .solana_wallet
+        .clone()
+        .filter(|v| !v.is_empty())
+        .ok_or((
+            StatusCode::CONFLICT,
+            "Privy Solana wallet is not ready".into(),
+        ))?;
     let (base_usdc, solana_usdc) = match state.network {
         AtlasNetwork::Mainnet => {
             state
@@ -247,6 +251,26 @@ pub(super) async fn balance(
             .checked_add(value_usdc)
             .ok_or((StatusCode::BAD_GATEWAY, "portfolio value overflow".into()))?;
         holdings.push(catalog_holding(asset, units, value_usdc, &currency, rate)?);
+    }
+    // Sui coins bought through Atlas, read from the user's own Sui wallet.
+    if let Ok(held) = near_intents::sui_holdings(&state, &headers, &user).await {
+        for (asset_id, symbol, name, decimals, units, value_usdc, icon_url) in held {
+            total = total
+                .checked_add(value_usdc)
+                .ok_or((StatusCode::BAD_GATEWAY, "portfolio value overflow".into()))?;
+            holdings.push(Holding {
+                asset_id,
+                symbol,
+                name,
+                kind: "crypto".into(),
+                chain: "sui".into(),
+                amount: markets::format_units(units, decimals),
+                value: money(value_usdc, &currency, rate)?,
+                value_usd: usd(value_usdc),
+                location: "wallet",
+                icon_url,
+            });
+        }
     }
     // Once a 1Click buy settles, read the destination wallet on Monad itself.
     // The spent Base USDC and received asset must both be reflected in Home.

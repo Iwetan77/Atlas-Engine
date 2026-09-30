@@ -5,6 +5,8 @@
     "start": "node server.mjs"
   },
   "dependencies": {
+    "@cetusprotocol/aggregator-sdk": "1.7.3",
+    "@mysten/sui": "2.33.2",
     "@noble/curves": "1.9.7",
     "@noble/hashes": "1.8.0",
     "@privy-io/node": "0.22.0",

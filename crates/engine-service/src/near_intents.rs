@@ -31,7 +31,23 @@ struct StoredQuote {
     minimum_out: u128,
     currency: String,
     expires: u64,
+    // An unlisted Sui coin: 1Click delivers SUI, then Cetus swaps it into this coin.
+    then_swap: Option<SuiSwap>,
 }
+// The second leg of an unlisted Sui buy.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SuiSwap {
+    coin_type: String,
+    symbol: String,
+    name: String,
+    decimals: u32,
+    icon_url: Option<String>,
+    // SUI (MIST) to swap, after keeping SUI_GAS_RESERVE for gas.
+    sui_in: u128,
+    expected_out: u128,
+}
+// SUI kept in the Sui wallet for gas: 0.02 SUI pays for dozens of swaps.
+const SUI_GAS_RESERVE: u128 = 20_000_000;
 #[derive(Clone, Serialize, Deserialize)]
 struct StoredIntent {
     owner: String,
@@ -44,6 +60,8 @@ struct StoredIntent {
     asset: Option<Token>,
     expires: u64,
     status: markets::IntentStatus,
+    #[serde(default)]
+    then_swap: Option<SuiSwap>,
 }
 impl NearState {
     pub(super) async fn new() -> Result<Self, Box<dyn std::error::Error>> {
@@ -254,6 +272,43 @@ impl NearState {
         }
         Ok(body["result"].clone())
     }
+    // Sui coins the user bought through Atlas (from settled intents).
+    async fn sui_coins(&self, owner: &str) -> Result<Vec<SuiSwap>, ApiError> {
+        let intents: Vec<StoredIntent> = if let Some(pg) = &self.postgres {
+            pg.query(
+                "SELECT payload FROM atlas_near_intents WHERE owner=$1",
+                &[&owner],
+            )
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .filter_map(|row| serde_json::from_str::<StoredIntent>(row.get::<_, &str>(0)).ok())
+            .collect()
+        } else {
+            self.intents
+                .lock()
+                .map_err(internal)?
+                .values()
+                .filter(|i| i.owner == owner)
+                .cloned()
+                .collect()
+        };
+        let mut coins = HashMap::<String, SuiSwap>::new();
+        for intent in intents {
+            let landed = intent.status.state == "filled"
+                || intent.status.stage == "execute"
+                || intent
+                    .status
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.starts_with("Your SUI arrived"));
+            if let (true, Some(swap)) = (landed, intent.then_swap) {
+                coins.insert(swap.coin_type.clone(), swap);
+            }
+        }
+        Ok(coins.into_values().collect())
+    }
+
     pub(super) fn icon_for(&self, asset: &Token) -> Option<String> {
         asset.coingecko_id.as_deref()
             .and_then(|id| self.icons.lock().ok().and_then(|m|m.get(id).cloned()))
@@ -452,6 +507,110 @@ async fn destination(
     Ok(address.to_owned())
 }
 
+// What the user holds on Sui from Atlas buys (SUI left for gas included), valued in USD:
+// (asset id, symbol, name, decimals, units, USDC units, icon). Nothing to read, nothing asked.
+pub(super) async fn sui_holdings(
+    state: &AppState,
+    headers: &HeaderMap,
+    user: &app_balance::VerifiedWallets,
+) -> Result<Vec<(String, String, String, u32, u128, u128, Option<String>)>, ApiError> {
+    let coins = state.near.sui_coins(&user.user_id).await?;
+    if coins.is_empty() {
+        return Ok(Vec::new());
+    }
+    let tokens = state.near.tokens().await?;
+    let Some(sui) = tokens
+        .iter()
+        .find(|t| t.blockchain == "sui" && t.symbol == "SUI")
+    else {
+        return Ok(Vec::new());
+    };
+    let owner = destination(state, headers, sui, user).await?;
+    let balances: Value = state
+        .near
+        .icon_http
+        .post("https://fullnode.mainnet.sui.io:443")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"suix_getAllBalances","params":[owner]}))
+        .send()
+        .await
+        .map_err(venue)?
+        .json()
+        .await
+        .map_err(venue)?;
+    let held = |coin: &str| -> u128 {
+        balances["result"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|b| b["coinType"].as_str() == Some(coin))
+            .filter_map(|b| b["totalBalance"].as_str()?.parse::<u128>().ok())
+            .sum()
+    };
+    let price_of = |v: &Option<Value>| {
+        v.as_ref()
+            .and_then(|v| v.as_f64().or_else(|| v.as_str()?.parse().ok()))
+            .filter(|p: &f64| p.is_finite() && *p > 0.0)
+    };
+    let mut out = Vec::new();
+    let sui_units = held("0x2::sui::SUI");
+    if let (true, Some(price)) = (sui_units > 0, price_of(&sui.price)) {
+        let value = (sui_units as f64 / 1e9 * price * 1e6) as u128;
+        out.push((
+            "near:sui:0x2::sui::SUI".into(),
+            "SUI".into(),
+            "Sui".into(),
+            9,
+            sui_units,
+            value,
+            state.near.icon_for(sui),
+        ));
+    }
+    for coin in coins {
+        let units = held(&coin.coin_type);
+        if units == 0 {
+            continue;
+        }
+        // DexScreener's price for the coin's most liquid Sui pair.
+        let pairs: Value = match state
+            .near
+            .icon_http
+            .get(format!(
+                "https://api.dexscreener.com/tokens/v1/sui/{}",
+                coin.coin_type
+            ))
+            .send()
+            .await
+        {
+            Ok(r) => r.json().await.unwrap_or(Value::Null),
+            Err(_) => Value::Null,
+        };
+        let price = pairs
+            .as_array()
+            .into_iter()
+            .flatten()
+            .max_by(|a, b| {
+                let l = |p: &Value| p["liquidity"]["usd"].as_f64().unwrap_or(0.0);
+                l(a).total_cmp(&l(b))
+            })
+            .and_then(|p| p["priceUsd"].as_str()?.parse::<f64>().ok())
+            .filter(|p| p.is_finite() && *p > 0.0);
+        let Some(price) = price else {
+            continue;
+        };
+        let value = (units as f64 / 10f64.powi(coin.decimals as i32) * price * 1e6) as u128;
+        out.push((
+            format!("near:sui:{}", coin.coin_type),
+            coin.symbol,
+            coin.name,
+            coin.decimals,
+            units,
+            value,
+            coin.icon_url,
+        ));
+    }
+    Ok(out)
+}
+
 fn sui_coin_type(value: &str) -> bool {
     let parts: Vec<_> = value.split("::").collect();
     parts.len() == 3
@@ -461,6 +620,183 @@ fn sui_coin_type(value: &str) -> bool {
         && parts[1..].iter().all(|part| {
             !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
         })
+}
+
+// Calls the Privy bridge with the user's own access token (it signs for their wallets only with it).
+async fn bridge(
+    state: &AppState,
+    headers: &HeaderMap,
+    path: &str,
+    mut body: Value,
+) -> Result<Value, ApiError> {
+    let AuthMode::Privy { bridge_url, http } = &state.auth else {
+        return Err(conflict("Privy identity is required for this"));
+    };
+    let access_token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or((
+            StatusCode::UNAUTHORIZED,
+            "Privy access token required".into(),
+        ))?;
+    body["accessToken"] = json!(access_token);
+    let response = http
+        .post(format!("{bridge_url}{path}"))
+        .timeout(Duration::from_secs(90))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|_| venue("Privy bridge unavailable"))?;
+    let status = response.status();
+    let body: Value = response.json().await.unwrap_or(Value::Null);
+    if !status.is_success() {
+        let reason = body["error"].as_str().unwrap_or("bridge error").to_owned();
+        return Err((StatusCode::BAD_GATEWAY, reason));
+    }
+    Ok(body)
+}
+
+// A Sui coin's symbol, name, decimals and icon from Sui's own metadata.
+async fn sui_meta(state: &AppState, coin: &str) -> Option<(String, String, u32, Option<String>)> {
+    let graphql = json!({
+        "query":"query($coinType:String!){coinMetadata(coinType:$coinType){symbol name decimals iconUrl}}",
+        "variables":{"coinType":coin}
+    });
+    let body: Value = state
+        .near
+        .icon_http
+        .post("https://graphql.mainnet.sui.io/graphql")
+        .json(&graphql)
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    let meta = &body["data"]["coinMetadata"];
+    let symbol = meta["symbol"].as_str().filter(|s| !s.is_empty())?;
+    let name = meta["name"].as_str().filter(|s| !s.is_empty())?;
+    let decimals = u32::try_from(meta["decimals"].as_u64()?)
+        .ok()
+        .filter(|d| *d <= 18)?;
+    let icon = meta["iconUrl"]
+        .as_str()
+        .filter(|url| url.starts_with("https://"))
+        .map(str::to_owned);
+    Some((symbol.into(), name.into(), decimals, icon))
+}
+
+// Buying an unlisted Sui coin: 1Click turns the Base USDC into SUI in the user's own Sui wallet
+// (keeping a little for gas), then Cetus swaps the rest into the coin once it lands.
+async fn sui_quote(
+    state: AppState,
+    headers: HeaderMap,
+    req: markets::QuoteRequest,
+    user: app_balance::VerifiedWallets,
+    coin: &str,
+) -> Result<Json<Value>, ApiError> {
+    if !sui_coin_type(coin) {
+        return Err(bad("not a Sui coin type"));
+    }
+    let sui = state
+        .near
+        .tokens()
+        .await?
+        .into_iter()
+        .find(|t| t.blockchain == "sui" && t.symbol == "SUI")
+        .ok_or_else(|| venue("1Click doesn't list SUI right now"))?;
+    let destination = destination(&state, &headers, &sui, &user).await?;
+    let wallet = user
+        .evm_wallet
+        .as_deref()
+        .filter(|w| is_evm(w))
+        .ok_or_else(|| conflict("Privy Base wallet is required"))?;
+    let rate = app_balance::fx_rate(&req.amount.currency).await?;
+    let amount = markets::parse_micros(&req.amount.amount)?
+        .checked_mul(1_000_000)
+        .ok_or_else(|| bad("amount too large"))?
+        / rate;
+    markets::check_limits(amount, &req.amount.currency, rate)?;
+    if let Ok(held) = state.markets.base.balance_of(BASE_USDC, wallet).await {
+        if held < amount {
+            return Err(markets::short_of_cash());
+        }
+    }
+    let deadline = deadline_utc(180);
+    let units = amount.to_string();
+    let request = QuoteRequest::exact_input(
+        BASE_USDC_1CLICK,
+        &sui.asset_id,
+        &units,
+        &destination,
+        wallet,
+        &deadline,
+        true,
+    );
+    let q = state.near.client.quote(&request).await.map_err(venue)?;
+    let sui_out: u128 = q.amount_out.parse().map_err(internal)?;
+    if sui_out <= SUI_GAS_RESERVE * 2 {
+        return Err(bad("That's too small to buy on Sui. Try a bigger amount."));
+    }
+    let sui_in = sui_out - SUI_GAS_RESERVE;
+    let (symbol, name, decimals, icon_url) = sui_meta(&state, coin)
+        .await
+        .ok_or_else(|| venue("Sui coin details unavailable"))?;
+    let routed = bridge(
+        &state,
+        &headers,
+        "/sui/quote",
+        json!({"coinType":coin,"amount":sui_in.to_string()}),
+    )
+    .await?;
+    let expected_out: u128 = routed["amountOut"]
+        .as_str()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .ok_or_else(|| venue("no Sui route for this coin"))?;
+    let minimum: u128 = q
+        .min_amount_out
+        .as_deref()
+        .unwrap_or(&q.amount_out)
+        .parse()
+        .map_err(internal)?;
+    let sui_usd = usd_micros(&q.amount_out_usd)?;
+    let value_usd = sui_usd.saturating_mul(sui_in) / sui_out;
+    let quote_id = id("q");
+    let expires = now() + 30_000;
+    state.near.quotes.lock().map_err(internal)?.insert(
+        quote_id.clone(),
+        StoredQuote {
+            owner: user.user_id,
+            wallet: wallet.into(),
+            recipient: destination,
+            asset: sui,
+            amount,
+            minimum_out: minimum,
+            currency: req.amount.currency.clone(),
+            expires,
+            then_swap: Some(SuiSwap {
+                coin_type: coin.into(),
+                symbol: symbol.clone(),
+                name,
+                decimals,
+                icon_url,
+                sui_in,
+                expected_out,
+            }),
+        },
+    );
+    Ok(Json(
+        json!({"quoteId":quote_id,"assetId":req.asset_id,"side":"buy",
+        "pay":{"amount":markets::format_units(amount,6),"symbol":"USDC","value":money(amount,&req.amount.currency,rate)},
+        "receive":{"amount":markets::format_units(expected_out,decimals),"symbol":symbol,
+            "value":money(value_usd,&req.amount.currency,rate)},
+        "price":unit_price(amount,expected_out,decimals,&req.amount.currency,rate),
+        "fee":{"amount":"0","currency":req.amount.currency},"expiresAtUnixMs":expires}),
+    ))
 }
 
 async fn search_sui_unlisted(
@@ -569,7 +905,7 @@ async fn search_sui_unlisted(
             "name":format!("{name} on sui"),"kind":"crypto","chain":"sui",
             "price":{"amount":format!("{display:.12}").trim_end_matches('0').trim_end_matches('.'),
                 "currency":currency},"change24hPct":null,"iconUrl":icon,"verified":false,
-            "tradeable":false}));
+            "tradeable":true}));
     }
     result
 }
@@ -633,11 +969,8 @@ pub(super) async fn quote(
     }
     markets::checked_currency(&req.amount.currency)?;
     let user = app_balance::verified_wallets(&state, &headers).await?;
-    if req.asset_id.starts_with("near:sui:") {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Sui token is discoverable, but its local swap route is not ready".into(),
-        ));
+    if let Some(coin) = req.asset_id.strip_prefix("near:sui:").map(str::to_owned) {
+        return sui_quote(state, headers, req, user, &coin).await;
     }
     let token = state
         .near
@@ -702,6 +1035,7 @@ pub(super) async fn quote(
             minimum_out: minimum,
             currency: req.amount.currency.clone(),
             expires,
+            then_swap: None,
         },
     );
     Ok(Json(
@@ -822,6 +1156,7 @@ pub(super) async fn execute(
                 asset: Some(stored.asset.clone()),
                 expires,
                 status,
+                then_swap: stored.then_swap.clone(),
             },
         )
         .await?;
@@ -830,10 +1165,24 @@ pub(super) async fn execute(
     if let Some(first) = chain.get_mut(..1) {
         first.make_ascii_uppercase();
     }
+    let get = match &stored.then_swap {
+        Some(swap) => format!(
+            "{} {}",
+            markets::format_units(swap.expected_out, swap.decimals),
+            swap.symbol
+        ),
+        None => format!(
+            "{} {}",
+            markets::format_units(
+                fresh.amount_out.parse().map_err(internal)?,
+                stored.asset.decimals
+            ),
+            stored.asset.symbol
+        ),
+    };
     Ok(Json(json!({"intentId":intent_id,"kind":"buy",
         "summary":[{"label":"You pay","value":markets::say_money(stored.amount,&stored.currency,rate)},
-        {"label":"You get (about)","value":format!("{} {}",markets::format_units(
-            fresh.amount_out.parse().map_err(internal)?,stored.asset.decimals),stored.asset.symbol)},
+        {"label":"You get (about)","value":get},
         {"label":"Lands on","value":chain}],
         "transactions":[{"chain":"base","chainId":8453,"to":tx.to,"data":tx.data,"value":"0"}],
         "expiresAtUnixMs":expires})))
@@ -942,7 +1291,47 @@ pub(super) async fn status(
                         return Ok(Json(result));
                     }
                     result.tx_ids.extend(hashes);
-                    result.state = "filled".into();
+                    if let Some(swap) = current.then_swap.clone() {
+                        // The SUI is in the user's Sui wallet: swap it now, once (the stage moves
+                        // first, so a second poll can't start another swap).
+                        result.stage = "execute".into();
+                        current.status = result.clone();
+                        state.near.save_intent(&id, current.clone()).await?;
+                        match bridge(
+                            &state,
+                            &headers,
+                            "/sui/swap",
+                            json!({"coinType":swap.coin_type,"amount":swap.sui_in.to_string(),
+                                "reserve":SUI_GAS_RESERVE.to_string()}),
+                        )
+                        .await
+                        {
+                            Ok(body) if body["ok"].as_bool() == Some(true) => {
+                                if let Some(digest) = body["digest"].as_str() {
+                                    result.tx_ids.push(digest.into());
+                                }
+                                result.stage = "settle".into();
+                                result.state = "filled".into();
+                            }
+                            Ok(body) => {
+                                result.state = "failed".into();
+                                result.error = Some(format!(
+                                    "Your SUI arrived, but the swap to {} didn't go through ({}). The SUI is in your balance.",
+                                    swap.symbol,
+                                    body["error"].as_str().unwrap_or("swap failed")
+                                ));
+                            }
+                            Err((_, reason)) => {
+                                result.state = "failed".into();
+                                result.error = Some(format!(
+                                    "Your SUI arrived, but the swap to {} didn't go through ({reason}). The SUI is in your balance.",
+                                    swap.symbol
+                                ));
+                            }
+                        }
+                    } else {
+                        result.state = "filled".into();
+                    }
                 }
                 "FAILED" | "REFUNDED" => {
                     result.state = "failed".into();

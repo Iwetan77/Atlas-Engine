@@ -3,6 +3,10 @@ import {createHash} from 'node:crypto';
 import {PrivyClient} from '@privy-io/node';
 import {authMessage, onboardingMessage, subkeyRegistrationMessage, recoverOnboardingPublicKey} from './paradex-onboarding.mjs';
 import {deriveTradeSubkey, signSubkeyAuth, signParadexOrder} from './trade-subkey.mjs';
+import {quoteSwap, swapFromSui} from './sui-swap.mjs';
+
+const SUI_COIN_TYPE = /^0x[0-9a-fA-F]{1,64}::[A-Za-z_][A-Za-z0-9_]*::[A-Za-z_][A-Za-z0-9_]*$/;
+const POSITIVE_INTEGER = /^[1-9][0-9]{0,30}$/;
 import {parseSignerConfig, walletHasSigner} from './signer-config.mjs';
 
 const appId = process.env.PRIVY_APP_ID;
@@ -74,8 +78,10 @@ const server = createServer(async (request, response) => {
   const authSubkey = request.method === 'POST' && request.url === '/paradex/subkey-auth-signature';
   const signOrder = request.method === 'POST' && request.url === '/paradex/order-signature';
   const relayEvm = request.method === 'POST' && request.url === '/relay/evm-transaction';
+  const suiQuote = request.method === 'POST' && request.url === '/sui/quote';
+  const suiSwap = request.method === 'POST' && request.url === '/sui/swap';
   if (!verifyOnly && !ensureWallet && !signOnboarding && !signAuth && !checkSigner &&
-      !registerSubkey && !authSubkey && !signOrder && !relayEvm) {
+      !registerSubkey && !authSubkey && !signOrder && !relayEvm && !suiQuote && !suiSwap) {
     response.writeHead(404).end();
     return;
   }
@@ -116,6 +122,45 @@ const server = createServer(async (request, response) => {
     const solanaWallet = wallets.find((account) => account.chain_type === 'solana')?.address ?? null;
     if (verifyOnly) {
       send(response, 200, {userId, evmWallet, solanaWallet});
+      return;
+    }
+    // Sui coins: price SUI → coin, and swap SUI in the user's own Sui wallet with their authorization.
+    if (suiQuote || suiSwap) {
+      if (!SUI_COIN_TYPE.test(input.coinType ?? '') || !POSITIVE_INTEGER.test(String(input.amount ?? ''))) {
+        send(response, 400, {error: 'invalid Sui swap request'});
+        return;
+      }
+      let wallet;
+      try {
+        wallet = await ensureReceivingWallet(userId, 'sui');
+      } catch {
+        send(response, 503, {error: 'Privy Sui wallet unavailable'});
+        return;
+      }
+      try {
+        if (suiQuote) {
+          const router = await quoteSwap(input.coinType, input.amount, wallet.address);
+          send(response, 200, {userId, address: wallet.address, amountOut: router.amountOut.toString()});
+          return;
+        }
+        const reserve = POSITIVE_INTEGER.test(String(input.reserve ?? '')) ? input.reserve : '0';
+        const result = await swapFromSui({
+          wallet,
+          coinType: input.coinType,
+          amount: input.amount,
+          reserve,
+          rawSign: async (hex) => {
+            const signed = await privy.wallets().rawSign(wallet.id, {
+              params: {bytes: hex, encoding: 'hex', hash_function: 'blake2b256'},
+              authorization_context: {user_jwts: [accessToken]},
+            });
+            return signed.signature;
+          },
+        });
+        send(response, 200, {userId, address: wallet.address, ...result});
+      } catch (error) {
+        send(response, 502, {error: `Sui swap unavailable: ${error.message}`});
+      }
       return;
     }
     if (ensureWallet) {
