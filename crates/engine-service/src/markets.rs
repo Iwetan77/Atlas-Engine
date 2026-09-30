@@ -742,10 +742,19 @@ pub(super) async fn chart(
         None => {
             // Solana: Jupiter's chart data (what jup.ag draws). Base: GeckoTerminal, whose free
             // limit is per IP and often spent on shared hosts, so it may be unavailable.
-            let points = if network == "solana" {
+            // WETH and AAPLc track the same thing as Ether (Portal) and Apple xStock on Solana,
+            // whose charts Jupiter has.
+            let solana_twin = match asset.id.as_str() {
+                "weth-base" => Some("7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs"),
+                "aaplc-base" => Some("XsbEhLAtcf6HdfpFZ5xEMdqW8nfAvcsP5bdudRLJzJp"),
+                _ => None,
+            };
+            let points = if let Some(mint) = (network == "solana")
+                .then_some(asset.token.as_str())
+                .or(solana_twin)
+            {
                 let url = format!(
-                    "{JUPITER_CHARTS}{}?interval={interval}&to={}&candles={limit}&type=price",
-                    asset.token,
+                    "{JUPITER_CHARTS}{mint}?interval={interval}&to={}&candles={limit}&type=price",
                     now()
                 );
                 let body: Value = state
