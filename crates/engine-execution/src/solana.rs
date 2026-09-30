@@ -470,6 +470,19 @@ impl SolanaAtaPreflight {
     }
 
     async fn rpc(&self, method: &str, params: Value) -> Result<Value, SolanaPreflightError> {
+        // A busy RPC (rate limited, a dropped connection) gets one more try before the call fails; a
+        // timeout doesn't, so a dead RPC isn't waited on twice. Resending is safe: a signed
+        // transaction lands once however often it's sent.
+        match self.rpc_once(method, &params).await {
+            Err(SolanaPreflightError::Transport(error)) if !error.is_timeout() => {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                self.rpc_once(method, &params).await
+            }
+            other => other,
+        }
+    }
+
+    async fn rpc_once(&self, method: &str, params: &Value) -> Result<Value, SolanaPreflightError> {
         let response: Value = self
             .http
             .post(&self.rpc_url)

@@ -1359,14 +1359,26 @@ pub(super) async fn chart(
         "1Y" => ("1_DAY", "day", 1, 365, Duration::from_secs(3600)),
         _ => return Err(bad("range must be 1D, 1W, 1M or 1Y")),
     };
-    let asset = find_asset(&state.markets, &asset_id).await?;
-    let rate = app_balance::fx_rate(&currency).await?;
-    let network = if asset.chain == "base" {
-        "base"
+    // 1Click assets (Sui, NEAR, Monad…) chart from GeckoTerminal by their own address; the rest are
+    // catalog assets on Solana or Base.
+    let (asset_id, network, token) = if asset_id.starts_with("near:") {
+        let (network, token) = near_intents::chart_token(&state, &asset_id)
+            .await?
+            .ok_or_else(|| unavailable("no price history for this asset yet"))?;
+        (asset_id, network, token)
     } else {
-        "solana"
+        let asset = find_asset(&state.markets, &asset_id).await?;
+        let network = if asset.chain == "base" {
+            "base"
+        } else {
+            "solana"
+        };
+        (asset.id, network, asset.token)
     };
-    let key = format!("{network}:{}:{range}", asset.token);
+    // Sui coin types ("0x…::deep::DEEP") go into GeckoTerminal paths with their colons escaped.
+    let token_path = token.replace(':', "%3A");
+    let rate = app_balance::fx_rate(&currency).await?;
+    let key = format!("{network}:{token}:{range}");
     let cached = state
         .markets
         .charts
@@ -1382,13 +1394,13 @@ pub(super) async fn chart(
             // limit is per IP and often spent on shared hosts, so it may be unavailable.
             // WETH and AAPLc track the same thing as Ether (Portal) and Apple xStock on Solana,
             // whose charts Jupiter has.
-            let solana_twin = match asset.id.as_str() {
+            let solana_twin = match asset_id.as_str() {
                 "weth-base" => Some("7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs"),
                 "aaplc-base" => Some("XsbEhLAtcf6HdfpFZ5xEMdqW8nfAvcsP5bdudRLJzJp"),
                 _ => None,
             };
             let points = if let Some(mint) = (network == "solana")
-                .then_some(asset.token.as_str())
+                .then_some(token.as_str())
                 .or(solana_twin)
             {
                 let url = format!(
@@ -1409,12 +1421,11 @@ pub(super) async fn chart(
                     .map_err(unavailable)?;
                 jupiter_closes(&body)
             } else {
-                let pool = deepest_pool(&state.markets, network, &asset.token).await?;
+                let pool = deepest_pool(&state.markets, network, &token_path).await?;
                 let body: Value = gecko(
                     &state.markets,
                     &format!(
-                        "{network}/pools/{pool}/ohlcv/{timeframe}?aggregate={aggregate}&limit={limit}&currency=usd&token={}",
-                        asset.token
+                        "{network}/pools/{pool}/ohlcv/{timeframe}?aggregate={aggregate}&limit={limit}&currency=usd&token={token_path}"
                     ),
                 )
                 .await?;
@@ -1439,7 +1450,7 @@ pub(super) async fn chart(
         .map(|(ms, usd)| json!([ms, usd * scale]))
         .collect();
     Ok(Json(
-        json!({"assetId":asset.id,"range":range,"currency":currency,"points":series}),
+        json!({"assetId":asset_id,"range":range,"currency":currency,"points":series}),
     ))
 }
 

@@ -5,6 +5,7 @@ use engine_execution::swaps::uniswap::BASE_USDC;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::HashSet,
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -19,6 +20,10 @@ pub(super) struct NearState {
     tokens: Arc<Mutex<Option<(Instant, Vec<Token>)>>>,
     icons: Arc<Mutex<HashMap<String, String>>>,
     icon_http: reqwest::Client,
+    // The tokens CoinGecko has reviewed and lists, per chain Atlas supports (lowercase addresses),
+    // refreshed daily: a token found by search counts as verified only when it's among them, so a
+    // look-alike with the same name never does. Held with the time it's good until.
+    listed: Arc<Mutex<Option<(Instant, Arc<Listed>)>>>,
     monad_rpc: reqwest::Url,
     postgres: Option<Arc<tokio_postgres::Client>>,
 }
@@ -90,6 +95,47 @@ struct StoredIntent {
     #[serde(default)]
     gas_order: Option<String>,
 }
+// CoinGecko's chain names for the chains Atlas supports, keyed by Atlas's.
+const LISTED_CHAINS: [(&str, &str); 8] = [
+    ("sui", "sui"),
+    ("near", "near-protocol"),
+    ("monad", "monad"),
+    ("arc", "arc"),
+    ("base", "base"),
+    ("solana", "solana"),
+    ("ethereum", "ethereum"),
+    ("arbitrum", "arbitrum-one"),
+];
+#[derive(Default)]
+pub(super) struct Listed(HashMap<&'static str, HashSet<String>>);
+impl Listed {
+    fn from_coins(coins: &[Value]) -> Self {
+        let mut by_chain: HashMap<&'static str, HashSet<String>> = HashMap::new();
+        for coin in coins {
+            for (chain, platform) in LISTED_CHAINS {
+                if let Some(address) = coin["platforms"][platform]
+                    .as_str()
+                    .filter(|a| !a.is_empty())
+                {
+                    by_chain
+                        .entry(chain)
+                        .or_default()
+                        .insert(address.to_ascii_lowercase());
+                }
+            }
+        }
+        Self(by_chain)
+    }
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    // Whether CoinGecko lists this exact token on this chain.
+    pub(super) fn has(&self, chain: &str, address: &str) -> bool {
+        self.0
+            .get(chain)
+            .is_some_and(|set| set.contains(&address.to_ascii_lowercase()))
+    }
+}
 impl NearState {
     pub(super) async fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let postgres = if let Ok(url) = env::var("DATABASE_URL") {
@@ -119,9 +165,49 @@ impl NearState {
             icon_http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(6))
                 .build()?,
+            listed: Arc::new(Mutex::new(None)),
             postgres,
             monad_rpc: env_url("ATLAS_MONAD_MAINNET_RPC_URL", "https://rpc.monad.xyz").parse()?,
         })
+    }
+    async fn listed(&self) -> Arc<Listed> {
+        let last = self.listed.lock().ok().and_then(|held| held.clone());
+        if let Some((until, listed)) = &last {
+            if Instant::now() < *until {
+                return listed.clone();
+            }
+        }
+        let fetched = async {
+            let body: Value = self
+                .icon_http
+                .get("https://api.coingecko.com/api/v3/coins/list")
+                .query(&[("include_platform", "true")])
+                // CoinGecko refuses requests without one.
+                .header(reqwest::header::USER_AGENT, "Atlas/1.0")
+                .timeout(Duration::from_secs(30))
+                .send()
+                .await
+                .ok()?
+                .error_for_status()
+                .ok()?
+                .json()
+                .await
+                .ok()?;
+            Some(Listed::from_coins(body.as_array()?))
+        }
+        .await;
+        // Unreachable: keep the last list, however old, and try again in ten minutes.
+        let (fresh_for, listed) = match fetched {
+            Some(listed) if !listed.is_empty() => (24 * 60 * 60, Arc::new(listed)),
+            _ => (10 * 60, last.map(|(_, listed)| listed).unwrap_or_default()),
+        };
+        if let Ok(mut held) = self.listed.lock() {
+            *held = Some((
+                Instant::now() + Duration::from_secs(fresh_for),
+                listed.clone(),
+            ));
+        }
+        listed
     }
     async fn tokens(&self) -> Result<Vec<Token>, ApiError> {
         if let Some((at, list)) = self.tokens.lock().map_err(internal)?.as_ref() {
@@ -1406,6 +1492,7 @@ async fn search_sui_unlisted(
     let Some(pairs) = body["pairs"].as_array() else {
         return Vec::new();
     };
+    let listed = state.near.listed().await;
     let mut candidates = HashMap::<String, (f64, f64)>::new();
     for pair in pairs {
         if pair["chainId"].as_str() != Some("sui") {
@@ -1480,13 +1567,55 @@ async fn search_sui_unlisted(
         let icon = meta["iconUrl"]
             .as_str()
             .filter(|url| url.starts_with("https://"));
+        let verified = listed.has("sui", &coin);
         result.push(json!({"assetId":format!("near:sui:{coin}"),"symbol":symbol,
             "name":format!("{name} on sui"),"kind":"crypto","chain":"sui",
             "price":{"amount":format!("{display:.12}").trim_end_matches('0').trim_end_matches('.'),
-                "currency":currency},"change24hPct":null,"iconUrl":icon,"verified":false,
+                "currency":currency},"change24hPct":null,"iconUrl":icon,"verified":verified,
             "tradeable":true}));
     }
     result
+}
+
+// Where a 1Click asset's price history lives on GeckoTerminal: (network, token address). None
+// when the chain or the token (a native coin without a wrapped twin there) has no pools to read.
+pub(super) async fn chart_token(
+    state: &AppState,
+    asset_id: &str,
+) -> Result<Option<(&'static str, String)>, ApiError> {
+    if let Some(coin) = asset_id.strip_prefix("near:sui:") {
+        return Ok(sui_coin_type(coin).then(|| ("sui-network", coin.to_string())));
+    }
+    let Some(id) = asset_id.strip_prefix("near:") else {
+        return Ok(None);
+    };
+    let Some(token) = state
+        .near
+        .tokens()
+        .await?
+        .into_iter()
+        .find(|t| t.asset_id == id)
+    else {
+        return Ok(None);
+    };
+    let network = match token.blockchain.as_str() {
+        "sui" => "sui-network",
+        "near" => "near",
+        "monad" => "monad",
+        "eth" => "eth",
+        "base" => "base",
+        "arb" => "arbitrum",
+        "bsc" => "bsc",
+        "sol" => "solana",
+        _ => return Ok(None),
+    };
+    let address = match (token.contract_address.clone(), token.blockchain.as_str()) {
+        (Some(address), _) if !address.is_empty() => address,
+        (_, "sui") => "0x2::sui::SUI".into(),
+        (_, "near") => "wrap.near".into(),
+        _ => return Ok(None),
+    };
+    Ok(Some((network, address)))
 }
 
 pub(super) async fn search_assets(
@@ -2507,6 +2636,26 @@ mod tests {
             venue_minimum_usd("Quoting for this pair is not available"),
             None
         );
+    }
+    #[test]
+    fn listed_tokens_are_matched_by_exact_address_per_chain() {
+        let listed = Listed::from_coins(&[
+            json!({"id":"deep","platforms":{"sui":"0xdeeb7a4662eec9f2f3def03fb937a663dddaa2e215b8078a284d026b7946c270::deep::DEEP"}}),
+            json!({"id":"usd-coin","platforms":{"base":"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+                "near-protocol":"17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1"}}),
+        ]);
+        assert!(listed.has(
+            "sui",
+            "0xDEEB7a4662eec9f2f3def03fb937a663dddaa2e215b8078a284d026b7946c270::deep::DEEP"
+        ));
+        assert!(listed.has("base", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"));
+        assert!(listed.has(
+            "near",
+            "17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1"
+        ));
+        // A look-alike with the same name but another address isn't listed.
+        assert!(!listed.has("sui", "0x1234::deep::DEEP"));
+        assert!(!listed.has("monad", "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"));
     }
     #[test]
     fn deposit_addresses_are_checked_per_chain() {
