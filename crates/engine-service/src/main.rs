@@ -242,6 +242,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             post(markets::execute_quote),
         )
         .route("/v1/intents/{intent_id}/signed", post(markets::signed))
+        .route(
+            "/v1/intents/{intent_id}/next",
+            get(markets::next_transactions),
+        )
         .route("/v1/relay/evm", post(relay::evm))
         .route("/v1/earn/options", get(earn::options))
         .route("/v1/earn/positions", get(earn::positions))

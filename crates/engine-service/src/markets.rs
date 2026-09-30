@@ -471,7 +471,8 @@ struct StoredQuote {
     currency: String,
     input_units: u128,
     output_units: u128,
-
+    // USDC (6 decimals) to move from Base to Solana before a Solana buy; 0 when Solana cash covers it.
+    funding_units: u128,
     expires: u64,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -484,6 +485,15 @@ struct StoredIntent {
     status: IntentStatus,
     // Set for spot buys and sells, so the fill can be kept as a trade.
     trade: Option<PlannedTrade>,
+    // A Solana buy paid with Base cash: Layerswap moves it first (the Base transfer is `expected`).
+    #[serde(default)]
+    funding: Option<CashMove>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct CashMove {
+    swap_id: String,
+    amount_units: u128,
+    tx_hash: Option<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct PlannedTrade {
@@ -636,7 +646,12 @@ impl MarketState {
     }
     // Moves a Solana intent from validate to execute exactly once, so a repeated /signed can't hand
     // Jupiter the same order twice. False if another request already did.
-    async fn claim_execution(&self, id: &str, intent: &StoredIntent) -> Result<bool, ApiError> {
+    async fn claim_execution(
+        &self,
+        id: &str,
+        intent: &StoredIntent,
+        from: &str,
+    ) -> Result<bool, ApiError> {
         let mut claimed = intent.clone();
         claimed.status.stage = "execute".into();
         if let Some(pg) = &self.postgres {
@@ -644,8 +659,8 @@ impl MarketState {
             let rows = pg
                 .execute(
                     "UPDATE atlas_intents SET payload=$2,stage='execute',updated_at_ms=$3
-                     WHERE intent_id=$1 AND stage='validate'",
-                    &[&id, &payload, &now_i64()],
+                     WHERE intent_id=$1 AND stage=$4",
+                    &[&id, &payload, &now_i64(), &from],
                 )
                 .await
                 .map_err(internal)?;
@@ -653,7 +668,7 @@ impl MarketState {
         }
         let mut intents = self.intents.lock().map_err(internal)?;
         match intents.get_mut(id) {
-            Some(stored) if stored.status.stage == "validate" => {
+            Some(stored) if stored.status.stage == from => {
                 stored.status.stage = "execute".into();
                 Ok(true)
             }
@@ -672,7 +687,11 @@ impl MarketState {
         Ok(self
             .get_intent(intent_id)
             .await?
-            .filter(|i| i.owner == owner && i.chain == "base" && i.status.stage == "validate")
+            .filter(|i| {
+                i.owner == owner
+                    && (i.chain == "base" || i.funding.is_some())
+                    && i.status.stage == "validate"
+            })
             .map(|i| i.expected)
             .unwrap_or_default())
     }
@@ -729,6 +748,7 @@ impl MarketState {
                     error: None,
                 },
                 trade: None,
+                funding: None,
             },
         )
         .await?;
@@ -762,6 +782,7 @@ impl MarketState {
                 request_id: None,
                 status,
                 trade: None,
+                funding: None,
             },
         )
         .await?;
@@ -1430,9 +1451,35 @@ pub(super) async fn quote(
     } else {
         (actual_in, actual_out)
     };
-    // Above what they have: say so now, in their currency, rather than at the confirm.
+    // Above what they have: say so now, in their currency, rather than at the confirm. A Solana buy
+    // can use Base cash too: Layerswap moves the shortfall over first.
+    let mut funding_units = 0;
+    let mut funding_fee = 0;
     if let Some(held) = spot_available(&state, &a, &req.side, &user).await {
-        if held < actual_in {
+        if held < actual_in && req.side == "buy" && a.chain == "solana" {
+            let base_cash = match user.evm_wallet.as_deref().filter(|w| !w.is_empty()) {
+                Some(evm) => state
+                    .markets
+                    .base
+                    .balance_of(BASE_USDC, evm)
+                    .await
+                    .unwrap_or(0),
+                None => 0,
+            };
+            let (send, fee) = funding_for(&state, actual_in - held).await?;
+            if base_cash < send {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!(
+                        "Not enough cash for this. You have {} on Solana and {} on Base.",
+                        say_money(held, &req.amount.currency, rate),
+                        say_money(base_cash, &req.amount.currency, rate)
+                    ),
+                ));
+            }
+            funding_units = send;
+            funding_fee = fee;
+        } else if held < actual_in {
             let chain = if a.chain == "base" { "Base" } else { "Solana" };
             return Err(if req.side == "buy" {
                 short_of_cash(held, chain, &req.amount.currency, rate)
@@ -1490,12 +1537,28 @@ pub(super) async fn quote(
             currency: req.amount.currency.clone(),
             input_units: actual_in,
             output_units: actual_out,
+            funding_units,
             expires,
         },
     );
     Ok(Json(
-        json!({"quoteId":quote_id,"assetId":a.id,"side":req.side,"pay":pay,"receive":receive,"price":price,"fee":money_from_usdc(fee_usdc,&req.amount.currency,rate)?,"expiresAtUnixMs":expires}),
+        json!({"quoteId":quote_id,"assetId":a.id,"side":req.side,"pay":pay,"receive":receive,"price":price,"fee":money_from_usdc(fee_usdc,&req.amount.currency,rate)?,
+            "funding":if funding_units > 0 {json!({"from":"Base","to":"Solana","amount":money_from_usdc(funding_units,&req.amount.currency,rate)?,"fee":money_from_usdc(funding_fee,&req.amount.currency,rate)?})} else {Value::Null},
+            "expiresAtUnixMs":expires}),
     ))
+}
+
+// How much Base USDC to send so at least `shortfall` lands on Solana, and Layerswap's fee in it:
+// its fee plus a 1% + $0.05 cushion. Layerswap wants at least $1, so smaller top-ups send $1 (the
+// extra stays in the user's Solana cash).
+async fn funding_for(state: &AppState, shortfall: u128) -> Result<(u128, u128), ApiError> {
+    let base = shortfall.max(1_000_000);
+    let fee = state
+        .layerswap
+        .base_to_solana_fee(base)
+        .await
+        .map_err(|_| unavailable("Couldn't move cash from Base right now; try again shortly"))?;
+    Ok((base + fee + base / 100 + 50_000, fee))
 }
 
 // What the user can spend on this trade: USDC on the asset's chain for a buy, the token for a sell.
@@ -1576,6 +1639,7 @@ pub(super) async fn execute_quote(
     }
     let a = stored.asset;
     ensure_stock_units(&state.markets, &a).await?;
+    let evm_wallet = user.evm_wallet.clone().filter(|w| !w.is_empty());
     let wallet = if a.chain == "base" {
         user.evm_wallet
     } else {
@@ -1586,6 +1650,8 @@ pub(super) async fn execute_quote(
     let mut transactions = Vec::new();
     let mut expected = Vec::new();
     let mut request_id = None;
+    let mut funding = None;
+    let intent_id = id("intent");
     let output: u128;
     if a.chain == "base" {
         let request = quote_request(&a, &stored.side, stored.input_units);
@@ -1651,6 +1717,41 @@ pub(super) async fn execute_quote(
         transactions
             .push(json!({"chain":"base","chainId":8453,"to":swap.to,"data":swap.data,"value":"0"}));
         output = fresh.amount_out;
+    } else if stored.funding_units > 0 {
+        // Base cash first: one Base transfer to Layerswap now; the Jupiter buy is signed once the
+        // USDC lands on Solana (GET /v1/intents/{id}/next).
+        let evm = evm_wallet.clone().ok_or((
+            StatusCode::CONFLICT,
+            "Privy Base wallet is not ready".into(),
+        ))?;
+        let base_cash = state
+            .markets
+            .base
+            .balance_of(BASE_USDC, &evm)
+            .await
+            .map_err(unavailable)?;
+        if base_cash < stored.funding_units {
+            let rate = app_balance::fx_rate(&stored.currency).await?;
+            return Err(short_of_cash(base_cash, "Base", &stored.currency, rate));
+        }
+        let deposit = state
+            .layerswap
+            .base_to_solana(&evm, &wallet, stored.funding_units, &intent_id)
+            .await
+            .map_err(unavailable)?;
+        expected.push((
+            deposit.to.to_ascii_lowercase(),
+            deposit.data.to_ascii_lowercase(),
+        ));
+        transactions.push(
+            json!({"chain":"base","chainId":8453,"to":deposit.to,"data":deposit.data,"value":"0"}),
+        );
+        funding = Some(CashMove {
+            swap_id: deposit.swap_id,
+            amount_units: deposit.amount_units,
+            tx_hash: None,
+        });
+        output = stored.output_units;
     } else {
         let order = state
             .markets
@@ -1686,11 +1787,21 @@ pub(super) async fn execute_quote(
         transactions.push(json!({"chain":"solana","transaction":order.transaction.ok_or((StatusCode::BAD_GATEWAY,"Jupiter returned no signable transaction".into()))?,"submit":"engine"}));
         request_id = Some(order.request_id);
     }
-    let intent_id = id("intent");
-    let expires = now() + if a.chain == "base" { 120_000 } else { 45_000 };
+    let expires = now()
+        + if a.chain == "base" || funding.is_some() {
+            120_000
+        } else {
+            45_000
+        };
     // The confirm sheet speaks their currency: cash as money, the asset as tokens.
     let rate = app_balance::fx_rate(&stored.currency).await?;
-    let summary = if stored.side == "buy" {
+    let summary = if let Some(cash) = &funding {
+        json!([
+            {"label":"You pay","value":say_money(stored.input_units, &stored.currency, rate)},
+            {"label":"You get (about)","value":format!("{} {}", format_units(output, a.decimals), a.symbol)},
+            {"label":"Moved from your Base cash first","value":say_money(cash.amount_units, &stored.currency, rate)},
+        ])
+    } else if stored.side == "buy" {
         json!([
             {"label":"You pay","value":say_money(stored.input_units, &stored.currency, rate)},
             {"label":"You get (about)","value":format!("{} {}", format_units(output, a.decimals), a.symbol)},
@@ -1730,6 +1841,7 @@ pub(super) async fn execute_quote(
                         BASE_USDC.to_ascii_lowercase()
                     },
                 }),
+                funding,
             },
         )
         .await?;
@@ -1791,10 +1903,30 @@ pub(super) async fn signed(
             "intent belongs to another user".into(),
         ));
     }
-    if current.status.state != "pending" || current.status.stage != "validate" {
+    // A Solana buy paid with Base cash signs twice: the Base transfer (validate), then the Jupiter
+    // buy once the cash has landed (sign). Anything else is a repeat: answer with the status.
+    let second_step = current.funding.is_some() && current.status.stage == "sign";
+    if current.status.state != "pending" || (current.status.stage != "validate" && !second_step) {
         return Ok(Json(current.status));
     }
     let mut status = current.status.clone();
+    if current.funding.is_some() && !second_step {
+        if !body.signed.is_empty()
+            || body.sent.len() != 1
+            || body.sent[0].chain != "base"
+            || !valid_hash(&body.sent[0].id)
+        {
+            return Err(bad("signed report does not match the transfer from Base"));
+        }
+        let mut updated = current;
+        if let Some(cash) = updated.funding.as_mut() {
+            cash.tx_hash = Some(body.sent[0].id.clone());
+        }
+        updated.status.tx_ids = vec![body.sent[0].id.clone()];
+        updated.status.stage = "fund".into();
+        state.markets.save_intent(&intent_id, &updated).await?;
+        return Ok(Json(updated.status));
+    }
     if current.chain == "base" {
         if !body.signed.is_empty()
             || body.sent.len() != current.expected.len()
@@ -1811,7 +1943,11 @@ pub(super) async fn signed(
         if !body.sent.is_empty() || body.signed.len() != 1 || body.signed[0].index != 0 {
             return Err(bad("signed report does not match Jupiter execution plan"));
         }
-        if !state.markets.claim_execution(&intent_id, &current).await? {
+        if !state
+            .markets
+            .claim_execution(&intent_id, &current, &current.status.stage)
+            .await?
+        {
             let latest = state.markets.get_intent(&intent_id).await?;
             return Ok(Json(latest.map_or(current.status, |i| i.status)));
         }
@@ -1873,6 +2009,33 @@ pub(super) async fn intent_status(
             "intent belongs to another user".into(),
         ));
     }
+    // Base cash moving to Solana: Layerswap says when it has landed; then the buy can be signed.
+    if current.status.state == "pending" && current.status.stage == "fund" {
+        let Some(cash) = &current.funding else {
+            return Ok(Json(current.status));
+        };
+        let next = match state.layerswap.swap_state(&cash.swap_id).await {
+            Ok(engine_execution::layerswap::SwapState::Completed) => Some(("sign", "pending", None)),
+            Ok(engine_execution::layerswap::SwapState::Failed(reason)) => Some((
+                "fund",
+                "failed",
+                Some(format!(
+                    "Moving your cash from Base to Solana didn't go through ({reason}). Layerswap returns it to Base."
+                )),
+            )),
+            // Still moving, or Layerswap didn't answer this time: ask again on the next poll.
+            _ => None,
+        };
+        let Some((stage, state_now, error)) = next else {
+            return Ok(Json(current.status));
+        };
+        let mut updated = current;
+        updated.status.stage = stage.into();
+        updated.status.state = state_now.into();
+        updated.status.error = error;
+        state.markets.save_intent(&intent_id, &updated).await?;
+        return Ok(Json(updated.status));
+    }
     if current.status.state != "pending"
         || current.status.stage != "settle"
         || current.chain != "base"
@@ -1924,6 +2087,94 @@ pub(super) async fn intent_status(
     updated.status = status.clone();
     state.markets.save_intent(&intent_id, &updated).await?;
     Ok(Json(status))
+}
+
+// The second step of a Solana buy paid with Base cash: once the cash has landed, a fresh Jupiter
+// order for what arrived, for the app to sign without asking again (the user confirmed the whole
+// buy). Asking again before it's signed makes a fresh order.
+pub(super) async fn next_transactions(
+    State(state): State<AppState>,
+    Path(intent_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let user = app_balance::verified_wallets(&state, &headers).await?;
+    let mut intent = state
+        .markets
+        .get_intent(&intent_id)
+        .await?
+        .ok_or((StatusCode::NOT_FOUND, "intent not found".into()))?;
+    if intent.owner != user.user_id {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "intent belongs to another user".into(),
+        ));
+    }
+    if intent.status.state != "pending" || intent.status.stage != "sign" {
+        return Err((
+            StatusCode::CONFLICT,
+            "nothing to sign for this intent".into(),
+        ));
+    }
+    let plan = intent
+        .trade
+        .clone()
+        .ok_or_else(|| unavailable("intent has no trade"))?;
+    let asset = find_asset(&state.markets, &plan.asset_id).await?;
+    let cash: u128 = state
+        .solana_mainnet
+        .owner_token_balances(&intent.wallet)
+        .await
+        .map_err(unavailable)?
+        .iter()
+        .filter(|(m, _, _)| m == SOL_USDC)
+        .map(|(_, u, _)| *u)
+        .sum();
+    let amount = plan.pay_units.min(cash);
+    if amount == 0 {
+        return Err((
+            StatusCode::CONFLICT,
+            "the cash hasn't reached Solana yet".into(),
+        ));
+    }
+    let order = state
+        .markets
+        .jupiter
+        .order(&JupiterOrderRequest {
+            input_mint: SOL_USDC.into(),
+            output_mint: asset.token.clone(),
+            amount_base_units: amount.try_into().map_err(|_| bad("amount too large"))?,
+            taker: Some(intent.wallet.clone()),
+        })
+        .await
+        .map_err(unavailable)?;
+    let out: u128 = order.out_amount.parse().map_err(unavailable)?;
+    // Prices move while cash crosses over; more than 5% worse than the quote isn't what they agreed to.
+    let expected = mul_div_units(plan.get_units, amount, plan.pay_units);
+    if out < expected.saturating_mul(95) / 100 {
+        intent.status.state = "failed".into();
+        intent.status.error = Some(
+            "The price moved more than 5% while your cash was moving. The cash is on Solana now; try again."
+                .into(),
+        );
+        state.markets.save_intent(&intent_id, &intent).await?;
+        return Err((
+            StatusCode::CONFLICT,
+            intent.status.error.unwrap_or_default(),
+        ));
+    }
+    let transaction = order.transaction.ok_or((
+        StatusCode::BAD_GATEWAY,
+        "Jupiter returned no signable transaction".into(),
+    ))?;
+    intent.request_id = Some(order.request_id);
+    if let Some(trade) = intent.trade.as_mut() {
+        trade.pay_units = amount;
+        trade.get_units = out;
+    }
+    state.markets.save_intent(&intent_id, &intent).await?;
+    Ok(Json(
+        json!({"transactions":[{"chain":"solana","transaction":transaction,"submit":"engine"}]}),
+    ))
 }
 
 // A filled spot trade goes into the trade book (the spot positions). Failing to keep it never
@@ -2017,6 +2268,7 @@ mod tests {
                 get_units: get,
                 receive_token: String::new(),
             }),
+            funding: None,
         }
     }
 
@@ -2043,9 +2295,18 @@ mod tests {
         intent.status.stage = "validate".into();
         intent.status.state = "pending".into();
         markets.insert_intent("intent-1", &intent).await.unwrap();
-        assert!(markets.claim_execution("intent-1", &intent).await.unwrap());
-        assert!(!markets.claim_execution("intent-1", &intent).await.unwrap());
-        assert!(!markets.claim_execution("missing", &intent).await.unwrap());
+        assert!(markets
+            .claim_execution("intent-1", &intent, "validate")
+            .await
+            .unwrap());
+        assert!(!markets
+            .claim_execution("intent-1", &intent, "validate")
+            .await
+            .unwrap());
+        assert!(!markets
+            .claim_execution("missing", &intent, "validate")
+            .await
+            .unwrap());
         let stored = markets.get_intent("intent-1").await.unwrap().unwrap();
         assert_eq!(stored.status.stage, "execute");
         // Base plans are readable by the relay only while they still await the user's transactions.
@@ -2067,6 +2328,48 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+        // A Solana buy paid with Base cash: the relay sees its Base transfer while it awaits it, and
+        // the buy is claimed once, from the sign stage.
+        let mut funded = spot_intent("buy", 5_000_000, 1_000);
+        funded.status.stage = "validate".into();
+        funded.status.state = "pending".into();
+        funded.expected = vec![("0xusdc".into(), "0xtransfer".into())];
+        funded.funding = Some(CashMove {
+            swap_id: "swap".into(),
+            amount_units: 5_400_000,
+            tx_hash: None,
+        });
+        markets
+            .insert_intent("intent-funded", &funded)
+            .await
+            .unwrap();
+        assert_eq!(
+            markets
+                .planned_base_txs("intent-funded", "did:privy:a")
+                .await
+                .unwrap(),
+            vec![("0xusdc".to_string(), "0xtransfer".to_string())]
+        );
+        funded.status.stage = "sign".into();
+        markets.save_intent("intent-funded", &funded).await.unwrap();
+        assert!(markets
+            .planned_base_txs("intent-funded", "did:privy:a")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(!markets
+            .claim_execution("intent-funded", &funded, "validate")
+            .await
+            .unwrap());
+        assert!(markets
+            .claim_execution("intent-funded", &funded, "sign")
+            .await
+            .unwrap());
+        // Intents saved before funding existed still load.
+        let old: StoredIntent = serde_json::from_value(serde_json::json!({"owner":"o","wallet":"w","chain":"solana",
+            "expected":[],"request_id":null,"status":{"intentId":"i","stage":"settle","state":"filled","txIds":[],"error":null},
+            "trade":null})).unwrap();
+        assert!(old.funding.is_none());
         let mut sent = markets.get_intent(&base_id).await.unwrap().unwrap();
         sent.status.stage = "settle".into();
         markets.save_intent(&base_id, &sent).await.unwrap();

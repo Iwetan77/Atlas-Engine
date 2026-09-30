@@ -1,5 +1,6 @@
-//! Layerswap moves USDC between the user's Base wallet and their Paradex account, so perps margin
-//! comes from the Atlas balance. No API key: the public v2 API creates swaps and reports status.
+//! Layerswap moves USDC out of the user's Base wallet: into their Paradex account (perps margin) or
+//! to their Solana wallet (a Solana buy paid with Base cash). No API key: the public v2 API quotes,
+//! creates swaps and reports status.
 use reqwest::{Client, Url};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -66,6 +67,59 @@ impl LayerswapClient {
         amount_units: u128,
         reference: &str,
     ) -> Result<BaseDeposit, LayerswapError> {
+        self.base_to(
+            "PARADEX_MAINNET",
+            source_address,
+            paradex_account,
+            amount_units,
+            reference,
+        )
+        .await
+    }
+
+    /// Creates a Base → Solana USDC swap to the user's own Solana wallet.
+    pub async fn base_to_solana(
+        &self,
+        source_address: &str,
+        solana_owner: &str,
+        amount_units: u128,
+        reference: &str,
+    ) -> Result<BaseDeposit, LayerswapError> {
+        self.base_to(
+            "SOLANA_MAINNET",
+            source_address,
+            solana_owner,
+            amount_units,
+            reference,
+        )
+        .await
+    }
+
+    /// Layerswap's total fee (USDC units, rounded up) to move `amount_units` of USDC Base → Solana.
+    pub async fn base_to_solana_fee(&self, amount_units: u128) -> Result<u128, LayerswapError> {
+        let mut url = self
+            .base
+            .join("quote")
+            .map_err(|_| LayerswapError::InvalidResponse("URL"))?;
+        url.query_pairs_mut()
+            .append_pair("source_network", "BASE_MAINNET")
+            .append_pair("source_token", "USDC")
+            .append_pair("destination_network", "SOLANA_MAINNET")
+            .append_pair("destination_token", "USDC")
+            .append_pair("amount", &usdc_decimal(amount_units))
+            .append_pair("use_deposit_address", "false");
+        let body = checked(self.http.get(url).send().await?).await?;
+        quote_fee_units(&body)
+    }
+
+    async fn base_to(
+        &self,
+        destination_network: &str,
+        source_address: &str,
+        destination_address: &str,
+        amount_units: u128,
+        reference: &str,
+    ) -> Result<BaseDeposit, LayerswapError> {
         let amount: serde_json::Number = usdc_decimal(amount_units)
             .parse()
             .map_err(|_| LayerswapError::InvalidResponse("amount"))?;
@@ -78,9 +132,9 @@ impl LayerswapClient {
             .post(url)
             .json(&json!({
                 "source_network":"BASE_MAINNET","source_token":"USDC",
-                "destination_network":"PARADEX_MAINNET","destination_token":"USDC",
+                "destination_network":destination_network,"destination_token":"USDC",
                 "amount":amount,"source_address":source_address,
-                "destination_address":paradex_account,
+                "destination_address":destination_address,
                 "use_deposit_address":false,"reference_id":reference
             }))
             .send()
@@ -178,6 +232,14 @@ fn parse_base_deposit(body: &Value, amount_units: u128) -> Result<BaseDeposit, L
     })
 }
 
+fn quote_fee_units(body: &Value) -> Result<u128, LayerswapError> {
+    let fee = body["data"]["quote"]["total_fee"]
+        .as_f64()
+        .filter(|f| f.is_finite() && *f >= 0.0)
+        .ok_or(LayerswapError::InvalidResponse("quote fee"))?;
+    Ok((fee * 1_000_000.0).ceil() as u128)
+}
+
 fn parse_swap_state(body: &Value) -> SwapState {
     let swap = &body["data"]["swap"];
     match swap["status"].as_str().unwrap_or_default() {
@@ -196,6 +258,17 @@ fn parse_swap_state(body: &Value) -> SwapState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_the_quote_fee_rounded_up() {
+        let body = json!({"data":{"quote":{"total_fee":0.310603,"receive_amount":4.689397}}});
+        assert_eq!(quote_fee_units(&body).unwrap(), 310_603);
+        assert_eq!(
+            quote_fee_units(&json!({"data":{"quote":{"total_fee":0.1000001}}})).unwrap(),
+            100_001
+        );
+        assert!(quote_fee_units(&json!({"data":{}})).is_err());
+    }
 
     // Captured from Layerswap's live API on 2026-09-30 (a 20 USDC Base → Paradex swap).
     fn live_response() -> Value {
@@ -266,5 +339,26 @@ mod tests {
             client.swap_state(&deposit.swap_id).await.unwrap(),
             SwapState::Waiting
         );
+    }
+
+    // A Base → Solana swap to a Solana wallet: one Base USDC transfer, and a fee we can read first.
+    #[tokio::test]
+    #[ignore]
+    async fn live_layerswap_base_to_solana_deposit() {
+        let client = LayerswapClient::new().unwrap();
+        let fee = client.base_to_solana_fee(5_000_000).await.unwrap();
+        println!("fee to move 5 USDC: {}", usdc_decimal(fee));
+        assert!(fee > 0 && fee < 2_000_000);
+        let deposit = client
+            .base_to_solana(
+                "0x845c22a46398E0a702733e556bEB6aFcB2E92132",
+                "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM",
+                5_000_000,
+                "atlas-live-check",
+            )
+            .await
+            .unwrap();
+        println!("{deposit:?}");
+        assert_eq!(deposit.amount_units, 5_000_000);
     }
 }
