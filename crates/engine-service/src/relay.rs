@@ -1,7 +1,6 @@
-//! Sends a Base transaction the user confirmed in the app, paid from the wallet's own ETH gas tank
-//! when it has some, with Privy gas sponsorship only as the fallback. Privy's Expo
-//! SDK can't ask for sponsorship, so the iPhone app hands the transaction here instead. Only a
-//! transaction Atlas planned for that user's intent, byte for byte, is ever relayed.
+//! Sends a Base transaction the user confirmed in the app, paid from the wallet's own ETH (plans
+//! make sure there is some: a CoW top-up or a refuel hop first). Privy sponsorship is never used.
+//! Only a transaction Atlas planned for that user's intent, byte for byte, is ever relayed.
 use super::*;
 use serde_json::{json, Value};
 
@@ -82,13 +81,11 @@ pub(super) async fn evm(
         req.intent_id,
         planned_index(&planned, &to, &data)
     );
-    // The user's own ETH pays when the wallet has some (the gas tank); Privy sponsors otherwise.
-    let sponsor = !markets::wallet_pays_gas(&state, &wallet).await;
     let response = http
         .post(format!("{bridge_url}/relay/evm-transaction"))
         .json(
             &json!({"accessToken":token,"walletAddress":wallet,"chainId":req.chain_id,
-            "to":to,"data":data,"idempotencyKey":idempotency_key,"sponsor":sponsor}),
+            "to":to,"data":data,"idempotencyKey":idempotency_key}),
         )
         .send()
         .await
@@ -101,13 +98,17 @@ pub(super) async fn evm(
     let status = response.status();
     let body: Value = response.json().await.unwrap_or(Value::Null);
     if !status.is_success() {
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            body["error"]
-                .as_str()
-                .unwrap_or("Privy could not send the transaction")
-                .into(),
-        ));
+        let reason = body["error"]
+            .as_str()
+            .unwrap_or("Privy could not send the transaction");
+        // No ETH left for gas (plans top up first, so this is rare): say what to do.
+        if reason.to_ascii_lowercase().contains("insufficient funds") {
+            return Err((
+                StatusCode::CONFLICT,
+                "Add money to cover network fees, then try again.".into(),
+            ));
+        }
+        return Err((StatusCode::BAD_GATEWAY, reason.into()));
     }
     let hash = body["hash"].as_str().unwrap_or_default();
     if body["userId"].as_str() != Some(&user.user_id)

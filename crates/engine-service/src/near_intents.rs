@@ -120,9 +120,7 @@ impl NearState {
                 .timeout(Duration::from_secs(6))
                 .build()?,
             postgres,
-            monad_rpc: env::var("ATLAS_MONAD_MAINNET_RPC_URL")
-                .unwrap_or_else(|_| "https://rpc.monad.xyz".into())
-                .parse()?,
+            monad_rpc: env_url("ATLAS_MONAD_MAINNET_RPC_URL", "https://rpc.monad.xyz").parse()?,
         })
     }
     async fn tokens(&self) -> Result<Vec<Token>, ApiError> {
@@ -612,8 +610,7 @@ pub(super) async fn near_holdings(
         *asset = fresh.clone();
     }
     let wallet = destination(state, headers, tracked.values().next().unwrap(), user).await?;
-    let rpc = std::env::var("ATLAS_NEAR_MAINNET_RPC_URL")
-        .unwrap_or_else(|_| "https://rpc.mainnet.near.org".into());
+    let rpc = env_url("ATLAS_NEAR_MAINNET_RPC_URL", "https://rpc.mainnet.near.org");
     let mut held = Vec::new();
     for asset in tracked.into_values() {
         let contract = asset
@@ -1683,8 +1680,13 @@ async fn pay_from(
             .unwrap_or(0),
         None => 0,
     };
+    // Base covers it and its gas is paid (own ETH, or USDC to spare for a CoW top-up).
     if let (Some(w), true) = (evm, base_cash >= amount) {
-        return Ok((w.into(), false, 0, BASE_USDC_1CLICK));
+        if markets::wallet_pays_gas(state, w).await
+            || markets::base_topup_fits(state, w, amount).await
+        {
+            return Ok((w.into(), false, 0, BASE_USDC_1CLICK));
+        }
     }
     let solana = user.solana_wallet.as_deref().filter(|w| !w.is_empty());
     let solana_cash = match solana {
@@ -1696,6 +1698,9 @@ async fn pay_from(
             let fee = markets::account_rent_usd(state).await;
             return Ok((s.into(), true, fee, SOLANA_USDC_1CLICK));
         }
+    }
+    if base_cash >= amount {
+        return Err(markets::short_of_gas(currency, rate));
     }
     Err(markets::not_enough_cash(
         base_cash + solana_cash,
@@ -1911,6 +1916,11 @@ pub(super) async fn execute(
     // No ETH on Base: a gasless CoW top-up goes first, so the deposit gets more time.
     let gas_topup = !stored.from_solana
         && markets::base_topup_fits(&state, &stored.wallet, stored.amount).await;
+    if !stored.from_solana && !gas_topup && !markets::wallet_pays_gas(&state, &stored.wallet).await
+    {
+        let rate = app_balance::fx_rate(&stored.currency).await?;
+        return Err(markets::short_of_gas(&stored.currency, rate));
+    }
     let deadline = deadline_utc(if gas_topup { 20 * 60 } else { 240 });
     let amount = stored.amount.to_string();
     let req = QuoteRequest::exact_input(

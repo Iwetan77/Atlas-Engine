@@ -60,7 +60,7 @@ async fn arc_balance(wallet: &str) -> Result<u128, ApiError> {
         return Err((StatusCode::BAD_REQUEST, "Wallet address is invalid".into()));
     }
     let (default_rpc, expected_chain) = ("https://rpc.mainnet.arc.io", "0x13b2");
-    let rpc = std::env::var("ATLAS_ARC_RPC_URL").unwrap_or_else(|_| default_rpc.into());
+    let rpc = env_url("ATLAS_ARC_RPC_URL", default_rpc);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(8))
         .build()

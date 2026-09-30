@@ -236,11 +236,10 @@ const server = createServer(async (request, response) => {
       return;
     }
     // Sends a transaction the user already confirmed in the app. The user's own session authorizes
-    // it (no server signer involved); the engine only asks for transactions it planned, and says
-    // whether the wallet pays its own gas or Privy sponsors it.
+    // it (no server signer involved); the engine only asks for transactions it planned. The wallet
+    // pays its own gas: Privy sponsorship is never requested.
     if (relayEvm) {
       const {chainId, to, data, idempotencyKey} = input;
-      const sponsor = input.sponsor !== false;
       if (![8453, 84532].includes(chainId) || !/^0x[0-9a-fA-F]{40}$/.test(to ?? '') ||
           !/^0x([0-9a-fA-F]{2})*$/.test(data ?? '') || typeof idempotencyKey !== 'string' ||
           idempotencyKey.length < 8 || idempotencyKey.length > 200) {
@@ -251,7 +250,7 @@ const server = createServer(async (request, response) => {
         const sent = await privy.wallets().ethereum().sendTransaction(evm.id, {
           caip2: `eip155:${chainId}`,
           params: {transaction: {to, data, value: '0x0', chain_id: chainId}},
-          sponsor,
+          sponsor: false,
           idempotency_key: idempotencyKey,
           authorization_context: {user_jwts: [accessToken]},
         });

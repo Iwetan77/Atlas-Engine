@@ -580,9 +580,11 @@ pub(super) struct Signed {
 
 impl MarketState {
     pub(super) fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let rpc: reqwest::Url = env::var("ATLAS_BASE_MAINNET_RPC_URL")
-            .unwrap_or_else(|_| "https://base-rpc.publicnode.com".into())
-            .parse()?;
+        let rpc: reqwest::Url = env_url(
+            "ATLAS_BASE_MAINNET_RPC_URL",
+            "https://base-rpc.publicnode.com",
+        )
+        .parse()?;
         Ok(Self {
             base: UniswapV3Client::new(rpc.clone())?,
             jupiter: JupiterClient::new(env::var("JUPITER_API_KEY").ok()),
@@ -900,6 +902,17 @@ pub(super) fn short_of_cash() -> ApiError {
     (
         StatusCode::CONFLICT,
         "Not enough in your balance for this. Add money to continue.".into(),
+    )
+}
+// A Base action the wallet can't pay gas for: no ETH, no USDC to spare for a top-up, no Solana cash
+// to hop over with ETH. Atlas never pays gas, so they're asked for a little more.
+pub(super) fn short_of_gas(currency: &str, rate: u128) -> ApiError {
+    (
+        StatusCode::CONFLICT,
+        format!(
+            "Add money to cover network fees (about {} more), then try again.",
+            say_money(BASE_GAS_REFILL_USDC, currency, rate)
+        ),
     )
 }
 // The same, with the cash they do have across every chain.
@@ -1705,6 +1718,12 @@ async fn move_to_solana(
             None,
         ));
     }
+    // Layerswap's deposit is a plain transfer: only when the wallet pays its own gas.
+    if !wallet_pays_gas(state, evm).await {
+        return Err(unavailable(
+            "Couldn't move your cash right now; try again shortly",
+        ));
+    }
     let deposit = state
         .layerswap
         .base_to_solana(evm, solana, send, intent_id)
@@ -1965,7 +1984,7 @@ pub(super) async fn account_rent_usd(state: &AppState) -> u128 {
 const BASE_GAS_FLOOR_WEI: u128 = 5_000_000_000_000;
 const BASE_GAS_REFILL_AT_WEI: u128 = 40_000_000_000_000;
 // A refill: $0.50 of USDC becomes about 0.0002 ETH, enough for dozens of transactions.
-const BASE_GAS_REFILL_USDC: u128 = 500_000;
+pub(super) const BASE_GAS_REFILL_USDC: u128 = 500_000;
 // What the user reads when the tank couldn't be filled: nothing else happened.
 pub(super) const GAS_NOT_READY: &str =
     "Couldn't get your account ready for this, so nothing happened and nothing left your balance. Try again.";
@@ -2237,13 +2256,10 @@ pub(super) async fn plan_base_with_cash(
             .await?;
         return Ok((intent_id, Vec::new(), None));
     }
-    let empty_tank = !wallet_pays_gas(state, &evm).await;
-    let refuel = empty_tank
-        && match solana.as_deref() {
-            Some(owner) => solana_cash(state, owner).await >= 2_000_000,
-            None => false,
-        };
-    let Some((send, fee)) = cash_for_base_with(
+    // Otherwise an empty tank gets ETH on a hop from Solana (Layerswap refuel). Atlas never pays gas:
+    // with neither, the user is asked for a little more.
+    let refuel = !wallet_pays_gas(state, &evm).await;
+    let hop = match cash_for_base_with(
         state,
         &evm,
         solana.as_deref(),
@@ -2252,8 +2268,22 @@ pub(super) async fn plan_base_with_cash(
         rate,
         refuel,
     )
-    .await?
-    else {
+    .await
+    {
+        Err(_)
+            if refuel
+                && state
+                    .markets
+                    .base
+                    .balance_of(BASE_USDC, &evm)
+                    .await
+                    .is_ok_and(|cash| cash >= needed) =>
+        {
+            return Err(short_of_gas(currency, rate));
+        }
+        other => other?,
+    };
+    let Some((send, fee)) = hop else {
         let transactions = as_base(&txs);
         let intent_id = state
             .markets
@@ -2540,6 +2570,9 @@ pub(super) async fn execute_quote(
         if base_topup_fits(&state, &wallet, spends).await {
             base_topup = Some(BaseTopup { uid: None });
             transactions.clear();
+        } else if !wallet_pays_gas(&state, &wallet).await {
+            let rate = app_balance::fx_rate(&stored.currency).await?;
+            return Err(short_of_gas(&stored.currency, rate));
         }
         output = fresh.amount_out;
     } else if stored.funding_units > 0 {

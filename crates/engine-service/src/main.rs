@@ -97,8 +97,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         solana_owner,
         solana_mainnet: SolanaAtaPreflight::new(
             SolanaNetwork::Mainnet,
-            env::var("ATLAS_SOLANA_MAINNET_RPC_URL")
-                .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".into()),
+            env_url(
+                "ATLAS_SOLANA_MAINNET_RPC_URL",
+                "https://api.mainnet-beta.solana.com",
+            ),
             "",
         )?,
         auth,
@@ -190,12 +192,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// Public and secret-free: lets anyone check which commit Render is actually serving.
+// Public and secret-free: which commit Render is serving, and which RPC hosts it reads (hosts only;
+// a key in the URL never shows).
 async fn health() -> Json<serde_json::Value> {
+    let host = |var: &str, default: &str| {
+        reqwest::Url::parse(&env_url(var, default))
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+    };
     Json(serde_json::json!({
         "ok": true,
         "commit": env::var("RENDER_GIT_COMMIT").unwrap_or_else(|_| "unknown".into()),
+        "rpc": {
+            "solana": host("ATLAS_SOLANA_MAINNET_RPC_URL", "https://api.mainnet-beta.solana.com"),
+            "base": host("ATLAS_BASE_MAINNET_RPC_URL", "https://base-rpc.publicnode.com"),
+        },
     }))
+}
+
+// An RPC URL from the environment, forgiving what a dashboard paste adds (spaces, quotes, the < >
+// of a placeholder). Still not a URL: the public default, logged by name only (it may hold a key).
+pub(crate) fn env_url(var: &str, default: &str) -> String {
+    let Ok(raw) = env::var(var) else {
+        return default.into();
+    };
+    clean_url(&raw).unwrap_or_else(|| {
+        eprintln!("{var} is not a valid URL; using the public endpoint");
+        default.into()
+    })
+}
+
+fn clean_url(raw: &str) -> Option<String> {
+    let value = raw
+        .trim()
+        .trim_matches(|c| matches!(c, '"' | '\'' | '<' | '>'))
+        .trim();
+    let url = reqwest::Url::parse(value).ok()?;
+    (matches!(url.scheme(), "https" | "http") && url.host_str().is_some())
+        .then(|| value.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pasted_rpc_urls_are_forgiven_or_refused() {
+        let helius = "https://mainnet.helius-rpc.com/?api-key=abc";
+        assert_eq!(clean_url(helius).as_deref(), Some(helius));
+        assert_eq!(
+            clean_url(&format!(" \"{helius}\"\n")).as_deref(),
+            Some(helius)
+        );
+        assert_eq!(clean_url(&format!("<{helius}>")).as_deref(), Some(helius));
+        assert_eq!(clean_url("mainnet.helius-rpc.com/?api-key=abc"), None);
+        assert_eq!(clean_url("wss://mainnet.helius-rpc.com"), None);
+        assert_eq!(clean_url(""), None);
+    }
 }
 
 fn configured_cors() -> Result<Option<CorsLayer>, Box<dyn std::error::Error>> {

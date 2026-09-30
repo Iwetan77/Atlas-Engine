@@ -603,6 +603,13 @@ pub(crate) async fn execute_quote(
                 gasless: true,
             })
         } else {
+            // A plain transfer: only when the wallet pays its own gas (Atlas never does).
+            if !markets::wallet_pays_gas(&state, &quote.wallet).await {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Couldn't move your margin right now; try again shortly".into(),
+                ));
+            }
             let deposit = state
                 .layerswap
                 .base_to_paradex(
