@@ -354,6 +354,21 @@ impl MarketState {
 }
 
 impl MarketState {
+    // The Base transactions Atlas planned for this user's intent, while it's still awaiting them.
+    pub(super) fn planned_base_txs(
+        &self,
+        intent_id: &str,
+        owner: &str,
+    ) -> Result<Vec<(String, String)>, ApiError> {
+        Ok(self
+            .intents
+            .lock()
+            .map_err(internal)?
+            .get(intent_id)
+            .filter(|i| i.owner == owner && i.chain == "base" && i.status.stage == "validate")
+            .map(|i| i.expected.clone())
+            .unwrap_or_default())
+    }
     pub(super) fn register_base_transfer(
         &self,
         owner: String,

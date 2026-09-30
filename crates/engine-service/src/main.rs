@@ -4,6 +4,7 @@
 mod app_balance;
 mod markets;
 mod perps;
+mod relay;
 mod social;
 
 use std::{
@@ -230,6 +231,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             post(markets::execute_quote),
         )
         .route("/v1/intents/{intent_id}/signed", post(markets::signed))
+        .route("/v1/relay/evm", post(relay::evm))
         .route("/v1/intents/{intent_id}", get(markets::intent_status))
         .route("/balance/{user}", get(balance))
         .route("/balance/{user}/movement", post(register_movement))
