@@ -24,7 +24,7 @@ pub struct Token {
     pub symbol: String,
     pub decimals: u32,
     pub contract_address: Option<String>,
-    pub price: Option<String>,
+    pub price: Option<serde_json::Value>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -93,7 +93,13 @@ pub struct Status {
 #[serde(rename_all = "camelCase")]
 pub struct SwapDetails {
     #[serde(default)]
-    pub destination_chain_tx_hashes: Vec<String>,
+    pub destination_chain_tx_hashes: Vec<ChainTx>,
+}
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChainTx {
+    pub hash: String,
+    pub explorer_url: Option<String>,
 }
 impl Client {
     pub fn new(key: Option<String>) -> Result<Self, reqwest::Error> {
@@ -180,6 +186,17 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn successful_status_has_destination_hash_objects() {
+        let result: Status = serde_json::from_value(serde_json::json!({
+            "status":"SUCCESS","swapDetails":{"destinationChainTxHashes":[
+                {"hash":"0xabc","explorerUrl":"https://example.com/tx/0xabc"}]}}))
+        .unwrap();
+        assert_eq!(
+            result.swap_details.unwrap().destination_chain_tx_hashes[0].hash,
+            "0xabc"
+        );
+    }
     #[test]
     fn quote_request_is_exact_input_and_origin_chain() {
         let r = QuoteRequest::exact_input(

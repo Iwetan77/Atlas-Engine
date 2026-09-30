@@ -478,14 +478,14 @@ pub(super) struct AssetsQuery {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct QuoteRequest {
-    asset_id: String,
-    side: String,
-    amount: Money,
+    pub(super) asset_id: String,
+    pub(super) side: String,
+    pub(super) amount: Money,
 }
 #[derive(Clone, Deserialize, Serialize)]
 pub(super) struct Money {
-    amount: String,
-    currency: String,
+    pub(super) amount: String,
+    pub(super) currency: String,
 }
 #[derive(Deserialize)]
 pub(super) struct Submission {
@@ -499,8 +499,8 @@ pub(super) struct Sent {
 }
 #[derive(Deserialize)]
 pub(super) struct Signed {
-    index: usize,
-    transaction: String,
+    pub(super) index: usize,
+    pub(super) transaction: String,
 }
 
 impl MarketState {
@@ -901,6 +901,9 @@ pub(super) async fn assets(
         };
         result.push(json!({"assetId":a.id,"symbol":a.symbol,"name":a.name,"kind":a.kind,"price":price,"change24hPct":change,"iconUrl":a.icon_url,"verified":a.verified}));
     }
+    if !raw.is_empty() && kind.is_none_or(|k| k == "crypto") {
+        result.extend(near_intents::search_assets(&state, raw, &currency, rate).await?);
+    }
     Ok(Json(json!({"assets":result})))
 }
 
@@ -1120,6 +1123,9 @@ pub(super) async fn quote(
     headers: HeaderMap,
     Json(req): Json<QuoteRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    if req.asset_id.starts_with("near:") {
+        return near_intents::quote(state, headers, req).await;
+    }
     let user = app_balance::verified_wallets(&state, &headers).await?;
     let a = find_asset(&state.markets, &req.asset_id).await?;
     if req.side != "buy" && req.side != "sell" {
@@ -1209,6 +1215,9 @@ pub(super) async fn execute_quote(
     headers: HeaderMap,
     Json(_): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
+    if quote_id.starts_with("near-q-") {
+        return near_intents::execute(state, headers, quote_id).await;
+    }
     let user = app_balance::verified_wallets(&state, &headers).await?;
     let stored = state
         .markets
@@ -1418,6 +1427,9 @@ pub(super) async fn signed(
     headers: HeaderMap,
     Json(body): Json<Submission>,
 ) -> Result<Json<IntentStatus>, ApiError> {
+    if intent_id.starts_with("near-intent-") {
+        return near_intents::signed(state, headers, intent_id, body).await;
+    }
     if intent_id.starts_with("perp-") {
         return perps::trade::signed(state, intent_id, headers, body).await;
     }
@@ -1511,6 +1523,9 @@ pub(super) async fn intent_status(
     Path(intent_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<IntentStatus>, ApiError> {
+    if intent_id.starts_with("near-intent-") {
+        return near_intents::status(state, headers, intent_id).await;
+    }
     if intent_id.starts_with("perp-") {
         return perps::trade::status(state, intent_id, headers).await;
     }

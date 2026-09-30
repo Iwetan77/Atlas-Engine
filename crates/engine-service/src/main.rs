@@ -4,6 +4,7 @@
 mod app_balance;
 mod earn;
 mod markets;
+mod near_intents;
 mod perps;
 mod positions;
 mod relay;
@@ -68,6 +69,7 @@ struct AppState {
     auth: AuthMode,
     network: AtlasNetwork,
     markets: markets::MarketState,
+    near: near_intents::NearState,
     paradex: engine_execution::perps::ParadexClient,
     paradex_tokens: Arc<Mutex<HashMap<String, (String, Instant)>>>,
     perps_trade: perps::TradeState,
@@ -178,6 +180,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auth,
         network: AtlasNetwork::from_env()?,
         markets: markets::MarketState::new()?,
+        near: near_intents::NearState::new().await?,
         paradex: engine_execution::perps::ParadexClient::new(
             &env::var("PARADEX_ENV").unwrap_or_else(|_| "prod".into()),
         )?,

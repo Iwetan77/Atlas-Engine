@@ -39,7 +39,12 @@ pub(super) async fn evm(
     }
     let to = req.to.to_ascii_lowercase();
     let data = req.data.unwrap_or_else(|| "0x".into()).to_ascii_lowercase();
-    let planned: Vec<(String, String)> = if req.intent_id.starts_with("perp-") {
+    let planned: Vec<(String, String)> = if req.intent_id.starts_with("near-intent-") {
+        state
+            .near
+            .planned_base_txs(&req.intent_id, &user.user_id)
+            .await?
+    } else if req.intent_id.starts_with("perp-") {
         perps::trade::planned_funding(&state, &req.intent_id, &user.user_id)
             .await?
             .into_iter()
