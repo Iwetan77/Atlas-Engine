@@ -3,6 +3,7 @@
 
 mod app_balance;
 mod earn;
+mod gasless;
 mod markets;
 mod near_intents;
 mod perps;
@@ -56,6 +57,7 @@ struct AppState {
     perps_trade: perps::TradeState,
     perp_cache: perps::PerpCache,
     layerswap: engine_execution::layerswap::LayerswapClient,
+    relay_link: engine_execution::relay_link::RelayClient,
     earn: earn::EarnState,
     social: social::SocialState,
     trades: positions::TradeBook,
@@ -168,6 +170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         perps_trade: perps::TradeState::new().await?,
         perp_cache: perps::PerpCache::default(),
         layerswap: engine_execution::layerswap::LayerswapClient::new()?,
+        relay_link: engine_execution::relay_link::RelayClient::new(env::var("RELAY_API_KEY").ok())?,
         earn: earn::EarnState::default(),
         social: social::SocialState::new().await?,
         trades: positions::TradeBook::new().await?,

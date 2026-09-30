@@ -505,6 +505,16 @@ struct CashMove {
     swap_id: String,
     amount_units: u128,
     tx_hash: Option<String>,
+    // Moved by Relay without Base gas (`swap_id` is Relay's request): what the user's wallet signs
+    // once they confirm. None for a Layerswap move started by a transaction.
+    #[serde(default)]
+    authorization: Option<Authorization>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct Authorization {
+    typed_data: Value,
+    // Relay's name for the flow, handed back with the signature.
+    api: String,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct PlannedTrade {
@@ -1542,7 +1552,13 @@ pub(super) async fn quote(
                     .unwrap_or(0),
                 None => 0,
             };
-            let (send, fee) = funding_for(&state, actual_in - held).await?;
+            let (send, fee) = funding_for(
+                &state,
+                user.evm_wallet.as_deref().filter(|w| !w.is_empty()),
+                user.solana_wallet.as_deref().filter(|w| !w.is_empty()),
+                actual_in - held,
+            )
+            .await?;
             if base_cash < send {
                 return Err(not_enough_cash(
                     held + base_cash,
@@ -1621,17 +1637,74 @@ pub(super) async fn quote(
     ))
 }
 
-// How much Base USDC to send so at least `shortfall` lands on Solana, and Layerswap's fee in it:
-// its fee plus a 1% + $0.05 cushion. Layerswap wants at least $1, so smaller top-ups send $1 (the
-// extra stays in the user's Solana cash).
-async fn funding_for(state: &AppState, shortfall: u128) -> Result<(u128, u128), ApiError> {
+// How much Base USDC to send so at least `shortfall` lands on Solana, and the fee in it. Relay lands
+// exactly that (plus a cent) for a few cents and needs no Base gas. When Relay can't, Layerswap: its
+// fee plus a 1% + $0.05 cushion, at least $1 (the extra stays in the user's Solana cash). Either
+// way, what lands is `send - fee`.
+async fn funding_for(
+    state: &AppState,
+    evm: Option<&str>,
+    solana: Option<&str>,
+    shortfall: u128,
+) -> Result<(u128, u128), ApiError> {
+    let land = shortfall + 10_000;
+    if let (Some(evm), Some(solana)) = (evm, solana) {
+        if let Ok(quote) = state.relay_link.base_to_solana(evm, solana, land).await {
+            return Ok((quote.amount_in_units, quote.amount_in_units - land));
+        }
+    }
     let base = shortfall.max(1_000_000);
     let fee = state
         .layerswap
         .base_to_solana_fee(base)
         .await
-        .map_err(|_| unavailable("Couldn't move cash from Base right now; try again shortly"))?;
+        .map_err(|_| unavailable("Couldn't move your cash right now; try again shortly"))?;
     Ok((base + fee + base / 100 + 50_000, fee))
+}
+
+// Starts moving `send` of Base cash (`fee` of it the network fee) to the user's Solana wallet: a
+// gasless Relay move when it can (the app sends nothing; the user's session signs it after the
+// confirm), else one Layerswap transfer for the app to send, returned as (to, data).
+async fn move_to_solana(
+    state: &AppState,
+    evm: &str,
+    solana: &str,
+    send: u128,
+    fee: u128,
+    intent_id: &str,
+) -> Result<(CashMove, Option<(String, String)>), ApiError> {
+    if let Ok(quote) = state
+        .relay_link
+        .base_to_solana(evm, solana, send - fee)
+        .await
+    {
+        return Ok((
+            CashMove {
+                swap_id: quote.request_id,
+                amount_units: quote.amount_in_units,
+                tx_hash: None,
+                authorization: Some(Authorization {
+                    typed_data: quote.typed_data,
+                    api: quote.api,
+                }),
+            },
+            None,
+        ));
+    }
+    let deposit = state
+        .layerswap
+        .base_to_solana(evm, solana, send, intent_id)
+        .await
+        .map_err(|_| unavailable("Couldn't move your cash right now; try again shortly"))?;
+    Ok((
+        CashMove {
+            swap_id: deposit.swap_id,
+            amount_units: deposit.amount_units,
+            tx_hash: None,
+            authorization: None,
+        },
+        Some((deposit.to, deposit.data)),
+    ))
 }
 
 // The gas tank. Every Solana transaction needs a little SOL for its fee unless Jupiter pays it
@@ -1992,6 +2065,7 @@ pub(super) async fn cash_for_base_with(
 pub(super) async fn cash_for_solana(
     state: &AppState,
     evm: Option<&str>,
+    solana: Option<&str>,
     held_on_solana: u128,
     needed: u128,
     currency: &str,
@@ -2009,7 +2083,7 @@ pub(super) async fn cash_for_solana(
             .unwrap_or(0),
         None => 0,
     };
-    let (send, fee) = funding_for(state, needed - held_on_solana).await?;
+    let (send, fee) = funding_for(state, evm, solana, needed - held_on_solana).await?;
     if base_cash < send {
         return Err(not_enough_cash(held_on_solana + base_cash, currency, rate));
     }
@@ -2104,6 +2178,7 @@ pub(super) async fn plan_base_with_cash(
                     swap_id: deposit.swap_id,
                     amount_units: deposit.amount_units,
                     tx_hash: None,
+                    authorization: None,
                 }),
                 buy_mint: None,
                 gas_request_id: gas.as_ref().map(|(id, _)| id.clone()),
@@ -2120,8 +2195,10 @@ pub(super) async fn plan_base_with_cash(
     Ok((intent_id, transactions, Some(fee)))
 }
 
-// A Solana swap from USDC into `buy_mint` (Earn into Jupiter Lend) paid with Base cash: the plan is
-// one Base transfer; /next makes the swap once the cash lands. Returns the intent and the Base tx.
+// A Solana swap from USDC into `buy_mint` (Earn into Jupiter Lend) paid with Base cash (`send`, `fee`
+// of it the network fee): the cash moves first (see move_to_solana); /next makes the swap once it
+// lands. Returns the intent and what the app sends now (nothing when the move is gasless).
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn plan_solana_swap_with_base_cash(
     state: &AppState,
     owner: String,
@@ -2130,14 +2207,14 @@ pub(super) async fn plan_solana_swap_with_base_cash(
     buy_mint: &str,
     amount: u128,
     send: u128,
-) -> Result<(String, Value), ApiError> {
+    fee: u128,
+) -> Result<(String, Vec<Value>), ApiError> {
     let intent_id = id("intent");
-    let deposit = state
-        .layerswap
-        .base_to_solana(evm, &solana, send, &intent_id)
-        .await
-        .map_err(unavailable)?;
-    let tx = json!({"chain":"base","chainId":8453,"to":deposit.to,"data":deposit.data,"value":"0"});
+    let (cash, transfer) = move_to_solana(state, evm, &solana, send, fee, &intent_id).await?;
+    let transactions = transfer
+        .iter()
+        .map(|(to, data)| json!({"chain":"base","chainId":8453,"to":to,"data":data,"value":"0"}))
+        .collect();
     state
         .markets
         .insert_intent(
@@ -2146,10 +2223,10 @@ pub(super) async fn plan_solana_swap_with_base_cash(
                 owner,
                 wallet: solana,
                 chain: "solana".into(),
-                expected: vec![(
-                    deposit.to.to_ascii_lowercase(),
-                    deposit.data.to_ascii_lowercase(),
-                )],
+                expected: transfer
+                    .iter()
+                    .map(|(to, data)| (to.to_ascii_lowercase(), data.to_ascii_lowercase()))
+                    .collect(),
                 request_id: None,
                 status: IntentStatus {
                     intent_id: intent_id.clone(),
@@ -2166,18 +2243,14 @@ pub(super) async fn plan_solana_swap_with_base_cash(
                     get_units: 0,
                     receive_token: String::new(),
                 }),
-                funding: Some(CashMove {
-                    swap_id: deposit.swap_id,
-                    amount_units: deposit.amount_units,
-                    tx_hash: None,
-                }),
+                funding: Some(cash),
                 buy_mint: Some(buy_mint.into()),
                 gas_request_id: None,
                 solana_transfer: false,
             },
         )
         .await?;
-    Ok((intent_id, tx))
+    Ok((intent_id, transactions))
 }
 
 // What the user can spend on this trade: USDC on the asset's chain for a buy, the token for a sell.
@@ -2337,8 +2410,8 @@ pub(super) async fn execute_quote(
             .push(json!({"chain":"base","chainId":8453,"to":swap.to,"data":swap.data,"value":"0"}));
         output = fresh.amount_out;
     } else if stored.funding_units > 0 {
-        // Base cash first: one Base transfer to Layerswap now; the Jupiter buy is signed once the
-        // USDC lands on Solana (GET /v1/intents/{id}/next).
+        // Base cash first (see move_to_solana); the Jupiter buy is signed once the USDC lands on
+        // Solana (GET /v1/intents/{id}/next).
         let evm = evm_wallet.clone().ok_or((
             StatusCode::CONFLICT,
             "Privy Base wallet is not ready".into(),
@@ -2349,26 +2422,24 @@ pub(super) async fn execute_quote(
             .balance_of(BASE_USDC, &evm)
             .await
             .map_err(unavailable)?;
-        if base_cash < stored.funding_units {
+        let (cash, transfer) = move_to_solana(
+            &state,
+            &evm,
+            &wallet,
+            stored.funding_units,
+            stored.funding_fee,
+            &intent_id,
+        )
+        .await?;
+        if base_cash < cash.amount_units {
             return Err(short_of_cash());
         }
-        let deposit = state
-            .layerswap
-            .base_to_solana(&evm, &wallet, stored.funding_units, &intent_id)
-            .await
-            .map_err(unavailable)?;
-        expected.push((
-            deposit.to.to_ascii_lowercase(),
-            deposit.data.to_ascii_lowercase(),
-        ));
-        transactions.push(
-            json!({"chain":"base","chainId":8453,"to":deposit.to,"data":deposit.data,"value":"0"}),
-        );
-        funding = Some(CashMove {
-            swap_id: deposit.swap_id,
-            amount_units: deposit.amount_units,
-            tx_hash: None,
-        });
+        if let Some((to, data)) = transfer {
+            expected.push((to.to_ascii_lowercase(), data.to_ascii_lowercase()));
+            transactions
+                .push(json!({"chain":"base","chainId":8453,"to":to,"data":data,"value":"0"}));
+        }
+        funding = Some(cash);
         output = stored.output_units;
     } else {
         let order = state
@@ -2546,6 +2617,51 @@ pub(super) async fn signed(
     if current.status.state != "pending" || (current.status.stage != "validate" && !second_step) {
         return Ok(Json(current.status));
     }
+    // Moved by Relay without Base gas: the app sent nothing; now that the user has confirmed, their
+    // own session signs the authorization and Relay's solver does the rest.
+    let authorization = current
+        .funding
+        .as_ref()
+        .and_then(|c| c.authorization.clone());
+    if let (Some(auth), false) = (authorization, second_step) {
+        if !body.sent.is_empty() || !body.signed.is_empty() {
+            return Err(bad("signed report does not match the move"));
+        }
+        let evm = user.evm_wallet.clone().filter(|w| !w.is_empty()).ok_or((
+            StatusCode::CONFLICT,
+            "Privy Base wallet is not ready".into(),
+        ))?;
+        if !state
+            .markets
+            .claim_execution(&intent_id, &current, "validate")
+            .await?
+        {
+            let latest = state.markets.get_intent(&intent_id).await?;
+            return Ok(Json(latest.map_or(current.status, |i| i.status)));
+        }
+        let mut updated = current;
+        let request_id = updated
+            .funding
+            .as_ref()
+            .map(|c| c.swap_id.clone())
+            .unwrap_or_default();
+        let moved = match gasless::sign(&state, &headers, &evm, &auth.typed_data).await {
+            Ok(signature) => state
+                .relay_link
+                .submit(&request_id, &auth.api, &signature)
+                .await
+                .map_err(|e| e.to_string()),
+            Err(reason) => Err(reason),
+        };
+        updated.status.stage = "fund".into();
+        if let Err(reason) = moved {
+            eprintln!("intent {intent_id}: gasless move not started: {reason}");
+            updated.status.state = "failed".into();
+            updated.status.error = Some(gasless::NOT_MOVED.into());
+        }
+        state.markets.save_intent(&intent_id, &updated).await?;
+        return Ok(Json(updated.status));
+    }
     let mut status = current.status.clone();
     if current.funding.is_some() && !second_step {
         // Cash moving to Solana starts with a Base transfer the app sent; cash moving to Base with a
@@ -2704,29 +2820,27 @@ pub(super) async fn intent_status(
             "intent belongs to another user".into(),
         ));
     }
-    // Base cash moving to Solana: Layerswap says when it has landed; then the buy can be signed.
+    // Cash moving between chains: Relay or Layerswap says when it has landed; then the rest is signed.
     if current.status.state == "pending" && current.status.stage == "fund" {
         let Some(cash) = &current.funding else {
             return Ok(Json(current.status));
         };
-        let next = match state.layerswap.swap_state(&cash.swap_id).await {
-            Ok(engine_execution::layerswap::SwapState::Completed) => {
+        let moved = if cash.authorization.is_some() {
+            state.relay_link.state(&cash.swap_id).await.ok()
+        } else {
+            state.layerswap.swap_state(&cash.swap_id).await.ok()
+        };
+        let next = match moved {
+            Some(engine_execution::layerswap::SwapState::Completed) => {
                 Some(("sign", "pending", None))
             }
-            Ok(engine_execution::layerswap::SwapState::Failed(reason)) => {
-                let (from, to) = if current.chain == "solana" {
-                    ("Base", "Solana")
-                } else {
-                    ("Solana", "Base")
-                };
-                Some((
-                    "fund",
-                    "failed",
-                    Some(format!(
-                        "Moving your cash from {from} to {to} didn't go through ({reason}). Layerswap returns it to {from}."
-                    )),
-                ))
-            }
+            Some(engine_execution::layerswap::SwapState::Failed(reason)) => Some((
+                "fund",
+                "failed",
+                Some(format!(
+                    "Moving your cash didn't go through ({reason}). It goes back to your balance."
+                )),
+            )),
             // Still moving, or Layerswap didn't answer this time: ask again on the next poll.
             _ => None,
         };
@@ -3092,6 +3206,7 @@ mod tests {
             swap_id: "swap".into(),
             amount_units: 5_400_000,
             tx_hash: None,
+            authorization: None,
         });
         markets
             .insert_intent("intent-funded", &funded)
@@ -3119,6 +3234,36 @@ mod tests {
             .claim_execution("intent-funded", &funded, "sign")
             .await
             .unwrap());
+        // A gasless move (Relay): nothing for the relay endpoint to send, the authorization kept for
+        // /signed, and moves saved before gasless ones existed still load as transfers.
+        let mut gasless = spot_intent("buy", 5_000_000, 1_000);
+        gasless.status.stage = "validate".into();
+        gasless.status.state = "pending".into();
+        gasless.funding = Some(CashMove {
+            swap_id: "0xrequest".into(),
+            amount_units: 5_035_780,
+            tx_hash: None,
+            authorization: Some(Authorization {
+                typed_data: serde_json::json!({"primaryType":"ReceiveWithAuthorization"}),
+                api: "swap".into(),
+            }),
+        });
+        markets
+            .insert_intent("intent-gasless", &gasless)
+            .await
+            .unwrap();
+        assert!(markets
+            .planned_base_txs("intent-gasless", "did:privy:a")
+            .await
+            .unwrap()
+            .is_empty());
+        let stored = markets.get_intent("intent-gasless").await.unwrap().unwrap();
+        assert_eq!(stored.funding.unwrap().authorization.unwrap().api, "swap");
+        let earlier: CashMove = serde_json::from_value(
+            serde_json::json!({"swap_id":"s","amount_units":1,"tx_hash":null}),
+        )
+        .unwrap();
+        assert!(earlier.authorization.is_none());
         // Intents saved before funding existed still load.
         let old: StoredIntent = serde_json::from_value(serde_json::json!({"owner":"o","wallet":"w","chain":"solana",
             "expected":[],"request_id":null,"status":{"intentId":"i","stage":"settle","state":"filled","txIds":[],"error":null},

@@ -608,8 +608,16 @@ pub(super) async fn quote(
         let solana = user.solana_wallet.filter(|w| !w.is_empty());
         let evm = user.evm_wallet.filter(|w| !w.is_empty());
         if lend_option {
-            markets::cash_for_solana(&state, evm.as_deref(), available, units, &currency, rate)
-                .await?;
+            markets::cash_for_solana(
+                &state,
+                evm.as_deref(),
+                solana.as_deref(),
+                available,
+                units,
+                &currency,
+                rate,
+            )
+            .await?;
         } else {
             markets::cash_for_base(&state, &wallet, solana.as_deref(), units, &currency, rate)
                 .await?;
@@ -804,6 +812,7 @@ async fn execute_lend(
         if let Some((send, fee)) = markets::cash_for_solana(
             state,
             evm.as_deref(),
+            Some(&wallet),
             held,
             quote.units,
             &quote.currency,
@@ -815,7 +824,7 @@ async fn execute_lend(
                 StatusCode::CONFLICT,
                 "Privy Base wallet is not ready".into(),
             ))?;
-            let (intent_id, tx) = markets::plan_solana_swap_with_base_cash(
+            let (intent_id, transactions) = markets::plan_solana_swap_with_base_cash(
                 state,
                 owner,
                 wallet,
@@ -823,6 +832,7 @@ async fn execute_lend(
                 share_mint,
                 quote.units,
                 send,
+                fee,
             )
             .await?;
             return Ok(Json(json!({
@@ -833,7 +843,7 @@ async fn execute_lend(
                     {"label":"Where","value":if share_mint == JITO_MINT {"Jito"} else {"Jupiter Lend"}},
                     {"label":"Network fee","value":markets::say_money(fee, &quote.currency, quote.rate)}
                 ],
-                "transactions":[tx],
+                "transactions":transactions,
                 "expiresAtUnixMs":now() + 120_000
             })));
         }

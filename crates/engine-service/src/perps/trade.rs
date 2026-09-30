@@ -203,6 +203,10 @@ struct Funding {
     solana: bool,
     #[serde(default)]
     gas_request_id: Option<String>,
+    // Paid from Base without Base gas: no transaction; once the user confirms, their session signs
+    // Layerswap's authorization and Layerswap's relayer makes the deposit.
+    #[serde(default)]
+    gasless: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Intent {
@@ -575,32 +579,56 @@ pub(crate) async fn execute_quote(
             tx_hash: None,
             solana: true,
             gas_request_id: gas.map(|(id, _)| id),
+            gasless: false,
         })
     } else if quote.funding_units > 0 {
-        let deposit = state
+        let gasless = state
             .layerswap
-            .base_to_paradex(
+            .base_to_paradex_gasless(
                 &quote.wallet,
                 &quote.account,
                 quote.funding_units,
                 &intent_id,
             )
-            .await
-            .map_err(|error| {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("Couldn't set up the move to Paradex: {error}"),
+            .await;
+        if let Ok(deposit) = gasless {
+            Some(Funding {
+                swap_id: deposit.swap_id,
+                to: String::new(),
+                data: String::new(),
+                amount_units: deposit.amount_units,
+                tx_hash: None,
+                solana: false,
+                gas_request_id: None,
+                gasless: true,
+            })
+        } else {
+            let deposit = state
+                .layerswap
+                .base_to_paradex(
+                    &quote.wallet,
+                    &quote.account,
+                    quote.funding_units,
+                    &intent_id,
                 )
-            })?;
-        Some(Funding {
-            swap_id: deposit.swap_id,
-            to: deposit.to,
-            data: deposit.data,
-            amount_units: deposit.amount_units,
-            tx_hash: None,
-            solana: false,
-            gas_request_id: None,
-        })
+                .await
+                .map_err(|error| {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("Couldn't set up the move to Paradex: {error}"),
+                    )
+                })?;
+            Some(Funding {
+                swap_id: deposit.swap_id,
+                to: deposit.to,
+                data: deposit.data,
+                amount_units: deposit.amount_units,
+                tx_hash: None,
+                solana: false,
+                gas_request_id: None,
+                gasless: false,
+            })
+        }
     } else {
         None
     };
@@ -609,6 +637,7 @@ pub(crate) async fn execute_quote(
     } else {
         funding
             .iter()
+            .filter(|f| !f.gasless)
             .map(|f| json!({"chain":"base","chainId":8453,"to":f.to,"data":f.data,"value":"0"}))
             .collect()
     };
@@ -1229,6 +1258,12 @@ pub(crate) async fn signed(
                 )
             })?;
         Some(signature)
+    } else if planned.funding.as_ref().is_some_and(|f| f.gasless) {
+        // Nothing sent from the app: the authorization is signed once the intent is claimed.
+        if !body.sent.is_empty() || !body.signed.is_empty() {
+            return Err(bad("expected no transactions for this move"));
+        }
+        None
     } else if planned.funding.is_some() {
         let [sent] = body.sent.as_slice() else {
             return Err(bad("expected the transfer to Paradex"));
@@ -1256,7 +1291,7 @@ pub(crate) async fn signed(
     let answer = current.status.clone();
     tokio::spawn(async move {
         if current.funding.is_some() {
-            match await_funding(&state, &current).await {
+            match await_funding(&state, &headers, &current).await {
                 Ok(()) => {
                     // The order window starts now, not when the plan was confirmed.
                     current.status.stage = "execute".into();
@@ -1317,7 +1352,7 @@ pub(crate) async fn planned_funding(
         .await?
         .filter(|i| i.quote.owner == owner && i.status.stage == "validate")
         .and_then(|i| i.funding)
-        .filter(|f| !f.solana)
+        .filter(|f| !f.solana && !f.gasless)
         .map(|f| (f.to, f.data)))
 }
 pub(crate) fn is_tx_hash(value: &str) -> bool {
@@ -1325,14 +1360,39 @@ pub(crate) fn is_tx_hash(value: &str) -> bool {
         && value.starts_with("0x")
         && value[2..].bytes().all(|b| b.is_ascii_hexdigit())
 }
-// Waits for the reported Base transfer to be the planned one and to succeed, then for Layerswap to
-// deliver it to the Paradex account. The error is what the user reads.
-async fn await_funding(state: &AppState, intent: &Intent) -> Result<(), String> {
+// Waits for the reported Base transfer to be the planned one and to succeed (or, gasless, has the
+// user's session sign Layerswap's authorization), then for Layerswap to deliver it to the Paradex
+// account. The error is what the user reads.
+async fn await_funding(
+    state: &AppState,
+    headers: &HeaderMap,
+    intent: &Intent,
+) -> Result<(), String> {
     let funding = intent.funding.as_ref().ok_or("No transfer was planned")?;
-    let hash = funding
-        .tx_hash
-        .as_deref()
-        .ok_or("No transfer to Paradex was reported; nothing was ordered")?;
+    if funding.gasless {
+        let not_moved = |reason: String| {
+            eprintln!("perps margin move not started: {reason}");
+            "Moving your margin didn't go through, so nothing left your balance and nothing was ordered".to_string()
+        };
+        let typed = state
+            .layerswap
+            .gasless_authorization(&funding.swap_id, &intent.quote.wallet, funding.amount_units)
+            .await
+            .map_err(|e| not_moved(e.to_string()))?;
+        let signature = gasless::sign(state, headers, &intent.quote.wallet, &typed)
+            .await
+            .map_err(not_moved)?;
+        state
+            .layerswap
+            .authorize(&funding.swap_id, &intent.quote.wallet, &signature)
+            .await
+            .map_err(|e| not_moved(e.to_string()))?;
+    }
+    let hash = match funding.tx_hash.as_deref() {
+        Some(hash) => hash,
+        None if funding.gasless => "",
+        None => return Err("No transfer to Paradex was reported; nothing was ordered".into()),
+    };
     let deadline = tokio::time::Instant::now() + FUNDING_LIMIT;
     let pause = || tokio::time::sleep(std::time::Duration::from_secs(4));
     while funding.solana {
@@ -1347,7 +1407,7 @@ async fn await_funding(state: &AppState, intent: &Intent) -> Result<(), String> 
             _ => pause().await,
         }
     }
-    while !funding.solana {
+    while !funding.solana && !funding.gasless {
         if tokio::time::Instant::now() > deadline {
             return Err(
                 "Your transfer to Paradex hasn't confirmed on Base; nothing was ordered".into(),
@@ -1648,10 +1708,19 @@ mod tests {
             tx_hash: Some(format!("0x{}", "ab".repeat(32))),
             solana: false,
             gas_request_id: None,
+            gasless: false,
         });
         let back: Intent = serde_json::from_str(&serde_json::to_string(&funded).unwrap()).unwrap();
         assert_eq!(back.quote.funding_units, 10_705_000);
         assert_eq!(back.funding.unwrap().amount_units, 10_705_000);
+        // Rows written before gasless moves existed load as plain transfers.
+        let mut earlier = serde_json::to_value(&funded).unwrap();
+        earlier["funding"]
+            .as_object_mut()
+            .unwrap()
+            .remove("gasless");
+        let earlier: Intent = serde_json::from_value(earlier).unwrap();
+        assert!(!earlier.funding.unwrap().gasless);
         // Rows written before funding existed still load.
         let mut old = serde_json::to_value(sample_intent()).unwrap();
         old.as_object_mut().unwrap().remove("funding");

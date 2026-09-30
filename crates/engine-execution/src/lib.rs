@@ -5,6 +5,7 @@ pub mod funding;
 pub mod gateway;
 pub mod layerswap;
 pub mod perps;
+pub mod relay_link;
 pub mod solana;
 pub mod swaps;
 pub mod yield_positions {}
