@@ -1,4 +1,5 @@
 import {createServer} from 'node:http';
+import {createHash} from 'node:crypto';
 import {PrivyClient} from '@privy-io/node';
 import {authMessage, onboardingMessage, subkeyRegistrationMessage, recoverOnboardingPublicKey} from './paradex-onboarding.mjs';
 import {deriveTradeSubkey, signSubkeyAuth, signParadexOrder} from './trade-subkey.mjs';
@@ -44,8 +45,26 @@ async function signerStatus(evm, address) {
   };
 }
 
+async function ensureReceivingWallet(userId, chainType) {
+  const externalId = `atlas_${chainType}_${createHash('sha256').update(userId).digest('hex').slice(0, 32)}`;
+  for await (const wallet of privy.wallets().list({external_id: externalId})) {
+    if (wallet.chain_type !== chainType || !wallet.address) {
+      throw new Error('Atlas receiving wallet does not match its chain');
+    }
+    return wallet;
+  }
+  return privy.wallets().create({
+    chain_type: chainType,
+    owner: {user_id: userId},
+    external_id: externalId,
+    display_name: `Atlas ${chainType.toUpperCase()}`,
+    idempotency_key: externalId,
+  });
+}
+
 const server = createServer(async (request, response) => {
   const verifyOnly = request.method === 'POST' && request.url === '/verify';
+  const ensureWallet = request.method === 'POST' && request.url === '/wallet/ensure';
   const signOnboarding = request.method === 'POST' &&
     request.url === '/paradex/onboarding-signature';
   const signAuth = request.method === 'POST' && request.url === '/paradex/auth-signature';
@@ -55,7 +74,7 @@ const server = createServer(async (request, response) => {
   const authSubkey = request.method === 'POST' && request.url === '/paradex/subkey-auth-signature';
   const signOrder = request.method === 'POST' && request.url === '/paradex/order-signature';
   const relayEvm = request.method === 'POST' && request.url === '/relay/evm-transaction';
-  if (!verifyOnly && !signOnboarding && !signAuth && !checkSigner &&
+  if (!verifyOnly && !ensureWallet && !signOnboarding && !signAuth && !checkSigner &&
       !registerSubkey && !authSubkey && !signOrder && !relayEvm) {
     response.writeHead(404).end();
     return;
@@ -97,6 +116,19 @@ const server = createServer(async (request, response) => {
     const solanaWallet = wallets.find((account) => account.chain_type === 'solana')?.address ?? null;
     if (verifyOnly) {
       send(response, 200, {userId, evmWallet, solanaWallet});
+      return;
+    }
+    if (ensureWallet) {
+      if (!['sui', 'near'].includes(input.chainType)) {
+        send(response, 400, {error: 'unsupported receiving wallet chain'});
+        return;
+      }
+      try {
+        const wallet = await ensureReceivingWallet(userId, input.chainType);
+        send(response, 200, {userId, chainType: input.chainType, address: wallet.address});
+      } catch {
+        send(response, 503, {error: 'Privy receiving wallet unavailable'});
+      }
       return;
     }
     if (typeof input.walletAddress !== 'string' ||

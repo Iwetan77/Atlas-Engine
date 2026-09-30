@@ -25,6 +25,7 @@ pub(super) struct NearState {
 struct StoredQuote {
     owner: String,
     wallet: String,
+    recipient: String,
     asset: Token,
     amount: u128,
     minimum_out: u128,
@@ -390,6 +391,189 @@ fn recipient<'a>(
         _ => Err(bad("unsupported destination chain")),
     }
 }
+async fn destination(
+    state: &AppState,
+    headers: &HeaderMap,
+    token: &Token,
+    user: &app_balance::VerifiedWallets,
+) -> Result<String, ApiError> {
+    if !matches!(token.blockchain.as_str(), "sui" | "near") {
+        return recipient(token, user).map(str::to_owned);
+    }
+    let AuthMode::Privy { bridge_url, http } = &state.auth else {
+        return Err(conflict("Privy identity is required for this destination"));
+    };
+    let access_token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or((
+            StatusCode::UNAUTHORIZED,
+            "Privy access token required".into(),
+        ))?;
+    let response = http
+        .post(format!("{bridge_url}/wallet/ensure"))
+        .json(&json!({"accessToken":access_token,"chainType":token.blockchain}))
+        .send()
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Privy receiving wallet unavailable".into(),
+            )
+        })?;
+    if !response.status().is_success() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Privy receiving wallet unavailable".into(),
+        ));
+    }
+    let body: Value = response.json().await.map_err(internal)?;
+    if body["userId"].as_str() != Some(user.user_id.as_str())
+        || body["chainType"].as_str() != Some(token.blockchain.as_str())
+    {
+        return Err(venue("Privy receiving wallet identity mismatch"));
+    }
+    let address = body["address"]
+        .as_str()
+        .ok_or_else(|| venue("Privy omitted receiving wallet"))?;
+    let valid = match token.blockchain.as_str() {
+        "sui" => {
+            address.len() == 66
+                && address.starts_with("0x")
+                && address[2..].bytes().all(|b| b.is_ascii_hexdigit())
+        }
+        "near" => address.len() == 64 && address.bytes().all(|b| b.is_ascii_hexdigit()),
+        _ => false,
+    };
+    if !valid {
+        return Err(venue("Privy returned an invalid receiving wallet address"));
+    }
+    Ok(address.to_owned())
+}
+
+fn sui_coin_type(value: &str) -> bool {
+    let parts: Vec<_> = value.split("::").collect();
+    parts.len() == 3
+        && parts[0].starts_with("0x")
+        && (3..=66).contains(&parts[0].len())
+        && parts[0][2..].bytes().all(|b| b.is_ascii_hexdigit())
+        && parts[1..].iter().all(|part| {
+            !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        })
+}
+
+async fn search_sui_unlisted(
+    state: &AppState,
+    query: &str,
+    currency: &str,
+    rate: u128,
+) -> Vec<Value> {
+    if query.len() < 2 || query.len() > 160 {
+        return Vec::new();
+    }
+    let Ok(response) = state
+        .near
+        .icon_http
+        .get("https://api.dexscreener.com/latest/dex/search")
+        .query(&[("q", query)])
+        .send()
+        .await
+    else {
+        return Vec::new();
+    };
+    let Ok(body) = response.error_for_status() else {
+        return Vec::new();
+    };
+    let Ok(body) = body.json::<Value>().await else {
+        return Vec::new();
+    };
+    let Some(pairs) = body["pairs"].as_array() else {
+        return Vec::new();
+    };
+    let mut candidates = HashMap::<String, (f64, f64)>::new();
+    for pair in pairs {
+        if pair["chainId"].as_str() != Some("sui") {
+            continue;
+        }
+        let Some(coin) = pair["baseToken"]["address"].as_str() else {
+            continue;
+        };
+        let symbol = pair["baseToken"]["symbol"].as_str().unwrap_or("");
+        let name = pair["baseToken"]["name"].as_str().unwrap_or("");
+        if !sui_coin_type(coin)
+            || !(coin.eq_ignore_ascii_case(query)
+                || symbol.eq_ignore_ascii_case(query)
+                || symbol
+                    .to_ascii_lowercase()
+                    .contains(&query.to_ascii_lowercase())
+                || name
+                    .to_ascii_lowercase()
+                    .contains(&query.to_ascii_lowercase()))
+        {
+            continue;
+        }
+        let liquidity = pair["liquidity"]["usd"].as_f64().unwrap_or_default();
+        let price = pair["priceUsd"]
+            .as_str()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or_default();
+        if liquidity < 5_000.0 || !liquidity.is_finite() || price <= 0.0 || !price.is_finite() {
+            continue;
+        }
+        let entry = candidates.entry(coin.to_owned()).or_insert((0.0, 0.0));
+        if liquidity > entry.0 {
+            *entry = (liquidity, price);
+        }
+    }
+    let mut candidates: Vec<_> = candidates.into_iter().collect();
+    candidates.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0));
+    let mut result = Vec::new();
+    for (coin, (_, price)) in candidates.into_iter().take(5) {
+        let graphql = json!({
+            "query":"query($coinType:String!){coinMetadata(coinType:$coinType){symbol name decimals iconUrl}}",
+            "variables":{"coinType":coin}
+        });
+        let Ok(response) = state
+            .near
+            .icon_http
+            .post("https://graphql.mainnet.sui.io/graphql")
+            .json(&graphql)
+            .send()
+            .await
+        else {
+            continue;
+        };
+        let Ok(body) = response.error_for_status() else {
+            continue;
+        };
+        let Ok(body) = body.json::<Value>().await else {
+            continue;
+        };
+        let meta = &body["data"]["coinMetadata"];
+        let (Some(symbol), Some(name), Some(decimals)) = (
+            meta["symbol"].as_str(),
+            meta["name"].as_str(),
+            meta["decimals"].as_u64(),
+        ) else {
+            continue;
+        };
+        if symbol.is_empty() || name.is_empty() || decimals > 18 {
+            continue;
+        }
+        let display = price * (rate as f64 / 1_000_000.0);
+        let icon = meta["iconUrl"]
+            .as_str()
+            .filter(|url| url.starts_with("https://"));
+        result.push(json!({"assetId":format!("near:sui:{coin}"),"symbol":symbol,
+            "name":format!("{name} on sui"),"kind":"crypto","chain":"sui",
+            "price":{"amount":format!("{display:.12}").trim_end_matches('0').trim_end_matches('.'),
+                "currency":currency},"change24hPct":null,"iconUrl":icon,"verified":false,
+            "tradeable":false}));
+    }
+    result
+}
+
 pub(super) async fn search_assets(
     state: &AppState,
     query: &str,
@@ -436,6 +620,7 @@ pub(super) async fn search_assets(
             break;
         }
     }
+    out.extend(search_sui_unlisted(state, &query, currency, rate).await);
     Ok(out)
 }
 pub(super) async fn quote(
@@ -448,6 +633,12 @@ pub(super) async fn quote(
     }
     markets::checked_currency(&req.amount.currency)?;
     let user = app_balance::verified_wallets(&state, &headers).await?;
+    if req.asset_id.starts_with("near:sui:") {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Sui token is discoverable, but its local swap route is not ready".into(),
+        ));
+    }
     let token = state
         .near
         .tokens()
@@ -455,7 +646,7 @@ pub(super) async fn quote(
         .into_iter()
         .find(|t| format!("near:{}", t.asset_id) == req.asset_id && supported(t))
         .ok_or((StatusCode::NOT_FOUND, "1Click asset not found".into()))?;
-    let destination = recipient(&token, &user)?;
+    let destination = destination(&state, &headers, &token, &user).await?;
     let wallet = user
         .evm_wallet
         .as_deref()
@@ -485,7 +676,7 @@ pub(super) async fn quote(
         BASE_USDC_1CLICK,
         &token.asset_id,
         &units,
-        destination,
+        &destination,
         wallet,
         &deadline,
         true,
@@ -510,6 +701,7 @@ pub(super) async fn quote(
         StoredQuote {
             owner: user.user_id,
             wallet: wallet.into(),
+            recipient: destination,
             asset: token.clone(),
             amount,
             minimum_out: minimum,
@@ -549,7 +741,10 @@ pub(super) async fn execute(
     if stored.expires < now() {
         return Err(conflict("quote expired; request a fresh quote"));
     }
-    let destination = recipient(&stored.asset, &user)?;
+    let destination = destination(&state, &headers, &stored.asset, &user).await?;
+    if destination != stored.recipient {
+        return Err(conflict("receiving wallet changed; request a fresh quote"));
+    }
     if user.evm_wallet.as_deref() != Some(&stored.wallet) {
         return Err(conflict("Privy wallet changed; request a fresh quote"));
     }
@@ -585,7 +780,7 @@ pub(super) async fn execute(
         BASE_USDC_1CLICK,
         &stored.asset.asset_id,
         &amount,
-        destination,
+        &destination,
         &stored.wallet,
         &deadline,
         false,
@@ -796,6 +991,16 @@ mod tests {
         assert_eq!(usd_micros("0.987654321").unwrap(), 987_654);
         assert_eq!(usd_micros("12").unwrap(), 12_000_000);
         assert!(usd_micros("NaN").is_err());
+    }
+    #[test]
+    fn sui_discovery_accepts_coin_types_but_not_wallet_addresses() {
+        assert!(sui_coin_type(
+            "0xdeeb7a4662eec9f2f3def03fb937a663dddaa2e215b8078a284d026b7946c270::deep::DEEP"
+        ));
+        assert!(!sui_coin_type(
+            "0xdeeb7a4662eec9f2f3def03fb937a663dddaa2e215b8078a284d026b7946c270"
+        ));
+        assert!(!sui_coin_type("javascript:evil::deep::DEEP"));
     }
     #[test]
     fn destination_requires_verified_wallet() {
