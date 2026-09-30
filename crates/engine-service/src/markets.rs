@@ -139,9 +139,9 @@ fn token_asset(token: &Value, verified: bool) -> Option<Asset> {
     let xstock = has("xstocks") || name.ends_with("xStock");
     // Launchpad coins (pump.fun, bonk.fun, stonkfun, LaunchLab, Meteora DBC…) are memes even when
     // Jupiter doesn't tag them; their mints often end in the launchpad's suffix.
-    let launched = token["firstPool"]["launchpad"]
-        .as_str()
-        .is_some_and(|l| !l.is_empty())
+    let launched = [&token["launchpad"], &token["firstPool"]["launchpad"]]
+        .iter()
+        .any(|l| l.as_str().is_some_and(|l| !l.is_empty()))
         || mint.ends_with("pump")
         || mint.ends_with("bonk");
     // Tokenized equities come from several issuers (xStocks, Backpack Securities, Tessera), not all
@@ -1603,7 +1603,7 @@ mod tests {
         );
         assert_eq!(solana_asset(&cate).unwrap().kind, "meme");
         cate["id"] = json!("ZCATmint");
-        cate["firstPool"] = json!({"launchpad":"stonkfun"});
+        cate["launchpad"] = json!("stonkfun");
         assert_eq!(solana_asset(&cate).unwrap().kind, "meme");
         assert_eq!(
             solana_asset(&token("doge", "DOGE", "Dogecoin", &["verified"], true, 5e6))
