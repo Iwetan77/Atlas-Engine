@@ -17,6 +17,12 @@ const SUBMIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
 // Status only gives up on a submission once it cannot still be running: past the plan's expiry
 // (the latest it could have been claimed) plus the submission bound, with a margin.
 const SUBMIT_GRACE_MS: u64 = 180_000;
+// Margin missing from the Paradex account is moved from the user's Base USDC through Layerswap
+// (about a minute on 2026-09-30). Room on top of the shortfall: 1% plus 10 cents covers Layerswap's
+// fee (under a cent then) and some price drift before the order goes in. Units: 1e12 = $1.
+const FUNDING_ROOM_FLAT: u128 = 100_000_000_000;
+const FUNDING_LIMIT: std::time::Duration = std::time::Duration::from_secs(600);
+const FUNDING_GRACE_MS: u64 = 900_000;
 
 #[derive(Clone, Default)]
 pub(crate) struct TradeState {
@@ -100,7 +106,14 @@ impl TradeState {
         }
         Ok(())
     }
-    async fn claim_intent(&self, id: &str, owner: &str) -> Result<(Intent, bool), ApiError> {
+    // Moves a confirmed plan out of `validate` exactly once. A funded plan may be claimed after its
+    // window: the user's transfer to Paradex is already on its way, and the order still re-checks price.
+    async fn claim_intent(
+        &self,
+        id: &str,
+        owner: &str,
+        funding_tx: Option<String>,
+    ) -> Result<(Intent, bool), ApiError> {
         let mut current = self
             .get_intent(id)
             .await?
@@ -114,15 +127,24 @@ impl TradeState {
         if current.status.stage != "validate" {
             return Ok((current, false));
         }
-        if now() >= current.expires {
+        let funded = current.funding.is_some();
+        if !funded && now() >= current.expires {
             return Err((StatusCode::GONE, "perps execution plan expired".into()));
         }
-        current.status.stage = "execute".into();
+        if let Some(funding) = current.funding.as_mut() {
+            funding.tx_hash = funding_tx;
+        }
+        current.status.stage = if funded { "fund" } else { "execute" }.into();
         if let Some(pg) = &self.postgres {
             let payload = serde_json::to_string(&current).map_err(internal)?;
+            let not_after = if funded {
+                i64::MIN
+            } else {
+                i64::try_from(now()).map_err(internal)?
+            };
             let changed=pg.execute(
-                "UPDATE atlas_perp_intents SET payload=$2,stage='execute' WHERE intent_id=$1 AND owner=$3 AND stage='validate' AND expires_at_ms>$4",
-                &[&id,&payload,&owner,&i64::try_from(now()).map_err(internal)?]
+                "UPDATE atlas_perp_intents SET payload=$2,stage=$5 WHERE intent_id=$1 AND owner=$3 AND stage='validate' AND expires_at_ms>$4",
+                &[&id,&payload,&owner,&not_after,&current.status.stage]
             ).await.map_err(internal)?;
             if changed == 1 {
                 return Ok((current, true));
@@ -140,7 +162,7 @@ impl TradeState {
         if stored.status.stage != "validate" {
             return Ok((stored.clone(), false));
         }
-        stored.status.stage = "execute".into();
+        *stored = current;
         Ok((stored.clone(), true))
     }
 }
@@ -159,6 +181,19 @@ struct Quote {
     position_id: Option<String>,
     currency: String,
     margin: String,
+    // USDC (6 decimals) to move from the Base wallet into Paradex before the order; 0 when the
+    // account already holds enough.
+    #[serde(default)]
+    funding_units: u128,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct Funding {
+    swap_id: String,
+    to: String,
+    data: String,
+    amount_units: u128,
+    #[serde(default)]
+    tx_hash: Option<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Intent {
@@ -167,6 +202,8 @@ struct Intent {
     order_id: Option<String>,
     status: markets::IntentStatus,
     expires: u64,
+    #[serde(default)]
+    funding: Option<Funding>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -375,16 +412,33 @@ pub(crate) async fn quotes(
     let size = order_size(notional, price, increment, min, liquidity)?;
     let fee = mul(mul(size, price)?, fee_rate)?;
     let collateral = units(venue_str(&account_data, "free_collateral")?)?;
-    if collateral
-        < margin
-            .checked_add(fee)
-            .ok_or((StatusCode::BAD_REQUEST, "margin too large".into()))?
-    {
+    let needed = margin
+        .checked_add(fee)
+        .ok_or((StatusCode::BAD_REQUEST, "margin too large".into()))?;
+    let funding_units = if collateral >= needed {
+        0
+    } else if trading_env()? == "prod" {
+        let usdc_units = funding_amount(needed, collateral)?;
+        let available = state
+            .markets
+            .base
+            .balance_of(engine_execution::swaps::uniswap::BASE_USDC, &wallet)
+            .await
+            .map_err(internal)?;
+        if available < usdc_units {
+            return Err((
+                StatusCode::CONFLICT,
+                "Not enough in your balance for this margin".into(),
+            ));
+        }
+        usdc_units
+    } else {
+        // Layerswap only reaches Paradex mainnet; a testnet account must already hold collateral.
         return Err((
             StatusCode::CONFLICT,
             "Insufficient Paradex free collateral".into(),
         ));
-    }
+    };
     let quote_id = new_id("quote");
     let expires = now() + QUOTE_MS;
     state.perps_trade.quotes.lock().map_err(internal)?.insert(
@@ -403,10 +457,17 @@ pub(crate) async fn quotes(
             position_id: None,
             currency: currency.clone(),
             margin: body.margin.amount.clone(),
+            funding_units,
         },
     );
+    let funding = if funding_units > 0 {
+        json!({"amount":rate_money(funding_units * 1_000_000,&currency,rate)?})
+    } else {
+        Value::Null
+    };
     Ok(Json(json!({
         "quoteId":quote_id,"marketId":body.market_id,"side":body.side,"leverage":body.leverage,
+        "funding":funding,
         "margin":money(&body.margin.amount,&currency),"size":format_units(size),
         "notional":rate_money(mul(size,price)?,&currency,rate)?,
         "entryPrice":rate_money(price,&currency,rate)?,
@@ -460,6 +521,53 @@ pub(crate) async fn execute_quote(
         ));
     }
     let intent_id = new_id("open");
+    let funding = if quote.funding_units > 0 {
+        let deposit = state
+            .layerswap
+            .base_to_paradex(
+                &quote.wallet,
+                &quote.account,
+                quote.funding_units,
+                &intent_id,
+            )
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Couldn't set up the move to Paradex: {error}"),
+                )
+            })?;
+        Some(Funding {
+            swap_id: deposit.swap_id,
+            to: deposit.to,
+            data: deposit.data,
+            amount_units: deposit.amount_units,
+            tx_hash: None,
+        })
+    } else {
+        None
+    };
+    let transactions: Vec<Value> = funding
+        .iter()
+        .map(|f| json!({"chain":"base","chainId":8453,"to":f.to,"data":f.data,"value":"0"}))
+        .collect();
+    let mut summary = vec![
+        json!({"label":"Market","value":quote.market}),
+        json!({"label":"Side","value":quote.side}),
+        json!({"label":"Size","value":quote.size}),
+        json!({"label":"Leverage","value":format!("{}x",quote.leverage)}),
+        json!({"label":"Margin","value":format!("{} {}",quote.margin,quote.currency)}),
+    ];
+    if let Some(f) = &funding {
+        summary.push(
+            json!({"label":"Moved from your balance to Paradex","value":format!(
+                "{}.{:06} USDC",
+                f.amount_units / 1_000_000,
+                f.amount_units % 1_000_000
+            )}),
+        );
+    }
+    summary.push(json!({"label":"Liquidation price","value":"Shown once open"}));
     let status = markets::IntentStatus {
         intent_id: intent_id.clone(),
         stage: "validate".into(),
@@ -478,16 +586,13 @@ pub(crate) async fn execute_quote(
                 order_id: None,
                 status,
                 expires,
+                funding,
             },
         )
         .await?;
     Ok(Json(
-        json!({"intentId":intent_id,"kind":"perp_open","summary":[
-        {"label":"Market","value":quote.market},{"label":"Side","value":quote.side},
-        {"label":"Size","value":quote.size},{"label":"Leverage","value":format!("{}x",quote.leverage)},
-        {"label":"Margin","value":format!("{} {}",quote.margin,quote.currency)},
-        {"label":"Liquidation price","value":"Shown once open"}
-    ],"transactions":[],"expiresAtUnixMs":expires}),
+        json!({"intentId":intent_id,"kind":"perp_open","summary":summary,
+        "transactions":transactions,"expiresAtUnixMs":expires}),
     ))
 }
 fn signed_number(value: &str) -> Result<i128, ApiError> {
@@ -614,6 +719,7 @@ pub(crate) async fn close_quote(
             position_id: Some(position_id.clone()),
             currency: currency.into(),
             margin: format_units(basis),
+            funding_units: 0,
         },
     );
     Ok(Json(json!({"quoteId":quote_id,"positionId":position_id,
@@ -714,6 +820,7 @@ pub(crate) async fn execute_close(
                 order_id: None,
                 status,
                 expires,
+                funding: None,
             },
         )
         .await?;
@@ -1021,20 +1128,64 @@ pub(crate) async fn signed(
     body: markets::Submission,
 ) -> Result<Json<markets::IntentStatus>, ApiError> {
     let user = app_balance::verified_wallets(&state, &headers).await?;
-    if !body.sent.is_empty() || !body.signed.is_empty() {
-        return Err(bad("Paradex confirmation plan has no app transactions"));
-    }
-    let (current, claimed) = state
+    let planned = state
         .perps_trade
-        .claim_intent(&intent_id, &user.user_id)
+        .get_intent(&intent_id)
+        .await?
+        .ok_or((StatusCode::NOT_FOUND, "perps intent not found".into()))?;
+    // A funded plan has exactly one app transaction: the Base transfer to Paradex. It's checked
+    // against the plan (sender, contract, calldata, receipt) before anything waits on it.
+    let funding_tx = if planned.funding.is_some() {
+        let [sent] = body.sent.as_slice() else {
+            return Err(bad("expected the transfer to Paradex"));
+        };
+        if !body.signed.is_empty() || sent.chain != "base" || !is_tx_hash(&sent.id) {
+            return Err(bad("expected the transfer to Paradex"));
+        }
+        Some(sent.id.to_ascii_lowercase())
+    } else {
+        if !body.sent.is_empty() || !body.signed.is_empty() {
+            return Err(bad("Paradex confirmation plan has no app transactions"));
+        }
+        None
+    };
+    let (mut current, claimed) = state
+        .perps_trade
+        .claim_intent(&intent_id, &user.user_id, funding_tx)
         .await?;
     if !claimed {
         return Ok(Json(current.status));
     }
-    // Submitting takes a dozen venue and signer calls. Answer once the intent is claimed and let the
-    // app poll GET /v1/intents/{id}; the stable client ID keeps the order single however this ends.
+    // Submitting takes a dozen venue and signer calls (and a funded plan first waits about a minute
+    // for its margin to reach Paradex). Answer once the intent is claimed and let the app poll
+    // GET /v1/intents/{id}; the stable client ID keeps the order single however this ends.
     let answer = current.status.clone();
     tokio::spawn(async move {
+        if current.funding.is_some() {
+            match await_funding(&state, &current).await {
+                Ok(()) => {
+                    // The order window starts now, not when the plan was confirmed.
+                    current.status.stage = "execute".into();
+                    current.expires = now() + QUOTE_MS;
+                    if let Err(error) = state
+                        .perps_trade
+                        .save_intent(&intent_id, current.clone())
+                        .await
+                    {
+                        eprintln!("perps intent {intent_id} could not be saved: {}", error.1);
+                    }
+                }
+                Err(message) => {
+                    current.status.stage = "settle".into();
+                    current.status.state = "failed".into();
+                    current.status.error = Some(message);
+                    if let Err(error) = state.perps_trade.save_intent(&intent_id, current).await {
+                        eprintln!("perps intent {intent_id} could not be saved: {}", error.1);
+                    }
+                    return;
+                }
+            }
+        }
         let result =
             match tokio::time::timeout(SUBMIT_LIMIT, submit_confirmed(&state, &headers, &current))
                 .await
@@ -1051,6 +1202,75 @@ pub(crate) async fn signed(
         }
     });
     Ok(Json(answer))
+}
+// USDC (6 decimals) to move so the account covers `needed` (1e12 = $1), with room for fees and drift.
+fn funding_amount(needed: u128, collateral: u128) -> Result<u128, ApiError> {
+    let shortfall = needed.saturating_sub(collateral);
+    shortfall
+        .checked_add(shortfall / 100 + FUNDING_ROOM_FLAT)
+        .map(|with_room| with_room.div_ceil(1_000_000))
+        .ok_or((StatusCode::BAD_REQUEST, "margin too large".into()))
+}
+fn is_tx_hash(value: &str) -> bool {
+    value.len() == 66
+        && value.starts_with("0x")
+        && value[2..].bytes().all(|b| b.is_ascii_hexdigit())
+}
+// Waits for the reported Base transfer to be the planned one and to succeed, then for Layerswap to
+// deliver it to the Paradex account. The error is what the user reads.
+async fn await_funding(state: &AppState, intent: &Intent) -> Result<(), String> {
+    let funding = intent.funding.as_ref().ok_or("No transfer was planned")?;
+    let hash = funding
+        .tx_hash
+        .as_deref()
+        .ok_or("No transfer to Paradex was reported; nothing was ordered")?;
+    let deadline = tokio::time::Instant::now() + FUNDING_LIMIT;
+    let pause = || tokio::time::sleep(std::time::Duration::from_secs(4));
+    loop {
+        if tokio::time::Instant::now() > deadline {
+            return Err(
+                "Your transfer to Paradex hasn't confirmed on Base; nothing was ordered".into(),
+            );
+        }
+        let Ok(tx) =
+            markets::base_rpc(&state.markets, "eth_getTransactionByHash", json!([hash])).await
+        else {
+            pause().await;
+            continue;
+        };
+        if tx.is_null() {
+            pause().await;
+            continue;
+        }
+        let field = |name: &str| tx[name].as_str().unwrap_or_default().to_ascii_lowercase();
+        if !field("from").eq_ignore_ascii_case(&intent.quote.wallet)
+            || field("to") != funding.to
+            || field("input") != funding.data
+        {
+            return Err("The reported transfer doesn't match the plan; nothing was ordered".into());
+        }
+        match markets::base_rpc(&state.markets, "eth_getTransactionReceipt", json!([hash])).await {
+            Ok(receipt) if receipt["status"].as_str() == Some("0x1") => break,
+            Ok(receipt) if !receipt.is_null() => {
+                return Err("Your transfer to Paradex failed on Base, so nothing left your balance and nothing was ordered".into());
+            }
+            _ => pause().await,
+        }
+    }
+    loop {
+        if tokio::time::Instant::now() > deadline {
+            return Err("Moving your margin to Paradex is taking longer than usual. It will show in your balance when it lands; nothing was ordered".into());
+        }
+        match state.layerswap.swap_state(&funding.swap_id).await {
+            Ok(engine_execution::layerswap::SwapState::Completed) => return Ok(()),
+            Ok(engine_execution::layerswap::SwapState::Failed(reason)) => {
+                return Err(format!(
+                    "Moving your margin to Paradex failed ({reason}). Layerswap refunds failed transfers to your wallet; nothing was ordered"
+                ));
+            }
+            _ => pause().await,
+        }
+    }
 }
 pub(crate) async fn status(
     state: AppState,
@@ -1069,16 +1289,39 @@ pub(crate) async fn status(
             "intent belongs to another user".into(),
         ));
     }
-    // Never claimed before its plan expired, so it can never be submitted.
-    if current.status.stage == "validate" && now() >= current.expires {
+    // Never claimed before its plan expired, so it can never be submitted. (A funded plan can still be
+    // claimed late, once its transfer is reported, so it gets longer.)
+    let claim_window = if current.funding.is_some() {
+        FUNDING_GRACE_MS
+    } else {
+        0
+    };
+    if current.status.stage == "validate" && now() >= current.expires + claim_window {
         current.status.stage = "settle".into();
         current.status.state = "failed".into();
-        current.status.error =
-            Some("The confirmation didn't reach Atlas in time; nothing was ordered".into());
+        current.status.error = Some(if current.funding.is_some() {
+            "The confirmation didn't reach Atlas; nothing was ordered. If your transfer to Paradex went through, it shows in your balance".into()
+        } else {
+            "The confirmation didn't reach Atlas in time; nothing was ordered".into()
+        });
         state
             .perps_trade
             .save_intent(&intent_id, current.clone())
             .await?;
+        return Ok(Json(current.status));
+    }
+    // Moving margin to Paradex: the background task advances this. If it never does (say the service
+    // restarted mid-wait), give up well after it would have.
+    if current.status.stage == "fund" && current.status.state == "pending" {
+        if now() > current.expires + FUNDING_GRACE_MS {
+            current.status.stage = "settle".into();
+            current.status.state = "failed".into();
+            current.status.error = Some("Moving your margin to Paradex took too long; nothing was ordered. Anything that arrived shows in your balance".into());
+            state
+                .perps_trade
+                .save_intent(&intent_id, current.clone())
+                .await?;
+        }
         return Ok(Json(current.status));
     }
     if current.status.stage == "execute" && current.status.state == "pending" {
@@ -1256,6 +1499,7 @@ mod tests {
                 position_id: None,
                 currency: "USD".into(),
                 margin: "20".into(),
+                funding_units: 0,
             },
             client_id: "perp-open-1".into(),
             order_id: None,
@@ -1267,7 +1511,45 @@ mod tests {
                 error: None,
             },
             expires: 0,
+            funding: None,
         }
+    }
+    #[test]
+    fn stored_intents_round_trip_with_and_without_funding() {
+        let mut funded = sample_intent();
+        funded.quote.funding_units = 10_705_000;
+        funded.funding = Some(Funding {
+            swap_id: "swap-1".into(),
+            to: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913".into(),
+            data: "0xa9059cbb00".into(),
+            amount_units: 10_705_000,
+            tx_hash: Some(format!("0x{}", "ab".repeat(32))),
+        });
+        let back: Intent = serde_json::from_str(&serde_json::to_string(&funded).unwrap()).unwrap();
+        assert_eq!(back.quote.funding_units, 10_705_000);
+        assert_eq!(back.funding.unwrap().amount_units, 10_705_000);
+        // Rows written before funding existed still load.
+        let mut old = serde_json::to_value(sample_intent()).unwrap();
+        old.as_object_mut().unwrap().remove("funding");
+        old["quote"]
+            .as_object_mut()
+            .unwrap()
+            .remove("funding_units");
+        let back: Intent = serde_json::from_value(old).unwrap();
+        assert!(back.funding.is_none());
+        assert_eq!(back.quote.funding_units, 0);
+    }
+    #[test]
+    fn funding_covers_the_shortfall_with_room() {
+        let usd = |v: &str| units(v).unwrap();
+        // $10.50 needed, nothing on Paradex: 10.50 + 1% + $0.10.
+        assert_eq!(funding_amount(usd("10.5"), 0).unwrap(), 10_705_000);
+        // $10.50 needed, $5 already there: only the gap moves.
+        assert_eq!(funding_amount(usd("10.5"), usd("5")).unwrap(), 5_655_000);
+        // A sub-micro remainder rounds up, never down.
+        assert_eq!(funding_amount(usd("1.0000001"), 0).unwrap(), 1_110_001);
+        assert!(is_tx_hash(&format!("0x{}", "ab".repeat(32))));
+        assert!(!is_tx_hash("0xabc"));
     }
     #[test]
     fn submission_results_map_to_settlement_states() {

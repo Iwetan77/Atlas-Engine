@@ -69,6 +69,7 @@ struct AppState {
     paradex_tokens: Arc<Mutex<HashMap<String, (String, Instant)>>>,
     perps_trade: perps::TradeState,
     perp_cache: perps::PerpCache,
+    layerswap: engine_execution::layerswap::LayerswapClient,
     social: social::SocialState,
 }
 
@@ -178,6 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         paradex_tokens: Arc::new(Mutex::new(HashMap::new())),
         perps_trade: perps::TradeState::new().await?,
         perp_cache: perps::PerpCache::default(),
+        layerswap: engine_execution::layerswap::LayerswapClient::new()?,
         social: social::SocialState::new().await?,
     };
     let bind: SocketAddr = env::var("ATLAS_BALANCE_BIND")

@@ -137,6 +137,13 @@ pub(super) async fn balance(
         }));
     }
 
+    // Perps margin is still the user's money: it counts, labelled as being in perps.
+    if let Some(units) = perps::paradex_account_value(&state, &headers, &user.user_id, &evm).await {
+        add_holding(&mut holdings, "paradex", "perps", units, &currency, rate)?;
+        total = total
+            .checked_add(units)
+            .ok_or((StatusCode::BAD_GATEWAY, "balance overflow".into()))?;
+    }
     for asset in markets::ASSETS {
         let units = if asset.chain == "base" {
             state

@@ -3,6 +3,7 @@
 pub mod balance;
 pub mod funding;
 pub mod gateway;
+pub mod layerswap;
 pub mod perps;
 pub mod solana;
 pub mod swaps;

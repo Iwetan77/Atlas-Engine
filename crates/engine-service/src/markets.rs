@@ -158,8 +158,8 @@ pub(super) struct Submission {
 }
 #[derive(Deserialize)]
 pub(super) struct Sent {
-    chain: String,
-    id: String,
+    pub(super) chain: String,
+    pub(super) id: String,
 }
 #[derive(Deserialize)]
 pub(super) struct Signed {
@@ -685,7 +685,11 @@ pub(super) async fn execute_quote(
     ))
 }
 
-async fn base_rpc(state: &MarketState, method: &str, params: Value) -> Result<Value, ApiError> {
+pub(super) async fn base_rpc(
+    state: &MarketState,
+    method: &str,
+    params: Value,
+) -> Result<Value, ApiError> {
     let body: Value = state
         .http
         .post(state.rpc.clone())

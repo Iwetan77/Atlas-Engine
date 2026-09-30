@@ -678,6 +678,29 @@ pub(super) async fn positions(
     Ok(Json(json!({"positions":result})))
 }
 
+// The user's Paradex account value in USDC units (6 decimals), for the Atlas balance. Only on prod,
+// and only when the account exists and Atlas may read it; otherwise there's nothing to add.
+pub(super) async fn paradex_account_value(
+    state: &AppState,
+    headers: &HeaderMap,
+    user_id: &str,
+    wallet: &str,
+) -> Option<u128> {
+    if trading_env().ok()? != "prod" {
+        return None;
+    }
+    let onboarded = state.paradex.onboarding_status(wallet).await.ok()?;
+    if !onboarded.exists {
+        return None;
+    }
+    let jwt = evm_jwt(state, headers, user_id, wallet, &onboarded.account_address)
+        .await
+        .ok()?;
+    let account = state.paradex.account(&jwt).await.ok()?;
+    let value = decimal_units(venue_str(&account, "account_value").ok()?).ok()?;
+    Some(value / 1_000_000)
+}
+
 pub(super) use trade::{close_quote, execute_close, execute_quote, quotes};
 
 #[cfg(test)]
