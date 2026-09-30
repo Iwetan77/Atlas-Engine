@@ -499,6 +499,15 @@ struct StoredIntent {
     // A plain Solana USDC transfer (a friend send), landed by the engine rather than Jupiter.
     #[serde(default)]
     solana_transfer: bool,
+    // Base transactions from a wallet with no ETH: a gasless CoW top-up runs first, then /next hands
+    // out `expected`.
+    #[serde(default)]
+    base_topup: Option<BaseTopup>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct BaseTopup {
+    // CoW's order, once placed.
+    uid: Option<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct CashMove {
@@ -710,8 +719,11 @@ impl MarketState {
             .await?
             .filter(|i| {
                 i.owner == owner
-                    && match (i.chain.as_str(), i.funding.is_some()) {
-                        // Base actions; paid with Solana cash, they're sent once it has landed.
+                    && match (
+                        i.chain.as_str(),
+                        i.funding.is_some() || i.base_topup.is_some(),
+                    ) {
+                        // Base actions; after cash from Solana or a gas top-up, sent once it lands.
                         ("base", false) => i.status.stage == "validate",
                         ("base", true) => i.status.stage == "sign",
                         // A Solana buy's transfer from Base.
@@ -728,6 +740,7 @@ impl MarketState {
         owner: String,
         wallet: String,
         txs: Vec<(String, String)>,
+        topup: bool,
     ) -> Result<String, ApiError> {
         let intent_id = id("intent");
         let status = IntentStatus {
@@ -754,6 +767,7 @@ impl MarketState {
                 buy_mint: None,
                 gas_request_id: None,
                 solana_transfer: false,
+                base_topup: topup.then_some(BaseTopup { uid: None }),
             },
         )
         .await?;
@@ -1834,6 +1848,7 @@ pub(super) async fn plan_jupiter_swap(
                 buy_mint: None,
                 gas_request_id: gas.as_ref().map(|(id, _)| id.clone()),
                 solana_transfer: false,
+                base_topup: None,
             },
         )
         .await?;
@@ -1892,6 +1907,7 @@ pub(super) async fn plan_solana_transfer(
                 buy_mint: None,
                 gas_request_id: gas.as_ref().map(|(id, _)| id.clone()),
                 solana_transfer: true,
+                base_topup: None,
             },
         )
         .await?;
@@ -1905,13 +1921,17 @@ pub(super) async fn plan_solana_transfer(
 
 // The Base gas tank, paid by the user, never by Atlas. At or above the floor the wallet pays its own
 // gas (a Base transaction costs about 0.000002 ETH). Below the refill mark (but above the floor) a
-// plan starts with a USDC → ETH refill the tank still pays for itself. An empty tank is filled by
-// Layerswap's refuel on a hop from Solana, where Jupiter pays the gas.
+// plan starts with a USDC → ETH refill the tank still pays for itself. An empty tank is filled first
+// by a gasless CoW top-up from the user's Base USDC (run_base_topup), or by Layerswap's refuel when
+// cash hops over from Solana anyway.
 // 0.000005 ETH, and 0.00004 ETH.
 const BASE_GAS_FLOOR_WEI: u128 = 5_000_000_000_000;
 const BASE_GAS_REFILL_AT_WEI: u128 = 40_000_000_000_000;
 // A refill: $0.50 of USDC becomes about 0.0002 ETH, enough for dozens of transactions.
 const BASE_GAS_REFILL_USDC: u128 = 500_000;
+// What the user reads when the tank couldn't be filled: nothing else happened.
+const GAS_NOT_READY: &str =
+    "Couldn't get your account ready for this, so nothing happened and nothing left your balance. Try again.";
 // What Layerswap's refuel turns into ETH on an empty tank's first hop from Solana.
 const BASE_REFUEL_USDC: u128 = 500_000;
 
@@ -1930,8 +1950,7 @@ pub(super) async fn wallet_pays_gas(state: &AppState, wallet: &str) -> bool {
 }
 
 // The Base transactions that refill the gas tank when it's low and the user has USDC to spare beyond
-// `reserve`: approve the router if needed, swap USDC → WETH, unwrap to ETH. Empty otherwise. These
-// few are the only ones Privy still sponsors.
+// `reserve`: approve the router if needed, swap USDC → WETH, unwrap to ETH. Empty otherwise.
 pub(super) async fn base_gas_refill(
     state: &AppState,
     wallet: &str,
@@ -1992,6 +2011,58 @@ pub(super) async fn base_gas_refill(
         format!("0x2e1a7d4d{unwrap:064x}"),
     ));
     txs
+}
+
+// Whether a Base plan should fill an empty tank first: no ETH to pay gas, and USDC to spare beyond
+// `spends` for the top-up.
+async fn base_topup_fits(state: &AppState, wallet: &str, spends: u128) -> bool {
+    if wallet_pays_gas(state, wallet).await {
+        return false;
+    }
+    state
+        .markets
+        .base
+        .balance_of(BASE_USDC, wallet)
+        .await
+        .is_ok_and(|usdc| usdc >= spends.saturating_add(BASE_GAS_REFILL_USDC))
+}
+
+// Fills an empty tank without gas once the user has confirmed: their session signs a USDC permit
+// for CoW and a $0.50 USDC → ETH order to themselves; a solver settles it and pays the gas. Returns
+// CoW's order id.
+async fn run_base_topup(
+    state: &AppState,
+    headers: &HeaderMap,
+    evm: &str,
+) -> Result<String, String> {
+    use engine_execution::cow;
+    let owner = evm.trim_start_matches("0x").to_ascii_lowercase();
+    // USDC.nonces(owner): the permit's nonce.
+    let nonce = base_rpc(
+        &state.markets,
+        "eth_call",
+        json!([{"to":BASE_USDC,"data":format!("0x7ecebe00{owner:0>64}")}, "latest"]),
+    )
+    .await
+    .ok()
+    .and_then(|v| u128::from_str_radix(v.as_str()?.trim_start_matches("0x"), 16).ok())
+    .ok_or("USDC nonce unavailable")?;
+    let deadline = now() / 1000 + 3600;
+    let permit = cow::permit_typed_data(evm, BASE_GAS_REFILL_USDC, nonce, deadline);
+    let permit_signature = gasless::sign(state, headers, evm, &permit).await?;
+    let app_data = cow::permit_app_data(evm, BASE_GAS_REFILL_USDC, deadline, &permit_signature)
+        .map_err(|e| e.to_string())?;
+    let order = state
+        .cow
+        .gas_order(evm, BASE_GAS_REFILL_USDC, &app_data)
+        .await
+        .map_err(|e| e.to_string())?;
+    let order_signature = gasless::sign(state, headers, evm, &order.typed_data()).await?;
+    state
+        .cow
+        .place(&order, &order_signature)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // USDC in a Solana wallet (0 if it can't be read).
@@ -2120,6 +2191,15 @@ pub(super) async fn plan_base_with_cash(
     } else {
         refill.iter().cloned().chain(txs).collect()
     };
+    // An empty tank with Base cash to spare fills itself first: a gasless CoW top-up from the user's
+    // own USDC (a fraction of a cent), then the Base transactions (GET /v1/intents/{id}/next).
+    if base_topup_fits(state, &evm, needed).await {
+        let intent_id = state
+            .markets
+            .register_base_txs(owner, evm, txs, true)
+            .await?;
+        return Ok((intent_id, Vec::new(), None));
+    }
     let empty_tank = !wallet_pays_gas(state, &evm).await;
     let refuel = empty_tank
         && match solana.as_deref() {
@@ -2138,7 +2218,10 @@ pub(super) async fn plan_base_with_cash(
     .await?
     else {
         let transactions = as_base(&txs);
-        let intent_id = state.markets.register_base_txs(owner, evm, txs).await?;
+        let intent_id = state
+            .markets
+            .register_base_txs(owner, evm, txs, false)
+            .await?;
         return Ok((intent_id, transactions, None));
     };
     let sol = solana.ok_or((
@@ -2183,6 +2266,7 @@ pub(super) async fn plan_base_with_cash(
                 buy_mint: None,
                 gas_request_id: gas.as_ref().map(|(id, _)| id.clone()),
                 solana_transfer: false,
+                base_topup: None,
             },
         )
         .await?;
@@ -2247,6 +2331,7 @@ pub(super) async fn plan_solana_swap_with_base_cash(
                 buy_mint: Some(buy_mint.into()),
                 gas_request_id: None,
                 solana_transfer: false,
+                base_topup: None,
             },
         )
         .await?;
@@ -2344,6 +2429,7 @@ pub(super) async fn execute_quote(
     let mut request_id = None;
     let mut funding = None;
     let mut gas_request_id = None;
+    let mut base_topup = None;
     let intent_id = id("intent");
     let output: u128;
     if a.chain == "base" {
@@ -2408,6 +2494,16 @@ pub(super) async fn execute_quote(
         expected.push((swap.to.to_ascii_lowercase(), swap.data.to_ascii_lowercase()));
         transactions
             .push(json!({"chain":"base","chainId":8453,"to":swap.to,"data":swap.data,"value":"0"}));
+        // No ETH for gas: a gasless CoW top-up from their USDC first; the swap goes out once it lands.
+        let spends = if stored.side == "buy" {
+            fresh.amount_in
+        } else {
+            0
+        };
+        if base_topup_fits(&state, &wallet, spends).await {
+            base_topup = Some(BaseTopup { uid: None });
+            transactions.clear();
+        }
         output = fresh.amount_out;
     } else if stored.funding_units > 0 {
         // Base cash first (see move_to_solana); the Jupiter buy is signed once the USDC lands on
@@ -2550,6 +2646,7 @@ pub(super) async fn execute_quote(
                 buy_mint: None,
                 gas_request_id,
                 solana_transfer: false,
+                base_topup,
             },
         )
         .await?;
@@ -2613,9 +2710,37 @@ pub(super) async fn signed(
     }
     // A Solana buy paid with Base cash signs twice: the Base transfer (validate), then the Jupiter
     // buy once the cash has landed (sign). Anything else is a repeat: answer with the status.
-    let second_step = current.funding.is_some() && current.status.stage == "sign";
+    let second_step = (current.funding.is_some() || current.base_topup.is_some())
+        && current.status.stage == "sign";
     if current.status.state != "pending" || (current.status.stage != "validate" && !second_step) {
         return Ok(Json(current.status));
+    }
+    // An empty Base gas tank: the app sent nothing; now that the user has confirmed, their session
+    // signs the CoW top-up, and the Base transactions follow once it fills.
+    if current.base_topup.is_some() && !second_step {
+        if !body.sent.is_empty() || !body.signed.is_empty() {
+            return Err(bad("signed report does not match the plan"));
+        }
+        if !state
+            .markets
+            .claim_execution(&intent_id, &current, "validate")
+            .await?
+        {
+            let latest = state.markets.get_intent(&intent_id).await?;
+            return Ok(Json(latest.map_or(current.status, |i| i.status)));
+        }
+        let mut updated = current;
+        updated.status.stage = "fund".into();
+        match run_base_topup(&state, &headers, &updated.wallet).await {
+            Ok(uid) => updated.base_topup = Some(BaseTopup { uid: Some(uid) }),
+            Err(reason) => {
+                eprintln!("intent {intent_id}: gas top-up not started: {reason}");
+                updated.status.state = "failed".into();
+                updated.status.error = Some(GAS_NOT_READY.into());
+            }
+        }
+        state.markets.save_intent(&intent_id, &updated).await?;
+        return Ok(Json(updated.status));
     }
     // Moved by Relay without Base gas: the app sent nothing; now that the user has confirmed, their
     // own session signs the authorization and Relay's solver does the rest.
@@ -2821,6 +2946,28 @@ pub(super) async fn intent_status(
         ));
     }
     // Cash moving between chains: Relay or Layerswap says when it has landed; then the rest is signed.
+    // A gas top-up filling: CoW says when; then the Base transactions can be sent.
+    let topup = current.base_topup.as_ref().and_then(|t| t.uid.clone());
+    if let (Some(uid), "pending", "fund") = (
+        topup,
+        current.status.state.as_str(),
+        current.status.stage.as_str(),
+    ) {
+        let mut updated = current;
+        match state.cow.order_state(&uid).await {
+            Ok(engine_execution::layerswap::SwapState::Completed) => {
+                updated.status.stage = "sign".into();
+            }
+            Ok(engine_execution::layerswap::SwapState::Failed(reason)) => {
+                eprintln!("intent {intent_id}: gas top-up {reason}");
+                updated.status.state = "failed".into();
+                updated.status.error = Some(GAS_NOT_READY.into());
+            }
+            _ => return Ok(Json(updated.status)),
+        }
+        state.markets.save_intent(&intent_id, &updated).await?;
+        return Ok(Json(updated.status));
+    }
     if current.status.state == "pending" && current.status.stage == "fund" {
         let Some(cash) = &current.funding else {
             return Ok(Json(current.status));
@@ -3137,6 +3284,7 @@ mod tests {
             buy_mint: None,
             gas_request_id: None,
             solana_transfer: false,
+            base_topup: None,
         }
     }
 
@@ -3183,9 +3331,36 @@ mod tests {
                 "did:privy:a".into(),
                 "0xwallet".into(),
                 vec![("0xPool".into(), "0xDATA".into())],
+                false,
             )
             .await
             .unwrap();
+        // An empty tank tops up first: the relay sends nothing until the top-up has filled.
+        let topped = markets
+            .register_base_txs(
+                "did:privy:a".into(),
+                "0xwallet".into(),
+                vec![("0xPool".into(), "0xDATA".into())],
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(markets
+            .planned_base_txs(&topped, "did:privy:a")
+            .await
+            .unwrap()
+            .is_empty());
+        let mut filled = markets.get_intent(&topped).await.unwrap().unwrap();
+        assert!(filled.base_topup.as_ref().is_some_and(|t| t.uid.is_none()));
+        filled.status.stage = "sign".into();
+        markets.save_intent(&topped, &filled).await.unwrap();
+        assert_eq!(
+            markets
+                .planned_base_txs(&topped, "did:privy:a")
+                .await
+                .unwrap(),
+            vec![("0xpool".to_string(), "0xdata".to_string())]
+        );
         let planned = markets
             .planned_base_txs(&base_id, "did:privy:a")
             .await

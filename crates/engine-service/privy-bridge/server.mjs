@@ -4,7 +4,7 @@ import {PrivyClient} from '@privy-io/node';
 import {authMessage, onboardingMessage, subkeyRegistrationMessage, recoverOnboardingPublicKey} from './paradex-onboarding.mjs';
 import {deriveTradeSubkey, signSubkeyAuth, signParadexOrder} from './trade-subkey.mjs';
 import {quoteSwap, swapFromSui, prepareSuiCashout, transferSui} from './sui-swap.mjs';
-import {checkAuthorizationSignature, receiveAuthorization} from './base-authorization.mjs';
+import {checkSignature, signable} from './base-authorization.mjs';
 
 const SUI_COIN_TYPE = /^0x[0-9a-fA-F]{1,64}::[A-Za-z_][A-Za-z0-9_]*::[A-Za-z_][A-Za-z0-9_]*$/;
 const POSITIVE_INTEGER = /^[1-9][0-9]{0,30}$/;
@@ -261,12 +261,12 @@ const server = createServer(async (request, response) => {
       }
       return;
     }
-    // A gasless Base USDC deposit the user already confirmed in the app: their own session signs the
-    // one authorization the venue's relayer needs, and nothing wider (see base-authorization.mjs).
+    // Base without gas, for a plan the user already confirmed in the app: their own session signs a
+    // venue's deposit authorization or a CoW gas top-up, and nothing wider (base-authorization.mjs).
     if (signAuthorization) {
       let typedData;
       try {
-        typedData = receiveAuthorization(input.typedData, evmWallet);
+        typedData = signable(input.typedData, evmWallet);
       } catch (error) {
         send(response, 400, {error: `invalid authorization: ${error.message}`});
         return;
@@ -276,7 +276,7 @@ const server = createServer(async (request, response) => {
           params: {typed_data: typedData},
           authorization_context: {user_jwts: [accessToken]},
         });
-        checkAuthorizationSignature(typedData.message, signed.signature, evmWallet);
+        checkSignature(typedData, signed.signature, evmWallet);
         send(response, 200, {userId, walletAddress: evmWallet, signature: signed.signature});
       } catch (error) {
         send(response, 502, {error: String(error?.message ?? error).slice(0, 200)});

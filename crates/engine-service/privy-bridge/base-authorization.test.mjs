@@ -2,90 +2,111 @@ import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {secp256k1} from '@noble/curves/secp256k1';
 import {keccak_256} from '@noble/hashes/sha3';
-import {
-  authorizationDigest,
-  checkAuthorizationSignature,
-  domainSeparator,
-  receiveAuthorization,
-} from './base-authorization.mjs';
+import {checkSignature, domainSeparator, signable, typedDigest} from './base-authorization.mjs';
 
 const key = new Uint8Array(32);
 key[31] = 7;
 const wallet = '0x' + Buffer.from(keccak_256(secp256k1.getPublicKey(key, false).subarray(1)).subarray(12))
   .toString('hex');
+const NOW = 1_790_000_000;
+const USDC_DOMAIN = {name: 'USD Coin', version: '2', chainId: '8453',
+  verifyingContract: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913'};
+const COW_DOMAIN = {name: 'Gnosis Protocol', version: 'v2', chainId: 8453,
+  verifyingContract: '0x9008d19f58aabd9ed0d60971565aa8510560ab41'};
+const field = (name, type) => ({name, type});
 
-// What Layerswap returns for a gasless Base → Solana swap.
-function venueTypedData(overrides = {}) {
+// What Relay and Layerswap return for a gasless Base → Solana move.
+function deposit(message = {}) {
   return {
-    types: {
-      EIP712Domain: [
-        {name: 'name', type: 'string'},
-        {name: 'version', type: 'string'},
-        {name: 'chainId', type: 'uint256'},
-        {name: 'verifyingContract', type: 'address'},
-      ],
-      ReceiveWithAuthorization: [
-        {name: 'from', type: 'address'},
-        {name: 'to', type: 'address'},
-        {name: 'value', type: 'uint256'},
-        {name: 'validAfter', type: 'uint256'},
-        {name: 'validBefore', type: 'uint256'},
-        {name: 'nonce', type: 'bytes32'},
-      ],
-    },
+    types: {ReceiveWithAuthorization: [field('from', 'address'), field('to', 'address'),
+      field('value', 'uint256'), field('validAfter', 'uint256'), field('validBefore', 'uint256'),
+      field('nonce', 'bytes32')]},
     primaryType: 'ReceiveWithAuthorization',
-    domain: {
-      name: 'USD Coin',
-      version: '2',
-      chainId: '8453',
-      verifyingContract: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913',
-      ...overrides.domain,
-    },
-    message: {
-      from: wallet,
-      to: '0x6351c235e6f7e08f80974009d01829e5a8250d62',
-      value: '5000000',
-      validAfter: '0',
-      validBefore: '1790807789',
-      nonce: '0xc5d45ec13b4d970bdd7cc5de84e783c807df2d1c645831e6d8b12717e7bdc87b',
-      ...overrides.message,
-    },
+    domain: USDC_DOMAIN,
+    message: {from: wallet, to: '0x6351c235e6f7e08f80974009d01829e5a8250d62', value: '5000000',
+      validAfter: '0', validBefore: '1790807789',
+      nonce: '0xc5d45ec13b4d970bdd7cc5de84e783c807df2d1c645831e6d8b12717e7bdc87b', ...message},
   };
 }
+// What the engine builds for a CoW gas top-up.
+function permit(message = {}) {
+  return {
+    types: {Permit: [field('owner', 'address'), field('spender', 'address'), field('value', 'uint256'),
+      field('nonce', 'uint256'), field('deadline', 'uint256')]},
+    primaryType: 'Permit',
+    domain: USDC_DOMAIN,
+    message: {owner: wallet, spender: '0xc92e8bdf79f0507f65a392b0ab4667716bfe0110', value: '500000',
+      nonce: '0', deadline: String(NOW + 3600), ...message},
+  };
+}
+function order(message = {}) {
+  return {
+    types: {Order: [field('sellToken', 'address'), field('buyToken', 'address'), field('receiver', 'address'),
+      field('sellAmount', 'uint256'), field('buyAmount', 'uint256'), field('validTo', 'uint32'),
+      field('appData', 'bytes32'), field('feeAmount', 'uint256'), field('kind', 'string'),
+      field('partiallyFillable', 'bool'), field('sellTokenBalance', 'string'), field('buyTokenBalance', 'string')]},
+    primaryType: 'Order',
+    domain: COW_DOMAIN,
+    message: {sellToken: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913',
+      buyToken: '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', receiver: wallet, sellAmount: '500000',
+      buyAmount: '181136261922604', validTo: NOW + 1200, appData: '0x' + 'ab'.repeat(32), feeAmount: '0',
+      kind: 'sell', partiallyFillable: false, sellTokenBalance: 'erc20', buyTokenBalance: 'erc20', ...message},
+  };
+}
+const sign = (typed, with_ = key) => {
+  const s = secp256k1.sign(typedDigest(typed), with_);
+  return '0x' + s.toCompactHex() + (27 + s.recovery).toString(16);
+};
 
-test('the domain matches Base USDC on chain', () => {
-  // DOMAIN_SEPARATOR() of 0x8335…2913 on Base mainnet.
-  assert.equal(Buffer.from(domainSeparator()).toString('hex'),
+test('domains match USDC and CoW settlement on Base', () => {
+  // DOMAIN_SEPARATOR() of USDC and domainSeparator() of GPv2Settlement on Base mainnet.
+  assert.equal(Buffer.from(domainSeparator({...USDC_DOMAIN, chainId: 8453})).toString('hex'),
     '02fa7265e7c5d81118673727957699e4d68f74cd74b7db77da710fe8a2c7834f');
+  assert.equal(Buffer.from(domainSeparator(COW_DOMAIN)).toString('hex'),
+    'd72ffa789b6fae41254d0b5a13e6e1e92ed947ec6a251edf1cf0b6c02c257b4b');
 });
 
-test('a venue authorization is rebuilt in Privy shape and its signature checked', () => {
-  const typed = receiveAuthorization(venueTypedData(), wallet.toUpperCase().replace('0X', '0x'));
-  assert.equal(typed.primary_type, 'ReceiveWithAuthorization');
-  assert.deepEqual(Object.keys(typed.types), ['ReceiveWithAuthorization']);
-  assert.equal(typed.domain.chainId, 8453);
-  assert.equal(typed.message.value, '5000000');
-  const signed = secp256k1.sign(authorizationDigest(typed.message), key);
-  const signature = '0x' + signed.toCompactHex() + (27 + signed.recovery).toString(16);
-  checkAuthorizationSignature(typed.message, signature, wallet);
-  const other = new Uint8Array(32);
-  other[31] = 8;
-  const forged = secp256k1.sign(authorizationDigest(typed.message), other);
-  assert.throws(() => checkAuthorizationSignature(typed.message,
-    '0x' + forged.toCompactHex() + (27 + forged.recovery).toString(16), wallet), /another wallet/);
+test('each shape is rebuilt in Privy format and its signature checked', () => {
+  for (const typed of [deposit(), permit(), order()]) {
+    const rebuilt = signable(typed, wallet.toUpperCase().replace('0X', '0x'), NOW);
+    assert.equal(rebuilt.primary_type, typed.primaryType);
+    assert.deepEqual(Object.keys(rebuilt.types), [typed.primaryType]);
+    assert.equal(rebuilt.domain.chainId, 8453);
+    checkSignature(rebuilt, sign(rebuilt), wallet);
+    const other = new Uint8Array(32);
+    other[31] = 8;
+    assert.throws(() => checkSignature(rebuilt, sign(rebuilt, other), wallet), /another wallet/);
+  }
+  signable(deposit({to: '0xccc88a9d1b4ed6b0eaba998850414b24f1c315be'}), wallet, NOW);
 });
 
-test('anything wider than a Base USDC deposit to the pinned receiver is refused', () => {
-  const refuse = (overrides, pattern) =>
-    assert.throws(() => receiveAuthorization(venueTypedData(overrides), wallet), pattern);
-  refuse({domain: {verifyingContract: '0x0000000000000000000000000000000000000001'}}, /Base USDC/);
-  refuse({domain: {chainId: '1'}}, /Base USDC/);
-  refuse({message: {from: '0x0000000000000000000000000000000000000002'}}, /this wallet/);
-  refuse({message: {to: '0x0000000000000000000000000000000000000003'}}, /receiver/);
-  receiveAuthorization(venueTypedData({message: {to: '0xccc88a9d1b4ed6b0eaba998850414b24f1c315be'}}), wallet);
-  refuse({message: {value: '0'}}, /invalid/);
-  refuse({message: {nonce: '0x12'}}, /invalid/);
-  const transfer = venueTypedData();
-  transfer.primaryType = 'TransferWithAuthorization';
-  assert.throws(() => receiveAuthorization(transfer, wallet), /Base USDC/);
+test('deposits go only to pinned receivers, from this wallet', () => {
+  const refuse = (typed, pattern) => assert.throws(() => signable(typed, wallet, NOW), pattern);
+  refuse({...deposit(), domain: {...USDC_DOMAIN, verifyingContract: '0x0000000000000000000000000000000000000001'}},
+    /not something/);
+  refuse({...deposit(), domain: {...USDC_DOMAIN, chainId: '1'}}, /not something/);
+  refuse(deposit({from: '0x0000000000000000000000000000000000000002'}), /this wallet/);
+  refuse(deposit({to: '0x0000000000000000000000000000000000000003'}), /receiver/);
+  refuse(deposit({value: '0'}), /invalid/);
+  refuse(deposit({nonce: '0x12'}), /invalid/);
+  refuse({...deposit(), primaryType: 'TransferWithAuthorization'}, /not something/);
+});
+
+test('CoW gets at most a gas top-up, sold for ETH to this wallet, briefly', () => {
+  const refuse = (typed, pattern) => assert.throws(() => signable(typed, wallet, NOW), pattern);
+  refuse(permit({spender: '0x0000000000000000000000000000000000000004'}), /spender/);
+  refuse(permit({value: '2000001'}), /top-up/);
+  refuse(permit({deadline: String(NOW + 3 * 3600)}), /expires/);
+  refuse(permit({deadline: String(NOW - 1)}), /expires/);
+  refuse(permit({owner: '0x0000000000000000000000000000000000000005'}), /this wallet/);
+  refuse(order({receiver: '0x0000000000000000000000000000000000000006'}), /this wallet/);
+  refuse(order({buyToken: '0x4200000000000000000000000000000000000006'}), /USDC to ETH/);
+  refuse(order({sellAmount: '5000000'}), /top-up/);
+  refuse(order({partiallyFillable: true}), /plain sell/);
+  refuse(order({feeAmount: '1'}), /plain sell/);
+  refuse(order({kind: 'buy'}), /plain sell/);
+  refuse(order({validTo: NOW + 3 * 3600}), /expires/);
+  refuse({...order(), domain: {...COW_DOMAIN, verifyingContract: '0x0000000000000000000000000000000000000007'}},
+    /not something/);
+  refuse({...order(), primaryType: 'toString'}, /not something/);
 });
