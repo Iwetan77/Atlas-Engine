@@ -261,7 +261,10 @@ pub(super) struct MarketState {
     catalog: Arc<Mutex<Option<(Instant, Arc<Vec<Asset>>)>>>,
     prices: Arc<Mutex<HashMap<String, (Instant, f64, Option<f64>)>>>,
     multipliers: Arc<Mutex<HashMap<String, (Instant, bool)>>>,
+    chart_pools: Arc<Mutex<HashMap<String, (Instant, String)>>>,
+    charts: ChartCache,
 }
+type ChartCache = Arc<Mutex<HashMap<String, (Instant, Arc<Vec<(u64, f64)>>)>>>;
 #[derive(Clone)]
 struct StoredQuote {
     owner: String,
@@ -344,6 +347,8 @@ impl MarketState {
             catalog: Arc::new(Mutex::new(None)),
             prices: Arc::new(Mutex::new(HashMap::new())),
             multipliers: Arc::new(Mutex::new(HashMap::new())),
+            chart_pools: Arc::new(Mutex::new(HashMap::new())),
+            charts: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 }
@@ -668,6 +673,146 @@ pub(super) async fn assets(
         result.push(json!({"assetId":a.id,"symbol":a.symbol,"name":a.name,"kind":a.kind,"price":price,"change24hPct":change,"iconUrl":a.icon_url}));
     }
     Ok(Json(json!({"assets":result})))
+}
+
+#[derive(Deserialize)]
+pub(super) struct ChartQuery {
+    range: Option<String>,
+    currency: Option<String>,
+}
+const GECKOTERMINAL: &str = "https://api.geckoterminal.com/api/v2/networks/";
+
+// Price history for an asset's detail screen, from on-chain trades in its deepest pool
+// (GeckoTerminal). Display only: `points` are [unix ms, price in the display currency], oldest first.
+pub(super) async fn chart(
+    State(state): State<AppState>,
+    Path(asset_id): Path<String>,
+    Query(q): Query<ChartQuery>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    app_balance::verified_wallets(&state, &headers).await?;
+    let currency = q.currency.unwrap_or_else(|| "NGN".into());
+    checked_currency(&currency)?;
+    let range = q.range.unwrap_or_else(|| "1D".into());
+    // GeckoTerminal allows ~30 calls a minute, so longer ranges are cached longer.
+    let (timeframe, aggregate, limit, ttl) = match range.as_str() {
+        "1D" => ("minute", 15, 96, Duration::from_secs(60)),
+        "1W" => ("hour", 1, 168, Duration::from_secs(300)),
+        "1M" => ("hour", 4, 180, Duration::from_secs(900)),
+        "1Y" => ("day", 1, 365, Duration::from_secs(3600)),
+        _ => return Err(bad("range must be 1D, 1W, 1M or 1Y")),
+    };
+    let asset = find_asset(&state.markets, &asset_id).await?;
+    let rate = app_balance::fx_rate(&currency).await?;
+    let network = if asset.chain == "base" {
+        "base"
+    } else {
+        "solana"
+    };
+    let key = format!("{network}:{}:{range}", asset.token);
+    let cached = state
+        .markets
+        .charts
+        .lock()
+        .map_err(internal)?
+        .get(&key)
+        .filter(|(at, _)| at.elapsed() < ttl)
+        .map(|(_, points)| points.clone());
+    let points = match cached {
+        Some(points) => points,
+        None => {
+            let pool = deepest_pool(&state.markets, network, &asset.token).await?;
+            let body: Value = gecko(
+                &state.markets,
+                &format!(
+                    "{network}/pools/{pool}/ohlcv/{timeframe}?aggregate={aggregate}&limit={limit}&currency=usd&token={}",
+                    asset.token
+                ),
+            )
+            .await?;
+            let points = Arc::new(ohlcv_closes(&body));
+            state
+                .markets
+                .charts
+                .lock()
+                .map_err(internal)?
+                .insert(key, (Instant::now(), points.clone()));
+            points
+        }
+    };
+    let scale = rate as f64 / 1_000_000.0;
+    let series: Vec<Value> = points
+        .iter()
+        .map(|(ms, usd)| json!([ms, usd * scale]))
+        .collect();
+    Ok(Json(
+        json!({"assetId":asset.id,"range":range,"currency":currency,"points":series}),
+    ))
+}
+
+async fn gecko(state: &MarketState, path: &str) -> Result<Value, ApiError> {
+    state
+        .http
+        .get(format!("{GECKOTERMINAL}{path}"))
+        .header("accept", "application/json")
+        .send()
+        .await
+        .map_err(unavailable)?
+        .error_for_status()
+        .map_err(|e| unavailable(format!("price history unavailable: {e}")))?
+        .json()
+        .await
+        .map_err(unavailable)
+}
+
+// The pool holding the most liquidity for a token: its trades are the truest price.
+async fn deepest_pool(state: &MarketState, network: &str, token: &str) -> Result<String, ApiError> {
+    let key = format!("{network}:{token}");
+    if let Some((at, pool)) = state.chart_pools.lock().map_err(internal)?.get(&key) {
+        if at.elapsed() < Duration::from_secs(3600) {
+            return Ok(pool.clone());
+        }
+    }
+    let body = gecko(state, &format!("{network}/tokens/{token}/pools?page=1")).await?;
+    let pool = body["data"]
+        .as_array()
+        .and_then(|pools| {
+            pools.iter().max_by(|a, b| {
+                let reserve = |p: &Value| {
+                    p["attributes"]["reserve_in_usd"]
+                        .as_str()
+                        .and_then(|r| r.parse::<f64>().ok())
+                        .unwrap_or(0.0)
+                };
+                reserve(a).total_cmp(&reserve(b))
+            })
+        })
+        .and_then(|p| p["attributes"]["address"].as_str())
+        .ok_or_else(|| unavailable("no trading pool for this asset"))?
+        .to_owned();
+    state
+        .chart_pools
+        .lock()
+        .map_err(internal)?
+        .insert(key, (Instant::now(), pool.clone()));
+    Ok(pool)
+}
+
+// GeckoTerminal candles are [unix seconds, open, high, low, close, volume], newest first.
+fn ohlcv_closes(body: &Value) -> Vec<(u64, f64)> {
+    let mut points: Vec<(u64, f64)> = body["data"]["attributes"]["ohlcv_list"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(|c| {
+                    let close = c[4].as_f64().filter(|v| v.is_finite() && *v > 0.0)?;
+                    Some((c[0].as_u64()? * 1000, close))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    points.sort_by_key(|(ms, _)| *ms);
+    points
 }
 
 // An indicative unit price from a floating USD price (display only; trades use venue quotes).
@@ -1296,6 +1441,18 @@ mod tests {
         assert!(!assets
             .iter()
             .any(|a| a.symbol.to_ascii_uppercase().contains("USD")));
+    }
+    #[test]
+    fn chart_points_are_oldest_first_and_skip_bad_candles() {
+        let body = json!({"data":{"attributes":{"ohlcv_list":[
+            [1790756100, 354.0, 354.0, 353.7, 353.77, 10.0],
+            [1790755200, 356.1, 356.2, 353.7, 0.0, 10.0],
+            [1790754300, 358.9, 360.6, 358.9, 359.35, 10.0]
+        ]}}});
+        assert_eq!(
+            ohlcv_closes(&body),
+            vec![(1790754300000, 359.35), (1790756100000, 353.77)]
+        );
     }
     #[test]
     fn indicative_prices_keep_small_values() {

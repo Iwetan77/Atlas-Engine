@@ -192,6 +192,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/health", get(health))
         .route("/v1/balance", get(app_balance::balance))
         .route("/v1/assets", get(markets::assets))
+        .route("/v1/assets/{asset_id}/chart", get(markets::chart))
         .route(
             "/v1/perps/onboarding",
             get(perps::onboarding).post(perps::onboard),
