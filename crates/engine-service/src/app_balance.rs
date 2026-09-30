@@ -50,6 +50,70 @@ pub(super) struct AppBalanceResponse {
     as_of_unix_ms: u128,
 }
 
+const ARC_USDC: &str = "0x3600000000000000000000000000000000000000";
+
+async fn arc_balance(wallet: &str, network: AtlasNetwork) -> Result<u128, ApiError> {
+    if wallet.len() != 42
+        || !wallet.starts_with("0x")
+        || !wallet[2..].bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err((StatusCode::BAD_REQUEST, "Wallet address is invalid".into()));
+    }
+    let (default_rpc, expected_chain) = match network {
+        AtlasNetwork::Mainnet => ("https://rpc.mainnet.arc.io", "0x13b2"),
+        AtlasNetwork::Testnet => ("https://rpc.testnet.arc.network", "0x4cef52"),
+    };
+    let rpc = std::env::var("ATLAS_ARC_RPC_URL").unwrap_or_else(|_| default_rpc.into());
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(internal)?;
+    let chain: Value = client
+        .post(&rpc)
+        .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}))
+        .send()
+        .await
+        .map_err(internal)?
+        .error_for_status()
+        .map_err(internal)?
+        .json()
+        .await
+        .map_err(internal)?;
+    if chain["result"].as_str() != Some(expected_chain) {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "Cash balance temporarily unavailable".into(),
+        ));
+    }
+    let data = format!("0x70a08231{:0>64}", &wallet[2..].to_ascii_lowercase());
+    let balance: Value = client
+        .post(&rpc)
+        .json(
+            &serde_json::json!({"jsonrpc":"2.0","id":1,"method":"eth_call",
+            "params":[{"to":ARC_USDC,"data":data},"latest"]}),
+        )
+        .send()
+        .await
+        .map_err(internal)?
+        .error_for_status()
+        .map_err(internal)?
+        .json()
+        .await
+        .map_err(internal)?;
+    let hex = balance["result"]
+        .as_str()
+        .and_then(|v| v.strip_prefix("0x"))
+        .ok_or((
+            StatusCode::BAD_GATEWAY,
+            "Cash balance temporarily unavailable".into(),
+        ))?;
+    u128::from_str_radix(hex, 16).map_err(|_| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "Cash balance temporarily unavailable".into(),
+        )
+    })
+}
 pub(super) async fn balance(
     State(state): State<AppState>,
     Query(query): Query<BalanceQuery>,
@@ -125,8 +189,11 @@ pub(super) async fn balance(
         &currency,
         rate,
     )?;
+    let arc_usdc = arc_balance(&evm, state.network).await?;
+    add_holding(&mut holdings, "arc", "wallet", arc_usdc, &currency, rate)?;
     let mut total = base_usdc
         .checked_add(solana_usdc)
+        .and_then(|cash| cash.checked_add(arc_usdc))
         .ok_or((StatusCode::BAD_GATEWAY, "balance overflow".into()))?;
 
     if state.network == AtlasNetwork::Testnet {
@@ -294,6 +361,38 @@ pub(super) async fn balance(
                 icon_url,
             });
         }
+    }
+    // A NEAR buy is held in the user's own Privy wallet; the current on-chain amount is authoritative.
+    for (asset, units) in near_intents::near_holdings(&state, &headers, &user).await? {
+        let price = asset
+            .price
+            .as_ref()
+            .and_then(|value| value.as_f64().or_else(|| value.as_str()?.parse().ok()))
+            .filter(|price: &f64| price.is_finite() && *price > 0.0)
+            .ok_or((
+                StatusCode::BAD_GATEWAY,
+                "An asset price is temporarily unavailable".into(),
+            ))?;
+        let value = units as f64 / 10f64.powi(asset.decimals as i32) * price * 1_000_000.0;
+        if !value.is_finite() || value < 0.0 || value > u128::MAX as f64 {
+            return Err((StatusCode::BAD_GATEWAY, "Portfolio value overflow".into()));
+        }
+        let value_usdc = value as u128;
+        total = total
+            .checked_add(value_usdc)
+            .ok_or((StatusCode::BAD_GATEWAY, "Portfolio value overflow".into()))?;
+        holdings.push(Holding {
+            asset_id: format!("near:{}", asset.asset_id),
+            symbol: asset.symbol.clone(),
+            name: asset.symbol.clone(),
+            kind: "crypto".into(),
+            chain: "near".into(),
+            amount: markets::format_units(units, asset.decimals),
+            value: money(value_usdc, &currency, rate)?,
+            value_usd: usd(value_usdc),
+            location: "wallet",
+            icon_url: state.near.icon_for(&asset),
+        });
     }
     // Once a 1Click buy settles, read the destination wallet on Monad itself.
     // The spent Base USDC and received asset must both be reflected in Home.

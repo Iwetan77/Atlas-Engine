@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 axum = "0.8"
+base64 = "0.22"
 engine-core = { path = "../engine-core" }
 engine-discovery = { path = "../engine-discovery" }
 engine-execution = { path = "../engine-execution" }

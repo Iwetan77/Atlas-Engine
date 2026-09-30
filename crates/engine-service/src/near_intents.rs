@@ -1,4 +1,5 @@
 use super::*;
+use base64::Engine;
 use engine_execution::near_intents::{Client, QuoteRequest, Token};
 use engine_execution::swaps::uniswap::BASE_USDC;
 use serde::{Deserialize, Serialize};
@@ -507,6 +508,98 @@ async fn destination(
     Ok(address.to_owned())
 }
 
+// A settled 1Click buy lands in the user's own NEAR account. Read the NEP-141 contract,
+// not an inferred 1Click amount: later sends and partial sells must change Home immediately.
+pub(super) async fn near_holdings(
+    state: &AppState,
+    headers: &HeaderMap,
+    user: &app_balance::VerifiedWallets,
+) -> Result<Vec<(Token, u128)>, ApiError> {
+    let intents: Vec<StoredIntent> = if let Some(pg) = &state.near.postgres {
+        pg.query(
+            "SELECT payload FROM atlas_near_intents WHERE owner=$1",
+            &[&user.user_id],
+        )
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .map(|row| serde_json::from_str::<StoredIntent>(row.get::<_, &str>(0)).map_err(internal))
+        .collect::<Result<_, _>>()?
+    } else {
+        state
+            .near
+            .intents
+            .lock()
+            .map_err(internal)?
+            .values()
+            .filter(|intent| intent.owner == user.user_id)
+            .cloned()
+            .collect()
+    };
+    let mut tracked = HashMap::<String, Token>::new();
+    for intent in intents {
+        if intent.status.state == "filled" {
+            if let Some(asset) = intent.asset.filter(|asset| asset.blockchain == "near") {
+                tracked.insert(asset.asset_id.clone(), asset);
+            }
+        }
+    }
+    if tracked.is_empty() {
+        return Ok(Vec::new());
+    }
+    let catalog = state.near.tokens().await?;
+    for asset in tracked.values_mut() {
+        let fresh = catalog
+            .iter()
+            .find(|token| token.asset_id == asset.asset_id)
+            .ok_or_else(|| venue("An asset price is temporarily unavailable"))?;
+        *asset = fresh.clone();
+    }
+    let wallet = destination(state, headers, tracked.values().next().unwrap(), user).await?;
+    let rpc = std::env::var("ATLAS_NEAR_MAINNET_RPC_URL")
+        .unwrap_or_else(|_| "https://rpc.mainnet.near.org".into());
+    let mut held = Vec::new();
+    for asset in tracked.into_values() {
+        let contract = asset
+            .contract_address
+            .as_deref()
+            .ok_or_else(|| venue("An asset balance is temporarily unavailable"))?;
+        if contract != asset.asset_id.trim_start_matches("nep141:") {
+            return Err(venue("An asset balance is temporarily unavailable"));
+        }
+        let args = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&json!({"account_id":wallet})).map_err(internal)?);
+        let body: Value = state
+            .near
+            .icon_http
+            .post(&rpc)
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":"query","params":{
+                "request_type":"call_function","finality":"final","account_id":contract,
+                "method_name":"ft_balance_of","args_base64":args}}))
+            .send()
+            .await
+            .map_err(venue)?
+            .error_for_status()
+            .map_err(venue)?
+            .json()
+            .await
+            .map_err(venue)?;
+        let raw = body["result"]["result"]
+            .as_array()
+            .ok_or_else(|| venue("An asset balance is temporarily unavailable"))?;
+        let bytes = raw
+            .iter()
+            .map(|v| v.as_u64().and_then(|n| u8::try_from(n).ok()))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| venue("An asset balance is temporarily unavailable"))?;
+        let units: String = serde_json::from_slice(&bytes).map_err(venue)?;
+        let units = units.parse::<u128>().map_err(venue)?;
+        if units > 0 {
+            held.push((asset, units));
+        }
+    }
+    Ok(held)
+}
 // What the user holds on Sui from Atlas buys (SUI left for gas included), valued in USD:
 // (asset id, symbol, name, decimals, units, USDC units, icon). Nothing to read, nothing asked.
 pub(super) async fn sui_holdings(

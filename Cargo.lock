@@ -648,6 +648,7 @@ name = "engine-service"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "engine-core",
  "engine-discovery",
  "engine-execution",
