@@ -46,6 +46,28 @@ pub(super) const JITO_MINT: &str = "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn
 const JITO_OPTION: &str = "jito-sol-staking";
 const JITO_STATS: &str = "https://kobe.mainnet.jito.network/api/v1/stake_pool_stats";
 pub(super) const JITO_ICON: &str = "https://www.jito.network/favicon.ico";
+// Morpho vaults on Base: USDC lent through curated ERC-4626 vaults. Only the three largest, from
+// known curators, so there's always deep liquidity to take money out. Pinned: (vault, option, curator).
+const MORPHO_VAULTS: [(&str, &str, &str); 3] = [
+    (
+        "0xee8f4ec5672f09119b96ab6fb59c27e1b7e44b61",
+        "morpho-gauntlet-usdc-base",
+        "Gauntlet",
+    ),
+    (
+        "0x7bfa7c4f149e7415b73bdedfe609237e29cbf34a",
+        "morpho-spark-usdc-base",
+        "Spark",
+    ),
+    (
+        "0xbeef010f9cb27031ad51e3333f9af9c6b1228183",
+        "morpho-steakhouse-usdc-base",
+        "Steakhouse",
+    ),
+];
+const MORPHO_API: &str = "https://api.morpho.org/graphql";
+const MORPHO_ICON: &str =
+    "https://coin-images.coingecko.com/coins/images/29837/large/Morpho-token-icon.png";
 const AAVE_ICON: &str =
     "https://coin-images.coingecko.com/coins/images/12645/large/aave-token-round.png";
 const QUOTE_MS: u64 = 60_000;
@@ -57,6 +79,8 @@ struct EarnQuote {
     owner: String,
     // Jupiter Lend: the market's share token. None for Aave.
     share_mint: Option<&'static str>,
+    // A Morpho vault's address. None for Aave.
+    vault: Option<&'static str>,
     // The wallet on the option's chain.
     wallet: String,
     deposit: bool,
@@ -77,7 +101,19 @@ pub(super) struct EarnState {
     apy: Arc<Mutex<Option<(Instant, f64)>>>,
     lend: Arc<Mutex<Option<(Instant, Vec<Lend>)>>>,
     jito_apy: Arc<Mutex<Option<(Instant, f64)>>>,
+    morpho: Arc<Mutex<Option<(Instant, Vec<Vault>)>>>,
     http: reqwest::Client,
+}
+
+// One Morpho vault right now.
+#[derive(Clone, Debug, PartialEq)]
+struct Vault {
+    address: &'static str,
+    option_id: &'static str,
+    curator: &'static str,
+    name: String,
+    apy: f64,
+    deposited_usd: f64,
 }
 
 // One Jupiter Lend market right now: its yearly rate and what a share is worth.
@@ -184,12 +220,8 @@ fn supply_apy(reserve_data: &str) -> Option<f64> {
     Some(((1.0 + per_second).powf(SECONDS_PER_YEAR) - 1.0) * 100.0)
 }
 
-async fn usdc_allowance(state: &AppState, owner: &str) -> Result<u128, ApiError> {
-    let data = format!(
-        "0xdd62ed3e{}{}",
-        word_address(owner),
-        word_address(AAVE_POOL)
-    );
+async fn usdc_allowance(state: &AppState, owner: &str, spender: &str) -> Result<u128, ApiError> {
+    let data = format!("0xdd62ed3e{}{}", word_address(owner), word_address(spender));
     let raw = eth_call(state, engine_execution::swaps::uniswap::BASE_USDC, &data).await?;
     let hex = raw.trim_start_matches("0x").trim_start_matches('0');
     // An allowance past u128 (an unlimited approval) is more than any deposit needs.
@@ -208,6 +240,112 @@ pub(super) async fn savings_units(state: &AppState, wallet: &str) -> Result<u128
         .balance_of(AAVE_USDC, wallet)
         .await
         .map_err(internal)
+}
+
+// Everything saving on Base (Aave and Morpho) in USDC units: what the balance counts as in Earn.
+pub(super) async fn base_savings_units(state: &AppState, wallet: &str) -> Result<u128, ApiError> {
+    let mut total = savings_units(state, wallet).await?;
+    for (vault, _, _) in MORPHO_VAULTS {
+        total = total.saturating_add(vault_position(state, vault, wallet).await?.1);
+    }
+    Ok(total)
+}
+
+fn vault_for(option_id: &str) -> Option<(&'static str, &'static str)> {
+    MORPHO_VAULTS
+        .iter()
+        .find(|(_, id, _)| *id == option_id)
+        .map(|(vault, _, curator)| (*vault, *curator))
+}
+
+fn word_to_units(raw: &str) -> Result<u128, ApiError> {
+    let hex = raw.trim_start_matches("0x").trim_start_matches('0');
+    if hex.len() > 32 {
+        return Err((StatusCode::BAD_GATEWAY, "vault value out of range".into()));
+    }
+    u128::from_str_radix(if hex.is_empty() { "0" } else { hex }, 16).map_err(internal)
+}
+
+// A wallet's shares in a Morpho vault and what they're worth now, in USDC units.
+async fn vault_position(
+    state: &AppState,
+    vault: &str,
+    wallet: &str,
+) -> Result<(u128, u128), ApiError> {
+    let shares = state
+        .markets
+        .base
+        .balance_of(vault, wallet)
+        .await
+        .map_err(internal)?;
+    if shares == 0 {
+        return Ok((0, 0));
+    }
+    // convertToAssets(shares)
+    let raw = eth_call(state, vault, &format!("0x07a2d13a{}", word_units(shares))).await?;
+    Ok((shares, word_to_units(&raw)?))
+}
+
+// The pinned vaults' names, net rates (after the curator's fee) and size, from Morpho's API.
+async fn morpho_vaults(state: &AppState) -> Result<Vec<Vault>, ApiError> {
+    if let Some((at, vaults)) = state.earn.morpho.lock().map_err(internal)?.clone() {
+        if at.elapsed() < APY_TTL {
+            return Ok(vaults);
+        }
+    }
+    let addresses: Vec<&str> = MORPHO_VAULTS.iter().map(|(v, _, _)| *v).collect();
+    let query = format!(
+        "{{ vaults(where: {{ chainId_in: [8453], address_in: {} }}) {{ items {{ address name state {{ netApy totalAssetsUsd }} }} }} }}",
+        serde_json::to_string(&addresses).map_err(internal)?
+    );
+    let body: Value = state
+        .earn
+        .http
+        .post(MORPHO_API)
+        .json(&json!({"query":query}))
+        .send()
+        .await
+        .map_err(internal)?
+        .error_for_status()
+        .map_err(internal)?
+        .json()
+        .await
+        .map_err(internal)?;
+    let vaults = parse_vaults(&body);
+    if vaults.is_empty() {
+        return Err((StatusCode::BAD_GATEWAY, "Morpho rates unavailable".into()));
+    }
+    *state.earn.morpho.lock().map_err(internal)? = Some((Instant::now(), vaults.clone()));
+    Ok(vaults)
+}
+
+fn parse_vaults(body: &Value) -> Vec<Vault> {
+    let items = body["data"]["vaults"]["items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    MORPHO_VAULTS
+        .iter()
+        .filter_map(|(address, option_id, curator)| {
+            let item = items.iter().find(|i| {
+                i["address"]
+                    .as_str()
+                    .is_some_and(|a| a.eq_ignore_ascii_case(address))
+            })?;
+            let apy = item["state"]["netApy"]
+                .as_f64()
+                .filter(|a| a.is_finite() && *a >= 0.0)?
+                * 100.0;
+            Some(Vault {
+                address,
+                option_id,
+                curator,
+                name: item["name"].as_str().unwrap_or("USDC vault").to_string(),
+                apy,
+                deposited_usd: item["state"]["totalAssetsUsd"].as_f64().unwrap_or(0.0),
+            })
+        })
+        .collect()
 }
 
 fn lend_markets(tokens: &Value) -> Vec<Lend> {
@@ -454,14 +592,26 @@ pub(super) async fn options(
     app_balance::verified_wallets(&state, &headers).await?;
     currency_of(q.currency)?;
     // One venue being down doesn't hide the others; all down is an error.
-    let (aave, lend, jito) =
-        tokio::join!(usdc_apy(&state), jupiter_lend(&state), jito_market(&state));
+    let (aave, lend, jito, morpho) = tokio::join!(
+        usdc_apy(&state),
+        jupiter_lend(&state),
+        jito_market(&state),
+        morpho_vaults(&state)
+    );
     let mut options: Vec<(f64, Value)> = Vec::new();
     if let Ok(apy) = aave {
         options.push((apy, json!({
             "optionId":OPTION_ID,"name":"USDC savings","venue":"Aave","chain":"base","asset":"USDC",
             "apyPct":format!("{apy:.2}"),"iconUrl":null,"venueIconUrl":AAVE_ICON,
             "about":"Your USDC on Base, lent on Aave, the largest lending market. Take it out any time."
+        })));
+    }
+    for vault in morpho.iter().flatten() {
+        options.push((vault.apy, json!({
+            "optionId":vault.option_id,"name":"USDC savings","venue":"Morpho","chain":"base","asset":"USDC",
+            "market":vault.name,"apyPct":format!("{:.2}",vault.apy),"iconUrl":null,"venueIconUrl":MORPHO_ICON,
+            "about":format!("Your USDC on Base in {}, a Morpho vault run by {} (${:.0}M saved in it). Take it out any time.",
+                vault.name, vault.curator, vault.deposited_usd / 1e6)
         })));
     }
     for market in lend.iter().flatten() {
@@ -508,6 +658,24 @@ pub(super) async fn positions(
             positions.push(json!({"optionId":OPTION_ID,"name":"USDC savings","venue":"Aave","amount":usdc(units),
                 "value":money(units,&currency,rate),"apyPct":format!("{apy:.2}")}));
         }
+        let mut held = Vec::new();
+        for (vault, option_id, _) in MORPHO_VAULTS {
+            let (_, units) = vault_position(&state, vault, wallet).await?;
+            if units > 0 {
+                held.push((option_id, units));
+            }
+        }
+        if !held.is_empty() {
+            let vaults = morpho_vaults(&state).await.unwrap_or_default();
+            for (option_id, units) in held {
+                let apy = vaults
+                    .iter()
+                    .find(|v| v.option_id == option_id)
+                    .map_or(0.0, |v| v.apy);
+                positions.push(json!({"optionId":option_id,"name":"USDC savings","venue":"Morpho",
+                    "amount":usdc(units),"value":money(units,&currency,rate),"apyPct":format!("{apy:.2}")}));
+            }
+        }
     }
     if let Some(owner) = user.solana_wallet.as_deref().filter(|w| !w.is_empty()) {
         let held = solana_wallet(&state, owner).await?;
@@ -546,7 +714,8 @@ pub(super) async fn quote(
         .find(|(_, id)| *id == req.option_id)
         .map(|(mint, _)| *mint)
         .or_else(|| (req.option_id == JITO_OPTION).then_some(JITO_MINT));
-    if req.option_id != OPTION_ID && share_mint.is_none() {
+    let vault = vault_for(&req.option_id);
+    if req.option_id != OPTION_ID && share_mint.is_none() && vault.is_none() {
         return Err((StatusCode::NOT_FOUND, "unknown earn option".into()));
     }
     let lend_option = share_mint.is_some();
@@ -578,6 +747,25 @@ pub(super) async fn quote(
             lend_value(shares, &lend)
         };
         (available, lend.apy, shares, Some(lend))
+    } else if let Some((address, _)) = vault {
+        let (available, shares) = if deposit {
+            let cash = state
+                .markets
+                .base
+                .balance_of(engine_execution::swaps::uniswap::BASE_USDC, &wallet)
+                .await
+                .map_err(internal)?;
+            (cash, 0)
+        } else {
+            let (shares, assets) = vault_position(&state, address, &wallet).await?;
+            (assets, shares)
+        };
+        let apy = morpho_vaults(&state)
+            .await?
+            .iter()
+            .find(|v| v.address == address)
+            .map_or(0.0, |v| v.apy);
+        (available, apy, shares, None)
     } else {
         let (available, apy) = tokio::try_join!(
             async {
@@ -643,6 +831,8 @@ pub(super) async fn quote(
     let shares = match &lend {
         Some(_) if all => held_shares,
         Some(lend) if !deposit => lend_shares_for(units, held_shares, lend),
+        // A Morpho vault taken out in full hands back every share.
+        None if all && vault.is_some() => held_shares,
         _ => 0,
     };
     let quote_id = format!("earn-q-{:x}", now());
@@ -652,6 +842,7 @@ pub(super) async fn quote(
         EarnQuote {
             owner,
             share_mint,
+            vault: vault.map(|(address, _)| address),
             wallet,
             deposit,
             units,
@@ -705,51 +896,108 @@ pub(super) async fn execute(
     }
     let usdc_token = engine_execution::swaps::uniswap::BASE_USDC.to_ascii_lowercase();
     let mut txs: Vec<(String, String)> = Vec::new();
-    if quote.deposit {
-        if usdc_allowance(&state, &wallet).await? < quote.units {
-            // approve(pool, amount): exactly this deposit, never an open-ended allowance.
+    let venue = if let Some(vault) = quote.vault {
+        let curator = MORPHO_VAULTS
+            .iter()
+            .find(|(v, _, _)| *v == vault)
+            .map_or("Morpho", |(_, _, c)| *c);
+        if quote.deposit {
+            if usdc_allowance(&state, &wallet, vault).await? < quote.units {
+                // approve(vault, amount): exactly this deposit, never an open-ended allowance.
+                txs.push((
+                    usdc_token.clone(),
+                    format!(
+                        "0x095ea7b3{}{}",
+                        word_address(vault),
+                        word_units(quote.units)
+                    ),
+                ));
+            }
+            // deposit(assets, receiver)
             txs.push((
-                usdc_token.clone(),
+                vault.into(),
                 format!(
-                    "0x095ea7b3{}{}",
-                    word_address(AAVE_POOL),
-                    word_units(quote.units)
+                    "0x6e553f65{}{}",
+                    word_units(quote.units),
+                    word_address(&wallet)
+                ),
+            ));
+        } else if quote.all {
+            // redeem(shares, receiver, owner): every share, interest included, no dust left.
+            txs.push((
+                vault.into(),
+                format!(
+                    "0xba087652{}{}{}",
+                    word_units(quote.shares),
+                    word_address(&wallet),
+                    word_address(&wallet)
+                ),
+            ));
+        } else {
+            // withdraw(assets, receiver, owner)
+            txs.push((
+                vault.into(),
+                format!(
+                    "0xb460af94{}{}{}",
+                    word_units(quote.units),
+                    word_address(&wallet),
+                    word_address(&wallet)
                 ),
             ));
         }
-        // supply(asset, amount, onBehalfOf, referralCode)
-        txs.push((
-            AAVE_POOL.into(),
-            format!(
-                "0x617ba037{}{}{}{}",
-                word_address(&usdc_token),
-                word_units(quote.units),
-                word_address(&wallet),
-                word_units(0)
-            ),
-        ));
+        (
+            format!("Morpho ({curator}), on Base"),
+            "Variable, set by the vault's borrowers",
+        )
     } else {
-        // withdraw(asset, amount, to): type(uint256).max takes everything, interest included.
-        let amount = if quote.all {
-            "f".repeat(64)
+        if quote.deposit {
+            if usdc_allowance(&state, &wallet, AAVE_POOL).await? < quote.units {
+                // approve(pool, amount): exactly this deposit, never an open-ended allowance.
+                txs.push((
+                    usdc_token.clone(),
+                    format!(
+                        "0x095ea7b3{}{}",
+                        word_address(AAVE_POOL),
+                        word_units(quote.units)
+                    ),
+                ));
+            }
+            // supply(asset, amount, onBehalfOf, referralCode)
+            txs.push((
+                AAVE_POOL.into(),
+                format!(
+                    "0x617ba037{}{}{}{}",
+                    word_address(&usdc_token),
+                    word_units(quote.units),
+                    word_address(&wallet),
+                    word_units(0)
+                ),
+            ));
         } else {
-            word_units(quote.units)
-        };
-        txs.push((
-            AAVE_POOL.into(),
-            format!(
-                "0x69328dec{}{}{}",
-                word_address(&usdc_token),
-                amount,
-                word_address(&wallet)
-            ),
-        ));
-    }
+            // withdraw(asset, amount, to): type(uint256).max takes everything, interest included.
+            let amount = if quote.all {
+                "f".repeat(64)
+            } else {
+                word_units(quote.units)
+            };
+            txs.push((
+                AAVE_POOL.into(),
+                format!(
+                    "0x69328dec{}{}{}",
+                    word_address(&usdc_token),
+                    amount,
+                    word_address(&wallet)
+                ),
+            ));
+        }
+        ("Aave, on Base".to_string(), "Variable, set by Aave")
+    };
     let solana = app_balance::verified_wallets(&state, &headers)
         .await?
         .solana_wallet
         .filter(|w| !w.is_empty());
-    // A deposit may need Solana cash moved over first; a withdrawal only needs gas, which Atlas covers.
+    // A deposit may need Solana cash moved over first; a withdrawal only needs gas, paid from the
+    // wallet's own ETH (topped up first when the tank is empty).
     let needed = if quote.deposit { quote.units } else { 0 };
     let (intent_id, transactions, fee) = markets::plan_base_with_cash(
         &state,
@@ -769,8 +1017,8 @@ pub(super) async fn execute(
     };
     let mut summary = vec![
         json!({"label":if quote.deposit {"Put in savings"} else {"Take out of savings"},"value":amount}),
-        json!({"label":"Where","value":"Aave, on Base"}),
-        json!({"label":"Rate","value":"Variable, set by Aave"}),
+        json!({"label":"Where","value":venue.0}),
+        json!({"label":"Rate","value":venue.1}),
     ];
     if let Some(fee) = fee {
         summary.push(json!({"label":"Network fee","value":markets::say_money(fee, &quote.currency, quote.rate)}));
@@ -932,6 +1180,31 @@ mod tests {
         assert!(lend_markets(&json!([])).is_empty());
         assert!(is_lend_share(LEND_MARKETS[2].0) && !is_lend_share("other"));
     }
+    #[test]
+    fn reads_only_the_pinned_morpho_vaults() {
+        // Shape of Morpho's API on 2026-10-01, plus a vault Atlas doesn't list.
+        let body = json!({"data":{"vaults":{"items":[
+            {"address":"0xeE8F4eC5672F09119b96Ab6fB59C27E1b7e44b61","name":"Gauntlet USDC Prime",
+             "state":{"netApy":0.0442,"totalAssetsUsd":415_100_000.0}},
+            {"address":"0x1111111111111111111111111111111111111111","name":"Somebody's vault",
+             "state":{"netApy":0.30,"totalAssetsUsd":1_000.0}},
+            {"address":"0xbeeF010f9cb27031ad51e3333f9aF9C6B1228183","name":"Steakhouse USDC",
+             "state":{"netApy":null,"totalAssetsUsd":124_500_000.0}}
+        ]}}});
+        let vaults = parse_vaults(&body);
+        assert_eq!(vaults.len(), 1);
+        assert_eq!(vaults[0].name, "Gauntlet USDC Prime");
+        assert_eq!(vaults[0].option_id, "morpho-gauntlet-usdc-base");
+        assert!((vaults[0].apy - 4.42).abs() < 1e-9);
+        assert_eq!(vault_for("morpho-spark-usdc-base").unwrap().1, "Spark");
+        assert!(vault_for("aave-usdc-base").is_none());
+        assert_eq!(
+            word_to_units("0x00000000000000000000000000000000000000000000000000000000004c4b40")
+                .unwrap(),
+            5_000_000
+        );
+    }
+
     #[test]
     fn reads_aave_rate_and_encodes_calls() {
         // currentLiquidityRate 4.292% APR in ray, as the third word of getReserveData.

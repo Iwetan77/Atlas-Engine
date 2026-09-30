@@ -175,8 +175,8 @@ pub(super) async fn balance(
         .and_then(|cash| cash.checked_add(arc_usdc))
         .ok_or((StatusCode::BAD_GATEWAY, "balance overflow".into()))?;
 
-    // Savings on Aave are cash that's earning: they count, labelled as being in Earn.
-    let savings = earn::savings_units(&state, &evm).await?;
+    // Savings on Aave and Morpho are cash that's earning: they count, labelled as being in Earn.
+    let savings = earn::base_savings_units(&state, &evm).await?;
     if savings > 0 {
         add_holding(&mut holdings, "base", "earn", savings, &currency, rate)?;
         total = total
