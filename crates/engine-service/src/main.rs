@@ -5,6 +5,7 @@ mod app_balance;
 mod earn;
 mod markets;
 mod near_intents;
+mod onramp;
 mod perps;
 mod positions;
 mod relay;
@@ -78,6 +79,7 @@ struct AppState {
     earn: earn::EarnState,
     social: social::SocialState,
     trades: positions::TradeBook,
+    onramp: Option<engine_execution::funding::circle::CircleOnrampClient>,
 }
 
 #[derive(Clone)]
@@ -191,6 +193,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         earn: earn::EarnState::default(),
         social: social::SocialState::new().await?,
         trades: positions::TradeBook::new().await?,
+        onramp: onramp::client_from_env()?,
     };
     let bind: SocketAddr = env::var("ATLAS_BALANCE_BIND")
         .unwrap_or_else(|_| "127.0.0.1:3000".into())
@@ -247,6 +250,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(markets::next_transactions),
         )
         .route("/v1/relay/evm", post(relay::evm))
+        .route("/v1/onramp/session", post(onramp::session))
         .route("/v1/earn/options", get(earn::options))
         .route("/v1/earn/positions", get(earn::positions))
         .route("/v1/earn/quotes", post(earn::quote))
