@@ -6,12 +6,218 @@ use serde_json::{json, Value};
 use std::{str::FromStr, time::Duration};
 pub(super) use trade::TradeState;
 
-const MARKET_IDS: [(&str, &str, &str); 3] = [
-    ("BTC-USD-PERP", "BTC", "Bitcoin Perpetual"),
-    ("ETH-USD-PERP", "ETH", "Ethereum Perpetual"),
-    ("SOL-USD-PERP", "SOL", "Solana Perpetual"),
-];
 const SCALE: u128 = 1_000_000_000_000;
+
+// Every perp Paradex lists is offered. Names for the ones we can name with confidence; anything else
+// keeps its ticker. Categories here override Paradex's tags, which lump stocks, commodities and
+// indices together as RWA (and call PAXG, tokenized gold, DEFI).
+const KNOWN_MARKETS: &[(&str, &str, &str)] = &[
+    ("BTC", "Bitcoin", "crypto"),
+    ("ETH", "Ethereum", "crypto"),
+    ("SOL", "Solana", "crypto"),
+    ("HYPE", "Hyperliquid", "crypto"),
+    ("BNB", "BNB", "crypto"),
+    ("SUI", "Sui", "crypto"),
+    ("XRP", "XRP", "crypto"),
+    ("AVAX", "Avalanche", "crypto"),
+    ("LINK", "Chainlink", "crypto"),
+    ("NEAR", "NEAR", "crypto"),
+    ("TAO", "Bittensor", "crypto"),
+    ("ADA", "Cardano", "crypto"),
+    ("LTC", "Litecoin", "crypto"),
+    ("UNI", "Uniswap", "crypto"),
+    ("AAVE", "Aave", "crypto"),
+    ("ENA", "Ethena", "crypto"),
+    ("ETHFI", "ether.fi", "crypto"),
+    ("JTO", "Jito", "crypto"),
+    ("JUP", "Jupiter", "crypto"),
+    ("KAITO", "Kaito", "crypto"),
+    ("LDO", "Lido DAO", "crypto"),
+    ("MORPHO", "Morpho", "crypto"),
+    ("ONDO", "Ondo", "crypto"),
+    ("PENDLE", "Pendle", "crypto"),
+    ("PYTH", "Pyth Network", "crypto"),
+    ("STRK", "Starknet", "crypto"),
+    ("TRX", "TRON", "crypto"),
+    ("XMR", "Monero", "crypto"),
+    ("ZEC", "Zcash", "crypto"),
+    ("MON", "Monad", "crypto"),
+    ("XPL", "Plasma", "crypto"),
+    ("WLFI", "World Liberty Financial", "crypto"),
+    ("DOGE", "Dogecoin", "meme"),
+    ("PUMP", "Pump.fun", "meme"),
+    ("TRUMP", "Official Trump", "meme"),
+    ("kPEPE", "Pepe (per 1,000)", "meme"),
+    ("kSHIB", "Shiba Inu (per 1,000)", "meme"),
+    ("GOOGL", "Alphabet", "stock"),
+    ("META", "Meta Platforms", "stock"),
+    ("MSFT", "Microsoft", "stock"),
+    ("MSTR", "Strategy", "stock"),
+    ("INTC", "Intel", "stock"),
+    ("CRCL", "Circle", "stock"),
+    ("MU", "Micron", "stock"),
+    ("MRVL", "Marvell", "stock"),
+    ("SNDK", "Sandisk", "stock"),
+    ("EWY", "iShares MSCI South Korea ETF", "stock"),
+    ("XAU", "Gold", "commodity"),
+    ("PAXG", "PAX Gold", "commodity"),
+    ("XAG", "Silver", "commodity"),
+    ("XPT", "Platinum", "commodity"),
+    ("XCU", "Copper", "commodity"),
+    ("CL", "Crude oil (WTI)", "commodity"),
+    ("BZ", "Brent crude", "commodity"),
+    ("NG", "Natural gas", "commodity"),
+    ("US100", "Nasdaq 100", "index"),
+    ("US500", "S&P 500", "index"),
+];
+
+fn classify(symbol: &str, tags: &[&str]) -> (String, &'static str) {
+    if let Some((_, name, category)) = KNOWN_MARKETS.iter().find(|(s, _, _)| *s == symbol) {
+        return ((*name).into(), category);
+    }
+    let category = if tags.contains(&"RWA") {
+        "stock"
+    } else if tags.contains(&"MEME") {
+        "meme"
+    } else {
+        "crypto"
+    };
+    (symbol.into(), category)
+}
+
+// Public logo CDNs: CoinCap by ticker for tokens, FMP for stock tickers. Commodities and indices
+// have no logo; the app falls back to initials (and does the same if a URL fails to load).
+fn icon_url(symbol: &str, category: &str) -> Option<String> {
+    // kPEPE / kSHIB quote 1,000 tokens; the logo is the token's.
+    let token = symbol
+        .strip_prefix('k')
+        .filter(|rest| rest.chars().all(|c| c.is_ascii_uppercase()))
+        .unwrap_or(symbol);
+    match category {
+        "crypto" | "meme" => Some(format!(
+            "https://assets.coincap.io/assets/icons/{}@2x.png",
+            token.to_ascii_lowercase()
+        )),
+        "stock" => Some(format!(
+            "https://financialmodelingprep.com/image-stock/{symbol}.png"
+        )),
+        _ if symbol == "PAXG" => Some("https://assets.coincap.io/assets/icons/paxg@2x.png".into()),
+        _ => None,
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct PerpMeta {
+    market_id: String,
+    symbol: String,
+    name: String,
+    category: &'static str,
+    max_leverage: u64,
+}
+
+// The catalog barely changes; prices are shared by every viewer for a few seconds.
+const CATALOG_TTL: Duration = Duration::from_secs(60 * 60);
+const PRICES_TTL: Duration = Duration::from_secs(15);
+const PRICE_FETCHES_AT_ONCE: usize = 16;
+
+type Cached<T> = Arc<Mutex<Option<(Instant, Arc<T>)>>>;
+
+#[derive(Clone, Default)]
+pub(super) struct PerpCache {
+    catalog: Cached<Vec<PerpMeta>>,
+    prices: Cached<HashMap<String, Value>>,
+}
+
+fn fresh<T>(slot: &Cached<T>, ttl: Duration) -> Result<Option<Arc<T>>, ApiError> {
+    Ok(slot
+        .lock()
+        .map_err(internal)?
+        .as_ref()
+        .filter(|(at, _)| at.elapsed() < ttl)
+        .map(|(_, value)| value.clone()))
+}
+
+async fn perp_catalog(state: &AppState) -> Result<Arc<Vec<PerpMeta>>, ApiError> {
+    if let Some(catalog) = fresh(&state.perp_cache.catalog, CATALOG_TTL)? {
+        return Ok(catalog);
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let mut catalog = Vec::new();
+    for market in state.paradex.perp_markets().await.map_err(internal)? {
+        let (Some(market_id), Some(symbol)) =
+            (market["symbol"].as_str(), market["base_currency"].as_str())
+        else {
+            continue;
+        };
+        // Not open yet or no longer trading normally: nothing to offer.
+        if market["open_at"].as_u64().unwrap_or(0) > now_ms
+            || market["trading_mode"].as_str() != Some("STANDARD")
+        {
+            continue;
+        }
+        let Some(max_leverage) = market["delta1_cross_margin_params"]["imf_base"]
+            .as_str()
+            .and_then(|imf| max_leverage(imf).ok())
+        else {
+            continue;
+        };
+        let tags: Vec<&str> = market["tags"]
+            .as_array()
+            .map(|tags| tags.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let (name, category) = classify(symbol, &tags);
+        catalog.push(PerpMeta {
+            market_id: market_id.into(),
+            symbol: symbol.into(),
+            name,
+            category,
+            max_leverage,
+        });
+    }
+    if catalog.is_empty() {
+        return Err(unavailable("Paradex listed no perpetual markets"));
+    }
+    let catalog = Arc::new(catalog);
+    *state.perp_cache.catalog.lock().map_err(internal)? = Some((Instant::now(), catalog.clone()));
+    Ok(catalog)
+}
+
+// One small summary request per market, a few at a time: Paradex's all-markets summary is ~3 MB
+// of options data we'd throw away.
+async fn perp_prices(
+    state: &AppState,
+    catalog: &[PerpMeta],
+) -> Result<Arc<HashMap<String, Value>>, ApiError> {
+    if let Some(prices) = fresh(&state.perp_cache.prices, PRICES_TTL)? {
+        return Ok(prices);
+    }
+    let limit = Arc::new(tokio::sync::Semaphore::new(PRICE_FETCHES_AT_ONCE));
+    let mut tasks = tokio::task::JoinSet::new();
+    for meta in catalog {
+        let (paradex, limit, market_id) =
+            (state.paradex.clone(), limit.clone(), meta.market_id.clone());
+        tasks.spawn(async move {
+            let _permit = limit.acquire_owned().await.ok()?;
+            let summary = paradex.summary(&market_id).await.ok()?;
+            Some((market_id, summary))
+        });
+    }
+    let mut prices = HashMap::new();
+    while let Some(done) = tasks.join_next().await {
+        if let Ok(Some((market_id, summary))) = done {
+            prices.insert(market_id, summary);
+        }
+    }
+    if prices.is_empty() {
+        return Err(unavailable("Paradex market prices are unavailable"));
+    }
+    let prices = Arc::new(prices);
+    *state.perp_cache.prices.lock().map_err(internal)? = Some((Instant::now(), prices.clone()));
+    Ok(prices)
+}
 
 #[derive(Deserialize)]
 pub(super) struct CurrencyQuery {
@@ -259,48 +465,43 @@ pub(super) async fn markets(
 ) -> Result<Json<Value>, ApiError> {
     app_balance::verified_wallets(&state, &headers).await?;
     let currency = checked_currency(q)?;
-    let rate = app_balance::fx_rate(&currency).await?;
-    let mut result = Vec::with_capacity(MARKET_IDS.len());
-    for (market_id, symbol, name) in MARKET_IDS {
-        let (metadata, summary, funding) = tokio::join!(
-            state.paradex.market(market_id),
-            state.paradex.summary(market_id),
-            state.paradex.funding(market_id),
-        );
-        let metadata = match metadata {
-            Ok(metadata) => metadata,
-            Err(engine_execution::perps::ParadexError::Rejected(
-                reqwest::StatusCode::NOT_FOUND,
-            )) => {
-                continue;
-            }
-            Err(error) => return Err(internal(error)),
+    let (rate, catalog) = tokio::try_join!(app_balance::fx_rate(&currency), perp_catalog(&state))?;
+    let prices = perp_prices(&state, &catalog).await?;
+    let mut rows = Vec::with_capacity(catalog.len());
+    for meta in catalog.iter() {
+        // A market whose price didn't come back this round is left out rather than failing the list.
+        let Some(summary) = prices.get(&meta.market_id) else {
+            continue;
         };
-        let summary = summary.map_err(internal)?;
-        let funding = funding.map_err(internal)?;
-        if venue_str(&metadata, "symbol")? != market_id
-            || venue_str(&metadata, "asset_kind")? != "PERP"
-            || venue_str(&summary, "symbol")? != market_id
-        {
-            return Err((
-                StatusCode::BAD_GATEWAY,
-                "Paradex market identity mismatch".into(),
-            ));
+        if summary["symbol"].as_str() != Some(meta.market_id.as_str()) {
+            continue;
         }
-        let mark = venue_str(&summary, "mark_price")?;
-        let imf = venue_str(&metadata["delta1_cross_margin_params"], "imf_base")?;
+        let Some(mark) = summary["mark_price"].as_str().filter(|v| !v.is_empty()) else {
+            continue;
+        };
         let change = summary["price_change_rate_24h"]
             .as_str()
             .map(percent)
             .transpose()?;
-        let funding_pct = funding
-            .as_ref()
-            .and_then(|v| v["funding_rate_8h"].as_str())
-            .map(percent)
-            .transpose()?;
-        result.push(json!({"marketId":market_id,"symbol":symbol,"name":name,"markPrice":display_money(mark,&currency,rate)?,"change24hPct":change,"maxLeverage":max_leverage(imf)?,"fundingRate8hPct":funding_pct}));
+        // Every Paradex perp funds every 8 hours, so the current rate is the 8h rate.
+        let funding_pct = summary["funding_rate"].as_str().map(percent).transpose()?;
+        let volume = summary["volume_24h"].as_str().unwrap_or("0");
+        rows.push((
+            volume.parse::<f64>().unwrap_or(0.0),
+            json!({
+                "marketId":meta.market_id,"symbol":meta.symbol,"name":meta.name,
+                "category":meta.category,"iconUrl":icon_url(&meta.symbol, meta.category),
+                "markPrice":display_money(mark,&currency,rate)?,"change24hPct":change,
+                "maxLeverage":meta.max_leverage,"fundingRate8hPct":funding_pct,
+                "volume24hUsd":volume
+            }),
+        ));
     }
-    Ok(Json(json!({"markets":result})))
+    // Most traded first: those are the markets that can actually fill an order.
+    rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+    Ok(Json(
+        json!({"markets":rows.into_iter().map(|(_, row)| row).collect::<Vec<_>>()}),
+    ))
 }
 
 async fn evm_jwt(
@@ -408,6 +609,7 @@ pub(super) async fn positions(
     )
     .await?;
     let venue_positions = state.paradex.positions(&jwt).await.map_err(internal)?;
+    let catalog = perp_catalog(&state).await.ok();
     let mut result = Vec::new();
     for position in venue_positions {
         if position["status"].as_str() != Some("OPEN") {
@@ -436,6 +638,7 @@ pub(super) async fn positions(
             "openedAtUnixMs":position["created_at"].as_u64().filter(|value| *value > 0).ok_or((StatusCode::BAD_GATEWAY, "Paradex omitted created_at".into()))?,
             "marketId":market_id,
             "symbol":symbol,
+            "iconUrl":catalog.as_ref().and_then(|c| c.iter().find(|m| m.market_id == market_id)).and_then(|m| icon_url(&m.symbol, m.category)),
             "side":side,
             "leverage":leverage,
             "size":size,
@@ -455,6 +658,25 @@ pub(super) use trade::{close_quote, execute_close, execute_quote, quotes};
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn markets_get_names_categories_and_icons() {
+        assert_eq!(classify("XAU", &["RWA"]), ("Gold".into(), "commodity"));
+        assert_eq!(classify("US500", &["RWA"]), ("S&P 500".into(), "index"));
+        assert_eq!(classify("PAXG", &["DEFI"]).1, "commodity");
+        assert_eq!(classify("NEWCO", &["RWA"]), ("NEWCO".into(), "stock"));
+        assert_eq!(classify("FROG", &["MEME"]).1, "meme");
+        assert_eq!(classify("NEWL1", &["LAYER-1"]).1, "crypto");
+        assert_eq!(
+            icon_url("kPEPE", "meme").as_deref(),
+            Some("https://assets.coincap.io/assets/icons/pepe@2x.png")
+        );
+        assert_eq!(
+            icon_url("GOOGL", "stock").as_deref(),
+            Some("https://financialmodelingprep.com/image-stock/GOOGL.png")
+        );
+        assert_eq!(icon_url("XAU", "commodity"), None);
+        assert_eq!(icon_url("US100", "index"), None);
+    }
     #[test]
     fn market_rate_conversion_preserves_precision() {
         assert_eq!(percent("0.01233").unwrap(), "1.233");

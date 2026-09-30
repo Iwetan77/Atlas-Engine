@@ -220,6 +220,19 @@ impl ParadexClient {
             .map(str::to_owned)
             .ok_or(ParadexError::InvalidResponse)
     }
+    /// Every perpetual Paradex lists. The venue returns options and spot in the same ~8 MB
+    /// response and can't filter it, so callers should cache this.
+    pub async fn perp_markets(&self) -> Result<Vec<Value>, ParadexError> {
+        let data = self.get("markets", None).await?;
+        Ok(data["results"]
+            .as_array()
+            .ok_or(ParadexError::InvalidResponse)?
+            .iter()
+            .filter(|market| market["asset_kind"].as_str() == Some("PERP"))
+            .cloned()
+            .collect())
+    }
+
     pub async fn market(&self, market: &str) -> Result<Value, ParadexError> {
         let data = self.get(&format!("markets?market={market}"), None).await?;
         data["results"]

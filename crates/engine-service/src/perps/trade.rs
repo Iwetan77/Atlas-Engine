@@ -343,9 +343,6 @@ pub(crate) async fn quotes(
 ) -> Result<Json<Value>, ApiError> {
     trading_env()?;
     let (user_id, wallet, account) = owner(&state, &headers).await?;
-    if !MARKET_IDS.iter().any(|(m, _, _)| *m == body.market_id) {
-        return Err(bad("unsupported Paradex market"));
-    }
     if !matches!(body.side.as_str(), "long" | "short") {
         return Err(bad("side must be long or short"));
     }
@@ -533,9 +530,6 @@ pub(crate) async fn close_quote(
             "open Paradex position not found".into(),
         ))?;
     let market = venue_str(&position, "market")?;
-    if !MARKET_IDS.iter().any(|(m, _, _)| *m == market) {
-        return Err(bad("unsupported Paradex market"));
-    }
     let close_side = match venue_str(&position, "side")? {
         "LONG" => "sell",
         "SHORT" => "buy",
