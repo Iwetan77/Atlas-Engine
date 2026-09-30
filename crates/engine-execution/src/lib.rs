@@ -8,4 +8,4 @@ pub mod perps;
 pub mod solana;
 pub mod swaps;
 pub mod yield_positions {}
-pub mod near_intents {}
+pub mod near_intents;
