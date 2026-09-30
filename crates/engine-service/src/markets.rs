@@ -1819,6 +1819,87 @@ pub(super) async fn plan_solana_transfer(
     Ok((intent_id, transactions))
 }
 
+// The Base gas tank. Below this much ETH a Base plan starts with a refill from the user's USDC;
+// at or above it the wallet pays its own gas (a Base transaction costs about 0.000002 ETH).
+const BASE_GAS_FLOOR_WEI: u128 = 5_000_000_000_000; // 0.000005 ETH
+                                                    // A refill: $0.50 of USDC becomes about 0.0002 ETH, enough for dozens of transactions.
+const BASE_GAS_REFILL_USDC: u128 = 500_000;
+
+async fn base_eth(state: &AppState, wallet: &str) -> Option<u128> {
+    let result = base_rpc(&state.markets, "eth_getBalance", json!([wallet, "latest"]))
+        .await
+        .ok()?;
+    u128::from_str_radix(result.as_str()?.trim_start_matches("0x"), 16).ok()
+}
+
+// Whether the wallet's own ETH can pay for a transaction now.
+pub(super) async fn wallet_pays_gas(state: &AppState, wallet: &str) -> bool {
+    base_eth(state, wallet)
+        .await
+        .is_some_and(|wei| wei >= BASE_GAS_FLOOR_WEI)
+}
+
+// The Base transactions that refill the gas tank when it's low and the user has USDC to spare beyond
+// `reserve`: approve the router if needed, swap USDC → WETH, unwrap to ETH. Empty otherwise. These
+// few are the only ones Privy still sponsors.
+pub(super) async fn base_gas_refill(
+    state: &AppState,
+    wallet: &str,
+    reserve: u128,
+) -> Vec<(String, String)> {
+    if wallet_pays_gas(state, wallet).await {
+        return Vec::new();
+    }
+    let usdc = state
+        .markets
+        .base
+        .balance_of(BASE_USDC, wallet)
+        .await
+        .unwrap_or(0);
+    if usdc < reserve.saturating_add(BASE_GAS_REFILL_USDC) {
+        return Vec::new();
+    }
+    let request = BaseSwapRequest {
+        source_token: BASE_USDC.into(),
+        destination_token: BASE_WETH.into(),
+        amount_base_units: BASE_GAS_REFILL_USDC,
+    };
+    let Ok(quote) = state.markets.base.quote_direct(&request).await else {
+        return Vec::new();
+    };
+    let Ok(swap) = state.markets.base.swap_transaction(&quote, wallet, 100) else {
+        return Vec::new();
+    };
+    let mut txs = Vec::new();
+    let allowance = state
+        .markets
+        .base
+        .allowance(BASE_USDC, wallet)
+        .await
+        .unwrap_or(0);
+    if allowance < BASE_GAS_REFILL_USDC {
+        if let Ok(approval) =
+            state
+                .markets
+                .base
+                .approval_transaction(BASE_USDC, wallet, BASE_GAS_REFILL_USDC)
+        {
+            txs.push((
+                approval.to.to_ascii_lowercase(),
+                approval.data.to_ascii_lowercase(),
+            ));
+        }
+    }
+    txs.push((swap.to.to_ascii_lowercase(), swap.data.to_ascii_lowercase()));
+    // WETH.withdraw(the least the swap delivers): the ETH lands natively for gas.
+    let unwrap = quote.amount_out.saturating_mul(99) / 100;
+    txs.push((
+        BASE_WETH.to_ascii_lowercase(),
+        format!("0x2e1a7d4d{unwrap:064x}"),
+    ));
+    txs
+}
+
 // USDC in a Solana wallet (0 if it can't be read).
 pub(super) async fn solana_cash(state: &AppState, owner: &str) -> u128 {
     state
@@ -1921,6 +2002,13 @@ pub(super) async fn plan_base_with_cash(
                 |(to, data)| json!({"chain":"base","chainId":8453,"to":to,"data":data,"value":"0"}),
             )
             .collect()
+    };
+    // A low gas tank is refilled from the user's USDC first (only when Base holds it already).
+    let refill = base_gas_refill(state, &evm, needed).await;
+    let txs = if refill.is_empty() {
+        txs
+    } else {
+        refill.iter().cloned().chain(txs).collect()
     };
     let Some((send, fee)) =
         cash_for_base(state, &evm, solana.as_deref(), needed, currency, rate).await?

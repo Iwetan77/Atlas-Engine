@@ -1,4 +1,5 @@
-//! Sends a Base transaction the user confirmed in the app, with Privy gas sponsorship. Privy's Expo
+//! Sends a Base transaction the user confirmed in the app, paid from the wallet's own ETH gas tank
+//! when it has some, with Privy gas sponsorship only as the fallback. Privy's Expo
 //! SDK can't ask for sponsorship, so the iPhone app hands the transaction here instead. Only a
 //! transaction Atlas planned for that user's intent, byte for byte, is ever relayed.
 use super::*;
@@ -81,11 +82,13 @@ pub(super) async fn evm(
         req.intent_id,
         planned_index(&planned, &to, &data)
     );
+    // The user's own ETH pays when the wallet has some (the gas tank); Privy sponsors otherwise.
+    let sponsor = !markets::wallet_pays_gas(&state, &wallet).await;
     let response = http
         .post(format!("{bridge_url}/relay/evm-transaction"))
         .json(
             &json!({"accessToken":token,"walletAddress":wallet,"chainId":req.chain_id,
-            "to":to,"data":data,"idempotencyKey":idempotency_key}),
+            "to":to,"data":data,"idempotencyKey":idempotency_key,"sponsor":sponsor}),
         )
         .send()
         .await
