@@ -611,6 +611,219 @@ pub(super) async fn sui_holdings(
     Ok(out)
 }
 
+// Networks people can deposit from besides Base and Solana (which use their own wallets): each is a
+// 1Click asset that becomes USDC in the user's Base wallet, their balance.
+// (id, label, network, asset, 1Click asset id)
+const DEPOSIT_NETWORKS: &[(&str, &str, &str, &str, &str)] = &[
+    (
+        "tron-usdt",
+        "USDT on Tron (TRC20)",
+        "Tron",
+        "USDT",
+        "nep141:tron-d28a265909efecdcee7c5028585214ea0b96f015.omft.near",
+    ),
+    (
+        "eth-usdt",
+        "USDT on Ethereum (ERC20)",
+        "Ethereum",
+        "USDT",
+        "nep141:eth-0xdac17f958d2ee523a2206206994597c13d831ec7.omft.near",
+    ),
+    (
+        "eth-usdc",
+        "USDC on Ethereum",
+        "Ethereum",
+        "USDC",
+        "nep141:eth-0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.omft.near",
+    ),
+    (
+        "arb-usdc",
+        "USDC on Arbitrum",
+        "Arbitrum",
+        "USDC",
+        "nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near",
+    ),
+    (
+        "bsc-usdt",
+        "USDT on BNB Chain (BEP20)",
+        "BNB Chain",
+        "USDT",
+        "nep245:v2_1.omni.hot.tg:56_2CMMyVTGZkeyNZTSvS5sarzfir6g",
+    ),
+    (
+        "pol-usdt",
+        "USDT on Polygon",
+        "Polygon",
+        "USDT",
+        "nep245:v2_1.omni.hot.tg:137_3hpYoaLtt8MP1Z2GH1U473DMRKgr",
+    ),
+    (
+        "ton-usdt",
+        "USDT on TON",
+        "TON",
+        "USDT",
+        "nep245:v2_1.omni.hot.tg:1117_3tsdfyziyc7EJbP2aULWSKU4toBaAcN4FdTgfm5W1mC4ouR",
+    ),
+    (
+        "sol-usdt",
+        "USDT on Solana",
+        "Solana",
+        "USDT",
+        "nep141:sol-c800a4bd850783ccb82c2b2c7e84175443606352.omft.near",
+    ),
+];
+// How long a deposit address waits for the money.
+const DEPOSIT_WINDOW_SECS: u64 = 2 * 60 * 60;
+
+pub(super) async fn deposit_networks() -> Json<Value> {
+    Json(
+        json!({"networks": DEPOSIT_NETWORKS.iter().map(|(id, label, network, asset, _)| {
+        json!({"id":id,"label":label,"network":network,"asset":asset})
+    }).collect::<Vec<_>>()}),
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct DepositRequest {
+    network_id: String,
+    amount: markets::Money,
+}
+
+// "Temporary swap limits: minimum swap amount is $100" → 100.
+fn venue_minimum_usd(message: &str) -> Option<u128> {
+    let tail = message.split("minimum swap amount is $").nth(1)?;
+    let digits: String = tail
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == ',')
+        .filter(|c| *c != ',')
+        .collect();
+    digits.parse().ok()
+}
+
+pub(super) async fn deposit_quote(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<DepositRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let user = app_balance::verified_wallets(&state, &headers).await?;
+    let (_, label, network, asset, asset_id) = DEPOSIT_NETWORKS
+        .iter()
+        .find(|(id, ..)| *id == req.network_id)
+        .ok_or((StatusCode::NOT_FOUND, "unknown deposit network".into()))?;
+    let wallet = user
+        .evm_wallet
+        .as_deref()
+        .filter(|w| is_evm(w))
+        .ok_or_else(|| conflict("Your wallet is still being set up. Try again in a moment."))?;
+    let tokens = state.near.tokens().await?;
+    let origin = tokens
+        .iter()
+        .find(|t| t.asset_id == *asset_id)
+        .ok_or_else(|| venue(format!("Deposits of {label} aren't available right now")))?;
+    let near = tokens
+        .iter()
+        .find(|t| t.blockchain == "near")
+        .ok_or_else(|| venue("NEAR Intents is unavailable right now"))?;
+    // Refunds (a deposit below the band, or one that can't be swapped) land in their own NEAR account.
+    let refund_to = destination(&state, &headers, near, &user).await?;
+    let currency = req.amount.currency.clone();
+    markets::checked_currency(&currency)?;
+    let rate = app_balance::fx_rate(&currency).await?;
+    let usd = markets::parse_micros(&req.amount.amount)?
+        .checked_mul(1_000_000)
+        .ok_or_else(|| bad("amount too large"))?
+        / rate;
+    markets::check_limits(usd, &currency, rate)?;
+    // Dollar coins: the amount to send is the dollar amount in the coin's own decimals.
+    let units = if origin.decimals >= 6 {
+        usd.checked_mul(10u128.pow(origin.decimals - 6))
+    } else {
+        Some(usd / 10u128.pow(6 - origin.decimals))
+    }
+    .ok_or_else(|| bad("amount too large"))?;
+    let deadline = deadline_utc(DEPOSIT_WINDOW_SECS);
+    let amount = units.to_string();
+    let request = QuoteRequest::flex_deposit(
+        asset_id,
+        BASE_USDC_1CLICK,
+        &amount,
+        wallet,
+        &refund_to,
+        &deadline,
+    );
+    let q = match state.near.client.quote(&request).await {
+        Ok(q) => q,
+        Err(engine_execution::near_intents::Error::Venue(_, text)) => {
+            if let Some(min) = venue_minimum_usd(&text) {
+                return Err(bad(&format!(
+                    "The smallest deposit from {network} right now is {} (${min}).",
+                    markets::say_money(min * 1_000_000, &currency, rate)
+                )));
+            }
+            return Err(venue(format!(
+                "Deposits from {network} aren't available right now"
+            )));
+        }
+        Err(e) => return Err(venue(e)),
+    };
+    let address = q
+        .deposit_address
+        .clone()
+        .ok_or_else(|| venue("1Click omitted the deposit address"))?;
+    let receive: u128 = q.amount_out.parse().map_err(internal)?;
+    let minimum: u128 = q
+        .min_amount_in
+        .as_deref()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(units.saturating_mul(99) / 100);
+    Ok(Json(json!({
+        "address": address,
+        "memo": q.deposit_memo,
+        "network": network,
+        "label": label,
+        "asset": asset,
+        "sendAmount": markets::format_units(units, origin.decimals),
+        "minAmount": markets::format_units(minimum, origin.decimals),
+        "receive": money(receive, &currency, rate),
+        "timeEstimateSec": q.time_estimate,
+        "expiresAtUnixMs": now() + DEPOSIT_WINDOW_SECS * 1000,
+    })))
+}
+
+#[derive(Deserialize)]
+pub(super) struct DepositStatusQuery {
+    address: String,
+    memo: Option<String>,
+}
+
+// Where a deposit from another network stands: waiting for it, swapping, done, or refunded.
+pub(super) async fn deposit_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<DepositStatusQuery>,
+) -> Result<Json<Value>, ApiError> {
+    app_balance::verified_wallets(&state, &headers).await?;
+    if q.address.is_empty() || q.address.len() > 128 {
+        return Err(bad("invalid deposit address"));
+    }
+    let status = state
+        .near
+        .client
+        .status(&q.address, q.memo.as_deref())
+        .await
+        .map_err(venue)?;
+    let state_name = match status.status.as_str() {
+        "PENDING_DEPOSIT" => "waiting",
+        "KNOWN_DEPOSIT_TX" | "PROCESSING" => "processing",
+        "SUCCESS" => "done",
+        "INCOMPLETE_DEPOSIT" => "incomplete",
+        "REFUNDED" => "refunded",
+        _ => "failed",
+    };
+    Ok(Json(json!({"state": state_name})))
+}
+
 fn sui_coin_type(value: &str) -> bool {
     let parts: Vec<_> = value.split("::").collect();
     parts.len() == 3
@@ -1354,6 +1567,23 @@ pub(super) async fn status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reads_the_venues_minimum() {
+        assert_eq!(
+            venue_minimum_usd(
+                r#"{"message":"Temporary swap limits: minimum swap amount is $100"}"#
+            ),
+            Some(100)
+        );
+        assert_eq!(
+            venue_minimum_usd("minimum swap amount is $1,000"),
+            Some(1000)
+        );
+        assert_eq!(
+            venue_minimum_usd("Quoting for this pair is not available"),
+            None
+        );
+    }
     #[test]
     fn utc_deadline_is_iso8601() {
         let d = deadline_utc(180);

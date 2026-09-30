@@ -44,6 +44,32 @@ pub struct QuoteRequest<'a> {
     pub deadline: &'a str,
 }
 impl<'a> QuoteRequest<'a> {
+    /// A deposit from another chain: the user sends about `amount` (at least 99% of it) to the deposit
+    /// address; it becomes `destination_asset` for `recipient`. Refunds go to their NEAR Intents
+    /// account, since they may have no wallet on the origin chain.
+    pub fn flex_deposit(
+        origin_asset: &'a str,
+        destination_asset: &'a str,
+        amount: &'a str,
+        recipient: &'a str,
+        refund_to_near: &'a str,
+        deadline: &'a str,
+    ) -> Self {
+        Self {
+            dry: false,
+            swap_type: "FLEX_INPUT",
+            slippage_tolerance: 100,
+            origin_asset,
+            deposit_type: "ORIGIN_CHAIN",
+            destination_asset,
+            amount,
+            recipient,
+            recipient_type: "DESTINATION_CHAIN",
+            refund_to: refund_to_near,
+            refund_type: "INTENTS",
+            deadline,
+        }
+    }
     pub fn exact_input(
         origin_asset: &'a str,
         destination_asset: &'a str,
@@ -76,6 +102,8 @@ pub struct Quote {
     pub amount_out: String,
     pub amount_out_usd: String,
     pub min_amount_out: Option<String>,
+    #[serde(default)]
+    pub min_amount_in: Option<String>,
     pub deposit_address: Option<String>,
     pub deposit_memo: Option<String>,
     pub time_estimate: Option<u64>,
