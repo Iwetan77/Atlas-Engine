@@ -100,3 +100,57 @@ export async function swapFromSui({wallet, coinType, amount, reserve, rawSign}) 
   return {digest: result?.digest, ok, error: ok ? null : result?.effects?.status?.error ?? 'swap failed',
     amountIn: input.toString(), amountOut: received.toString()};
 }
+
+// Send an exact amount of SUI to a 1Click deposit address. Privy signs only with the current
+// user's JWT; the server never holds a Sui key or signs on their behalf.
+export async function transferSui({wallet, recipient, amount, reserve, rawSign}) {
+  if (!/^0x[0-9a-fA-F]{64}$/.test(recipient)) throw new Error('invalid Sui recipient');
+  const input = BigInt(amount);
+  if (input <= 0n) throw new Error('invalid SUI transfer amount');
+  const balance = await suiBalance(wallet.address);
+  if (balance < input + BigInt(reserve)) throw new Error('not enough SUI to send and pay gas');
+  const publicKey = walletPublicKey(wallet.public_key, wallet.address);
+  const txb = new Transaction();
+  txb.setSender(wallet.address);
+  const [coin] = txb.splitCoins(txb.gas, [input]);
+  txb.transferObjects([coin], recipient);
+  const txBytes = await txb.build({client: client()});
+  const signatureHex = await rawSign(`0x${toHex(intentMessage(txBytes))}`);
+  const signature = serializedSignature(signatureHex, publicKey);
+  if (!(await publicKey.verifyTransaction(txBytes, signature))) throw new Error('Sui signature did not verify');
+  const result = await rpc('sui_executeTransactionBlock', [
+    toBase64(txBytes), [signature], {showEffects: true, showBalanceChanges: true}, 'WaitForLocalExecution',
+  ]);
+  const ok = result?.effects?.status?.status === 'success';
+  return {digest: result?.digest, ok, error: ok ? null : result?.effects?.status?.error ?? 'transfer failed',
+    amountIn: input.toString(), recipient};
+}
+// A prepare step obtains the only allowed destination from 1Click for this same user's Base
+// wallet. The engine persists this address before the commit step signs any Sui transaction.
+export async function prepareSuiCashout({wallet, evmWallet, amount, minimumOut}) {
+  if (!/^0x[0-9a-fA-F]{40}$/.test(evmWallet)) throw new Error('invalid cash wallet');
+  const input = BigInt(amount);
+  if (input <= 0n || BigInt(minimumOut) <= 0n) throw new Error('invalid cashout amount');
+  const quoteRequest = {
+    dry: false, swapType: 'EXACT_INPUT', slippageTolerance: 100,
+    originAsset: 'nep141:sui.omft.near', depositType: 'ORIGIN_CHAIN',
+    destinationAsset: 'nep141:base-0x833589fcd6edb6e08f4c7c32d4f71b54bda02913.omft.near',
+    amount: input.toString(), recipient: evmWallet, recipientType: 'DESTINATION_CHAIN',
+    refundTo: wallet.address, refundType: 'ORIGIN_CHAIN',
+    deadline: new Date(Date.now() + 240_000).toISOString(),
+  };
+  const key = process.env.NEAR_INTENTS_API_KEY;
+  const response = await fetch('https://1click.chaindefuser.com/v0/quote', {
+    method: 'POST',
+    headers: {'content-type': 'application/json', ...(key ? {'X-API-Key': key} : {})},
+    body: JSON.stringify(quoteRequest),
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (!response.ok) throw new Error('cashout route unavailable');
+  const quote = (await response.json()).quote;
+  if (quote?.amountIn !== input.toString() ||
+      BigInt(quote.minAmountOut ?? quote.amountOut ?? 0) < BigInt(minimumOut) ||
+      !/^0x[0-9a-fA-F]{64}$/.test(quote.depositAddress ?? '') ||
+      quote.depositMemo != null) throw new Error('invalid cashout deposit route');
+  return {depositAddress: quote.depositAddress, amountOut: quote.amountOut};
+}

@@ -1,12 +1,13 @@
 import {createServer} from 'node:http';
-import {createHash} from 'node:crypto';
+import {createHash, randomUUID} from 'node:crypto';
 import {PrivyClient} from '@privy-io/node';
 import {authMessage, onboardingMessage, subkeyRegistrationMessage, recoverOnboardingPublicKey} from './paradex-onboarding.mjs';
 import {deriveTradeSubkey, signSubkeyAuth, signParadexOrder} from './trade-subkey.mjs';
-import {quoteSwap, swapFromSui} from './sui-swap.mjs';
+import {quoteSwap, swapFromSui, prepareSuiCashout, transferSui} from './sui-swap.mjs';
 
 const SUI_COIN_TYPE = /^0x[0-9a-fA-F]{1,64}::[A-Za-z_][A-Za-z0-9_]*::[A-Za-z_][A-Za-z0-9_]*$/;
 const POSITIVE_INTEGER = /^[1-9][0-9]{0,30}$/;
+const preparedCashouts = new Map();
 import {parseSignerConfig, walletHasSigner} from './signer-config.mjs';
 
 const appId = process.env.PRIVY_APP_ID;
@@ -80,8 +81,10 @@ const server = createServer(async (request, response) => {
   const relayEvm = request.method === 'POST' && request.url === '/relay/evm-transaction';
   const suiQuote = request.method === 'POST' && request.url === '/sui/quote';
   const suiSwap = request.method === 'POST' && request.url === '/sui/swap';
+  const suiCashoutPrepare = request.method === 'POST' && request.url === '/sui/cashout/prepare';
+  const suiCashoutCommit = request.method === 'POST' && request.url === '/sui/cashout/commit';
   if (!verifyOnly && !ensureWallet && !signOnboarding && !signAuth && !checkSigner &&
-      !registerSubkey && !authSubkey && !signOrder && !relayEvm && !suiQuote && !suiSwap) {
+      !registerSubkey && !authSubkey && !signOrder && !relayEvm && !suiQuote && !suiSwap && !suiCashoutPrepare && !suiCashoutCommit) {
     response.writeHead(404).end();
     return;
   }
@@ -122,6 +125,54 @@ const server = createServer(async (request, response) => {
     const solanaWallet = wallets.find((account) => account.chain_type === 'solana')?.address ?? null;
     if (verifyOnly) {
       send(response, 200, {userId, evmWallet, solanaWallet});
+      return;
+    }
+    // A cashout can only land in the verified user's own Base wallet. Prepare stores the
+    // venue-issued deposit address so the engine can persist it before commit moves SUI.
+    if (suiCashoutPrepare || suiCashoutCommit) {
+      try {
+        const wallet = await ensureReceivingWallet(userId, 'sui');
+        if (suiCashoutPrepare) {
+          if (!evmWallet || !POSITIVE_INTEGER.test(String(input.amount ?? '')) ||
+              !POSITIVE_INTEGER.test(String(input.minimumOut ?? ''))) {
+            send(response, 400, {error: 'invalid cashout request'});
+            return;
+          }
+          const quote = await prepareSuiCashout({
+            wallet, evmWallet, amount: input.amount, minimumOut: input.minimumOut,
+          });
+          for (const [id, prepared] of preparedCashouts) {
+            if (prepared.expires <= Date.now()) preparedCashouts.delete(id);
+          }
+          if (preparedCashouts.size >= 1000) throw new Error('cashout queue is full');
+          const cashoutId = randomUUID();
+          preparedCashouts.set(cashoutId, {userId, walletId: wallet.id, address: wallet.address,
+            amount: input.amount, depositAddress: quote.depositAddress,
+            expires: Date.now() + 180_000});
+          send(response, 200, {userId, address: wallet.address, cashoutId, ...quote});
+          return;
+        }
+        const prepared = preparedCashouts.get(input.cashoutId);
+        if (!prepared || prepared.userId !== userId || prepared.walletId !== wallet.id ||
+            prepared.address !== wallet.address || prepared.expires <= Date.now()) {
+          send(response, 409, {error: 'cashout preparation expired'});
+          return;
+        }
+        preparedCashouts.delete(input.cashoutId); // one use, even if the network response is lost
+        const result = await transferSui({
+          wallet, recipient: prepared.depositAddress, amount: prepared.amount, reserve: '20000000',
+          rawSign: async (hex) => {
+            const signed = await privy.wallets().rawSign(wallet.id, {
+              params: {bytes: hex, encoding: 'hex', hash_function: 'blake2b256'},
+              authorization_context: {user_jwts: [accessToken]},
+            });
+            return signed.signature;
+          },
+        });
+        send(response, 200, {userId, address: wallet.address, ...result});
+      } catch (error) {
+        send(response, 502, {error: `Cashout unavailable: ${error.message}`});
+      }
       return;
     }
     // Sui coins: price SUI → coin, and swap SUI in the user's own Sui wallet with their authorization.

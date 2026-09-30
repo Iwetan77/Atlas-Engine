@@ -34,6 +34,7 @@ struct StoredQuote {
     expires: u64,
     // An unlisted Sui coin: 1Click delivers SUI, then Cetus swaps it into this coin.
     then_swap: Option<SuiSwap>,
+    sell_sui: bool,
 }
 // The second leg of an unlisted Sui buy.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -63,6 +64,14 @@ struct StoredIntent {
     status: markets::IntentStatus,
     #[serde(default)]
     then_swap: Option<SuiSwap>,
+    #[serde(default)]
+    sell_sui: bool,
+    #[serde(default)]
+    amount: u128,
+    #[serde(default)]
+    minimum_out: u128,
+    #[serde(default)]
+    sui_wallet: Option<String>,
 }
 impl NearState {
     pub(super) async fn new() -> Result<Self, Box<dyn std::error::Error>> {
@@ -182,6 +191,27 @@ impl NearState {
                 .insert(id.into(), intent);
         }
         Ok(())
+    }
+    // Only one confirmed sell may start signing, including across concurrent Render requests.
+    async fn claim_sui_sell(&self, id: &str, mut intent: StoredIntent) -> Result<bool, ApiError> {
+        intent.status.stage = "execute".into();
+        if let Some(pg) = &self.postgres {
+            let payload = serde_json::to_string(&intent).map_err(internal)?;
+            let changed = pg.execute(
+                "UPDATE atlas_near_intents SET payload=$2,stage='execute' WHERE intent_id=$1 AND stage='validate'",
+                &[&id, &payload],
+            ).await.map_err(internal)?;
+            return Ok(changed == 1);
+        }
+        let mut intents = self.intents.lock().map_err(internal)?;
+        if intents
+            .get(id)
+            .is_none_or(|saved| saved.status.stage != "validate")
+        {
+            return Ok(false);
+        }
+        intents.insert(id.into(), intent);
+        Ok(true)
     }
     pub(super) async fn monad_holdings(
         &self,
@@ -608,9 +638,6 @@ pub(super) async fn sui_holdings(
     user: &app_balance::VerifiedWallets,
 ) -> Result<Vec<(String, String, String, u32, u128, u128, Option<String>)>, ApiError> {
     let coins = state.near.sui_coins(&user.user_id).await?;
-    if coins.is_empty() {
-        return Ok(Vec::new());
-    }
     let tokens = state.near.tokens().await?;
     let Some(sui) = tokens
         .iter()
@@ -1224,6 +1251,7 @@ async fn sui_quote(
             minimum_out: minimum,
             currency: req.amount.currency.clone(),
             expires,
+            sell_sui: false,
             then_swap: Some(SuiSwap {
                 coin_type: coin.into(),
                 symbol: symbol.clone(),
@@ -1405,16 +1433,138 @@ pub(super) async fn search_assets(
     out.extend(search_sui_unlisted(state, &query, currency, rate).await);
     Ok(out)
 }
+async fn sui_sell_quote(
+    state: AppState,
+    headers: HeaderMap,
+    req: markets::QuoteRequest,
+    user: app_balance::VerifiedWallets,
+) -> Result<Json<Value>, ApiError> {
+    let token = state
+        .near
+        .tokens()
+        .await?
+        .into_iter()
+        .find(|t| {
+            t.blockchain == "sui"
+                && t.symbol == "SUI"
+                && req.asset_id == format!("near:{}", t.asset_id)
+        })
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Selling this asset is not ready yet".into(),
+        ))?;
+    let wallet = user
+        .evm_wallet
+        .as_deref()
+        .filter(|w| is_evm(w))
+        .ok_or_else(|| conflict("Your cash wallet is not ready"))?;
+    let sui_wallet = destination(&state, &headers, &token, &user).await?;
+    let price = token
+        .price
+        .as_ref()
+        .and_then(|v| v.as_f64().or_else(|| v.as_str()?.parse().ok()))
+        .filter(|p: &f64| p.is_finite() && *p > 0.0)
+        .ok_or_else(|| venue("Asset price is temporarily unavailable"))?;
+    let price_micros = (price * 1_000_000.0).round() as u128;
+    if price_micros == 0 {
+        return Err(venue("Asset price is temporarily unavailable"));
+    }
+    let rate = app_balance::fx_rate(&req.amount.currency).await?;
+    let value_usdc = markets::parse_micros(&req.amount.amount)?
+        .checked_mul(1_000_000)
+        .ok_or_else(|| bad("amount too large"))?
+        / rate;
+    markets::check_limits(value_usdc, &req.amount.currency, rate)?;
+    let amount = value_usdc
+        .checked_mul(1_000_000_000)
+        .ok_or_else(|| bad("amount too large"))?
+        / price_micros;
+    if amount == 0 || amount > u64::MAX as u128 {
+        return Err(bad("amount is outside the supported range"));
+    }
+    let balance: Value = state
+        .near
+        .icon_http
+        .post("https://fullnode.mainnet.sui.io:443")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"suix_getBalance",
+            "params":[sui_wallet,"0x2::sui::SUI"]}))
+        .send()
+        .await
+        .map_err(venue)?
+        .error_for_status()
+        .map_err(venue)?
+        .json()
+        .await
+        .map_err(venue)?;
+    let held = balance["result"]["totalBalance"]
+        .as_str()
+        .and_then(|raw| raw.parse::<u128>().ok())
+        .ok_or_else(|| venue("Your balance is temporarily unavailable"))?;
+    if held < amount.saturating_add(SUI_GAS_RESERVE) {
+        return Err(markets::short_of_cash());
+    }
+    let deadline = deadline_utc(180);
+    let units = amount.to_string();
+    let request = QuoteRequest::exact_input(
+        &token.asset_id,
+        BASE_USDC_1CLICK,
+        &units,
+        wallet,
+        &sui_wallet,
+        &deadline,
+        true,
+    );
+    let q = state.near.client.quote(&request).await.map_err(venue)?;
+    if q.amount_in.parse::<u128>().ok() != Some(amount) {
+        return Err(venue("The route changed the sell amount"));
+    }
+    let output: u128 = q.amount_out.parse().map_err(internal)?;
+    let minimum: u128 = q
+        .min_amount_out
+        .as_deref()
+        .unwrap_or(&q.amount_out)
+        .parse()
+        .map_err(internal)?;
+    let quote_id = id("q");
+    let expires = now() + 30_000;
+    state.near.quotes.lock().map_err(internal)?.insert(
+        quote_id.clone(),
+        StoredQuote {
+            owner: user.user_id,
+            wallet: wallet.into(),
+            recipient: sui_wallet,
+            asset: token.clone(),
+            amount,
+            minimum_out: minimum,
+            currency: req.amount.currency.clone(),
+            expires,
+            then_swap: None,
+            sell_sui: true,
+        },
+    );
+    Ok(Json(json!({
+        "quoteId":quote_id,"assetId":req.asset_id,"side":"sell",
+        "pay":{"amount":markets::format_units(amount,9),"symbol":"SUI",
+            "value":money(value_usdc,&req.amount.currency,rate)},
+        "receive":{"amount":markets::format_units(output,6),"symbol":"USDC",
+            "value":money(output,&req.amount.currency,rate)},
+        "price":unit_price(output,amount,9,&req.amount.currency,rate),
+        "fee":{"amount":"0","currency":req.amount.currency},"expiresAtUnixMs":expires
+    })))
+}
 pub(super) async fn quote(
     state: AppState,
     headers: HeaderMap,
     req: markets::QuoteRequest,
 ) -> Result<Json<Value>, ApiError> {
-    if req.side != "buy" {
-        return Err(bad("1Click sell routing is not available yet"));
-    }
     markets::checked_currency(&req.amount.currency)?;
     let user = app_balance::verified_wallets(&state, &headers).await?;
+    if req.side == "sell" {
+        return sui_sell_quote(state, headers, req, user).await;
+    }
+    if req.side != "buy" {
+        return Err(bad("unsupported trade side"));
+    }
     if let Some(coin) = req.asset_id.strip_prefix("near:sui:").map(str::to_owned) {
         return sui_quote(state, headers, req, user, &coin).await;
     }
@@ -1482,6 +1632,7 @@ pub(super) async fn quote(
             currency: req.amount.currency.clone(),
             expires,
             then_swap: None,
+            sell_sui: false,
         },
     );
     Ok(Json(
@@ -1492,6 +1643,51 @@ pub(super) async fn quote(
         "price":unit_price(input,output,token.decimals,&req.amount.currency,rate),
         "fee":{"amount":"0","currency":req.amount.currency},"expiresAtUnixMs":expires}),
     ))
+}
+async fn execute_sui_sell(
+    state: &AppState,
+    user: &app_balance::VerifiedWallets,
+    quote: StoredQuote,
+) -> Result<Json<Value>, ApiError> {
+    let intent_id = id("intent");
+    let expires = now() + 120_000;
+    let rate = app_balance::fx_rate(&quote.currency).await?;
+    let status = markets::IntentStatus {
+        intent_id: intent_id.clone(),
+        stage: "validate".into(),
+        state: "pending".into(),
+        tx_ids: Vec::new(),
+        error: None,
+    };
+    state
+        .near
+        .insert_intent(
+            &intent_id,
+            StoredIntent {
+                owner: user.user_id.clone(),
+                wallet: quote.wallet,
+                expected_to: String::new(),
+                expected_data: String::new(),
+                deposit_address: String::new(),
+                deposit_memo: None,
+                asset: Some(quote.asset),
+                expires,
+                status,
+                then_swap: None,
+                sell_sui: true,
+                amount: quote.amount,
+                minimum_out: quote.minimum_out,
+                sui_wallet: Some(quote.recipient),
+            },
+        )
+        .await?;
+    Ok(Json(json!({"intentId":intent_id,"kind":"sell",
+        "summary":[
+            {"label":"You sell","value":format!("{} SUI",markets::format_units(quote.amount,9))},
+            {"label":"You receive (at least)","value":markets::say_money(quote.minimum_out,&quote.currency,rate)}
+        ],
+        "transactions":[],"expiresAtUnixMs":expires
+    })))
 }
 pub(super) async fn execute(
     state: AppState,
@@ -1533,6 +1729,9 @@ pub(super) async fn execute(
         .is_none()
     {
         return Err(conflict("quote already used; request a fresh quote"));
+    }
+    if stored.sell_sui {
+        return execute_sui_sell(&state, &user, stored).await;
     }
     let balance = state
         .markets
@@ -1603,6 +1802,10 @@ pub(super) async fn execute(
                 expires,
                 status,
                 then_swap: stored.then_swap.clone(),
+                sell_sui: false,
+                amount: stored.amount,
+                minimum_out: stored.minimum_out,
+                sui_wallet: None,
             },
         )
         .await?;
@@ -1633,6 +1836,97 @@ pub(super) async fn execute(
         "transactions":[{"chain":"base","chainId":8453,"to":tx.to,"data":tx.data,"value":"0"}],
         "expiresAtUnixMs":expires})))
 }
+async fn signed_sui_sell(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+    user: &app_balance::VerifiedWallets,
+    mut current: StoredIntent,
+    body: markets::Submission,
+) -> Result<Json<markets::IntentStatus>, ApiError> {
+    if current.expires < now() {
+        return Err(conflict("quote expired; request a fresh quote"));
+    }
+    if !body.sent.is_empty() || !body.signed.is_empty() {
+        return Err(bad(
+            "cashout confirmation must not include app transactions",
+        ));
+    }
+    if !state.near.claim_sui_sell(id, current.clone()).await? {
+        let latest = state
+            .near
+            .get_intent(id)
+            .await?
+            .ok_or((StatusCode::NOT_FOUND, "intent not found".into()))?;
+        return Ok(Json(latest.status));
+    }
+    current.status.stage = "execute".into();
+    let prepared = bridge(
+        state,
+        headers,
+        "/sui/cashout/prepare",
+        json!({"amount":current.amount.to_string(),
+            "minimumOut":current.minimum_out.to_string()}),
+    )
+    .await;
+    let prepared = match prepared {
+        Ok(value) => value,
+        Err(_) => {
+            current.status.state = "failed".into();
+            current.status.error = Some("Cashout route is unavailable; nothing was sent".into());
+            state.near.save_intent(id, current.clone()).await?;
+            return Ok(Json(current.status));
+        }
+    };
+    let expected_wallet = current.sui_wallet.as_deref().unwrap_or("");
+    let address = prepared["depositAddress"].as_str().unwrap_or("");
+    let cashout_id = prepared["cashoutId"].as_str().unwrap_or("");
+    if prepared["userId"].as_str() != Some(user.user_id.as_str())
+        || prepared["address"].as_str() != Some(expected_wallet)
+        || address.len() != 66
+        || !address.starts_with("0x")
+        || !address[2..].bytes().all(|b| b.is_ascii_hexdigit())
+        || cashout_id.len() != 36
+    {
+        current.status.state = "failed".into();
+        current.status.error = Some("Cashout preparation was invalid; nothing was sent".into());
+        state.near.save_intent(id, current.clone()).await?;
+        return Ok(Json(current.status));
+    }
+    current.deposit_address = address.into();
+    current.expires = now() + 240_000;
+    // Persist before any signing: a lost bridge response can still be followed by deposit address.
+    state.near.save_intent(id, current.clone()).await?;
+    let result = bridge(
+        state,
+        headers,
+        "/sui/cashout/commit",
+        json!({"cashoutId":cashout_id}),
+    )
+    .await;
+    current.status.stage = "settle".into();
+    match result {
+        Ok(sent)
+            if sent["ok"].as_bool() == Some(true)
+                && sent["userId"].as_str() == Some(user.user_id.as_str())
+                && sent["address"].as_str() == Some(expected_wallet) =>
+        {
+            if let Some(digest) = sent["digest"].as_str() {
+                current.status.tx_ids.push(digest.into());
+            }
+        }
+        Ok(sent) if sent["ok"].as_bool() == Some(false) => {
+            current.status.state = "failed".into();
+            current.status.error = Some("Cashout transfer did not complete".into());
+        }
+        _ => {
+            // The bridge may have sent before losing its response. Never retry the transfer.
+            current.status.error = Some("Checking your cashout transfer".into());
+        }
+    }
+    state.near.save_intent(id, current.clone()).await?;
+    Ok(Json(current.status))
+}
 pub(super) async fn signed(
     state: AppState,
     headers: HeaderMap,
@@ -1653,6 +1947,9 @@ pub(super) async fn signed(
     }
     if current.status.stage != "validate" {
         return Ok(Json(current.status));
+    }
+    if current.sell_sui {
+        return signed_sui_sell(&state, &headers, &id, &user, current, body).await;
     }
     if !body.signed.is_empty()
         || body.sent.len() != 1
@@ -1686,6 +1983,53 @@ pub(super) async fn status(
         ));
     }
     let mut result = current.status.clone();
+    if current.sell_sui && result.state == "pending" {
+        if current.deposit_address.is_empty() {
+            if now() > current.expires {
+                result.state = "failed".into();
+                result.error = Some("Cashout confirmation expired; nothing was sent".into());
+                current.status = result.clone();
+                state.near.save_intent(&id, current).await?;
+            }
+            return Ok(Json(result));
+        }
+        let venue_status = state
+            .near
+            .client
+            .status(&current.deposit_address, None)
+            .await
+            .map_err(venue)?;
+        match venue_status.status.as_str() {
+            "SUCCESS" => {
+                let hashes = venue_status
+                    .swap_details
+                    .map(|details| {
+                        details
+                            .destination_chain_tx_hashes
+                            .into_iter()
+                            .map(|tx| tx.hash)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if hashes.is_empty() {
+                    return Ok(Json(result));
+                }
+                result.tx_ids.extend(hashes);
+                result.stage = "settle".into();
+                result.state = "filled".into();
+                result.error = None;
+            }
+            "REFUNDED" | "FAILED" | "EXPIRED" => {
+                result.stage = "settle".into();
+                result.state = "failed".into();
+                result.error = Some("Cashout did not settle; check Activity for the refund".into());
+            }
+            _ => return Ok(Json(result)),
+        }
+        current.status = result.clone();
+        state.near.save_intent(&id, current).await?;
+        return Ok(Json(result));
+    }
     if result.stage != "settle" || result.state != "pending" {
         return Ok(Json(result));
     }
