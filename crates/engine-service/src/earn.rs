@@ -40,6 +40,10 @@ const LEND_MARKETS: &[(&str, &str)] = &[
     ),
 ];
 const JUPITER_LEND_TOKENS: &str = "https://lite-api.jup.ag/lend/v1/earn/tokens";
+// Logos the app shows for each venue.
+const JUPITER_ICON: &str = "https://static.jup.ag/jup/icon.png";
+const AAVE_ICON: &str =
+    "https://coin-images.coingecko.com/coins/images/12645/large/aave-token-round.png";
 const QUOTE_MS: u64 = 60_000;
 const APY_TTL: Duration = Duration::from_secs(300);
 const SECONDS_PER_YEAR: f64 = 31_536_000.0;
@@ -85,6 +89,7 @@ struct Lend {
     asset_decimals: u32,
     // USD per whole asset; USDC is the cash unit, so exactly 1.
     asset_price: f64,
+    icon_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -226,6 +231,7 @@ fn lend_markets(tokens: &Value) -> Vec<Lend> {
                 share_decimals: u32::try_from(t["decimals"].as_u64()?).ok()?,
                 asset_decimals: u32::try_from(t["asset"]["decimals"].as_u64()?).ok()?,
                 asset_price,
+                icon_url: t["asset"]["logoUrl"].as_str().map(str::to_owned),
             };
             (assets_per_share > 0 && bps.is_finite() && asset_price > 0.0).then_some(lend)
         })
@@ -374,14 +380,15 @@ pub(super) async fn options(
     if let Ok(apy) = aave {
         options.push((apy, json!({
             "optionId":OPTION_ID,"name":"USDC savings","venue":"Aave","chain":"base","asset":"USDC",
-            "apyPct":format!("{apy:.2}"),
+            "apyPct":format!("{apy:.2}"),"iconUrl":null,"venueIconUrl":AAVE_ICON,
             "about":"Your USDC on Base, lent on Aave, the largest lending market. Take it out any time."
         })));
     }
     for market in lend.iter().flatten() {
         options.push((market.apy, json!({
             "optionId":market.option_id,"name":format!("{} savings",market.asset),"venue":"Jupiter Lend",
-            "chain":"solana","asset":market.asset,"apyPct":format!("{:.2}",market.apy),"about":lend_about(market)
+            "chain":"solana","asset":market.asset,"apyPct":format!("{:.2}",market.apy),"about":lend_about(market),
+            "iconUrl":market.icon_url,"venueIconUrl":JUPITER_ICON
         })));
     }
     if options.is_empty() {
