@@ -497,6 +497,7 @@ pub(super) async fn send_quote(
 ) -> Result<Json<Value>, ApiError> {
     let user = app_balance::verified_wallets(&state, &headers).await?;
     state.social.require_storage()?;
+    let solana = user.solana_wallet.clone().filter(|w| !w.is_empty());
     let wallet = user.evm_wallet.filter(|w| !w.is_empty()).ok_or((
         StatusCode::CONFLICT,
         "Privy Ethereum wallet is not ready".into(),
@@ -536,6 +537,16 @@ pub(super) async fn send_quote(
         .ok_or_else(|| bad("amount too large"))?
         / rate;
     markets::check_limits(usdc_units, &req.amount.currency, rate)?;
+    // One balance: short on Base, the rest comes from Solana; short on both, say so now.
+    markets::cash_for_base(
+        &state,
+        &wallet,
+        solana.as_deref(),
+        usdc_units,
+        &req.amount.currency,
+        rate,
+    )
+    .await?;
     let quote_id = format!(
         "send-{:x}-{:x}",
         now(),
@@ -590,21 +601,6 @@ pub(super) async fn execute_send(
     if user.evm_wallet.as_deref() != Some(quote.sender_wallet.as_str()) {
         return Err((StatusCode::CONFLICT, "Privy wallet changed".into()));
     }
-    let balance = state
-        .markets
-        .base
-        .balance_of(BASE_USDC, &quote.sender_wallet)
-        .await
-        .map_err(internal)?;
-    if balance < quote.usdc_units {
-        let rate = app_balance::fx_rate(&quote.currency).await?;
-        return Err(markets::short_of_cash(
-            balance,
-            "Base",
-            &quote.currency,
-            rate,
-        ));
-    }
     let tx = state
         .markets
         .base
@@ -629,15 +625,17 @@ pub(super) async fn execute_send(
     {
         return Ok(Json(plan));
     }
-    let intent_id = state
-        .markets
-        .register_base_transfer(
-            user.user_id,
-            quote.sender_wallet,
-            tx.to.clone(),
-            tx.data.clone(),
-        )
-        .await?;
+    let (intent_id, transactions, moved) = markets::plan_base_with_cash(
+        &state,
+        user.user_id,
+        quote.sender_wallet.clone(),
+        user.solana_wallet.clone().filter(|w| !w.is_empty()),
+        vec![(tx.to.clone(), tx.data.clone())],
+        quote.usdc_units,
+        &quote.currency,
+        rate,
+    )
+    .await?;
     let mut quotes = state.social.quotes.lock().map_err(internal)?;
     let stored = quotes
         .get_mut(&quote_id)
@@ -646,7 +644,14 @@ pub(super) async fn execute_send(
     if let Some(plan) = &stored.plan {
         return Ok(Json(plan.clone()));
     }
-    let plan = json!({"intentId":intent_id,"kind":"send","summary":[{"label":"Send to","value":quote.label},{"label":"Amount","value":markets::say_money(quote.usdc_units,&quote.currency,rate)}],"transactions":[{"chain":"base","chainId":8453,"to":tx.to,"data":tx.data,"value":"0"}],"expiresAtUnixMs":now()+120_000});
+    let mut summary = vec![
+        json!({"label":"Send to","value":quote.label}),
+        json!({"label":"Amount","value":markets::say_money(quote.usdc_units,&quote.currency,rate)}),
+    ];
+    if let Some(moved) = moved {
+        summary.push(json!({"label":"Moved from your Solana cash first","value":markets::say_money(moved,&quote.currency,rate)}));
+    }
+    let plan = json!({"intentId":intent_id,"kind":"send","summary":summary,"transactions":transactions,"expiresAtUnixMs":now()+120_000});
     stored.plan = Some(plan.clone());
     Ok(Json(plan))
 }

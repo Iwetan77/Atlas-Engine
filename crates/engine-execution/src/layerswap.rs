@@ -42,6 +42,14 @@ pub struct BaseDeposit {
     pub amount_units: u128,
 }
 
+/// The one Solana transaction that funds a Solana → Base swap, unsigned, base64.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SolanaDeposit {
+    pub swap_id: String,
+    pub transaction: String,
+    pub amount_units: u128,
+}
+
 /// Where a swap stands. `Completed` means the destination received the funds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SwapState {
@@ -97,14 +105,62 @@ impl LayerswapClient {
 
     /// Layerswap's total fee (USDC units, rounded up) to move `amount_units` of USDC Base → Solana.
     pub async fn base_to_solana_fee(&self, amount_units: u128) -> Result<u128, LayerswapError> {
+        self.fee("BASE_MAINNET", "SOLANA_MAINNET", amount_units)
+            .await
+    }
+
+    /// The same, Solana → Base.
+    pub async fn solana_to_base_fee(&self, amount_units: u128) -> Result<u128, LayerswapError> {
+        self.fee("SOLANA_MAINNET", "BASE_MAINNET", amount_units)
+            .await
+    }
+
+    /// Creates a Solana → Base USDC swap from the user's Solana wallet to their Base wallet. The
+    /// deposit is one Solana transaction (base64) for the user to sign; its fee payer is the user.
+    pub async fn solana_to_base(
+        &self,
+        solana_owner: &str,
+        base_address: &str,
+        amount_units: u128,
+        reference: &str,
+    ) -> Result<SolanaDeposit, LayerswapError> {
+        let amount: serde_json::Number = usdc_decimal(amount_units)
+            .parse()
+            .map_err(|_| LayerswapError::InvalidResponse("amount"))?;
+        let url = self
+            .base
+            .join("swaps")
+            .map_err(|_| LayerswapError::InvalidResponse("URL"))?;
+        let response = self
+            .http
+            .post(url)
+            .json(&json!({
+                "source_network":"SOLANA_MAINNET","source_token":"USDC",
+                "destination_network":"BASE_MAINNET","destination_token":"USDC",
+                "amount":amount,"source_address":solana_owner,
+                "destination_address":base_address,
+                "use_deposit_address":false,"reference_id":reference
+            }))
+            .send()
+            .await?;
+        let body = checked(response).await?;
+        parse_solana_deposit(&body, amount_units)
+    }
+
+    async fn fee(
+        &self,
+        source: &str,
+        destination: &str,
+        amount_units: u128,
+    ) -> Result<u128, LayerswapError> {
         let mut url = self
             .base
             .join("quote")
             .map_err(|_| LayerswapError::InvalidResponse("URL"))?;
         url.query_pairs_mut()
-            .append_pair("source_network", "BASE_MAINNET")
+            .append_pair("source_network", source)
             .append_pair("source_token", "USDC")
-            .append_pair("destination_network", "SOLANA_MAINNET")
+            .append_pair("destination_network", destination)
             .append_pair("destination_token", "USDC")
             .append_pair("amount", &usdc_decimal(amount_units))
             .append_pair("use_deposit_address", "false");
@@ -232,6 +288,39 @@ fn parse_base_deposit(body: &Value, amount_units: u128) -> Result<BaseDeposit, L
     })
 }
 
+fn parse_solana_deposit(body: &Value, amount_units: u128) -> Result<SolanaDeposit, LayerswapError> {
+    let data = &body["data"];
+    let swap_id = data["swap"]["id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or(LayerswapError::InvalidResponse("swap id"))?;
+    let actions = data["deposit_actions"]
+        .as_array()
+        .ok_or(LayerswapError::InvalidResponse("deposit actions"))?;
+    let [action] = actions.as_slice() else {
+        return Err(LayerswapError::InvalidResponse(
+            "expected one deposit action",
+        ));
+    };
+    if action["type"].as_str() != Some("transfer")
+        || action["network"]["name"].as_str() != Some("SOLANA_MAINNET")
+    {
+        return Err(LayerswapError::InvalidResponse("not a Solana transfer"));
+    }
+    if action["amount_in_base_units"].as_str() != Some(amount_units.to_string().as_str()) {
+        return Err(LayerswapError::InvalidResponse("amount changed"));
+    }
+    let transaction = action["call_data"]
+        .as_str()
+        .filter(|tx| !tx.is_empty())
+        .ok_or(LayerswapError::InvalidResponse("transaction"))?;
+    Ok(SolanaDeposit {
+        swap_id: swap_id.into(),
+        transaction: transaction.into(),
+        amount_units,
+    })
+}
+
 fn quote_fee_units(body: &Value) -> Result<u128, LayerswapError> {
     let fee = body["data"]["quote"]["total_fee"]
         .as_f64()
@@ -258,6 +347,21 @@ fn parse_swap_state(body: &Value) -> SwapState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_solana_deposit_is_one_transfer_of_the_asked_amount() {
+        // Shape captured from Layerswap's live API on 2026-09-30 (Solana → Base, 5 USDC).
+        let body = |amount: &str, network: &str| {
+            json!({"data":{"swap":{"id":"s1","status":"user_transfer_pending"},"deposit_actions":[{"step":"deposit",
+                "type":"transfer","to_address":"2ZUoHEPcN7bsSXw6YTj85CMrU8xNtcYNGiSMXPLomaa2","amount":5,
+                "amount_in_base_units":amount,"call_data":"AAEAAgV+jAiH","network":{"name":network}}]},"error":null})
+        };
+        let deposit = parse_solana_deposit(&body("5000000", "SOLANA_MAINNET"), 5_000_000).unwrap();
+        assert_eq!(deposit.swap_id, "s1");
+        assert_eq!(deposit.transaction, "AAEAAgV+jAiH");
+        assert!(parse_solana_deposit(&body("6000000", "SOLANA_MAINNET"), 5_000_000).is_err());
+        assert!(parse_solana_deposit(&body("5000000", "BASE_MAINNET"), 5_000_000).is_err());
+    }
 
     #[test]
     fn reads_the_quote_fee_rounded_up() {
@@ -360,5 +464,17 @@ mod tests {
             .unwrap();
         println!("{deposit:?}");
         assert_eq!(deposit.amount_units, 5_000_000);
+        let fee = client.solana_to_base_fee(5_000_000).await.unwrap();
+        println!("fee Solana → Base: {}", usdc_decimal(fee));
+        let back = client
+            .solana_to_base(
+                "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM",
+                "0x845c22a46398E0a702733e556bEB6aFcB2E92132",
+                5_000_000,
+                "atlas-live-check",
+            )
+            .await
+            .unwrap();
+        println!("solana deposit tx: {} chars", back.transaction.len());
     }
 }

@@ -488,6 +488,9 @@ struct StoredIntent {
     // A Solana buy paid with Base cash: Layerswap moves it first (the Base transfer is `expected`).
     #[serde(default)]
     funding: Option<CashMove>,
+    // A funded Solana step that isn't a trade (Earn into Jupiter Lend): what /next swaps USDC into.
+    #[serde(default)]
+    buy_mint: Option<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct CashMove {
@@ -689,21 +692,17 @@ impl MarketState {
             .await?
             .filter(|i| {
                 i.owner == owner
-                    && (i.chain == "base" || i.funding.is_some())
-                    && i.status.stage == "validate"
+                    && match (i.chain.as_str(), i.funding.is_some()) {
+                        // Base actions; paid with Solana cash, they're sent once it has landed.
+                        ("base", false) => i.status.stage == "validate",
+                        ("base", true) => i.status.stage == "sign",
+                        // A Solana buy's transfer from Base.
+                        (_, true) => i.status.stage == "validate",
+                        _ => false,
+                    }
             })
             .map(|i| i.expected)
             .unwrap_or_default())
-    }
-    pub(super) async fn register_base_transfer(
-        &self,
-        owner: String,
-        wallet: String,
-        to: String,
-        data: String,
-    ) -> Result<String, ApiError> {
-        self.register_base_txs(owner, wallet, vec![(to, data)])
-            .await
     }
     // One Jupiter swap the user signs (Earn moving USDC in or out of Jupiter Lend), settled through the
     // same /signed path as a Solana trade. Returns the intent, the transaction and what Jupiter expects
@@ -749,6 +748,7 @@ impl MarketState {
                 },
                 trade: None,
                 funding: None,
+                buy_mint: None,
             },
         )
         .await?;
@@ -783,6 +783,7 @@ impl MarketState {
                 status,
                 trade: None,
                 funding: None,
+                buy_mint: None,
             },
         )
         .await?;
@@ -1561,6 +1562,232 @@ async fn funding_for(state: &AppState, shortfall: u128) -> Result<(u128, u128), 
     Ok((base + fee + base / 100 + 50_000, fee))
 }
 
+// USDC in a Solana wallet (0 if it can't be read).
+async fn solana_cash(state: &AppState, owner: &str) -> u128 {
+    state
+        .solana_mainnet
+        .owner_token_balances(owner)
+        .await
+        .map(|held| {
+            held.iter()
+                .filter(|(m, _, _)| m == SOL_USDC)
+                .map(|(_, u, _)| *u)
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+// The unified balance for something paid on Base: None when Base cash covers `needed`, else how
+// much USDC to move from Solana first (Layerswap's fee and a cushion included). Short on both: the
+// error says what each chain holds.
+pub(super) async fn cash_for_base(
+    state: &AppState,
+    evm: &str,
+    solana: Option<&str>,
+    needed: u128,
+    currency: &str,
+    rate: u128,
+) -> Result<Option<u128>, ApiError> {
+    let base_cash = state
+        .markets
+        .base
+        .balance_of(BASE_USDC, evm)
+        .await
+        .map_err(unavailable)?;
+    if base_cash >= needed {
+        return Ok(None);
+    }
+    let sol_cash = match solana {
+        Some(owner) => solana_cash(state, owner).await,
+        None => 0,
+    };
+    let shortfall = (needed - base_cash).max(1_000_000);
+    let fee = state
+        .layerswap
+        .solana_to_base_fee(shortfall)
+        .await
+        .map_err(|_| unavailable("Couldn't move cash from Solana right now; try again shortly"))?;
+    let send = shortfall + fee + shortfall / 100 + 50_000;
+    if sol_cash < send {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "Not enough cash for this. You have {} on Base and {} on Solana.",
+                say_money(base_cash, currency, rate),
+                say_money(sol_cash, currency, rate)
+            ),
+        ));
+    }
+    Ok(Some(send))
+}
+
+// Base USDC to send so at least `needed` is on Solana (see funding_for); None when Solana already
+// has it. Short on both: the error says what each chain holds.
+pub(super) async fn cash_for_solana(
+    state: &AppState,
+    evm: Option<&str>,
+    held_on_solana: u128,
+    needed: u128,
+    currency: &str,
+    rate: u128,
+) -> Result<Option<u128>, ApiError> {
+    if held_on_solana >= needed {
+        return Ok(None);
+    }
+    let base_cash = match evm {
+        Some(evm) => state
+            .markets
+            .base
+            .balance_of(BASE_USDC, evm)
+            .await
+            .unwrap_or(0),
+        None => 0,
+    };
+    let (send, _) = funding_for(state, needed - held_on_solana).await?;
+    if base_cash < send {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "Not enough cash for this. You have {} on Solana and {} on Base.",
+                say_money(held_on_solana, currency, rate),
+                say_money(base_cash, currency, rate)
+            ),
+        ));
+    }
+    Ok(Some(send))
+}
+
+// Plans Base transactions paid from the unified balance. With enough on Base they go out as they
+// are. Otherwise the plan is one Solana transaction moving the shortfall over (Layerswap) and the
+// Base transactions are sent once it lands (GET /v1/intents/{id}/next), still one confirm.
+// Returns the intent, what the app signs now, and how much moves from Solana.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn plan_base_with_cash(
+    state: &AppState,
+    owner: String,
+    evm: String,
+    solana: Option<String>,
+    txs: Vec<(String, String)>,
+    needed: u128,
+    currency: &str,
+    rate: u128,
+) -> Result<(String, Vec<Value>, Option<u128>), ApiError> {
+    let as_base = |txs: &[(String, String)]| -> Vec<Value> {
+        txs.iter()
+            .map(
+                |(to, data)| json!({"chain":"base","chainId":8453,"to":to,"data":data,"value":"0"}),
+            )
+            .collect()
+    };
+    let Some(send) = cash_for_base(state, &evm, solana.as_deref(), needed, currency, rate).await?
+    else {
+        let transactions = as_base(&txs);
+        let intent_id = state.markets.register_base_txs(owner, evm, txs).await?;
+        return Ok((intent_id, transactions, None));
+    };
+    let sol = solana.ok_or((
+        StatusCode::CONFLICT,
+        "Privy Solana wallet is not ready".into(),
+    ))?;
+    let intent_id = id("intent");
+    let deposit = state
+        .layerswap
+        .solana_to_base(&sol, &evm, send, &intent_id)
+        .await
+        .map_err(unavailable)?;
+    state
+        .markets
+        .insert_intent(
+            &intent_id,
+            &StoredIntent {
+                owner,
+                wallet: evm,
+                chain: "base".into(),
+                expected: txs
+                    .into_iter()
+                    .map(|(to, data)| (to.to_ascii_lowercase(), data.to_ascii_lowercase()))
+                    .collect(),
+                request_id: None,
+                status: IntentStatus {
+                    intent_id: intent_id.clone(),
+                    stage: "validate".into(),
+                    state: "pending".into(),
+                    tx_ids: Vec::new(),
+                    error: None,
+                },
+                trade: None,
+                funding: Some(CashMove {
+                    swap_id: deposit.swap_id,
+                    amount_units: deposit.amount_units,
+                    tx_hash: None,
+                }),
+                buy_mint: None,
+            },
+        )
+        .await?;
+    let transactions =
+        vec![json!({"chain":"solana","transaction":deposit.transaction,"submit":"engine"})];
+    Ok((intent_id, transactions, Some(send)))
+}
+
+// A Solana swap from USDC into `buy_mint` (Earn into Jupiter Lend) paid with Base cash: the plan is
+// one Base transfer; /next makes the swap once the cash lands. Returns the intent and the Base tx.
+pub(super) async fn plan_solana_swap_with_base_cash(
+    state: &AppState,
+    owner: String,
+    solana: String,
+    evm: &str,
+    buy_mint: &str,
+    amount: u128,
+    send: u128,
+) -> Result<(String, Value), ApiError> {
+    let intent_id = id("intent");
+    let deposit = state
+        .layerswap
+        .base_to_solana(evm, &solana, send, &intent_id)
+        .await
+        .map_err(unavailable)?;
+    let tx = json!({"chain":"base","chainId":8453,"to":deposit.to,"data":deposit.data,"value":"0"});
+    state
+        .markets
+        .insert_intent(
+            &intent_id,
+            &StoredIntent {
+                owner,
+                wallet: solana,
+                chain: "solana".into(),
+                expected: vec![(
+                    deposit.to.to_ascii_lowercase(),
+                    deposit.data.to_ascii_lowercase(),
+                )],
+                request_id: None,
+                status: IntentStatus {
+                    intent_id: intent_id.clone(),
+                    stage: "validate".into(),
+                    state: "pending".into(),
+                    tx_ids: Vec::new(),
+                    error: None,
+                },
+                // Not a trade (never kept as a position): /next swaps `amount` into `buy_mint`.
+                trade: Some(PlannedTrade {
+                    asset_id: buy_mint.into(),
+                    side: "buy".into(),
+                    pay_units: amount,
+                    get_units: 0,
+                    receive_token: String::new(),
+                }),
+                funding: Some(CashMove {
+                    swap_id: deposit.swap_id,
+                    amount_units: deposit.amount_units,
+                    tx_hash: None,
+                }),
+                buy_mint: Some(buy_mint.into()),
+            },
+        )
+        .await?;
+    Ok((intent_id, tx))
+}
+
 // What the user can spend on this trade: USDC on the asset's chain for a buy, the token for a sell.
 // None when the wallet can't be read (the confirm still checks before anything is signed).
 async fn spot_available(
@@ -1842,6 +2069,7 @@ pub(super) async fn execute_quote(
                     },
                 }),
                 funding,
+                buy_mint: None,
             },
         )
         .await?;
@@ -1911,18 +2139,37 @@ pub(super) async fn signed(
     }
     let mut status = current.status.clone();
     if current.funding.is_some() && !second_step {
-        if !body.signed.is_empty()
-            || body.sent.len() != 1
-            || body.sent[0].chain != "base"
-            || !valid_hash(&body.sent[0].id)
-        {
-            return Err(bad("signed report does not match the transfer from Base"));
-        }
+        // Cash moving to Solana starts with a Base transfer the app sent; cash moving to Base with a
+        // Solana transaction the app signed, which the engine lands.
+        let hash = if current.chain == "solana" {
+            if !body.signed.is_empty()
+                || body.sent.len() != 1
+                || body.sent[0].chain != "base"
+                || !valid_hash(&body.sent[0].id)
+            {
+                return Err(bad("signed report does not match the transfer from Base"));
+            }
+            body.sent[0].id.clone()
+        } else {
+            if !body.sent.is_empty() || body.signed.len() != 1 || body.signed[0].index != 0 {
+                return Err(bad("signed report does not match the transfer from Solana"));
+            }
+            state
+                .solana_mainnet
+                .send_signed(&body.signed[0].transaction)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        format!("Moving your cash from Solana didn't go through: {e}"),
+                    )
+                })?
+        };
         let mut updated = current;
         if let Some(cash) = updated.funding.as_mut() {
-            cash.tx_hash = Some(body.sent[0].id.clone());
+            cash.tx_hash = Some(hash.clone());
         }
-        updated.status.tx_ids = vec![body.sent[0].id.clone()];
+        updated.status.tx_ids = vec![hash];
         updated.status.stage = "fund".into();
         state.markets.save_intent(&intent_id, &updated).await?;
         return Ok(Json(updated.status));
@@ -2015,14 +2262,23 @@ pub(super) async fn intent_status(
             return Ok(Json(current.status));
         };
         let next = match state.layerswap.swap_state(&cash.swap_id).await {
-            Ok(engine_execution::layerswap::SwapState::Completed) => Some(("sign", "pending", None)),
-            Ok(engine_execution::layerswap::SwapState::Failed(reason)) => Some((
-                "fund",
-                "failed",
-                Some(format!(
-                    "Moving your cash from Base to Solana didn't go through ({reason}). Layerswap returns it to Base."
-                )),
-            )),
+            Ok(engine_execution::layerswap::SwapState::Completed) => {
+                Some(("sign", "pending", None))
+            }
+            Ok(engine_execution::layerswap::SwapState::Failed(reason)) => {
+                let (from, to) = if current.chain == "solana" {
+                    ("Base", "Solana")
+                } else {
+                    ("Solana", "Base")
+                };
+                Some((
+                    "fund",
+                    "failed",
+                    Some(format!(
+                        "Moving your cash from {from} to {to} didn't go through ({reason}). Layerswap returns it to {from}."
+                    )),
+                ))
+            }
             // Still moving, or Layerswap didn't answer this time: ask again on the next poll.
             _ => None,
         };
@@ -2115,11 +2371,25 @@ pub(super) async fn next_transactions(
             "nothing to sign for this intent".into(),
         ));
     }
+    // Cash landed on Base: the Base transactions planned at the start.
+    if intent.chain == "base" {
+        let txs: Vec<Value> = intent
+            .expected
+            .iter()
+            .map(
+                |(to, data)| json!({"chain":"base","chainId":8453,"to":to,"data":data,"value":"0"}),
+            )
+            .collect();
+        return Ok(Json(json!({"transactions":txs})));
+    }
     let plan = intent
         .trade
         .clone()
         .ok_or_else(|| unavailable("intent has no trade"))?;
-    let asset = find_asset(&state.markets, &plan.asset_id).await?;
+    let output_mint = match &intent.buy_mint {
+        Some(mint) => mint.clone(),
+        None => find_asset(&state.markets, &plan.asset_id).await?.token,
+    };
     let cash: u128 = state
         .solana_mainnet
         .owner_token_balances(&intent.wallet)
@@ -2141,7 +2411,7 @@ pub(super) async fn next_transactions(
         .jupiter
         .order(&JupiterOrderRequest {
             input_mint: SOL_USDC.into(),
-            output_mint: asset.token.clone(),
+            output_mint,
             amount_base_units: amount.try_into().map_err(|_| bad("amount too large"))?,
             taker: Some(intent.wallet.clone()),
         })
@@ -2150,7 +2420,7 @@ pub(super) async fn next_transactions(
     let out: u128 = order.out_amount.parse().map_err(unavailable)?;
     // Prices move while cash crosses over; more than 5% worse than the quote isn't what they agreed to.
     let expected = mul_div_units(plan.get_units, amount, plan.pay_units);
-    if out < expected.saturating_mul(95) / 100 {
+    if intent.buy_mint.is_none() && out < expected.saturating_mul(95) / 100 {
         intent.status.state = "failed".into();
         intent.status.error = Some(
             "The price moved more than 5% while your cash was moving. The cash is on Solana now; try again."
@@ -2269,6 +2539,7 @@ mod tests {
                 receive_token: String::new(),
             }),
             funding: None,
+            buy_mint: None,
         }
     }
 

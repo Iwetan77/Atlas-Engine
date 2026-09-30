@@ -380,6 +380,21 @@ impl SolanaAtaPreflight {
         Ok(result.get("value").filter(|v| !v.is_null()).cloned())
     }
 
+    /// Sends a transaction the user already signed (base64) and returns its signature.
+    pub async fn send_signed(
+        &self,
+        transaction_base64: &str,
+    ) -> Result<String, SolanaPreflightError> {
+        self.rpc(
+            "sendTransaction",
+            json!([transaction_base64, {"encoding":"base64","preflightCommitment":"confirmed"}]),
+        )
+        .await?
+        .as_str()
+        .map(str::to_owned)
+        .ok_or(SolanaPreflightError::InvalidResponse)
+    }
+
     async fn rpc(&self, method: &str, params: Value) -> Result<Value, SolanaPreflightError> {
         let response: Value = self
             .http

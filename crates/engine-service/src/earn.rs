@@ -505,7 +505,24 @@ pub(super) async fn quote(
     if all {
         units = available;
     }
-    if units > available || available == 0 {
+    // Putting cash in draws on the whole balance: short on this option's chain, the rest moves over
+    // from the other chain first (checked, and the error names both, before anything is signed).
+    let cash_ok = if deposit {
+        let user = app_balance::verified_wallets(&state, &headers).await?;
+        let solana = user.solana_wallet.filter(|w| !w.is_empty());
+        let evm = user.evm_wallet.filter(|w| !w.is_empty());
+        if lend_option {
+            markets::cash_for_solana(&state, evm.as_deref(), available, units, &currency, rate)
+                .await?;
+        } else {
+            markets::cash_for_base(&state, &wallet, solana.as_deref(), units, &currency, rate)
+                .await?;
+        }
+        true
+    } else {
+        false
+    };
+    if !cash_ok && (units > available || available == 0) {
         return Err((
             StatusCode::CONFLICT,
             if deposit {
@@ -580,7 +597,7 @@ pub(super) async fn execute(
         ));
     }
     if let Some(mint) = quote.share_mint {
-        return execute_lend(&state, &quote, mint, owner, wallet).await;
+        return execute_lend(&state, &headers, &quote, mint, owner, wallet).await;
     }
     let usdc_token = engine_execution::swaps::uniswap::BASE_USDC.to_ascii_lowercase();
     let mut txs: Vec<(String, String)> = Vec::new();
@@ -624,27 +641,40 @@ pub(super) async fn execute(
             ),
         ));
     }
-    let intent_id = state
-        .markets
-        .register_base_txs(owner, wallet, txs.clone())
-        .await?;
-    let transactions: Vec<Value> = txs
-        .iter()
-        .map(|(to, data)| json!({"chain":"base","chainId":8453,"to":to,"data":data,"value":"0"}))
-        .collect();
+    let solana = app_balance::verified_wallets(&state, &headers)
+        .await?
+        .solana_wallet
+        .filter(|w| !w.is_empty());
+    // A deposit may need Solana cash moved over first; a withdrawal only needs gas, which Atlas covers.
+    let needed = if quote.deposit { quote.units } else { 0 };
+    let (intent_id, transactions, moved) = markets::plan_base_with_cash(
+        &state,
+        owner,
+        wallet,
+        solana,
+        txs,
+        needed,
+        &quote.currency,
+        quote.rate,
+    )
+    .await?;
     let amount = if quote.all {
         "Everything in savings".into()
     } else {
         markets::say_money(quote.units, &quote.currency, quote.rate)
     };
+    let mut summary = vec![
+        json!({"label":if quote.deposit {"Put in savings"} else {"Take out of savings"},"value":amount}),
+        json!({"label":"Where","value":"Aave, on Base"}),
+        json!({"label":"Rate","value":"Variable, set by Aave"}),
+    ];
+    if let Some(moved) = moved {
+        summary.push(json!({"label":"Moved from your Solana cash first","value":markets::say_money(moved, &quote.currency, quote.rate)}));
+    }
     Ok(Json(json!({
         "intentId":intent_id,
         "kind":if quote.deposit {"earn_deposit"} else {"earn_withdraw"},
-        "summary":[
-            {"label":if quote.deposit {"Put in savings"} else {"Take out of savings"},"value":amount},
-            {"label":"Where","value":"Aave, on Base"},
-            {"label":"Rate","value":"Variable, set by Aave"}
-        ],
+        "summary":summary,
         "transactions":transactions,
         "expiresAtUnixMs":now() + 120_000
     })))
@@ -654,6 +684,7 @@ pub(super) async fn execute(
 // asset into a Lend deposit); out is shares → USDC. One Solana transaction either way.
 async fn execute_lend(
     state: &AppState,
+    headers: &HeaderMap,
     quote: &EarnQuote,
     share_mint: &str,
     owner: String,
@@ -664,6 +695,52 @@ async fn execute_lend(
     } else {
         (share_mint, markets::SOL_USDC_MINT, quote.shares)
     };
+    // Short of cash on Solana: Base cash moves over first, and the deposit is made once it lands.
+    if quote.deposit {
+        let held = shares_of(
+            &solana_wallet(state, &wallet).await?,
+            markets::SOL_USDC_MINT,
+        );
+        let evm = app_balance::verified_wallets(state, headers)
+            .await?
+            .evm_wallet
+            .filter(|w| !w.is_empty());
+        if let Some(send) = markets::cash_for_solana(
+            state,
+            evm.as_deref(),
+            held,
+            quote.units,
+            &quote.currency,
+            quote.rate,
+        )
+        .await?
+        {
+            let evm = evm.ok_or((
+                StatusCode::CONFLICT,
+                "Privy Base wallet is not ready".into(),
+            ))?;
+            let (intent_id, tx) = markets::plan_solana_swap_with_base_cash(
+                state,
+                owner,
+                wallet,
+                &evm,
+                share_mint,
+                quote.units,
+                send,
+            )
+            .await?;
+            return Ok(Json(json!({
+                "intentId":intent_id,"kind":"earn_deposit",
+                "summary":[
+                    {"label":"Put in savings","value":markets::say_money(quote.units, &quote.currency, quote.rate)},
+                    {"label":"Where","value":"Jupiter Lend, on Solana"},
+                    {"label":"Moved from your Base cash first","value":markets::say_money(send, &quote.currency, quote.rate)}
+                ],
+                "transactions":[tx],
+                "expiresAtUnixMs":now() + 120_000
+            })));
+        }
+    }
     let asset = jupiter_lend(state)
         .await?
         .into_iter()
