@@ -106,7 +106,21 @@ fn solana_asset(token: &Value) -> Option<Asset> {
         return None;
     }
     let xstock = has("xstocks") || name.ends_with("xStock");
-    let kind = if xstock || has("stocks") || has("equities") || has("prestocks") {
+    // Tokenized equities come from several issuers (xStocks, Backpack Securities, Tessera), not all
+    // tagged "stocks" on Jupiter.
+    let kind = if xstock
+        || [
+            "stocks",
+            "equities",
+            "prestocks",
+            "rwa",
+            "backpack",
+            "tessera",
+        ]
+        .iter()
+        .any(|t| has(t))
+        || name.contains(" Securities")
+    {
         "stock"
     } else if has("meme") {
         "meme"
@@ -117,6 +131,11 @@ fn solana_asset(token: &Value) -> Option<Asset> {
         .iter()
         .map(|k| token["stats24h"][*k].as_f64().unwrap_or(0.0))
         .sum();
+    // "Trump Media & Technology Group Corp. Common Stock - Backpack Securities" → the company name.
+    let name = name
+        .trim_end_matches(" - Backpack Securities")
+        .trim_end_matches(" Common Stock")
+        .trim();
     let (symbol, name) = if mint == SOL_MINT {
         ("SOL", "Solana")
     } else {
@@ -477,8 +496,9 @@ fn quote_request(a: &Asset, side: &str, input: u128) -> BaseSwapRequest {
         amount_base_units: input,
     }
 }
-// xStocks track a share count through a multiplier (splits, dividends). Atlas shows one token as one
-// share, so quotes pause for any xStock whose multiplier isn't 1 until that's handled.
+// xStocks track shares through a multiplier that drifts above 1 as dividends accrue; prices are per
+// token, so that drift doesn't change what anyone pays or gets. A scheduled change (a split or
+// reverse split, `newMultiplier`) does jump the token's value, so quotes pause while one is pending.
 async fn ensure_stock_units(state: &MarketState, a: &Asset) -> Result<(), ApiError> {
     if !a.xstock {
         return Ok(());
@@ -511,7 +531,10 @@ async fn ensure_stock_units(state: &MarketState, a: &Asset) -> Result<(), ApiErr
         .json()
         .await
         .map_err(unavailable)?;
-    let ok = response["currentMultiplier"] == 1;
+    let ok = response["currentMultiplier"]
+        .as_f64()
+        .is_some_and(|m| m.is_finite() && m > 0.0)
+        && response["newMultiplier"].as_f64().unwrap_or(0.0) == 0.0;
     state
         .multipliers
         .lock()
@@ -526,7 +549,7 @@ async fn ensure_stock_units(state: &MarketState, a: &Asset) -> Result<(), ApiErr
 fn paused_stock(symbol: &str) -> ApiError {
     (
         StatusCode::SERVICE_UNAVAILABLE,
-        format!("{symbol} display multiplier changed; quotes are paused until adjusted"),
+        format!("{symbol} has a share split or similar change pending; trading resumes once it takes effect"),
     )
 }
 pub(super) async fn venue_quote(
@@ -1193,6 +1216,29 @@ mod tests {
             .kind,
             "meme"
         );
+        let nflx = solana_asset(&token(
+            "NFLXmint",
+            "NFLX",
+            "Netflix - Backpack Securities",
+            &["verified"],
+            true,
+            5e5,
+        ))
+        .unwrap();
+        assert_eq!(
+            (nflx.kind.as_str(), nflx.name.as_str()),
+            ("stock", "Netflix")
+        );
+        let djt = solana_asset(&token(
+            "DJTmint",
+            "DJT",
+            "Trump Media & Technology Group Corp. Common Stock - Backpack Securities",
+            &["verified", "backpack"],
+            true,
+            5e5,
+        ))
+        .unwrap();
+        assert_eq!(djt.name, "Trump Media & Technology Group Corp.");
         let sol = solana_asset(&token(
             SOL_MINT,
             "SOL",
