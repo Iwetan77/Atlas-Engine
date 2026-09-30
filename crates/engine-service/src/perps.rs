@@ -449,7 +449,7 @@ pub(super) async fn onboard(
         .paradex
         .onboard_evm(&current.account_address, signature, message, public_key)
         .await
-        .map_err(internal)?;
+        .map_err(onboarding_refusal)?;
     let confirmed = state
         .paradex
         .onboarding_status(&wallet)
@@ -678,6 +678,21 @@ pub(super) async fn positions(
     Ok(Json(json!({"positions":result})))
 }
 
+// Paradex refuses to open accounts for empty wallets (its guard against fake accounts). That's
+// something the user can fix, so say how; anything else keeps Paradex's own reason.
+fn onboarding_refusal(error: engine_execution::perps::ParadexError) -> ApiError {
+    let text = error.to_string();
+    if text.contains("INSUFFICIENT_MIN_CHAIN_BALANCE")
+        || text.contains("at least 0.001 ETH or 5 USDC")
+    {
+        return (
+            StatusCode::CONFLICT,
+            "Paradex only opens accounts for wallets holding at least 5 USDC or 0.001 ETH. Add 5 USDC to your balance, then set up again".into(),
+        );
+    }
+    internal(text)
+}
+
 // The user's Paradex account value in USDC units (6 decimals), for the Atlas balance. Only on prod,
 // and only when the account exists and Atlas may read it; otherwise there's nothing to add.
 pub(super) async fn paradex_account_value(
@@ -767,6 +782,23 @@ mod tests {
         assert_eq!(row["volume24hUsd"], "816.96");
         assert_eq!(row["markPrice"]["amount"], "83382.16591683");
         assert!(market_row(&meta, &json!({"symbol":"ETH-USD-PERP"}), "USD", 1_000_000).is_err());
+    }
+    #[test]
+    fn empty_wallet_onboarding_refusal_says_what_to_do() {
+        let refusal = engine_execution::perps::ParadexError::RejectedOperation {
+            operation: "account onboarding",
+            status: reqwest::StatusCode::BAD_REQUEST,
+            reason: "INSUFFICIENT_MIN_CHAIN_BALANCE: creating an account requires EVM wallet to contain at least 0.001 ETH or 5 USDC on any supported chain".into(),
+        };
+        let (status, message) = onboarding_refusal(refusal);
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(message.contains("5 USDC"));
+        let other = engine_execution::perps::ParadexError::RejectedOperation {
+            operation: "account onboarding",
+            status: reqwest::StatusCode::BAD_REQUEST,
+            reason: "EVM_SIGNATURE_VERIFICATION_FAILED".into(),
+        };
+        assert_eq!(onboarding_refusal(other).0, StatusCode::BAD_GATEWAY);
     }
     #[test]
     fn markets_get_names_categories_and_icons() {

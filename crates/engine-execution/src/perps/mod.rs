@@ -180,7 +180,7 @@ impl ParadexClient {
             .send()
             .await?;
         if !response.status().is_success() {
-            return Err(ParadexError::Rejected(response.status()));
+            return Err(rejected_operation(response, "account onboarding").await);
         }
         Ok(())
     }
