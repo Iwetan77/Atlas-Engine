@@ -35,6 +35,9 @@ struct StoredQuote {
     // An unlisted Sui coin: 1Click delivers SUI, then Cetus swaps it into this coin.
     then_swap: Option<SuiSwap>,
     sell_sui: bool,
+    // Paid from Solana cash (`wallet` is the Solana wallet), and what that costs on top (USD micros).
+    from_solana: bool,
+    network_fee: u128,
 }
 // The second leg of an unlisted Sui buy.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -48,6 +51,8 @@ struct SuiSwap {
     sui_in: u128,
     expected_out: u128,
 }
+// What the user reads when their deposit to 1Click didn't go out: nothing left the balance.
+const NOT_SENT: &str = "The payment didn't go through, so nothing left your balance. Try again.";
 // SUI kept in the Sui wallet for gas: 0.02 SUI pays for dozens of swaps.
 const SUI_GAS_RESERVE: u128 = 20_000_000;
 #[derive(Clone, Serialize, Deserialize)]
@@ -72,6 +77,18 @@ struct StoredIntent {
     minimum_out: u128,
     #[serde(default)]
     sui_wallet: Option<String>,
+    // Paid from Solana cash: the engine lands the transfer (`expected_to` is 1Click's address), after
+    // the gas top-up when there is one.
+    #[serde(default)]
+    from_solana: bool,
+    #[serde(default)]
+    gas_request_id: Option<String>,
+    // Paid from Base with no ETH: a gasless CoW top-up first (its order once placed), then the
+    // transfer is handed out by /next.
+    #[serde(default)]
+    gas_topup: bool,
+    #[serde(default)]
+    gas_order: Option<String>,
 }
 impl NearState {
     pub(super) async fn new() -> Result<Self, Box<dyn std::error::Error>> {
@@ -357,7 +374,16 @@ impl NearState {
         Ok(self
             .get_intent(id)
             .await?
-            .filter(|i| i.owner == owner && i.status.stage == "validate" && i.expires > now())
+            .filter(|i| {
+                i.owner == owner
+                    && !i.from_solana
+                    && i.expires > now()
+                    && if i.gas_topup {
+                        i.status.stage == "sign"
+                    } else {
+                        i.status.stage == "validate"
+                    }
+            })
             .map(|i| vec![(i.expected_to.clone(), i.expected_data.clone())])
             .unwrap_or_default())
     }
@@ -1270,30 +1296,22 @@ async fn sui_quote(
         .find(|t| t.blockchain == "sui" && t.symbol == "SUI")
         .ok_or_else(|| venue("1Click doesn't list SUI right now"))?;
     let destination = destination(&state, &headers, &sui, &user).await?;
-    let wallet = user
-        .evm_wallet
-        .as_deref()
-        .filter(|w| is_evm(w))
-        .ok_or_else(|| conflict("Privy Base wallet is required"))?;
     let rate = app_balance::fx_rate(&req.amount.currency).await?;
     let amount = markets::parse_micros(&req.amount.amount)?
         .checked_mul(1_000_000)
         .ok_or_else(|| bad("amount too large"))?
         / rate;
     markets::check_limits(amount, &req.amount.currency, rate)?;
-    if let Ok(held) = state.markets.base.balance_of(BASE_USDC, wallet).await {
-        if held < amount {
-            return Err(markets::short_of_cash());
-        }
-    }
+    let (wallet, from_solana, network_fee, origin) =
+        pay_from(&state, &user, amount, &req.amount.currency, rate).await?;
     let deadline = deadline_utc(180);
     let units = amount.to_string();
     let request = QuoteRequest::exact_input(
-        BASE_USDC_1CLICK,
+        origin,
         &sui.asset_id,
         &units,
         &destination,
-        wallet,
+        &wallet,
         &deadline,
         true,
     );
@@ -1332,7 +1350,7 @@ async fn sui_quote(
         quote_id.clone(),
         StoredQuote {
             owner: user.user_id,
-            wallet: wallet.into(),
+            wallet,
             recipient: destination,
             asset: sui,
             amount,
@@ -1340,6 +1358,8 @@ async fn sui_quote(
             currency: req.amount.currency.clone(),
             expires,
             sell_sui: false,
+            from_solana,
+            network_fee,
             then_swap: Some(SuiSwap {
                 coin_type: coin.into(),
                 symbol: symbol.clone(),
@@ -1357,7 +1377,7 @@ async fn sui_quote(
         "receive":{"amount":markets::format_units(expected_out,decimals),"symbol":symbol,
             "value":money(value_usd,&req.amount.currency,rate)},
         "price":unit_price(amount,expected_out,decimals,&req.amount.currency,rate),
-        "fee":{"amount":"0","currency":req.amount.currency},"expiresAtUnixMs":expires}),
+        "fee":money(network_fee,&req.amount.currency,rate),"expiresAtUnixMs":expires}),
     ))
 }
 
@@ -1628,6 +1648,8 @@ async fn sui_sell_quote(
             expires,
             then_swap: None,
             sell_sui: true,
+            from_solana: false,
+            network_fee: 0,
         },
     );
     Ok(Json(json!({
@@ -1640,6 +1662,56 @@ async fn sui_sell_quote(
         "fee":{"amount":"0","currency":req.amount.currency},"expiresAtUnixMs":expires
     })))
 }
+// Which cash pays a 1Click buy of `amount`: Base when it covers it (a plain USDC transfer; an empty
+// gas tank fills itself first), else Solana (gas topped up gaslessly, but 1Click's one-off deposit
+// address needs its USDC account opened, about 0.002 SOL of rent, shown as the network fee).
+// Returns the paying wallet, whether it's Solana, the network fee (USD micros) and 1Click's asset.
+async fn pay_from(
+    state: &AppState,
+    user: &app_balance::VerifiedWallets,
+    amount: u128,
+    currency: &str,
+    rate: u128,
+) -> Result<(String, bool, u128, &'static str), ApiError> {
+    let evm = user.evm_wallet.as_deref().filter(|w| is_evm(w));
+    let base_cash = match evm {
+        Some(w) => state
+            .markets
+            .base
+            .balance_of(BASE_USDC, w)
+            .await
+            .unwrap_or(0),
+        None => 0,
+    };
+    if let (Some(w), true) = (evm, base_cash >= amount) {
+        return Ok((w.into(), false, 0, BASE_USDC_1CLICK));
+    }
+    let solana = user.solana_wallet.as_deref().filter(|w| !w.is_empty());
+    let solana_cash = match solana {
+        Some(s) => markets::solana_cash(state, s).await,
+        None => 0,
+    };
+    if let Some(s) = solana {
+        if solana_cash >= amount && markets::solana_can_send(state, s, amount).await {
+            let fee = markets::account_rent_usd(state).await;
+            return Ok((s.into(), true, fee, SOLANA_USDC_1CLICK));
+        }
+    }
+    Err(markets::not_enough_cash(
+        base_cash + solana_cash,
+        currency,
+        rate,
+    ))
+}
+
+// A Solana address (base58, 32 bytes).
+fn is_solana(address: &str) -> bool {
+    (32..=44).contains(&address.len())
+        && address
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() && !b"0OIl".contains(&b))
+}
+
 pub(super) async fn quote(
     state: AppState,
     headers: HeaderMap,
@@ -1664,11 +1736,6 @@ pub(super) async fn quote(
         .find(|t| format!("near:{}", t.asset_id) == req.asset_id && supported(t))
         .ok_or((StatusCode::NOT_FOUND, "1Click asset not found".into()))?;
     let destination = destination(&state, &headers, &token, &user).await?;
-    let wallet = user
-        .evm_wallet
-        .as_deref()
-        .filter(|w| is_evm(w))
-        .ok_or_else(|| conflict("Privy Base wallet is required"))?;
     let rate = app_balance::fx_rate(&req.amount.currency).await?;
     let micros = markets::parse_micros(&req.amount.amount)?;
     let amount = micros
@@ -1676,20 +1743,16 @@ pub(super) async fn quote(
         .ok_or_else(|| bad("amount too large"))?
         / rate;
     markets::check_limits(amount, &req.amount.currency, rate)?;
-    // More than the cash on Base: say so at the quote, in their currency.
-    if let Ok(held) = state.markets.base.balance_of(BASE_USDC, wallet).await {
-        if held < amount {
-            return Err(markets::short_of_cash());
-        }
-    }
+    let (wallet, from_solana, network_fee, origin) =
+        pay_from(&state, &user, amount, &req.amount.currency, rate).await?;
     let deadline = deadline_utc(180);
     let units = amount.to_string();
     let request = QuoteRequest::exact_input(
-        BASE_USDC_1CLICK,
+        origin,
         &token.asset_id,
         &units,
         &destination,
-        wallet,
+        &wallet,
         &deadline,
         true,
     );
@@ -1712,7 +1775,7 @@ pub(super) async fn quote(
         quote_id.clone(),
         StoredQuote {
             owner: user.user_id,
-            wallet: wallet.into(),
+            wallet,
             recipient: destination,
             asset: token.clone(),
             amount,
@@ -1721,6 +1784,8 @@ pub(super) async fn quote(
             expires,
             then_swap: None,
             sell_sui: false,
+            from_solana,
+            network_fee,
         },
     );
     Ok(Json(
@@ -1729,7 +1794,7 @@ pub(super) async fn quote(
         "receive":{"amount":markets::format_units(output,token.decimals),"symbol":token.symbol,
             "value":money(output_usd,&req.amount.currency,rate)},
         "price":unit_price(input,output,token.decimals,&req.amount.currency,rate),
-        "fee":{"amount":"0","currency":req.amount.currency},"expiresAtUnixMs":expires}),
+        "fee":money(network_fee,&req.amount.currency,rate),"expiresAtUnixMs":expires}),
     ))
 }
 async fn execute_sui_sell(
@@ -1766,6 +1831,10 @@ async fn execute_sui_sell(
                 amount: quote.amount,
                 minimum_out: quote.minimum_out,
                 sui_wallet: Some(quote.recipient),
+                from_solana: false,
+                gas_request_id: None,
+                gas_topup: false,
+                gas_order: None,
             },
         )
         .await?;
@@ -1804,7 +1873,12 @@ pub(super) async fn execute(
     if destination != stored.recipient {
         return Err(conflict("receiving wallet changed; request a fresh quote"));
     }
-    if user.evm_wallet.as_deref() != Some(&stored.wallet) {
+    let paying = if stored.from_solana {
+        user.solana_wallet.as_deref()
+    } else {
+        user.evm_wallet.as_deref()
+    };
+    if paying != Some(&stored.wallet) {
         return Err(conflict("Privy wallet changed; request a fresh quote"));
     }
     // A quote can generate only one deposit plan, even if the client retries execute.
@@ -1821,19 +1895,30 @@ pub(super) async fn execute(
     if stored.sell_sui {
         return execute_sui_sell(&state, &user, stored).await;
     }
-    let balance = state
-        .markets
-        .base
-        .balance_of(BASE_USDC, &stored.wallet)
-        .await
-        .map_err(venue)?;
+    let balance = if stored.from_solana {
+        markets::solana_cash(&state, &stored.wallet).await
+    } else {
+        state
+            .markets
+            .base
+            .balance_of(BASE_USDC, &stored.wallet)
+            .await
+            .map_err(venue)?
+    };
     if balance < stored.amount {
         return Err(markets::short_of_cash());
     }
-    let deadline = deadline_utc(240);
+    // No ETH on Base: a gasless CoW top-up goes first, so the deposit gets more time.
+    let gas_topup = !stored.from_solana
+        && markets::base_topup_fits(&state, &stored.wallet, stored.amount).await;
+    let deadline = deadline_utc(if gas_topup { 20 * 60 } else { 240 });
     let amount = stored.amount.to_string();
     let req = QuoteRequest::exact_input(
-        BASE_USDC_1CLICK,
+        if stored.from_solana {
+            SOLANA_USDC_1CLICK
+        } else {
+            BASE_USDC_1CLICK
+        },
         &stored.asset.asset_id,
         &amount,
         &destination,
@@ -1856,16 +1941,43 @@ pub(super) async fn execute(
     let deposit = fresh
         .deposit_address
         .ok_or_else(|| venue("1Click omitted deposit address"))?;
-    if !is_evm(&deposit) || fresh.deposit_memo.is_some() {
-        return Err(venue(
-            "1Click returned an unsupported Base deposit destination",
-        ));
+    let expected_chain = if stored.from_solana {
+        is_solana(&deposit)
+    } else {
+        is_evm(&deposit)
+    };
+    if !expected_chain || fresh.deposit_memo.is_some() {
+        return Err(venue("1Click returned an unsupported deposit destination"));
     }
-    let tx = state
-        .markets
-        .base
-        .transfer_transaction(BASE_USDC, &stored.wallet, &deposit, stored.amount)
-        .map_err(venue)?;
+    // What the app signs now: from Solana, [gas top-up?, transfer] that the engine lands; from Base,
+    // the transfer (nothing yet when the tank tops up first; /next hands it out).
+    let (expected_to, expected_data, transactions, gas_request_id) = if stored.from_solana {
+        let (gas, transfer) =
+            markets::solana_usdc_transfer(&state, &stored.wallet, &deposit, stored.amount).await?;
+        let mut txs = Vec::new();
+        if let Some((_, gas_tx)) = &gas {
+            txs.push(json!({"chain":"solana","transaction":gas_tx,"submit":"engine"}));
+        }
+        txs.push(json!({"chain":"solana","transaction":transfer,"submit":"engine"}));
+        (deposit.clone(), String::new(), txs, gas.map(|(id, _)| id))
+    } else {
+        let tx = state
+            .markets
+            .base
+            .transfer_transaction(BASE_USDC, &stored.wallet, &deposit, stored.amount)
+            .map_err(venue)?;
+        let txs = if gas_topup {
+            Vec::new()
+        } else {
+            vec![json!({"chain":"base","chainId":8453,"to":tx.to,"data":tx.data,"value":"0"})]
+        };
+        (
+            tx.to.to_ascii_lowercase(),
+            tx.data.to_ascii_lowercase(),
+            txs,
+            None,
+        )
+    };
     let intent_id = id("intent");
     let status = markets::IntentStatus {
         intent_id: intent_id.clone(),
@@ -1882,8 +1994,8 @@ pub(super) async fn execute(
             StoredIntent {
                 owner: user.user_id,
                 wallet: stored.wallet,
-                expected_to: tx.to.to_ascii_lowercase(),
-                expected_data: tx.data.to_ascii_lowercase(),
+                expected_to,
+                expected_data,
                 deposit_address: deposit,
                 deposit_memo: fresh.deposit_memo,
                 asset: Some(stored.asset.clone()),
@@ -1894,6 +2006,10 @@ pub(super) async fn execute(
                 amount: stored.amount,
                 minimum_out: stored.minimum_out,
                 sui_wallet: None,
+                from_solana: stored.from_solana,
+                gas_request_id,
+                gas_topup,
+                gas_order: None,
             },
         )
         .await?;
@@ -1917,12 +2033,19 @@ pub(super) async fn execute(
             stored.asset.symbol
         ),
     };
-    Ok(Json(json!({"intentId":intent_id,"kind":"buy",
-        "summary":[{"label":"You pay","value":markets::say_money(stored.amount,&stored.currency,rate)},
-        {"label":"You get (about)","value":get},
-        {"label":"Lands on","value":chain}],
-        "transactions":[{"chain":"base","chainId":8453,"to":tx.to,"data":tx.data,"value":"0"}],
-        "expiresAtUnixMs":expires})))
+    let mut summary = vec![
+        json!({"label":"You pay","value":markets::say_money(stored.amount,&stored.currency,rate)}),
+        json!({"label":"You get (about)","value":get}),
+        json!({"label":"Lands on","value":chain}),
+    ];
+    if stored.network_fee > 0 {
+        summary.push(json!({"label":"Network fee",
+            "value":markets::say_money(stored.network_fee,&stored.currency,rate)}));
+    }
+    Ok(Json(
+        json!({"intentId":intent_id,"kind":"buy","summary":summary,
+        "transactions":transactions,"expiresAtUnixMs":expires}),
+    ))
 }
 async fn signed_sui_sell(
     state: &AppState,
@@ -2033,11 +2156,60 @@ pub(super) async fn signed(
             "intent belongs to another user".into(),
         ));
     }
-    if current.status.stage != "validate" {
+    // After a gas top-up, the Base transfer is reported from the sign stage.
+    let second_step = current.gas_topup && current.status.stage == "sign";
+    if current.status.stage != "validate" && !second_step {
         return Ok(Json(current.status));
     }
     if current.sell_sui {
         return signed_sui_sell(&state, &headers, &id, &user, current, body).await;
+    }
+    if current.from_solana {
+        let main = usize::from(current.gas_request_id.is_some());
+        if !body.sent.is_empty() || body.signed.len() != main + 1 || body.signed[main].index != main
+        {
+            return Err(bad("signed report does not match 1Click deposit plan"));
+        }
+        // The stage moves first, so a repeated report can't land it twice.
+        current.status.stage = "execute".into();
+        state.near.save_intent(&id, current.clone()).await?;
+        if let (Some(gas_id), true) = (&current.gas_request_id, main == 1) {
+            markets::land_gas_topup(&state, gas_id, &body.signed[0].transaction).await;
+        }
+        current.status.stage = "settle".into();
+        match state
+            .solana_mainnet
+            .send_signed(&body.signed[main].transaction)
+            .await
+        {
+            Ok(signature) => current.status.tx_ids = vec![signature],
+            Err(error) => {
+                eprintln!("intent {id}: 1Click deposit from Solana not sent: {error}");
+                current.status.state = "failed".into();
+                current.status.error = Some(NOT_SENT.into());
+            }
+        }
+        let result = current.status.clone();
+        state.near.save_intent(&id, current).await?;
+        return Ok(Json(result));
+    }
+    if current.gas_topup && !second_step {
+        if !body.sent.is_empty() || !body.signed.is_empty() {
+            return Err(bad("signed report does not match 1Click deposit plan"));
+        }
+        current.status.stage = "fund".into();
+        state.near.save_intent(&id, current.clone()).await?;
+        match markets::run_base_topup(&state, &headers, &current.wallet).await {
+            Ok(uid) => current.gas_order = Some(uid),
+            Err(reason) => {
+                eprintln!("intent {id}: gas top-up not started: {reason}");
+                current.status.state = "failed".into();
+                current.status.error = Some(markets::GAS_NOT_READY.into());
+            }
+        }
+        let result = current.status.clone();
+        state.near.save_intent(&id, current).await?;
+        return Ok(Json(result));
     }
     if !body.signed.is_empty()
         || body.sent.len() != 1
@@ -2118,36 +2290,39 @@ pub(super) async fn status(
         state.near.save_intent(&id, current).await?;
         return Ok(Json(result));
     }
+    // A gas top-up filling: CoW says when; then the Base transfer is handed out (/next).
+    if let (Some(uid), "fund", "pending") = (
+        current.gas_order.clone(),
+        result.stage.as_str(),
+        result.state.as_str(),
+    ) {
+        match state.cow.order_state(&uid).await {
+            Ok(engine_execution::layerswap::SwapState::Completed) => {
+                result.stage = "sign".into();
+                current.expires = now() + 120_000;
+            }
+            Ok(engine_execution::layerswap::SwapState::Failed(reason)) => {
+                eprintln!("intent {id}: gas top-up {reason}");
+                result.state = "failed".into();
+                result.error = Some(markets::GAS_NOT_READY.into());
+            }
+            _ => return Ok(Json(result)),
+        }
+        current.status = result.clone();
+        state.near.save_intent(&id, current).await?;
+        return Ok(Json(result));
+    }
     if result.stage != "settle" || result.state != "pending" {
         return Ok(Json(result));
     }
-    let hash = &result.tx_ids[0];
-    let tx = markets::base_rpc(&state.markets, "eth_getTransactionByHash", json!([hash])).await?;
-    if tx.is_null() {
-        return Ok(Json(result));
-    }
-    if !tx["from"]
-        .as_str()
-        .is_some_and(|v| v.eq_ignore_ascii_case(&current.wallet))
-        || !tx["to"]
-            .as_str()
-            .is_some_and(|v| v.eq_ignore_ascii_case(&current.expected_to))
-        || !tx["input"]
-            .as_str()
-            .is_some_and(|v| v.eq_ignore_ascii_case(&current.expected_data))
-    {
-        result.state = "failed".into();
-        result.error = Some("reported transaction does not match the deposit plan".into());
-    } else {
-        let receipt =
-            markets::base_rpc(&state.markets, "eth_getTransactionReceipt", json!([hash])).await?;
-        if receipt.is_null() {
-            return Ok(Json(result));
-        }
-        if receipt["status"].as_str() != Some("0x1") {
+    let hash = result.tx_ids[0].clone();
+    match deposit_landed(&state, &current, &hash).await? {
+        Ok(false) => return Ok(Json(result)),
+        Err(message) => {
             result.state = "failed".into();
-            result.error = Some("Base deposit reverted".into());
-        } else {
+            result.error = Some(message);
+        }
+        Ok(true) => {
             let venue_status = state
                 .near
                 .client
@@ -2229,6 +2404,80 @@ pub(super) async fn status(
     state.near.save_intent(&id, current).await?;
     Ok(Json(result))
 }
+
+// Whether the user's deposit to 1Click has landed: Ok(true) once it has, as planned; Ok(false)
+// until then; Err with what the user reads when it failed.
+async fn deposit_landed(
+    state: &AppState,
+    current: &StoredIntent,
+    hash: &str,
+) -> Result<Result<bool, String>, ApiError> {
+    if current.from_solana {
+        return Ok(
+            match state
+                .solana_mainnet
+                .signature_status(hash)
+                .await
+                .map_err(venue)?
+            {
+                None => Ok(false),
+                Some(Ok(())) => Ok(true),
+                Some(Err(_)) => Err(NOT_SENT.into()),
+            },
+        );
+    }
+    let tx = markets::base_rpc(&state.markets, "eth_getTransactionByHash", json!([hash])).await?;
+    if tx.is_null() {
+        return Ok(Ok(false));
+    }
+    let field = |name: &str, want: &str| {
+        tx[name]
+            .as_str()
+            .is_some_and(|v| v.eq_ignore_ascii_case(want))
+    };
+    if !field("from", &current.wallet)
+        || !field("to", &current.expected_to)
+        || !field("input", &current.expected_data)
+    {
+        return Ok(Err(
+            "reported transaction does not match the deposit plan".into()
+        ));
+    }
+    let receipt =
+        markets::base_rpc(&state.markets, "eth_getTransactionReceipt", json!([hash])).await?;
+    if receipt.is_null() {
+        return Ok(Ok(false));
+    }
+    if receipt["status"].as_str() != Some("0x1") {
+        return Ok(Err(NOT_SENT.into()));
+    }
+    Ok(Ok(true))
+}
+
+// The Base transfer to 1Click once an empty gas tank has been topped up (GET /v1/intents/{id}/next).
+pub(super) async fn next(
+    state: AppState,
+    headers: HeaderMap,
+    id: String,
+) -> Result<Json<Value>, ApiError> {
+    let user = app_balance::verified_wallets(&state, &headers).await?;
+    let current = state
+        .near
+        .get_intent(&id)
+        .await?
+        .ok_or((StatusCode::NOT_FOUND, "intent not found".into()))?;
+    if current.owner != user.user_id {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "intent belongs to another user".into(),
+        ));
+    }
+    if !current.gas_topup || current.status.stage != "sign" || current.status.state != "pending" {
+        return Err(conflict("nothing to sign for this intent"));
+    }
+    Ok(Json(json!({"transactions":[{"chain":"base","chainId":8453,
+        "to":current.expected_to,"data":current.expected_data,"value":"0"}]})))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2248,6 +2497,24 @@ mod tests {
             venue_minimum_usd("Quoting for this pair is not available"),
             None
         );
+    }
+    #[test]
+    fn deposit_addresses_are_checked_per_chain() {
+        // A 1Click Solana deposit address captured on 2026-09-30.
+        assert!(is_solana("9r5gSYHALmVWGnhGtR5VTibkN9Yn94TX1uLqX3n7APHK"));
+        assert!(!is_solana("0x845c22a46398E0a702733e556bEB6aFcB2E92132"));
+        assert!(!is_solana("9r5gSYHALmVWGnhGtR5VTibkN9Yn94TX1uLqX3n7AP0K"));
+        assert!(!is_solana("short"));
+    }
+    #[test]
+    fn intents_saved_before_solana_payments_still_load() {
+        let old: StoredIntent = serde_json::from_value(json!({"owner":"o","wallet":"0xw",
+            "expected_to":"0xt","expected_data":"0x","deposit_address":"0xd","deposit_memo":null,
+            "expires":1,"status":{"intentId":"i","stage":"settle","state":"pending","txIds":["0xh"],
+            "error":null}}))
+        .unwrap();
+        assert!(!old.from_solana && !old.gas_topup);
+        assert!(old.gas_order.is_none() && old.gas_request_id.is_none());
     }
     #[test]
     fn deposit_options_are_distinct_with_the_featured_first() {

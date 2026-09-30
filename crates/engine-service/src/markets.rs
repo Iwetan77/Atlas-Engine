@@ -1869,21 +1869,7 @@ pub(super) async fn plan_solana_transfer(
     to: &str,
     amount: u128,
 ) -> Result<(String, Vec<Value>), ApiError> {
-    let (transfer, creates) = state
-        .solana_mainnet
-        .usdc_transfer_transaction(
-            &from,
-            to,
-            amount.try_into().map_err(|_| bad("amount too large"))?,
-        )
-        .await
-        .map_err(unavailable)?;
-    let floor = if creates {
-        3_000_000
-    } else {
-        GAS_FLOOR_LAMPORTS
-    };
-    let gas = gas_topup_below(state, &from, amount, floor).await;
+    let (gas, transfer) = solana_usdc_transfer(state, &from, to, amount).await?;
     let intent_id = id("intent");
     state
         .markets
@@ -1919,6 +1905,57 @@ pub(super) async fn plan_solana_transfer(
     Ok((intent_id, transactions))
 }
 
+// A USDC transfer from a Solana wallet that the engine lands (a friend send, a 1Click deposit): the
+// gas top-up to run first when the wallet needs one (Jupiter request and transaction), and the
+// transfer. Opening the receiver's USDC account costs rent, so the floor is higher then.
+pub(super) async fn solana_usdc_transfer(
+    state: &AppState,
+    from: &str,
+    to: &str,
+    amount: u128,
+) -> Result<(Option<(String, String)>, String), ApiError> {
+    let (transfer, creates) = state
+        .solana_mainnet
+        .usdc_transfer_transaction(
+            from,
+            to,
+            amount.try_into().map_err(|_| bad("amount too large"))?,
+        )
+        .await
+        .map_err(unavailable)?;
+    let floor = if creates {
+        3_000_000
+    } else {
+        GAS_FLOOR_LAMPORTS
+    };
+    Ok((gas_topup_below(state, from, amount, floor).await, transfer))
+}
+
+// Rent for a new USDC account on Solana, which the sender pays and doesn't get back.
+pub(super) const ACCOUNT_RENT_LAMPORTS: u128 = 2_039_280;
+
+// Whether a Solana wallet can pay for a USDC transfer of `amount` that opens the receiver's account:
+// SOL for the fee and rent already there, or USDC to spare for the gasless top-up.
+pub(super) async fn solana_can_send(state: &AppState, owner: &str, amount: u128) -> bool {
+    let sol = state
+        .solana_mainnet
+        .owner_sol_balance(owner)
+        .await
+        .unwrap_or(0);
+    sol >= ACCOUNT_RENT_LAMPORTS + 100_000
+        || solana_cash(state, owner).await >= amount.saturating_add(GAS_TOPUP_USDC)
+}
+
+// That rent in USD micros at SOL's live price (0 if the price is unavailable).
+pub(super) async fn account_rent_usd(state: &AppState) -> u128 {
+    let price = usd_prices(&state.markets, &[SOL_MINT.to_string()])
+        .await
+        .ok()
+        .and_then(|p| p.get(SOL_MINT).map(|(price, _)| *price))
+        .unwrap_or(0.0);
+    (ACCOUNT_RENT_LAMPORTS as f64 / 1e9 * price * 1e6).ceil() as u128
+}
+
 // The Base gas tank, paid by the user, never by Atlas. At or above the floor the wallet pays its own
 // gas (a Base transaction costs about 0.000002 ETH). Below the refill mark (but above the floor) a
 // plan starts with a USDC → ETH refill the tank still pays for itself. An empty tank is filled first
@@ -1930,7 +1967,7 @@ const BASE_GAS_REFILL_AT_WEI: u128 = 40_000_000_000_000;
 // A refill: $0.50 of USDC becomes about 0.0002 ETH, enough for dozens of transactions.
 const BASE_GAS_REFILL_USDC: u128 = 500_000;
 // What the user reads when the tank couldn't be filled: nothing else happened.
-const GAS_NOT_READY: &str =
+pub(super) const GAS_NOT_READY: &str =
     "Couldn't get your account ready for this, so nothing happened and nothing left your balance. Try again.";
 // What Layerswap's refuel turns into ETH on an empty tank's first hop from Solana.
 const BASE_REFUEL_USDC: u128 = 500_000;
@@ -2015,7 +2052,7 @@ pub(super) async fn base_gas_refill(
 
 // Whether a Base plan should fill an empty tank first: no ETH to pay gas, and USDC to spare beyond
 // `spends` for the top-up.
-async fn base_topup_fits(state: &AppState, wallet: &str, spends: u128) -> bool {
+pub(super) async fn base_topup_fits(state: &AppState, wallet: &str, spends: u128) -> bool {
     if wallet_pays_gas(state, wallet).await {
         return false;
     }
@@ -2030,7 +2067,7 @@ async fn base_topup_fits(state: &AppState, wallet: &str, spends: u128) -> bool {
 // Fills an empty tank without gas once the user has confirmed: their session signs a USDC permit
 // for CoW and a $0.50 USDC → ETH order to themselves; a solver settles it and pays the gas. Returns
 // CoW's order id.
-async fn run_base_topup(
+pub(super) async fn run_base_topup(
     state: &AppState,
     headers: &HeaderMap,
     evm: &str,
@@ -3086,6 +3123,9 @@ pub(super) async fn next_transactions(
     Path(intent_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
+    if intent_id.starts_with("near-intent-") {
+        return near_intents::next(state, headers, intent_id).await;
+    }
     let user = app_balance::verified_wallets(&state, &headers).await?;
     let mut intent = state
         .markets
