@@ -16,6 +16,9 @@ pub(super) struct NearState {
     quotes: Arc<Mutex<HashMap<String, StoredQuote>>>,
     intents: Arc<Mutex<HashMap<String, StoredIntent>>>,
     tokens: Arc<Mutex<Option<(Instant, Vec<Token>)>>>,
+    icons: Arc<Mutex<HashMap<String, String>>>,
+    icon_http: reqwest::Client,
+    monad_rpc: reqwest::Url,
     postgres: Option<Arc<tokio_postgres::Client>>,
 }
 #[derive(Clone)]
@@ -37,6 +40,8 @@ struct StoredIntent {
     expected_data: String,
     deposit_address: String,
     deposit_memo: Option<String>,
+    #[serde(default)]
+    asset: Option<Token>,
     expires: u64,
     status: markets::IntentStatus,
 }
@@ -65,16 +70,49 @@ impl NearState {
             quotes: Arc::new(Mutex::new(HashMap::new())),
             intents: Arc::new(Mutex::new(HashMap::new())),
             tokens: Arc::new(Mutex::new(None)),
+            icons: Arc::new(Mutex::new(HashMap::new())),
+            icon_http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(6))
+                .build()?,
             postgres,
+            monad_rpc: env::var("ATLAS_MONAD_MAINNET_RPC_URL")
+                .unwrap_or_else(|_| "https://rpc.monad.xyz".into())
+                .parse()?,
         })
     }
     async fn tokens(&self) -> Result<Vec<Token>, ApiError> {
         if let Some((at, list)) = self.tokens.lock().map_err(internal)?.as_ref() {
-            if at.elapsed() < Duration::from_secs(15 * 60) {
+            if at.elapsed() < Duration::from_secs(60) {
                 return Ok(list.clone());
             }
         }
         let list = self.client.tokens().await.map_err(venue)?;
+        // CoinGecko IDs are supplied by 1Click. Fetch images in one bounded request.
+        let ids: Vec<&str> = list
+            .iter()
+            .filter(|t| supported(t))
+            .filter_map(|t| t.coingecko_id.as_deref())
+            .collect();
+        if !ids.is_empty() {
+            if let Ok(response) = self
+                .icon_http
+                .get("https://api.coingecko.com/api/v3/coins/markets")
+                .query(&[("vs_currency", "usd"), ("ids", &ids.join(","))])
+                .send()
+                .await
+            {
+                if let Ok(rows) = response.json::<Vec<Value>>().await {
+                    let mut icons = self.icons.lock().map_err(internal)?;
+                    for row in rows {
+                        if let (Some(id), Some(url)) = (row["id"].as_str(), row["image"].as_str()) {
+                            if url.starts_with("https://coin-images.coingecko.com/") {
+                                icons.insert(id.into(), url.into());
+                            }
+                        }
+                    }
+                }
+            }
+        }
         *self.tokens.lock().map_err(internal)? = Some((Instant::now(), list.clone()));
         Ok(list)
     }
@@ -125,6 +163,105 @@ impl NearState {
                 .insert(id.into(), intent);
         }
         Ok(())
+    }
+    pub(super) async fn monad_holdings(
+        &self,
+        owner: &str,
+        wallet: &str,
+    ) -> Result<Vec<(Token, u128)>, ApiError> {
+        let intents: Vec<StoredIntent> = if let Some(pg) = &self.postgres {
+            pg.query(
+                "SELECT payload FROM atlas_near_intents WHERE owner=$1",
+                &[&owner],
+            )
+            .await
+            .map_err(internal)?
+            .into_iter()
+            .map(|row| {
+                serde_json::from_str::<StoredIntent>(row.get::<_, &str>(0)).map_err(internal)
+            })
+            .collect::<Result<_, _>>()?
+        } else {
+            self.intents
+                .lock()
+                .map_err(internal)?
+                .values()
+                .filter(|i| i.owner == owner)
+                .cloned()
+                .collect()
+        };
+        let mut assets = HashMap::<String, Token>::new();
+        for intent in intents {
+            if intent.status.state == "filled" {
+                if let Some(asset) = intent.asset.filter(|a| a.blockchain == "monad") {
+                    assets.insert(asset.asset_id.clone(), asset);
+                }
+            }
+        }
+        if assets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let catalog = self.tokens().await?;
+        for asset in assets.values_mut() {
+            let fresh = catalog
+                .iter()
+                .find(|t| t.asset_id == asset.asset_id)
+                .ok_or_else(|| venue(format!("no live 1Click price for {}", asset.symbol)))?;
+            *asset = fresh.clone();
+        }
+        let chain = self.monad_call("eth_chainId", json!([])).await?;
+        if chain.as_str() != Some("0x8f") {
+            return Err(venue("Monad RPC returned a different chain ID"));
+        }
+        let mut result = Vec::new();
+        for asset in assets.into_values() {
+            let value = if let Some(contract) = asset.contract_address.as_deref() {
+                if !is_evm(contract) {
+                    return Err(venue("invalid Monad token contract"));
+                }
+                let data = format!("0x70a08231{:0>64}", &wallet[2..].to_ascii_lowercase());
+                self.monad_call("eth_call", json!([{"to":contract,"data":data},"latest"]))
+                    .await?
+            } else {
+                self.monad_call("eth_getBalance", json!([wallet, "latest"]))
+                    .await?
+            };
+            let hex = value
+                .as_str()
+                .and_then(|v| v.strip_prefix("0x"))
+                .ok_or_else(|| venue("Monad RPC returned no balance"))?;
+            let units = u128::from_str_radix(hex, 16).map_err(internal)?;
+            if units > 0 {
+                result.push((asset, units));
+            }
+        }
+        Ok(result)
+    }
+    async fn monad_call(&self, method: &str, params: Value) -> Result<Value, ApiError> {
+        let response = self
+            .icon_http
+            .post(self.monad_rpc.clone())
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
+            .send()
+            .await
+            .map_err(venue)?;
+        if !response.status().is_success() {
+            return Err(venue(format!("Monad RPC HTTP {}", response.status())));
+        }
+        let body: Value = response.json().await.map_err(venue)?;
+        if !body["error"].is_null() {
+            return Err(venue("Monad RPC returned an error"));
+        }
+        Ok(body["result"].clone())
+    }
+    pub(super) fn icon_for(&self, asset: &Token) -> Option<String> {
+        asset.coingecko_id.as_deref()
+            .and_then(|id| self.icons.lock().ok().and_then(|m|m.get(id).cloned()))
+            .or_else(||match asset.coingecko_id.as_deref() {
+                Some("monad")=>Some("https://coin-images.coingecko.com/coins/images/38927/small/mon.png".into()),
+                Some("sui")=>Some("https://coin-images.coingecko.com/coins/images/26375/small/sui-ocean-square.png".into()),
+                _=>None
+            })
     }
     pub(super) async fn planned_base_txs(
         &self,
@@ -268,11 +405,12 @@ pub(super) async fn search_assets(
             continue;
         }
         let display = usd * (rate as f64 / 1_000_000.0);
+        let icon = state.near.icon_for(t);
         out.push(
             json!({"assetId":format!("near:{}", t.asset_id),"symbol":t.symbol,
             "name":format!("{} on {}",t.symbol,t.blockchain),"kind":"crypto",
             "price":{"amount":format!("{display:.12}").trim_end_matches('0').trim_end_matches('.'),
-                "currency":currency},"change24hPct":null,"iconUrl":null,"verified":true}),
+                "currency":currency},"change24hPct":null,"iconUrl":icon,"verified":true}),
         );
         if out.len() >= 30 {
             break;
@@ -464,6 +602,7 @@ pub(super) async fn execute(
                 expected_data: tx.data.to_ascii_lowercase(),
                 deposit_address: deposit,
                 deposit_memo: fresh.deposit_memo,
+                asset: Some(stored.asset.clone()),
                 expires,
                 status,
             },
@@ -625,6 +764,7 @@ mod tests {
             decimals: 9,
             contract_address: None,
             price: None,
+            coingecko_id: None,
         };
         let user = app_balance::VerifiedWallets {
             user_id: "u".into(),

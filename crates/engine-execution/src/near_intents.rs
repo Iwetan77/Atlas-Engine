@@ -16,7 +16,7 @@ pub struct Client {
     http: reqwest::Client,
     key: Option<String>,
 }
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Token {
     pub asset_id: String,
@@ -25,6 +25,7 @@ pub struct Token {
     pub decimals: u32,
     pub contract_address: Option<String>,
     pub price: Option<serde_json::Value>,
+    pub coingecko_id: Option<String>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]

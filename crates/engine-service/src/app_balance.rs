@@ -237,6 +237,45 @@ pub(super) async fn balance(
             .ok_or((StatusCode::BAD_GATEWAY, "portfolio value overflow".into()))?;
         holdings.push(catalog_holding(asset, units, value_usdc, &currency, rate)?);
     }
+    // Once a 1Click buy settles, read the destination wallet on Monad itself.
+    // The spent Base USDC and received asset must both be reflected in Home.
+    for (asset, units) in state.near.monad_holdings(&user.user_id, &evm).await? {
+        let price = asset
+            .price
+            .as_ref()
+            .and_then(|v| {
+                v.as_f64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+            })
+            .filter(|p| p.is_finite() && *p > 0.0)
+            .ok_or((
+                StatusCode::BAD_GATEWAY,
+                format!("no live price for {}", asset.symbol),
+            ))?;
+        let value_usdc_f = units as f64 / 10f64.powi(asset.decimals as i32) * price * 1_000_000.0;
+        if !value_usdc_f.is_finite() || value_usdc_f < 0.0 || value_usdc_f > u128::MAX as f64 {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                "Monad portfolio value overflow".into(),
+            ));
+        }
+        let value_usdc = value_usdc_f as u128;
+        total = total
+            .checked_add(value_usdc)
+            .ok_or((StatusCode::BAD_GATEWAY, "portfolio value overflow".into()))?;
+        holdings.push(Holding {
+            asset_id: format!("near:{}", asset.asset_id),
+            symbol: asset.symbol.clone(),
+            name: format!("{} on Monad", asset.symbol),
+            kind: "crypto".into(),
+            chain: "monad".into(),
+            amount: markets::format_units(units, asset.decimals),
+            value: money(value_usdc, &currency, rate)?,
+            value_usd: usd(value_usdc),
+            location: "wallet",
+            icon_url: state.near.icon_for(&asset),
+        });
+    }
     let as_of_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(internal)?
