@@ -46,6 +46,8 @@ pub(super) struct Asset {
     pub(super) verified: bool,
     // Jupiter's USD price when the catalog was read: orders the Crypto list, never shown or traded on.
     pub(super) ref_price: f64,
+    // 24h price change (%) when the catalog was read: orders Trending.
+    pub(super) change_24h: f64,
     // False keeps an asset out of Trade (another row already sells the same coin) while the balance
     // still values it.
     pub(super) listed: bool,
@@ -101,6 +103,7 @@ fn base_assets() -> Vec<Asset> {
         xstock: false,
         verified: true,
         ref_price: 0.0,
+        change_24h: 0.0,
         listed: true,
     };
     vec![
@@ -241,6 +244,7 @@ fn token_asset(token: &Value, verified: bool) -> Option<Asset> {
         xstock,
         verified,
         ref_price: token["usdPrice"].as_f64().unwrap_or(0.0),
+        change_24h: token["stats24h"]["priceChange"].as_f64().unwrap_or(0.0),
         listed: true,
     })
 }
@@ -318,6 +322,36 @@ pub(super) async fn catalog(state: &MarketState) -> Result<Arc<Vec<Asset>>, ApiE
     let assets = Arc::new(curate(&tokens));
     *state.catalog.lock().map_err(internal)? = Some((Instant::now(), assets.clone()));
     Ok(assets)
+}
+
+// Trending: what's rising most, with each kind judged against its own kind. A meme up 300% and a
+// stock up 6% can both be the top mover of their kind, so the top meme, stock and coin all lead.
+// Assets that aren't rising follow, most traded first.
+fn trending_order(assets: Vec<&Asset>) -> Vec<&Asset> {
+    let mut scored: Vec<(f64, &Asset)> = Vec::with_capacity(assets.len());
+    let mut kinds: Vec<&str> = assets.iter().map(|a| a.kind.as_str()).collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    for kind in kinds {
+        let mut rising: Vec<&Asset> = assets
+            .iter()
+            .copied()
+            .filter(|a| a.kind == kind && a.change_24h > 0.0)
+            .collect();
+        rising.sort_by(|a, b| b.change_24h.total_cmp(&a.change_24h));
+        let n = rising.len() as f64;
+        for (i, a) in rising.into_iter().enumerate() {
+            // 1.0 for the top mover of its kind, down towards 0 for the last one rising.
+            scored.push((1.0 - i as f64 / n, a));
+        }
+    }
+    scored.sort_by(|(sa, a), (sb, b)| sb.total_cmp(sa).then(b.change_24h.total_cmp(&a.change_24h)));
+    let mut rest: Vec<&Asset> = assets
+        .into_iter()
+        .filter(|a| !(a.change_24h > 0.0))
+        .collect();
+    rest.sort_by(|a, b| b.volume_24h.total_cmp(&a.volume_24h));
+    scored.into_iter().map(|(_, a)| a).chain(rest).collect()
 }
 
 // Jupiter's list → Atlas's catalog: one row per coin. Wrapped copies of a major give way to its
@@ -784,6 +818,86 @@ pub(super) fn parse_micros(s: &str) -> Result<u128, ApiError> {
         .filter(|v| *v > 0)
         .ok_or_else(|| bad("amount must be positive"))
 }
+// Every buy, sell, send and savings move is between $0.10 and $10,000 (USDC units).
+pub(super) const MIN_USDC: u128 = 100_000;
+pub(super) const MAX_USDC: u128 = 10_000_000_000;
+
+fn currency_symbol(currency: &str) -> &'static str {
+    match currency {
+        "NGN" => "₦",
+        "USD" => "$",
+        "EUR" => "€",
+        "GBP" => "£",
+        "KES" => "KSh ",
+        "GHS" => "GH₵",
+        "ZAR" => "R",
+        _ => "",
+    }
+}
+fn group_digits(n: u128) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+// Money in a sentence people read, in their own currency: "₦1,504.69".
+pub(super) fn say_money(usdc_units: u128, currency: &str, rate: u128) -> String {
+    let micros = usdc_units.saturating_mul(rate) / 1_000_000;
+    format!(
+        "{}{}.{:02}",
+        currency_symbol(currency),
+        group_digits(micros / 1_000_000),
+        (micros % 1_000_000) / 10_000
+    )
+}
+// A limit in whole units of their currency, rounded so it stays inside the limit: "₦151".
+fn say_limit(usdc_units: u128, currency: &str, rate: u128, round_up: bool) -> String {
+    let micros = usdc_units.saturating_mul(rate) / 1_000_000;
+    let whole = if round_up {
+        micros.div_ceil(1_000_000)
+    } else {
+        micros / 1_000_000
+    };
+    format!("{}{}", currency_symbol(currency), group_digits(whole))
+}
+// The $0.10–$10,000 range, said in the currency the user typed in.
+pub(super) fn check_limits(usdc_units: u128, currency: &str, rate: u128) -> Result<(), ApiError> {
+    if usdc_units < MIN_USDC {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "The smallest amount is {}",
+                say_limit(MIN_USDC, currency, rate, true)
+            ),
+        ));
+    }
+    if usdc_units > MAX_USDC {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "The most at once is {}",
+                say_limit(MAX_USDC, currency, rate, false)
+            ),
+        ));
+    }
+    Ok(())
+}
+// Short of cash on a chain: say how much they do have there.
+pub(super) fn short_of_cash(available: u128, chain: &str, currency: &str, rate: u128) -> ApiError {
+    (
+        StatusCode::CONFLICT,
+        format!(
+            "Not enough cash on {chain} for this. You have {} there.",
+            say_money(available, currency, rate)
+        ),
+    )
+}
+
 pub(super) fn format_units(units: u128, decimals: u32) -> String {
     let scale = 10u128.pow(decimals);
     let mut result = format!(
@@ -1006,8 +1120,9 @@ pub(super) async fn assets(
             .collect()
     };
     // Most traded first (a search puts close name matches ahead of that); Crypto goes by price,
-    // Bitcoin at the top.
+    // Bitcoin at the top; Trending (no chip filter) goes by who's rising.
     let by_price = kind == Some("crypto") && query.is_empty();
+    let trending = kind.is_none() && query.is_empty() && !by_address;
     picked.sort_by(|a, b| {
         let by_match = if query.is_empty() { 0 } else { rank(a) }.cmp(&if query.is_empty() {
             0
@@ -1020,6 +1135,9 @@ pub(super) async fn assets(
             by_match.then(b.volume_24h.total_cmp(&a.volume_24h))
         }
     });
+    if trending {
+        picked = trending_order(picked);
+    }
     picked.truncate(if !query.is_empty() {
         30
     } else if kind.is_none() {
@@ -1290,9 +1408,7 @@ pub(super) async fn quote(
         .checked_mul(1_000_000)
         .ok_or_else(|| bad("amount too large"))?
         / rate;
-    if usdc_units < 100_000 || usdc_units > 10_000_000_000 {
-        return Err(bad("amount must be between 0.10 and 10000 USD"));
-    }
+    check_limits(usdc_units, &req.amount.currency, rate)?;
     let input = if req.side == "buy" {
         usdc_units
     } else {
@@ -1312,6 +1428,26 @@ pub(super) async fn quote(
     } else {
         (actual_in, actual_out)
     };
+    // Above what they have: say so now, in their currency, rather than at the confirm.
+    if let Some(held) = spot_available(&state, &a, &req.side, &user).await {
+        if held < actual_in {
+            let chain = if a.chain == "base" { "Base" } else { "Solana" };
+            return Err(if req.side == "buy" {
+                short_of_cash(held, chain, &req.amount.currency, rate)
+            } else {
+                let worth = mul_div_units(held, stable_units, asset_units);
+                (
+                    StatusCode::CONFLICT,
+                    format!(
+                        "You only have {} {} ({}).",
+                        format_units(held, a.decimals),
+                        a.symbol,
+                        say_money(worth, &req.amount.currency, rate)
+                    ),
+                )
+            });
+        }
+    }
     let price = unit_price(
         stable_units,
         asset_units,
@@ -1359,6 +1495,52 @@ pub(super) async fn quote(
     Ok(Json(
         json!({"quoteId":quote_id,"assetId":a.id,"side":req.side,"pay":pay,"receive":receive,"price":price,"fee":money_from_usdc(fee_usdc,&req.amount.currency,rate)?,"expiresAtUnixMs":expires}),
     ))
+}
+
+// What the user can spend on this trade: USDC on the asset's chain for a buy, the token for a sell.
+// None when the wallet can't be read (the confirm still checks before anything is signed).
+async fn spot_available(
+    state: &AppState,
+    a: &Asset,
+    side: &str,
+    user: &app_balance::VerifiedWallets,
+) -> Option<u128> {
+    let token = if side == "buy" {
+        if a.chain == "base" {
+            BASE_USDC
+        } else {
+            SOL_USDC
+        }
+    } else {
+        a.token.as_str()
+    };
+    if a.chain == "base" {
+        let wallet = user.evm_wallet.as_deref().filter(|w| !w.is_empty())?;
+        return state.markets.base.balance_of(token, wallet).await.ok();
+    }
+    let owner = user.solana_wallet.as_deref().filter(|w| !w.is_empty())?;
+    let held = state
+        .solana_mainnet
+        .owner_token_balances(owner)
+        .await
+        .ok()?;
+    let mut units: u128 = held
+        .iter()
+        .filter(|(m, _, _)| m == token)
+        .map(|(_, u, _)| *u)
+        .sum();
+    if token == SOL_MINT {
+        units = units.saturating_add(state.solana_mainnet.owner_sol_balance(owner).await.ok()?);
+    }
+    Some(units)
+}
+fn mul_div_units(a: u128, b: u128, c: u128) -> u128 {
+    if c == 0 {
+        return 0;
+    }
+    a.checked_mul(b)
+        .map(|n| n / c)
+        .unwrap_or_else(|| (a as f64 * b as f64 / c as f64) as u128)
 }
 
 pub(super) async fn execute_quote(
@@ -1426,10 +1608,19 @@ pub(super) async fn execute_quote(
             .await
             .map_err(unavailable)?;
         if balance < fresh.amount_in {
-            return Err((
-                StatusCode::CONFLICT,
-                "insufficient Base mainnet token balance".into(),
-            ));
+            let rate = app_balance::fx_rate(&stored.currency).await?;
+            return Err(if stored.side == "buy" {
+                short_of_cash(balance, "Base", &stored.currency, rate)
+            } else {
+                (
+                    StatusCode::CONFLICT,
+                    format!(
+                        "You only have {} {}.",
+                        format_units(balance, a.decimals),
+                        a.symbol
+                    ),
+                )
+            });
         }
         let allowance = state
             .markets
@@ -2167,6 +2358,15 @@ mod tests {
                 .map(|a| format!("{} ${:.2}", a.symbol, a.ref_price))
                 .collect::<Vec<_>>()
         );
+        let trending = trending_order(catalog.iter().filter(|a| a.listed).collect());
+        println!(
+            "trending: {:?}",
+            trending
+                .iter()
+                .take(15)
+                .map(|a| format!("{} {} {:+.0}%", a.kind, a.symbol, a.change_24h))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(crypto[0].name, "Bitcoin");
         assert_eq!(crypto[1].name, "Ethereum");
         assert_eq!(
@@ -2182,6 +2382,66 @@ mod tests {
                 .filter(|a| a.listed && a.name == "Ethereum")
                 .count(),
             1
+        );
+    }
+    #[test]
+    fn trending_puts_each_kinds_top_mover_first() {
+        let asset = |id: &str, kind: &str, change: f64, volume: f64| Asset {
+            id: id.into(),
+            symbol: id.into(),
+            name: id.into(),
+            kind: kind.into(),
+            chain: "solana".into(),
+            token: id.into(),
+            decimals: 6,
+            icon_url: None,
+            volume_24h: volume,
+            xstock: false,
+            verified: true,
+            ref_price: 1.0,
+            change_24h: change,
+            listed: true,
+        };
+        let list = [
+            asset("meme1", "meme", 900.0, 1.0),
+            asset("meme2", "meme", 300.0, 1.0),
+            asset("meme3", "meme", 40.0, 1.0),
+            asset("stock1", "stock", 6.0, 1.0),
+            asset("stock2", "stock", 1.0, 1.0),
+            asset("coin1", "crypto", 12.0, 1.0),
+            asset("flat", "crypto", 0.0, 50.0),
+            asset("down", "meme", -20.0, 99.0),
+        ];
+        let order: Vec<&str> = trending_order(list.iter().collect())
+            .iter()
+            .map(|a| a.id.as_str())
+            .collect();
+        // Each kind's top mover first (biggest move leading), then the next rank of each kind.
+        assert_eq!(&order[..3], &["meme1", "coin1", "stock1"]);
+        assert_eq!(&order[3..6], &["meme2", "stock2", "meme3"]);
+        // Not rising: last, most traded first.
+        assert_eq!(&order[6..], &["down", "flat"]);
+    }
+    #[test]
+    fn limits_and_shortfalls_speak_the_users_currency() {
+        // ₦1,504.69 per dollar.
+        let ngn = 1_504_690_000;
+        assert_eq!(say_money(1_000_000, "NGN", ngn), "₦1,504.69");
+        assert_eq!(say_money(12_345_678_900, "USD", 1_000_000), "$12,345.67");
+        assert_eq!(say_money(0, "EUR", 900_000), "€0.00");
+        let small = check_limits(33_000, "NGN", ngn).unwrap_err();
+        assert_eq!(small.1, "The smallest amount is ₦151");
+        let big = check_limits(MAX_USDC + 1, "NGN", ngn).unwrap_err();
+        assert_eq!(big.1, "The most at once is ₦15,046,900");
+        assert!(check_limits(MIN_USDC, "USD", 1_000_000).is_ok());
+        assert_eq!(
+            check_limits(MIN_USDC - 1, "USD", 1_000_000).unwrap_err().1,
+            "The smallest amount is $1"
+        );
+        let short = short_of_cash(2_500_000, "Solana", "KES", 129_000_000);
+        assert_eq!(
+            short.1,
+            "Not enough cash on Solana for this. You have KSh 322.50 there."
         );
     }
     #[test]

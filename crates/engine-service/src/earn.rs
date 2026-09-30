@@ -356,9 +356,7 @@ pub(super) async fn quote(
     let rate = app_balance::fx_rate(&currency).await?;
     let display = markets::parse_micros(&req.amount.amount)?;
     let mut units = display.saturating_mul(1_000_000) / rate;
-    if units < 100_000 {
-        return Err(bad("amount must be at least 0.10 USD"));
-    }
+    markets::check_limits(units, &currency, rate)?;
     // What can move: cash on the option's chain to put in, or what's in savings to take out.
     let (available, apy, held_shares, lend) = if lend_option {
         let ((cash, shares), lend) =
@@ -397,8 +395,9 @@ pub(super) async fn quote(
             StatusCode::CONFLICT,
             if deposit {
                 format!(
-                    "Not enough in your balance on {} for this",
-                    if lend_option { "Solana" } else { "Base" }
+                    "Not enough cash on {} for this. You have {} there.",
+                    if lend_option { "Solana" } else { "Base" },
+                    markets::say_money(available, &currency, rate)
                 )
             } else {
                 "That's more than you have in savings".into()

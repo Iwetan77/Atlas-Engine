@@ -545,9 +545,7 @@ pub(super) async fn send_quote(
         .checked_mul(1_000_000)
         .ok_or_else(|| bad("amount too large"))?
         / rate;
-    if usdc_units < 100_000 || usdc_units > 10_000_000_000 {
-        return Err(bad("send amount must be between 0.10 and 10000 USD"));
-    }
+    markets::check_limits(usdc_units, &req.amount.currency, rate)?;
     let quote_id = format!(
         "send-{:x}-{:x}",
         now(),
@@ -609,9 +607,12 @@ pub(super) async fn execute_send(
         .await
         .map_err(internal)?;
     if balance < quote.usdc_units {
-        return Err((
-            StatusCode::CONFLICT,
-            "insufficient Base mainnet USDC".into(),
+        let rate = app_balance::fx_rate(&quote.currency).await?;
+        return Err(markets::short_of_cash(
+            balance,
+            "Base",
+            &quote.currency,
+            rate,
         ));
     }
     let tx = state

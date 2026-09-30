@@ -447,9 +447,7 @@ pub(super) async fn quote(
     if req.side != "buy" {
         return Err(bad("1Click sell routing is not available yet"));
     }
-    if !matches!(req.amount.currency.as_str(), "USD" | "NGN") {
-        return Err(bad("unsupported display currency"));
-    }
+    markets::checked_currency(&req.amount.currency)?;
     let user = app_balance::verified_wallets(&state, &headers).await?;
     let token = state
         .near
@@ -470,8 +468,17 @@ pub(super) async fn quote(
         .checked_mul(1_000_000)
         .ok_or_else(|| bad("amount too large"))?
         / rate;
-    if !(100_000..=10_000_000_000).contains(&amount) {
-        return Err(bad("amount must be between 0.10 and 10000 USD"));
+    markets::check_limits(amount, &req.amount.currency, rate)?;
+    // More than the cash on Base: say so at the quote, in their currency.
+    if let Ok(held) = state.markets.base.balance_of(BASE_USDC, wallet).await {
+        if held < amount {
+            return Err(markets::short_of_cash(
+                held,
+                "Base",
+                &req.amount.currency,
+                rate,
+            ));
+        }
     }
     let deadline = deadline_utc(180);
     let units = amount.to_string();
@@ -566,7 +573,13 @@ pub(super) async fn execute(
         .await
         .map_err(venue)?;
     if balance < stored.amount {
-        return Err(conflict("insufficient Base mainnet USDC balance"));
+        let rate = app_balance::fx_rate(&stored.currency).await?;
+        return Err(markets::short_of_cash(
+            balance,
+            "Base",
+            &stored.currency,
+            rate,
+        ));
     }
     let deadline = deadline_utc(240);
     let amount = stored.amount.to_string();

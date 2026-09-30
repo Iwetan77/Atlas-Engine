@@ -426,10 +426,7 @@ pub(crate) async fn quotes(
             .await
             .map_err(internal)?;
         if available < usdc_units {
-            return Err((
-                StatusCode::CONFLICT,
-                "Not enough in your balance for this margin".into(),
-            ));
+            return Err(markets::short_of_cash(available, "Base", &currency, rate));
         }
         usdc_units
     } else {
