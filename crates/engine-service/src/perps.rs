@@ -293,6 +293,14 @@ fn percent(raw: &str) -> Result<String, ApiError> {
         format_units(value)
     ))
 }
+// Display-only rates can carry more places than the exact parser accepts (Paradex's summary funding
+// rate has 14). Cut the fraction for display; never use this for values that must match the venue.
+fn truncated(raw: &str, places: usize) -> &str {
+    match raw.find('.') {
+        Some(dot) if raw.len() > dot + 1 + places => &raw[..dot + 1 + places],
+        _ => raw,
+    }
+}
 fn display_money(usd_raw: &str, currency: &str, fx_micros: u128) -> Result<Value, ApiError> {
     let value = decimal_units(usd_raw)?
         .checked_mul(fx_micros)
@@ -469,38 +477,54 @@ pub(super) async fn markets(
     let prices = perp_prices(&state, &catalog).await?;
     let mut rows = Vec::with_capacity(catalog.len());
     for meta in catalog.iter() {
-        // A market whose price didn't come back this round is left out rather than failing the list.
+        // A market whose price didn't come back, or doesn't parse, is left out rather than failing the list.
         let Some(summary) = prices.get(&meta.market_id) else {
             continue;
         };
-        if summary["symbol"].as_str() != Some(meta.market_id.as_str()) {
-            continue;
+        match market_row(meta, summary, &currency, rate) {
+            Ok(row) => rows.push(row),
+            Err(error) => eprintln!("perps market {} skipped: {}", meta.market_id, error.1),
         }
-        let Some(mark) = summary["mark_price"].as_str().filter(|v| !v.is_empty()) else {
-            continue;
-        };
-        let change = summary["price_change_rate_24h"]
-            .as_str()
-            .map(percent)
-            .transpose()?;
-        // Every Paradex perp funds every 8 hours, so the current rate is the 8h rate.
-        let funding_pct = summary["funding_rate"].as_str().map(percent).transpose()?;
-        let volume = summary["volume_24h"].as_str().unwrap_or("0");
-        rows.push((
-            volume.parse::<f64>().unwrap_or(0.0),
-            json!({
-                "marketId":meta.market_id,"symbol":meta.symbol,"name":meta.name,
-                "category":meta.category,"iconUrl":icon_url(&meta.symbol, meta.category),
-                "markPrice":display_money(mark,&currency,rate)?,"change24hPct":change,
-                "maxLeverage":meta.max_leverage,"fundingRate8hPct":funding_pct,
-                "volume24hUsd":volume
-            }),
-        ));
     }
     // Most traded first: those are the markets that can actually fill an order.
     rows.sort_by(|a, b| b.0.total_cmp(&a.0));
     Ok(Json(
         json!({"markets":rows.into_iter().map(|(_, row)| row).collect::<Vec<_>>()}),
+    ))
+}
+
+fn market_row(
+    meta: &PerpMeta,
+    summary: &Value,
+    currency: &str,
+    rate: u128,
+) -> Result<(f64, Value), ApiError> {
+    if summary["symbol"].as_str() != Some(meta.market_id.as_str()) {
+        return Err((StatusCode::BAD_GATEWAY, "Paradex summary mismatch".into()));
+    }
+    let mark = venue_str(summary, "mark_price")?;
+    let change = summary["price_change_rate_24h"]
+        .as_str()
+        .map(|raw| percent(truncated(raw, 10)))
+        .transpose()?;
+    // Every Paradex perp funds every 8 hours, so the current rate is the 8h rate.
+    let funding_pct = summary["funding_rate"]
+        .as_str()
+        .map(|raw| percent(truncated(raw, 8)))
+        .transpose()?;
+    let volume = summary["volume_24h"]
+        .as_str()
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    Ok((
+        volume,
+        json!({
+            "marketId":meta.market_id,"symbol":meta.symbol,"name":meta.name,
+            "category":meta.category,"iconUrl":icon_url(&meta.symbol, meta.category),
+            "markPrice":display_money(mark,currency,rate)?,"change24hPct":change,
+            "maxLeverage":meta.max_leverage,"fundingRate8hPct":funding_pct,
+            "volume24hUsd":format!("{volume:.2}")
+        }),
     ))
 }
 
@@ -658,6 +682,68 @@ pub(super) use trade::{close_quote, execute_close, execute_quote, quotes};
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Network: runs the real catalog and row code on every perp Paradex lists right now.
+    // cargo test -p engine-service live_paradex_markets -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn live_paradex_markets_all_parse() {
+        for environment in ["prod", "testnet"] {
+            let paradex = engine_execution::perps::ParadexClient::new(environment).unwrap();
+            let markets = paradex.perp_markets().await.unwrap();
+            let (mut ok, mut failed) = (0, Vec::new());
+            for market in &markets {
+                let symbol = market["base_currency"].as_str().unwrap();
+                let tags: Vec<&str> = market["tags"]
+                    .as_array()
+                    .map(|t| t.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                let (name, category) = classify(symbol, &tags);
+                let meta = PerpMeta {
+                    market_id: market["symbol"].as_str().unwrap().into(),
+                    symbol: symbol.into(),
+                    name,
+                    category,
+                    max_leverage: max_leverage(
+                        market["delta1_cross_margin_params"]["imf_base"]
+                            .as_str()
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                };
+                let summary = paradex.summary(&meta.market_id).await.unwrap();
+                match market_row(&meta, &summary, "NGN", 1_328_000_000) {
+                    Ok(_) => ok += 1,
+                    Err(error) => failed.push(format!("{}: {}", meta.market_id, error.1)),
+                }
+            }
+            println!(
+                "{environment}: {ok}/{} markets parse; failed: {failed:?}",
+                markets.len()
+            );
+            assert!(failed.is_empty());
+        }
+    }
+    #[test]
+    fn live_summary_fields_parse_for_display() {
+        // Real Paradex values: 14-place funding, float-artifact volume, negative change.
+        let meta = PerpMeta {
+            market_id: "BTC-USD-PERP".into(),
+            symbol: "BTC".into(),
+            name: "Bitcoin".into(),
+            category: "crypto",
+            max_leverage: 50,
+        };
+        let summary = json!({"symbol":"BTC-USD-PERP","mark_price":"83382.16591683",
+            "price_change_rate_24h":"-0.0123456789012345","funding_rate":"0.00005073015796",
+            "volume_24h":"816.9563999999999"});
+        let (volume, row) = market_row(&meta, &summary, "USD", 1_000_000).unwrap();
+        assert_eq!(volume, 816.9563999999999);
+        assert_eq!(row["fundingRate8hPct"], "0.005073");
+        assert_eq!(row["change24hPct"], "-1.23456789");
+        assert_eq!(row["volume24hUsd"], "816.96");
+        assert_eq!(row["markPrice"]["amount"], "83382.16591683");
+        assert!(market_row(&meta, &json!({"symbol":"ETH-USD-PERP"}), "USD", 1_000_000).is_err());
+    }
     #[test]
     fn markets_get_names_categories_and_icons() {
         assert_eq!(classify("XAU", &["RWA"]), ("Gold".into(), "commodity"));
