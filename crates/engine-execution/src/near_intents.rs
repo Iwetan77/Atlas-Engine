@@ -74,6 +74,7 @@ impl<'a> QuoteRequest<'a> {
 pub struct Quote {
     pub amount_in: String,
     pub amount_out: String,
+    pub amount_out_usd: String,
     pub min_amount_out: Option<String>,
     pub deposit_address: Option<String>,
     pub deposit_memo: Option<String>,

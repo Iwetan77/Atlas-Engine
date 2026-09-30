@@ -336,6 +336,27 @@ fn money(amount: u128, currency: &str, rate: u128) -> Value {
     let micros = amount.saturating_mul(rate) / 1_000_000;
     json!({"amount":markets::format_units(micros,6),"currency":currency})
 }
+fn usd_micros(value: &str) -> Result<u128, ApiError> {
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|b| b.is_ascii_digit())
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(venue("1Click returned an invalid USD valuation"));
+    }
+    let units = whole
+        .parse::<u128>()
+        .ok()
+        .and_then(|n| n.checked_mul(1_000_000))
+        .and_then(|n| {
+            format!("{:0<6}", &fraction[..fraction.len().min(6)])
+                .parse::<u128>()
+                .ok()
+                .and_then(|part| n.checked_add(part))
+        })
+        .ok_or_else(|| venue("1Click USD valuation is too large"))?;
+    Ok(units)
+}
 fn unit_price(
     amount_in: u128,
     amount_out: u128,
@@ -466,6 +487,7 @@ pub(super) async fn quote(
     let q = state.near.client.quote(&request).await.map_err(venue)?;
     let input: u128 = q.amount_in.parse().map_err(internal)?;
     let output: u128 = q.amount_out.parse().map_err(internal)?;
+    let output_usd = usd_micros(&q.amount_out_usd)?;
     let minimum: u128 = q
         .min_amount_out
         .as_deref()
@@ -494,7 +516,7 @@ pub(super) async fn quote(
         json!({"quoteId":quote_id,"assetId":req.asset_id,"side":"buy",
         "pay":{"amount":markets::format_units(input,6),"symbol":"USDC","value":money(input,&req.amount.currency,rate)},
         "receive":{"amount":markets::format_units(output,token.decimals),"symbol":token.symbol,
-            "value":money(input,&req.amount.currency,rate)},
+            "value":money(output_usd,&req.amount.currency,rate)},
         "price":unit_price(input,output,token.decimals,&req.amount.currency,rate),
         "fee":{"amount":"0","currency":req.amount.currency},"expiresAtUnixMs":expires}),
     ))
@@ -754,6 +776,12 @@ mod tests {
     fn quoted_unit_price_uses_usdc_and_display_currency_scales() {
         let p = unit_price(1_000_000, 35_000_000_000_000_000_000, 18, "USD", 1_000_000);
         assert_eq!(p["amount"], "0.028571428571");
+    }
+    #[test]
+    fn venue_usd_value_preserves_six_decimal_places() {
+        assert_eq!(usd_micros("0.987654321").unwrap(), 987_654);
+        assert_eq!(usd_micros("12").unwrap(), 12_000_000);
+        assert!(usd_micros("NaN").is_err());
     }
     #[test]
     fn destination_requires_verified_wallet() {
