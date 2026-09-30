@@ -380,6 +380,80 @@ impl SolanaAtaPreflight {
         Ok(result.get("value").filter(|v| !v.is_null()).cloned())
     }
 
+    /// An unsigned USDC transfer from one wallet to another (base64, legacy message, the sender pays
+    /// the fee), creating the recipient's USDC account if it doesn't exist yet. Also says whether
+    /// it creates that account (the sender then pays its rent, about 0.002 SOL).
+    pub async fn usdc_transfer_transaction(
+        &self,
+        from_owner: &str,
+        to_owner: &str,
+        amount: u64,
+    ) -> Result<(String, bool), SolanaPreflightError> {
+        let from =
+            Pubkey::from_str(from_owner).map_err(|_| SolanaPreflightError::InvalidResponse)?;
+        let to = Pubkey::from_str(to_owner).map_err(|_| SolanaPreflightError::InvalidResponse)?;
+        let mint = Pubkey::from_str(match self.network {
+            SolanaNetwork::Mainnet => MAINNET_USDC_MINT,
+            _ => DEVNET_USDC_MINT,
+        })
+        .map_err(|_| SolanaPreflightError::InvalidResponse)?;
+        let source = get_associated_token_address_with_program_id(&from, &mint, &spl_token::id());
+        let destination =
+            get_associated_token_address_with_program_id(&to, &mint, &spl_token::id());
+        let creates = self.account(&destination).await?.is_none();
+        let blockhash = self
+            .rpc("getLatestBlockhash", json!([{"commitment":"confirmed"}]))
+            .await?;
+        let blockhash = blockhash["value"]["blockhash"]
+            .as_str()
+            .ok_or(SolanaPreflightError::InvalidResponse)?;
+        let hash = Hash::from_str(blockhash).map_err(|_| SolanaPreflightError::InvalidResponse)?;
+        let instructions = vec![
+            create_associated_token_account_idempotent(&from, &to, &mint, &spl_token::id()),
+            spl_token::instruction::transfer_checked(
+                &spl_token::id(),
+                &source,
+                &mint,
+                &destination,
+                &from,
+                &[],
+                amount,
+                6,
+            )
+            .map_err(|_| SolanaPreflightError::InvalidResponse)?,
+        ];
+        let mut transaction = Transaction::new_with_payer(&instructions, Some(&from));
+        transaction.message.recent_blockhash = hash;
+        let bytes =
+            bincode::serialize(&transaction).map_err(|_| SolanaPreflightError::InvalidResponse)?;
+        Ok((STANDARD.encode(bytes), creates))
+    }
+
+    /// None while a signature hasn't landed; Some(Ok) once confirmed, Some(Err) if it failed.
+    pub async fn signature_status(
+        &self,
+        signature: &str,
+    ) -> Result<Option<Result<(), String>>, SolanaPreflightError> {
+        let statuses = self
+            .rpc(
+                "getSignatureStatuses",
+                json!([[signature], {"searchTransactionHistory": true}]),
+            )
+            .await?;
+        let status = &statuses["value"][0];
+        if status.is_null() {
+            return Ok(None);
+        }
+        if !status["err"].is_null() {
+            return Ok(Some(Err(status["err"].to_string())));
+        }
+        Ok(matches!(
+            status["confirmationStatus"].as_str(),
+            Some("confirmed" | "finalized")
+        )
+        .then_some(Ok(())))
+    }
+
     /// Sends a transaction the user already signed (base64) and returns its signature.
     pub async fn send_signed(
         &self,
@@ -441,6 +515,30 @@ fn verify_token_account(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // A friend send on Solana: a mainnet USDC transfer builds, and says whether it opens an account.
+    #[tokio::test]
+    #[ignore]
+    async fn live_usdc_transfer_builds() {
+        let client = SolanaAtaPreflight::new(
+            SolanaNetwork::Mainnet,
+            "https://api.mainnet-beta.solana.com",
+            "",
+        )
+        .unwrap();
+        let (tx, creates) = client
+            .usdc_transfer_transaction(
+                "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM",
+                &Pubkey::new_unique().to_string(),
+                1_000_000,
+            )
+            .await
+            .unwrap();
+        let bytes = STANDARD.decode(tx).unwrap();
+        let parsed: Transaction = bincode::deserialize(&bytes).unwrap();
+        assert!(creates, "a brand-new recipient has no USDC account yet");
+        assert_eq!(parsed.message.instructions.len(), 2);
+        assert_eq!(parsed.signatures.len(), 1);
+    }
     #[test]
     fn derives_the_native_usdc_ata_for_a_first_time_recipient() {
         let owner = Pubkey::from_str("CVgQZTfRhyweQZdYT2kzmdKgT6mKpHNryiFobSWU7ri5").unwrap();

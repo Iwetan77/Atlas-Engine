@@ -496,6 +496,9 @@ struct StoredIntent {
     // A gas top-up (Jupiter order) that runs just before the main Solana transaction.
     #[serde(default)]
     gas_request_id: Option<String>,
+    // A plain Solana USDC transfer (a friend send), landed by the engine rather than Jupiter.
+    #[serde(default)]
+    solana_transfer: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct CashMove {
@@ -740,6 +743,7 @@ impl MarketState {
                 funding: None,
                 buy_mint: None,
                 gas_request_id: None,
+                solana_transfer: false,
             },
         )
         .await?;
@@ -1641,8 +1645,18 @@ const GAS_TOPUP_USDC: u128 = 500_000;
 // floor and has the USDC to spare beyond `reserve` (what the main step spends). Returns the Jupiter
 // request and its transaction, or None when no top-up is needed or none can be made.
 async fn gas_topup(state: &AppState, owner: &str, reserve: u128) -> Option<(String, String)> {
+    gas_topup_below(state, owner, reserve, GAS_FLOOR_LAMPORTS).await
+}
+
+// The same, with a higher floor when the step also opens a token account (rent ~0.002 SOL).
+async fn gas_topup_below(
+    state: &AppState,
+    owner: &str,
+    reserve: u128,
+    floor: u128,
+) -> Option<(String, String)> {
     let sol = state.solana_mainnet.owner_sol_balance(owner).await.ok()?;
-    if sol >= GAS_FLOOR_LAMPORTS {
+    if sol >= floor {
         return None;
     }
     if solana_cash(state, owner).await < reserve.saturating_add(GAS_TOPUP_USDC) {
@@ -1735,6 +1749,7 @@ pub(super) async fn plan_jupiter_swap(
                 funding: None,
                 buy_mint: None,
                 gas_request_id: gas.as_ref().map(|(id, _)| id.clone()),
+                solana_transfer: false,
             },
         )
         .await?;
@@ -1746,8 +1761,66 @@ pub(super) async fn plan_jupiter_swap(
     Ok((intent_id, transactions, out))
 }
 
+// A USDC transfer on Solana from one Atlas wallet to another (a friend send when the cash is on
+// Solana): no bridge, lands in seconds. The sender pays the fee (gas tank topped up first if low).
+pub(super) async fn plan_solana_transfer(
+    state: &AppState,
+    owner: String,
+    from: String,
+    to: &str,
+    amount: u128,
+) -> Result<(String, Vec<Value>), ApiError> {
+    let (transfer, creates) = state
+        .solana_mainnet
+        .usdc_transfer_transaction(
+            &from,
+            to,
+            amount.try_into().map_err(|_| bad("amount too large"))?,
+        )
+        .await
+        .map_err(unavailable)?;
+    let floor = if creates {
+        3_000_000
+    } else {
+        GAS_FLOOR_LAMPORTS
+    };
+    let gas = gas_topup_below(state, &from, amount, floor).await;
+    let intent_id = id("intent");
+    state
+        .markets
+        .insert_intent(
+            &intent_id,
+            &StoredIntent {
+                owner,
+                wallet: from,
+                chain: "solana".into(),
+                expected: Vec::new(),
+                request_id: None,
+                status: IntentStatus {
+                    intent_id: intent_id.clone(),
+                    stage: "validate".into(),
+                    state: "pending".into(),
+                    tx_ids: Vec::new(),
+                    error: None,
+                },
+                trade: None,
+                funding: None,
+                buy_mint: None,
+                gas_request_id: gas.as_ref().map(|(id, _)| id.clone()),
+                solana_transfer: true,
+            },
+        )
+        .await?;
+    let mut transactions = Vec::new();
+    if let Some((_, gas_tx)) = gas {
+        transactions.push(json!({"chain":"solana","transaction":gas_tx,"submit":"engine"}));
+    }
+    transactions.push(json!({"chain":"solana","transaction":transfer,"submit":"engine"}));
+    Ok((intent_id, transactions))
+}
+
 // USDC in a Solana wallet (0 if it can't be read).
-async fn solana_cash(state: &AppState, owner: &str) -> u128 {
+pub(super) async fn solana_cash(state: &AppState, owner: &str) -> u128 {
     state
         .solana_mainnet
         .owner_token_balances(owner)
@@ -1896,6 +1969,7 @@ pub(super) async fn plan_base_with_cash(
                 }),
                 buy_mint: None,
                 gas_request_id: gas.as_ref().map(|(id, _)| id.clone()),
+                solana_transfer: false,
             },
         )
         .await?;
@@ -1961,6 +2035,7 @@ pub(super) async fn plan_solana_swap_with_base_cash(
                 }),
                 buy_mint: Some(buy_mint.into()),
                 gas_request_id: None,
+                solana_transfer: false,
             },
         )
         .await?;
@@ -2265,6 +2340,7 @@ pub(super) async fn execute_quote(
                 funding,
                 buy_mint: None,
                 gas_request_id,
+                solana_transfer: false,
             },
         )
         .await?;
@@ -2393,6 +2469,36 @@ pub(super) async fn signed(
         {
             return Err(bad("signed report does not match Jupiter execution plan"));
         }
+        // A plain USDC transfer: the engine lands it and status follows its signature.
+        if current.solana_transfer {
+            if !state
+                .markets
+                .claim_execution(&intent_id, &current, "validate")
+                .await?
+            {
+                let latest = state.markets.get_intent(&intent_id).await?;
+                return Ok(Json(latest.map_or(current.status, |i| i.status)));
+            }
+            run_gas_topup(&state, &current, &body.signed).await;
+            let mut updated = current;
+            match state
+                .solana_mainnet
+                .send_signed(&body.signed[main].transaction)
+                .await
+            {
+                Ok(signature) => {
+                    updated.status.tx_ids = vec![signature];
+                    updated.status.stage = "settle".into();
+                }
+                Err(error) => {
+                    updated.status.stage = "settle".into();
+                    updated.status.state = "failed".into();
+                    updated.status.error = Some(format!("The transfer didn't go through: {error}"));
+                }
+            }
+            state.markets.save_intent(&intent_id, &updated).await?;
+            return Ok(Json(updated.status));
+        }
         if !state
             .markets
             .claim_execution(&intent_id, &current, &current.status.stage)
@@ -2493,6 +2599,30 @@ pub(super) async fn intent_status(
         updated.status.stage = stage.into();
         updated.status.state = state_now.into();
         updated.status.error = error;
+        state.markets.save_intent(&intent_id, &updated).await?;
+        return Ok(Json(updated.status));
+    }
+    if current.solana_transfer
+        && current.status.state == "pending"
+        && current.status.stage == "settle"
+    {
+        let Some(signature) = current.status.tx_ids.first().cloned() else {
+            return Ok(Json(current.status));
+        };
+        let landed = state
+            .solana_mainnet
+            .signature_status(&signature)
+            .await
+            .map_err(unavailable)?;
+        let mut updated = current;
+        match landed {
+            None => return Ok(Json(updated.status)),
+            Some(Ok(())) => updated.status.state = "filled".into(),
+            Some(Err(error)) => {
+                updated.status.state = "failed".into();
+                updated.status.error = Some(format!("The transfer didn't go through ({error})"));
+            }
+        }
         state.markets.save_intent(&intent_id, &updated).await?;
         return Ok(Json(updated.status));
     }
@@ -2754,6 +2884,7 @@ mod tests {
             funding: None,
             buy_mint: None,
             gas_request_id: None,
+            solana_transfer: false,
         }
     }
 

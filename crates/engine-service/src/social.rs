@@ -34,12 +34,17 @@ struct HandleRecord {
     handle: String,
     display_name: Option<String>,
     evm_wallet: String,
+    // Where friends can pay them on Solana (filled in when they claim a handle or open the app).
+    #[serde(default)]
+    solana_wallet: Option<String>,
 }
 #[derive(Clone)]
 struct SendQuote {
     owner: String,
     sender_wallet: String,
     recipient_wallet: String,
+    sender_solana: Option<String>,
+    recipient_solana: Option<String>,
     label: String,
     currency: String,
     usdc_units: u128,
@@ -164,6 +169,7 @@ impl SocialState {
                 display_name TEXT,
                 evm_wallet TEXT NOT NULL
             );
+            ALTER TABLE atlas_handles ADD COLUMN IF NOT EXISTS solana_wallet TEXT;
             CREATE TABLE IF NOT EXISTS atlas_avatars (
                 user_id TEXT PRIMARY KEY,
                 image TEXT NOT NULL,
@@ -258,7 +264,7 @@ impl SocialState {
     }
     async fn find_user(&self, user_id: &str) -> Result<Option<HandleRecord>, ApiError> {
         if let Some(pg) = &self.postgres {
-            let row = pg.query_opt("SELECT user_id, handle, display_name, evm_wallet FROM atlas_handles WHERE user_id=$1", &[&user_id]).await.map_err(internal)?;
+            let row = pg.query_opt("SELECT user_id, handle, display_name, evm_wallet, solana_wallet FROM atlas_handles WHERE user_id=$1", &[&user_id]).await.map_err(internal)?;
             return Ok(row.map(record_from_row));
         }
         Ok(self
@@ -272,7 +278,7 @@ impl SocialState {
     }
     async fn find_handle(&self, handle: &str) -> Result<Option<HandleRecord>, ApiError> {
         if let Some(pg) = &self.postgres {
-            let row = pg.query_opt("SELECT user_id, handle, display_name, evm_wallet FROM atlas_handles WHERE handle=$1", &[&handle]).await.map_err(internal)?;
+            let row = pg.query_opt("SELECT user_id, handle, display_name, evm_wallet, solana_wallet FROM atlas_handles WHERE handle=$1", &[&handle]).await.map_err(internal)?;
             return Ok(row.map(record_from_row));
         }
         Ok(self
@@ -288,8 +294,8 @@ impl SocialState {
             .postgres
             .as_ref()
             .ok_or_else(|| unavailable("database not configured"))?;
-        let result = pg.execute("INSERT INTO atlas_handles (handle,user_id,display_name,evm_wallet) VALUES ($1,$2,$3,$4)",
-            &[&record.handle,&record.user_id,&record.display_name,&record.evm_wallet]).await;
+        let result = pg.execute("INSERT INTO atlas_handles (handle,user_id,display_name,evm_wallet,solana_wallet) VALUES ($1,$2,$3,$4,$5)",
+            &[&record.handle,&record.user_id,&record.display_name,&record.evm_wallet,&record.solana_wallet]).await;
         match result {
             Ok(1) => Ok(()),
             Ok(_) => Err(internal("handle insert affected no rows")),
@@ -325,6 +331,7 @@ fn record_from_row(row: tokio_postgres::Row) -> HandleRecord {
         handle: row.get("handle"),
         display_name: row.get("display_name"),
         evm_wallet: row.get("evm_wallet"),
+        solana_wallet: row.try_get("solana_wallet").ok().flatten(),
     }
 }
 pub(super) async fn me(
@@ -334,6 +341,21 @@ pub(super) async fn me(
     let user = app_balance::verified_wallets(&state, &headers).await?;
     state.social.require_storage()?;
     let record = state.social.find_user(&user.user_id).await?;
+    // Handles claimed before Solana sends existed learn their Solana wallet here.
+    if let (Some(r), Some(solana), Some(pg)) = (
+        &record,
+        user.solana_wallet.as_deref().filter(|w| !w.is_empty()),
+        &state.social.postgres,
+    ) {
+        if r.solana_wallet.as_deref() != Some(solana) {
+            pg.execute(
+                "UPDATE atlas_handles SET solana_wallet=$2 WHERE user_id=$1",
+                &[&user.user_id, &solana],
+            )
+            .await
+            .map_err(internal)?;
+        }
+    }
     let avatar = state.social.avatar(&user.user_id).await?;
 
     Ok(Json(
@@ -416,6 +438,7 @@ pub(super) async fn set_handle(
             handle: body.handle.clone(),
             display_name: None,
             evm_wallet: wallet,
+            solana_wallet: user.solana_wallet.clone().filter(|w| !w.is_empty()),
         };
         state.social.register_postgres(&record).await?;
         return Ok(Json(
@@ -439,6 +462,7 @@ pub(super) async fn set_handle(
         handle: body.handle.clone(),
         display_name: None,
         evm_wallet: wallet,
+        solana_wallet: user.solana_wallet.clone().filter(|w| !w.is_empty()),
     };
     let mut next = ledger.clone();
     next.handles.insert(body.handle.clone(), record);
@@ -502,7 +526,7 @@ pub(super) async fn send_quote(
         StatusCode::CONFLICT,
         "Privy Ethereum wallet is not ready".into(),
     ))?;
-    let (recipient, label) = match req.destination {
+    let (recipient, recipient_solana, label) = match req.destination {
         Destination::Atlas { handle } => {
             let record = state
                 .social
@@ -513,7 +537,11 @@ pub(super) async fn send_quote(
             if record.user_id == user.user_id {
                 return Err(bad("cannot send to yourself"));
             }
-            (record.evm_wallet.clone(), format!("@{}", record.handle))
+            (
+                record.evm_wallet.clone(),
+                record.solana_wallet.clone(),
+                format!("@{}", record.handle),
+            )
         }
         Destination::Bank {
             bank_code,
@@ -537,16 +565,29 @@ pub(super) async fn send_quote(
         .ok_or_else(|| bad("amount too large"))?
         / rate;
     markets::check_limits(usdc_units, &req.amount.currency, rate)?;
-    // One balance: short on Base, the rest comes from Solana; short on both, say so now.
-    markets::cash_for_base(
-        &state,
-        &wallet,
-        solana.as_deref(),
-        usdc_units,
-        &req.amount.currency,
-        rate,
-    )
-    .await?;
+    // One balance. Friends are paid on the chain the cash is on: Base, or Solana straight to their
+    // Solana wallet. Only when neither chain holds it all does cash move first; short on both, say so.
+    let base_cash = state
+        .markets
+        .base
+        .balance_of(BASE_USDC, &wallet)
+        .await
+        .unwrap_or(0);
+    let solana_covers = match (&solana, &recipient_solana) {
+        (Some(from), Some(_)) => markets::solana_cash(&state, from).await >= usdc_units,
+        _ => false,
+    };
+    if base_cash < usdc_units && !solana_covers {
+        markets::cash_for_base(
+            &state,
+            &wallet,
+            solana.as_deref(),
+            usdc_units,
+            &req.amount.currency,
+            rate,
+        )
+        .await?;
+    }
     let quote_id = format!(
         "send-{:x}-{:x}",
         now(),
@@ -559,6 +600,8 @@ pub(super) async fn send_quote(
             owner: user.user_id,
             sender_wallet: wallet,
             recipient_wallet: recipient,
+            sender_solana: solana,
+            recipient_solana,
             label: label.clone(),
             currency: req.amount.currency.clone(),
             usdc_units,
@@ -625,17 +668,41 @@ pub(super) async fn execute_send(
     {
         return Ok(Json(plan));
     }
-    let (intent_id, transactions, fee) = markets::plan_base_with_cash(
-        &state,
-        user.user_id,
-        quote.sender_wallet.clone(),
-        user.solana_wallet.clone().filter(|w| !w.is_empty()),
-        vec![(tx.to.clone(), tx.data.clone())],
-        quote.usdc_units,
-        &quote.currency,
-        rate,
-    )
-    .await?;
+    // Same chain first: Base if it holds the amount, else Solana to the friend's Solana wallet;
+    // only then move cash across.
+    let base_cash = state
+        .markets
+        .base
+        .balance_of(BASE_USDC, &quote.sender_wallet)
+        .await
+        .unwrap_or(0);
+    let solana_route = match (&quote.sender_solana, &quote.recipient_solana) {
+        (Some(from), Some(to))
+            if base_cash < quote.usdc_units
+                && markets::solana_cash(&state, from).await >= quote.usdc_units =>
+        {
+            Some((from.clone(), to.clone()))
+        }
+        _ => None,
+    };
+    let (intent_id, transactions, fee) = if let Some((from, to)) = solana_route {
+        let (intent_id, transactions) =
+            markets::plan_solana_transfer(&state, user.user_id, from, &to, quote.usdc_units)
+                .await?;
+        (intent_id, transactions, None)
+    } else {
+        markets::plan_base_with_cash(
+            &state,
+            user.user_id,
+            quote.sender_wallet.clone(),
+            user.solana_wallet.clone().filter(|w| !w.is_empty()),
+            vec![(tx.to.clone(), tx.data.clone())],
+            quote.usdc_units,
+            &quote.currency,
+            rate,
+        )
+        .await?
+    };
     let mut quotes = state.social.quotes.lock().map_err(internal)?;
     let stored = quotes
         .get_mut(&quote_id)
