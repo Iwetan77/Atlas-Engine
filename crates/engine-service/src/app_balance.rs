@@ -139,6 +139,14 @@ pub(super) async fn balance(
         }));
     }
 
+    // Savings on Aave are cash that's earning: they count, labelled as being in Earn.
+    let savings = earn::savings_units(&state, &evm).await?;
+    if savings > 0 {
+        add_holding(&mut holdings, "base", "earn", savings, &currency, rate)?;
+        total = total
+            .checked_add(savings)
+            .ok_or((StatusCode::BAD_GATEWAY, "balance overflow".into()))?;
+    }
     // Perps margin is still the user's money: it counts, labelled as being in perps.
     if let Some(units) = perps::paradex_account_value(&state, &headers, &user.user_id, &evm).await {
         add_holding(&mut holdings, "paradex", "perps", units, &currency, rate)?;

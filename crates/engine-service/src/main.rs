@@ -2,6 +2,7 @@
 //! available only when the operator explicitly enables local demo mode.
 
 mod app_balance;
+mod earn;
 mod markets;
 mod perps;
 mod relay;
@@ -71,6 +72,7 @@ struct AppState {
     perps_trade: perps::TradeState,
     perp_cache: perps::PerpCache,
     layerswap: engine_execution::layerswap::LayerswapClient,
+    earn: earn::EarnState,
     social: social::SocialState,
 }
 
@@ -181,6 +183,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         perps_trade: perps::TradeState::new().await?,
         perp_cache: perps::PerpCache::default(),
         layerswap: engine_execution::layerswap::LayerswapClient::new()?,
+        earn: earn::EarnState::default(),
         social: social::SocialState::new().await?,
     };
     let bind: SocketAddr = env::var("ATLAS_BALANCE_BIND")
@@ -233,6 +236,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/v1/intents/{intent_id}/signed", post(markets::signed))
         .route("/v1/relay/evm", post(relay::evm))
+        .route("/v1/earn/options", get(earn::options))
+        .route("/v1/earn/positions", get(earn::positions))
+        .route("/v1/earn/quotes", post(earn::quote))
+        .route("/v1/earn/quotes/{quote_id}/execute", post(earn::execute))
         .route("/v1/intents/{intent_id}", get(markets::intent_status))
         .route("/balance/{user}", get(balance))
         .route("/balance/{user}/movement", post(register_movement))

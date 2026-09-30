@@ -466,6 +466,15 @@ impl MarketState {
         to: String,
         data: String,
     ) -> Result<String, ApiError> {
+        self.register_base_txs(owner, wallet, vec![(to, data)])
+    }
+    // A plan of Base transactions the user sends in order; /signed and status check each against it.
+    pub(super) fn register_base_txs(
+        &self,
+        owner: String,
+        wallet: String,
+        txs: Vec<(String, String)>,
+    ) -> Result<String, ApiError> {
         let intent_id = id("intent");
         let status = IntentStatus {
             intent_id: intent_id.clone(),
@@ -480,7 +489,10 @@ impl MarketState {
                 owner,
                 wallet,
                 chain: "base".into(),
-                expected: vec![(to.to_ascii_lowercase(), data.to_ascii_lowercase())],
+                expected: txs
+                    .into_iter()
+                    .map(|(to, data)| (to.to_ascii_lowercase(), data.to_ascii_lowercase()))
+                    .collect(),
                 request_id: None,
                 status,
             },
@@ -514,7 +526,7 @@ fn checked_currency(currency: &str) -> Result<(), ApiError> {
         Err(bad("unsupported display currency"))
     }
 }
-fn parse_micros(s: &str) -> Result<u128, ApiError> {
+pub(super) fn parse_micros(s: &str) -> Result<u128, ApiError> {
     let (whole, frac) = s.split_once('.').unwrap_or((s, ""));
     if whole.is_empty()
         || !whole.bytes().all(|x| x.is_ascii_digit())
