@@ -59,6 +59,7 @@ const KNOWN_MARKETS: &[(&str, &str, &str)] = &[
     ("MRVL", "Marvell", "stock"),
     ("SNDK", "Sandisk", "stock"),
     ("EWY", "iShares MSCI South Korea ETF", "stock"),
+    ("SPCX", "SpaceX", "stock"),
     ("XAU", "Gold", "commodity"),
     ("PAXG", "PAX Gold", "commodity"),
     ("XAG", "Silver", "commodity"),
