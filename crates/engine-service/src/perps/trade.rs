@@ -1646,6 +1646,8 @@ mod tests {
             data: "0xa9059cbb00".into(),
             amount_units: 10_705_000,
             tx_hash: Some(format!("0x{}", "ab".repeat(32))),
+            solana: false,
+            gas_request_id: None,
         });
         let back: Intent = serde_json::from_str(&serde_json::to_string(&funded).unwrap()).unwrap();
         assert_eq!(back.quote.funding_units, 10_705_000);
