@@ -44,7 +44,47 @@ pub(super) struct Asset {
     pub(super) xstock: bool,
     // False only for tokens found by pasting their address (Jupiter hasn't verified them).
     pub(super) verified: bool,
+    // Jupiter's USD price when the catalog was read: orders the Crypto list, never shown or traded on.
+    pub(super) ref_price: f64,
+    // False keeps an asset out of Trade (another row already sells the same coin) while the balance
+    // still values it.
+    pub(super) listed: bool,
 }
+
+// Coins Jupiter only carries as wrapped copies (cbBTC, WBTC, xBTC, zBTC… are all Bitcoin), or under
+// just a ticker. Each shows once under its real name, backed by one deep copy.
+// (backing mint, symbol, name)
+type Major = (&'static str, &'static str, &'static str);
+const MAJORS: &[Major] = &[
+    (
+        "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij",
+        "BTC",
+        "Bitcoin",
+    ),
+    (
+        "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",
+        "ETH",
+        "Ethereum",
+    ),
+    (
+        "cbLTC4T5NpzSUtQ7ekgEMZGaUPVJY1ko6BUikqa4gGf",
+        "LTC",
+        "Litecoin",
+    ),
+    ("9gP2kCy3wA1ctvYWQk75guqXuHfrEomqydHLtcTCqiLa", "BNB", "BNB"),
+    (
+        "avaxGHCq3T7hoxd73oY2KY9hJSTaeMibXvHy5KNzh5D",
+        "AVAX",
+        "Avalanche",
+    ),
+    (
+        "98sMhvDwXj1RQi5c5Mndm3vPe9cBqPrbLaufMXFNMh5g",
+        "HYPE",
+        "Hyperliquid",
+    ),
+];
+// Another copy of a major carries its symbol and trades within this much of its price.
+const COPY_PRICE_BAND: f64 = 0.1;
 
 // Base assets route through fixed Uniswap V3 pools, so they stay a short fixed list.
 fn base_assets() -> Vec<Asset> {
@@ -60,16 +100,22 @@ fn base_assets() -> Vec<Asset> {
         volume_24h: 0.0,
         xstock: false,
         verified: true,
+        ref_price: 0.0,
+        listed: true,
     };
     vec![
-        base(
-            "weth-base",
-            "WETH",
-            "Wrapped Ether",
-            "crypto",
-            BASE_WETH,
-            18,
-        ),
+        // Ethereum is listed once, as the Solana copy; WETH held on Base still counts in the balance.
+        Asset {
+            listed: false,
+            ..base(
+                "weth-base",
+                "WETH",
+                "Wrapped Ether",
+                "crypto",
+                BASE_WETH,
+                18,
+            )
+        },
         base("brett-base", "BRETT", "Brett", "meme", BRETT, 18),
         base(
             "aaplc-base",
@@ -171,11 +217,14 @@ fn token_asset(token: &Value, verified: bool) -> Option<Asset> {
         .sum();
     // "Trump Media & Technology Group Corp. Common Stock - Backpack Securities" → the company name.
     let name = name
+        .trim_end_matches(" (Portal)")
         .trim_end_matches(" - Backpack Securities")
         .trim_end_matches(" Common Stock")
         .trim();
     let (symbol, name) = if mint == SOL_MINT {
         ("SOL", "Solana")
+    } else if let Some((_, symbol, name)) = MAJORS.iter().find(|(m, _, _)| *m == mint) {
+        (*symbol, *name)
     } else {
         (symbol, name)
     };
@@ -191,6 +240,8 @@ fn token_asset(token: &Value, verified: bool) -> Option<Asset> {
         volume_24h: volume,
         xstock,
         verified,
+        ref_price: token["usdPrice"].as_f64().unwrap_or(0.0),
+        listed: true,
     })
 }
 
@@ -264,8 +315,32 @@ pub(super) async fn catalog(state: &MarketState) -> Result<Arc<Vec<Asset>>, ApiE
                 .ok_or_else(|| unavailable(format!("Jupiter token list unavailable: {error}")));
         }
     };
+    let assets = Arc::new(curate(&tokens));
+    *state.catalog.lock().map_err(internal)? = Some((Instant::now(), assets.clone()));
+    Ok(assets)
+}
+
+// Jupiter's list → Atlas's catalog: one row per coin. Wrapped copies of a major give way to its
+// backing copy, and within a kind one row per symbol (the most traded wins).
+fn curate(tokens: &[Value]) -> Vec<Asset> {
     let mut solana: Vec<Asset> = tokens.iter().filter_map(solana_asset).collect();
-    // One row per symbol within a kind (there are two WBTCs, for one): the most traded wins.
+    let majors: Vec<(&str, f64)> = MAJORS
+        .iter()
+        .filter_map(|(mint, symbol, _)| {
+            let price = solana.iter().find(|a| a.id == *mint)?.ref_price;
+            Some((*symbol, price))
+        })
+        .collect();
+    let copy_of_major = |a: &Asset| {
+        a.kind == "crypto"
+            && !MAJORS.iter().any(|(mint, _, _)| *mint == a.id)
+            && majors.iter().any(|(symbol, price)| {
+                a.symbol.to_ascii_uppercase().contains(symbol)
+                    && *price > 0.0
+                    && (a.ref_price - price).abs() <= price * COPY_PRICE_BAND
+            })
+    };
+    solana.retain(|a| !copy_of_major(a));
     solana.sort_by(|a, b| b.volume_24h.total_cmp(&a.volume_24h));
     let mut symbols = std::collections::HashSet::new();
     let mut mints = std::collections::HashSet::new();
@@ -277,9 +352,7 @@ pub(super) async fn catalog(state: &MarketState) -> Result<Arc<Vec<Asset>>, ApiE
             assets.push(asset);
         }
     }
-    let assets = Arc::new(assets);
-    *state.catalog.lock().map_err(internal)? = Some((Instant::now(), assets.clone()));
-    Ok(assets)
+    assets
 }
 
 pub(super) async fn find_asset(state: &MarketState, id: &str) -> Result<Asset, ApiError> {
@@ -771,6 +844,7 @@ pub(super) async fn assets(
     } else {
         catalog
             .iter()
+            .filter(|a| a.listed)
             .filter(|a| kind.is_none_or(|k| a.kind == k))
             .filter(|a| {
                 query.is_empty()
@@ -779,21 +853,27 @@ pub(super) async fn assets(
             })
             .collect()
     };
-    // Most traded first (a search puts close name matches ahead of that).
+    // Most traded first (a search puts close name matches ahead of that); Crypto goes by price,
+    // Bitcoin at the top.
+    let by_price = kind == Some("crypto") && query.is_empty();
     picked.sort_by(|a, b| {
         let by_match = if query.is_empty() { 0 } else { rank(a) }.cmp(&if query.is_empty() {
             0
         } else {
             rank(b)
         });
-        by_match.then(b.volume_24h.total_cmp(&a.volume_24h))
+        if by_price {
+            b.ref_price.total_cmp(&a.ref_price)
+        } else {
+            by_match.then(b.volume_24h.total_cmp(&a.volume_24h))
+        }
     });
     picked.truncate(if !query.is_empty() {
         30
     } else if kind.is_none() {
         40
     } else {
-        60
+        100
     });
     let mints: Vec<String> = picked
         .iter()
@@ -1855,6 +1935,99 @@ mod tests {
         assert!(!assets
             .iter()
             .any(|a| a.symbol.to_ascii_uppercase().contains("USD")));
+        // The real catalog: one Bitcoin and one Ethereum, by their real names, and Crypto by price.
+        let catalog = curate(&tokens);
+        let listed = |symbol: &str| {
+            catalog
+                .iter()
+                .filter(|a| {
+                    a.listed && a.kind == "crypto" && a.symbol.to_ascii_uppercase().contains(symbol)
+                })
+                .map(|a| format!("{} {} ${:.0}", a.symbol, a.name, a.ref_price))
+                .collect::<Vec<_>>()
+        };
+        println!("BTC rows: {:?}", listed("BTC"));
+        println!("ETH rows: {:?}", listed("ETH"));
+        let mut crypto: Vec<&Asset> = catalog
+            .iter()
+            .filter(|a| a.listed && a.kind == "crypto")
+            .collect();
+        crypto.sort_by(|a, b| b.ref_price.total_cmp(&a.ref_price));
+        println!(
+            "crypto by price ({}): {:?}",
+            crypto.len(),
+            crypto
+                .iter()
+                .take(12)
+                .map(|a| format!("{} ${:.2}", a.symbol, a.ref_price))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(crypto[0].name, "Bitcoin");
+        assert_eq!(crypto[1].name, "Ethereum");
+        assert_eq!(
+            catalog
+                .iter()
+                .filter(|a| a.listed && a.name == "Bitcoin")
+                .count(),
+            1
+        );
+        assert_eq!(
+            catalog
+                .iter()
+                .filter(|a| a.listed && a.name == "Ethereum")
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn wrapped_copies_of_a_major_list_once_under_its_real_name() {
+        let token = |mint: &str, symbol: &str, name: &str, price: f64, tags: &[&str]| {
+            json!({"id":mint,"symbol":symbol,"name":name,"decimals":8,"isVerified":true,
+                "liquidity":5e6,"usdPrice":price,"tags":tags,"stats24h":{"buyVolume":1000.0,"sellVolume":500.0}})
+        };
+        let tokens = [
+            token(
+                MAJORS[0].0,
+                "cbBTC",
+                "Coinbase Wrapped BTC",
+                85_500.0,
+                &["verified"],
+            ),
+            token(
+                "wbtc",
+                "WBTC",
+                "Wrapped BTC (Portal)",
+                85_490.0,
+                &["verified"],
+            ),
+            token("xbtc", "xBTC", "OKX Wrapped BTC", 85_225.0, &["verified"]),
+            // Different coins that happen to say Bitcoin stay.
+            token("pbtc", "PBTC", "Purple Bitcoin", 0.17, &["verified"]),
+            token(
+                "ibit",
+                "IBITon",
+                "iShares Bitcoin Trust",
+                47.7,
+                &["verified", "stocks"],
+            ),
+            token(MAJORS[1].0, "ETH", "Ether (Portal)", 2_734.0, &["verified"]),
+            token("jup", "JUP", "Jupiter", 0.5, &["verified"]),
+        ];
+        let catalog = curate(&tokens);
+        let listed: Vec<(&str, &str)> = catalog
+            .iter()
+            .filter(|a| a.listed)
+            .map(|a| (a.symbol.as_str(), a.name.as_str()))
+            .collect();
+        assert!(listed.contains(&("BTC", "Bitcoin")));
+        assert!(listed.contains(&("ETH", "Ethereum")));
+        assert!(listed.contains(&("PBTC", "Purple Bitcoin")));
+        assert!(listed.contains(&("IBITon", "iShares Bitcoin Trust")));
+        assert!(!listed
+            .iter()
+            .any(|(s, _)| *s == "WBTC" || *s == "xBTC" || *s == "WETH"));
+        // Base WETH stays in the catalog (the balance values it) but off the Trade list.
+        assert!(catalog.iter().any(|a| a.id == "weth-base" && !a.listed));
     }
     #[test]
     fn jupiter_chart_candles_become_points() {
