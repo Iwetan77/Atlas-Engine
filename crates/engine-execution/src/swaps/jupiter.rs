@@ -46,6 +46,9 @@ pub struct JupiterOrder {
     pub error_message: Option<String>,
     #[serde(default)]
     pub last_valid_block_height: Option<u64>,
+    /// True when Jupiter pays the network fee and account rent (low-SOL takers on eligible routes).
+    #[serde(default)]
+    pub gasless: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -169,6 +172,20 @@ fn validate_order(request: &JupiterOrderRequest) -> Result<(), JupiterError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reads_whether_jupiter_pays_the_gas() {
+        // Captured 2026-09-30: $0.50 USDC → SOL for a low-SOL taker, filled by JupiterZ.
+        let order: JupiterOrder = serde_json::from_value(serde_json::json!({
+            "inputMint":"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v","outputMint":"So11111111111111111111111111111111111111112",
+            "inAmount":"500000","outAmount":"4200538","requestId":"r","router":"jupiterz","transaction":"tx","gasless":true
+        })).unwrap();
+        assert!(order.gasless);
+        let older: JupiterOrder = serde_json::from_value(serde_json::json!({
+            "inputMint":"a","outputMint":"b","inAmount":"1","outAmount":"1","requestId":"r","router":"metis","transaction":null
+        })).unwrap();
+        assert!(!older.gasless);
+    }
+
     use super::*;
 
     #[test]

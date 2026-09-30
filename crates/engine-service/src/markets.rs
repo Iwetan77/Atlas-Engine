@@ -493,6 +493,9 @@ struct StoredIntent {
     // A funded Solana step that isn't a trade (Earn into Jupiter Lend): what /next swaps USDC into.
     #[serde(default)]
     buy_mint: Option<String>,
+    // A gas top-up (Jupiter order) that runs just before the main Solana transaction.
+    #[serde(default)]
+    gas_request_id: Option<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct CashMove {
@@ -706,56 +709,6 @@ impl MarketState {
             .map(|i| i.expected)
             .unwrap_or_default())
     }
-    // One Jupiter swap the user signs (Earn moving USDC in or out of Jupiter Lend), settled through the
-    // same /signed path as a Solana trade. Returns the intent, the transaction and what Jupiter expects
-    // to deliver.
-    pub(super) async fn plan_jupiter_swap(
-        &self,
-        owner: String,
-        wallet: String,
-        input_mint: &str,
-        output_mint: &str,
-        amount: u128,
-    ) -> Result<(String, String, u128), ApiError> {
-        let order = self
-            .jupiter
-            .order(&JupiterOrderRequest {
-                input_mint: input_mint.into(),
-                output_mint: output_mint.into(),
-                amount_base_units: amount.try_into().map_err(|_| bad("amount too large"))?,
-                taker: Some(wallet.clone()),
-            })
-            .await
-            .map_err(unavailable)?;
-        let out: u128 = order.out_amount.parse().map_err(unavailable)?;
-        let transaction = order.transaction.ok_or((
-            StatusCode::BAD_GATEWAY,
-            "Jupiter returned no signable transaction".into(),
-        ))?;
-        let intent_id = id("intent");
-        self.insert_intent(
-            &intent_id,
-            &StoredIntent {
-                owner,
-                wallet,
-                chain: "solana".into(),
-                expected: Vec::new(),
-                request_id: Some(order.request_id),
-                status: IntentStatus {
-                    intent_id: intent_id.clone(),
-                    stage: "validate".into(),
-                    state: "pending".into(),
-                    tx_ids: Vec::new(),
-                    error: None,
-                },
-                trade: None,
-                funding: None,
-                buy_mint: None,
-            },
-        )
-        .await?;
-        Ok((intent_id, transaction, out))
-    }
     // A plan of Base transactions the user sends in order; /signed and status check each against it.
     pub(super) async fn register_base_txs(
         &self,
@@ -786,6 +739,7 @@ impl MarketState {
                 trade: None,
                 funding: None,
                 buy_mint: None,
+                gas_request_id: None,
             },
         )
         .await?;
@@ -1676,6 +1630,122 @@ async fn funding_for(state: &AppState, shortfall: u128) -> Result<(u128, u128), 
     Ok((base + fee + base / 100 + 50_000, fee))
 }
 
+// The gas tank. Every Solana transaction needs a little SOL for its fee unless Jupiter pays it
+// (gasless swaps). Below this, a Solana step gets a top-up first.
+const GAS_FLOOR_LAMPORTS: u128 = 1_000_000; // 0.001 SOL
+                                            // What a top-up buys: about 0.004 SOL, hundreds of fees. The tank stays under the 0.01 SOL line
+                                            // below which Jupiter keeps paying for swaps of about $10 and more (their fees and new token accounts).
+const GAS_TOPUP_USDC: u128 = 500_000;
+
+// A gasless $0.50 USDC → SOL swap (Jupiter's market makers pay its fee) when the wallet is below the
+// floor and has the USDC to spare beyond `reserve` (what the main step spends). Returns the Jupiter
+// request and its transaction, or None when no top-up is needed or none can be made.
+async fn gas_topup(state: &AppState, owner: &str, reserve: u128) -> Option<(String, String)> {
+    let sol = state.solana_mainnet.owner_sol_balance(owner).await.ok()?;
+    if sol >= GAS_FLOOR_LAMPORTS {
+        return None;
+    }
+    if solana_cash(state, owner).await < reserve.saturating_add(GAS_TOPUP_USDC) {
+        return None;
+    }
+    let order = state
+        .markets
+        .jupiter
+        .order(&JupiterOrderRequest {
+            input_mint: SOL_USDC.into(),
+            output_mint: SOL_MINT.into(),
+            amount_base_units: GAS_TOPUP_USDC as u64,
+            taker: Some(owner.into()),
+        })
+        .await
+        .ok()?;
+    if !order.gasless {
+        return None;
+    }
+    Some((order.request_id, order.transaction?))
+}
+
+// Runs the gas top-up the user signed (index 0) before their main Solana transaction. A failed
+// top-up isn't fatal here: the main transaction reports its own result.
+async fn run_gas_topup(state: &AppState, intent: &StoredIntent, signed: &[Signed]) {
+    if let (Some(request_id), Some(tx)) = (&intent.gas_request_id, signed.first()) {
+        if let Err(error) = state
+            .markets
+            .jupiter
+            .execute(request_id, &tx.transaction)
+            .await
+        {
+            eprintln!("gas top-up didn't land: {error}");
+        }
+    }
+}
+
+// One Jupiter swap the user signs (Earn moving USDC in or out of Jupiter Lend), settled through the
+// same /signed path as a Solana trade, with a gas top-up first when it needs one. Returns the
+// intent, the transactions to sign and what Jupiter expects to deliver.
+pub(super) async fn plan_jupiter_swap(
+    state: &AppState,
+    owner: String,
+    wallet: String,
+    input_mint: &str,
+    output_mint: &str,
+    amount: u128,
+) -> Result<(String, Vec<Value>, u128), ApiError> {
+    let order = state
+        .markets
+        .jupiter
+        .order(&JupiterOrderRequest {
+            input_mint: input_mint.into(),
+            output_mint: output_mint.into(),
+            amount_base_units: amount.try_into().map_err(|_| bad("amount too large"))?,
+            taker: Some(wallet.clone()),
+        })
+        .await
+        .map_err(unavailable)?;
+    let out: u128 = order.out_amount.parse().map_err(unavailable)?;
+    let main_tx = order.transaction.ok_or((
+        StatusCode::BAD_GATEWAY,
+        "Jupiter returned no signable transaction".into(),
+    ))?;
+    let spends = if input_mint == SOL_USDC { amount } else { 0 };
+    let gas = if order.gasless {
+        None
+    } else {
+        gas_topup(state, &wallet, spends).await
+    };
+    let intent_id = id("intent");
+    state
+        .markets
+        .insert_intent(
+            &intent_id,
+            &StoredIntent {
+                owner,
+                wallet,
+                chain: "solana".into(),
+                expected: Vec::new(),
+                request_id: Some(order.request_id),
+                status: IntentStatus {
+                    intent_id: intent_id.clone(),
+                    stage: "validate".into(),
+                    state: "pending".into(),
+                    tx_ids: Vec::new(),
+                    error: None,
+                },
+                trade: None,
+                funding: None,
+                buy_mint: None,
+                gas_request_id: gas.as_ref().map(|(id, _)| id.clone()),
+            },
+        )
+        .await?;
+    let mut transactions = Vec::new();
+    if let Some((_, gas_tx)) = gas {
+        transactions.push(json!({"chain":"solana","transaction":gas_tx,"submit":"engine"}));
+    }
+    transactions.push(json!({"chain":"solana","transaction":main_tx,"submit":"engine"}));
+    Ok((intent_id, transactions, out))
+}
+
 // USDC in a Solana wallet (0 if it can't be read).
 async fn solana_cash(state: &AppState, owner: &str) -> u128 {
     state
@@ -1796,6 +1866,8 @@ pub(super) async fn plan_base_with_cash(
         .solana_to_base(&sol, &evm, send, &intent_id)
         .await
         .map_err(unavailable)?;
+    // The Solana deposit pays its own fee; a low wallet gets its tank topped up first.
+    let gas = gas_topup(state, &sol, send).await;
     state
         .markets
         .insert_intent(
@@ -1823,11 +1895,16 @@ pub(super) async fn plan_base_with_cash(
                     tx_hash: None,
                 }),
                 buy_mint: None,
+                gas_request_id: gas.as_ref().map(|(id, _)| id.clone()),
             },
         )
         .await?;
-    let transactions =
-        vec![json!({"chain":"solana","transaction":deposit.transaction,"submit":"engine"})];
+    let mut transactions = Vec::new();
+    if let Some((_, gas_tx)) = gas {
+        transactions.push(json!({"chain":"solana","transaction":gas_tx,"submit":"engine"}));
+    }
+    transactions
+        .push(json!({"chain":"solana","transaction":deposit.transaction,"submit":"engine"}));
     Ok((intent_id, transactions, Some(fee)))
 }
 
@@ -1883,6 +1960,7 @@ pub(super) async fn plan_solana_swap_with_base_cash(
                     tx_hash: None,
                 }),
                 buy_mint: Some(buy_mint.into()),
+                gas_request_id: None,
             },
         )
         .await?;
@@ -1979,6 +2057,7 @@ pub(super) async fn execute_quote(
     let mut expected = Vec::new();
     let mut request_id = None;
     let mut funding = None;
+    let mut gas_request_id = None;
     let intent_id = id("intent");
     let output: u128;
     if a.chain == "base" {
@@ -2110,7 +2189,23 @@ pub(super) async fn execute_quote(
                 "market price changed; request a fresh quote".into(),
             ));
         }
-        transactions.push(json!({"chain":"solana","transaction":order.transaction.ok_or((StatusCode::BAD_GATEWAY,"Jupiter returned no signable transaction".into()))?,"submit":"engine"}));
+        let main_tx = order.transaction.ok_or((
+            StatusCode::BAD_GATEWAY,
+            "Jupiter returned no signable transaction".into(),
+        ))?;
+        // Jupiter pays the gas on many swaps; otherwise a low wallet gets its tank topped up first.
+        if !order.gasless {
+            let spends = if stored.side == "buy" {
+                stored.input_units
+            } else {
+                0
+            };
+            if let Some((gas_id, gas_tx)) = gas_topup(&state, &wallet, spends).await {
+                transactions.push(json!({"chain":"solana","transaction":gas_tx,"submit":"engine"}));
+                gas_request_id = Some(gas_id);
+            }
+        }
+        transactions.push(json!({"chain":"solana","transaction":main_tx,"submit":"engine"}));
         request_id = Some(order.request_id);
     }
     let expires = now()
@@ -2169,6 +2264,7 @@ pub(super) async fn execute_quote(
                 }),
                 funding,
                 buy_mint: None,
+                gas_request_id,
             },
         )
         .await?;
@@ -2250,12 +2346,17 @@ pub(super) async fn signed(
             }
             body.sent[0].id.clone()
         } else {
-            if !body.sent.is_empty() || body.signed.len() != 1 || body.signed[0].index != 0 {
+            let main = usize::from(current.gas_request_id.is_some());
+            if !body.sent.is_empty()
+                || body.signed.len() != main + 1
+                || body.signed[main].index != main
+            {
                 return Err(bad("signed report does not match the transfer from Solana"));
             }
+            run_gas_topup(&state, &current, &body.signed).await;
             state
                 .solana_mainnet
-                .send_signed(&body.signed[0].transaction)
+                .send_signed(&body.signed[main].transaction)
                 .await
                 .map_err(|e| {
                     (
@@ -2286,7 +2387,10 @@ pub(super) async fn signed(
         status.tx_ids = body.sent.iter().map(|s| s.id.clone()).collect();
         status.stage = "settle".into();
     } else {
-        if !body.sent.is_empty() || body.signed.len() != 1 || body.signed[0].index != 0 {
+        // With a gas top-up the plan is [top-up, swap]; the swap is the last one signed.
+        let main = usize::from(current.gas_request_id.is_some());
+        if !body.sent.is_empty() || body.signed.len() != main + 1 || body.signed[main].index != main
+        {
             return Err(bad("signed report does not match Jupiter execution plan"));
         }
         if !state
@@ -2301,10 +2405,11 @@ pub(super) async fn signed(
             .request_id
             .as_deref()
             .ok_or_else(|| unavailable("Jupiter request ID missing"))?;
+        run_gas_topup(&state, &current, &body.signed).await;
         match state
             .markets
             .jupiter
-            .execute(request_id, &body.signed[0].transaction)
+            .execute(request_id, &body.signed[main].transaction)
             .await
         {
             Ok(result) => {
@@ -2535,15 +2640,24 @@ pub(super) async fn next_transactions(
         StatusCode::BAD_GATEWAY,
         "Jupiter returned no signable transaction".into(),
     ))?;
+    let gas = if order.gasless {
+        None
+    } else {
+        gas_topup(&state, &intent.wallet, amount).await
+    };
     intent.request_id = Some(order.request_id);
+    intent.gas_request_id = gas.as_ref().map(|(id, _)| id.clone());
     if let Some(trade) = intent.trade.as_mut() {
         trade.pay_units = amount;
         trade.get_units = out;
     }
     state.markets.save_intent(&intent_id, &intent).await?;
-    Ok(Json(
-        json!({"transactions":[{"chain":"solana","transaction":transaction,"submit":"engine"}]}),
-    ))
+    let mut transactions = Vec::new();
+    if let Some((_, gas_tx)) = gas {
+        transactions.push(json!({"chain":"solana","transaction":gas_tx,"submit":"engine"}));
+    }
+    transactions.push(json!({"chain":"solana","transaction":transaction,"submit":"engine"}));
+    Ok(Json(json!({ "transactions": transactions })))
 }
 
 // A filled spot trade goes into the trade book (the spot positions). Failing to keep it never
@@ -2639,6 +2753,7 @@ mod tests {
             }),
             funding: None,
             buy_mint: None,
+            gas_request_id: None,
         }
     }
 

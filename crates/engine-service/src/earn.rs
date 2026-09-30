@@ -750,10 +750,8 @@ async fn execute_lend(
     if amount == 0 {
         return Err(bad("nothing to move"));
     }
-    let (intent_id, transaction, _) = state
-        .markets
-        .plan_jupiter_swap(owner, wallet, input, output, amount)
-        .await?;
+    let (intent_id, transactions, _) =
+        markets::plan_jupiter_swap(state, owner, wallet, input, output, amount).await?;
     let amount = if quote.all {
         "Everything in savings".into()
     } else {
@@ -767,7 +765,7 @@ async fn execute_lend(
             {"label":"Where","value":format!("Jupiter Lend ({asset}), on Solana")},
             {"label":"Rate","value":"Variable, set by Jupiter Lend"}
         ],
-        "transactions":[{"chain":"solana","transaction":transaction,"submit":"engine"}],
+        "transactions":transactions,
         "expiresAtUnixMs":now() + 45_000
     })))
 }
