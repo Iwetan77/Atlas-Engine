@@ -653,6 +653,54 @@ impl MarketState {
         self.register_base_txs(owner, wallet, vec![(to, data)])
             .await
     }
+    // One Jupiter swap the user signs (Earn moving USDC in or out of Jupiter Lend), settled through the
+    // same /signed path as a Solana trade. Returns the intent, the transaction and what Jupiter expects
+    // to deliver.
+    pub(super) async fn plan_jupiter_swap(
+        &self,
+        owner: String,
+        wallet: String,
+        input_mint: &str,
+        output_mint: &str,
+        amount: u128,
+    ) -> Result<(String, String, u128), ApiError> {
+        let order = self
+            .jupiter
+            .order(&JupiterOrderRequest {
+                input_mint: input_mint.into(),
+                output_mint: output_mint.into(),
+                amount_base_units: amount.try_into().map_err(|_| bad("amount too large"))?,
+                taker: Some(wallet.clone()),
+            })
+            .await
+            .map_err(unavailable)?;
+        let out: u128 = order.out_amount.parse().map_err(unavailable)?;
+        let transaction = order.transaction.ok_or((
+            StatusCode::BAD_GATEWAY,
+            "Jupiter returned no signable transaction".into(),
+        ))?;
+        let intent_id = id("intent");
+        self.insert_intent(
+            &intent_id,
+            &StoredIntent {
+                owner,
+                wallet,
+                chain: "solana".into(),
+                expected: Vec::new(),
+                request_id: Some(order.request_id),
+                status: IntentStatus {
+                    intent_id: intent_id.clone(),
+                    stage: "validate".into(),
+                    state: "pending".into(),
+                    tx_ids: Vec::new(),
+                    error: None,
+                },
+                trade: None,
+            },
+        )
+        .await?;
+        Ok((intent_id, transaction, out))
+    }
     // A plan of Base transactions the user sends in order; /signed and status check each against it.
     pub(super) async fn register_base_txs(
         &self,
