@@ -42,6 +42,10 @@ const LEND_MARKETS: &[(&str, &str)] = &[
 const JUPITER_LEND_TOKENS: &str = "https://lite-api.jup.ag/lend/v1/earn/tokens";
 // Logos the app shows for each venue.
 const JUPITER_ICON: &str = "https://static.jup.ag/jup/icon.png";
+pub(super) const JITO_MINT: &str = "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn";
+const JITO_OPTION: &str = "jito-sol-staking";
+const JITO_STATS: &str = "https://kobe.mainnet.jito.network/api/v1/stake_pool_stats";
+pub(super) const JITO_ICON: &str = "https://www.jito.network/favicon.ico";
 const AAVE_ICON: &str =
     "https://coin-images.coingecko.com/coins/images/12645/large/aave-token-round.png";
 const QUOTE_MS: u64 = 60_000;
@@ -72,6 +76,7 @@ pub(super) struct EarnState {
     quotes: Arc<Mutex<HashMap<String, EarnQuote>>>,
     apy: Arc<Mutex<Option<(Instant, f64)>>>,
     lend: Arc<Mutex<Option<(Instant, Vec<Lend>)>>>,
+    jito_apy: Arc<Mutex<Option<(Instant, f64)>>>,
     http: reqwest::Client,
 }
 
@@ -268,6 +273,80 @@ async fn jupiter_lend(state: &AppState) -> Result<Vec<Lend>, ApiError> {
     Ok(markets)
 }
 
+async fn jito_apy(state: &AppState) -> Result<f64, ApiError> {
+    if let Some((at, apy)) = *state.earn.jito_apy.lock().map_err(internal)? {
+        if at.elapsed() < APY_TTL {
+            return Ok(apy);
+        }
+    }
+    let stats: Value = state
+        .earn
+        .http
+        .get(JITO_STATS)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(internal)?
+        .error_for_status()
+        .map_err(internal)?
+        .json()
+        .await
+        .map_err(internal)?;
+    let ratio = stats["apy"]
+        .as_array()
+        .and_then(|points| points.iter().rev().find_map(|point| point["data"].as_f64()))
+        .filter(|value| value.is_finite() && *value > 0.0 && *value < 0.5)
+        .ok_or((
+            StatusCode::BAD_GATEWAY,
+            "Jito staking rate unavailable".into(),
+        ))?;
+    let apy = ratio * 100.0;
+    *state.earn.jito_apy.lock().map_err(internal)? = Some((Instant::now(), apy));
+    Ok(apy)
+}
+
+async fn jito_market(state: &AppState) -> Result<Lend, ApiError> {
+    let mints = [JITO_MINT.to_owned()];
+    let (apy, prices) =
+        tokio::try_join!(jito_apy(state), markets::usd_prices(&state.markets, &mints))?;
+    let price = prices
+        .get(JITO_MINT)
+        .map(|(value, _)| *value)
+        .ok_or((StatusCode::BAD_GATEWAY, "JitoSOL price unavailable".into()))?;
+    Ok(Lend {
+        option_id: JITO_OPTION,
+        share_mint: JITO_MINT,
+        asset: "SOL".into(),
+        apy,
+        assets_per_share: 1_000_000_000,
+        share_decimals: 9,
+        asset_decimals: 9,
+        asset_price: price,
+        icon_url: Some(JITO_ICON.into()),
+    })
+}
+
+async fn market_for_mint(state: &AppState, mint: &str) -> Result<Lend, ApiError> {
+    if mint == JITO_MINT {
+        return jito_market(state).await;
+    }
+    jupiter_lend(state)
+        .await?
+        .into_iter()
+        .find(|market| market.share_mint == mint)
+        .ok_or((StatusCode::BAD_GATEWAY, "Savings market unavailable".into()))
+}
+
+pub(super) async fn jito_staked_value(
+    state: &AppState,
+    held: &[(String, u128, u32)],
+) -> Result<u128, ApiError> {
+    let shares = shares_of(held, JITO_MINT);
+    if shares == 0 {
+        return Ok(0);
+    }
+    Ok(lend_value(shares, &jito_market(state).await?))
+}
 // What `shares` of a market are worth, in USDC units.
 fn lend_value(shares: u128, lend: &Lend) -> u128 {
     let assets = shares.saturating_mul(lend.assets_per_share) / 10u128.pow(lend.share_decimals);
@@ -291,7 +370,7 @@ fn lend_shares_for(units: u128, held: u128, lend: &Lend) -> u128 {
 }
 
 pub(super) fn is_lend_share(mint: &str) -> bool {
-    LEND_MARKETS.iter().any(|(m, _)| *m == mint)
+    mint == JITO_MINT || LEND_MARKETS.iter().any(|(m, _)| *m == mint)
 }
 
 // What the user's Jupiter Lend shares (from a wallet read: mint, units, decimals) are worth in
@@ -302,7 +381,7 @@ pub(super) async fn lend_savings_units(
 ) -> Result<u128, ApiError> {
     if !held
         .iter()
-        .any(|(m, units, _)| *units > 0 && is_lend_share(m))
+        .any(|(m, units, _)| *units > 0 && LEND_MARKETS.iter().any(|(mint, _)| *mint == m))
     {
         return Ok(0);
     }
@@ -375,7 +454,8 @@ pub(super) async fn options(
     app_balance::verified_wallets(&state, &headers).await?;
     currency_of(q.currency)?;
     // One venue being down doesn't hide the others; all down is an error.
-    let (aave, lend) = tokio::join!(usdc_apy(&state), jupiter_lend(&state));
+    let (aave, lend, jito) =
+        tokio::join!(usdc_apy(&state), jupiter_lend(&state), jito_market(&state));
     let mut options: Vec<(f64, Value)> = Vec::new();
     if let Ok(apy) = aave {
         options.push((apy, json!({
@@ -391,10 +471,19 @@ pub(super) async fn options(
             "iconUrl":market.icon_url,"venueIconUrl":JUPITER_ICON
         })));
     }
+    if let Ok(market) = &jito {
+        options.push((market.apy, json!({
+            "optionId":JITO_OPTION,"name":"SOL staking","venue":"Jito",
+            "chain":"solana","asset":"SOL","apyPct":format!("{:.2}",market.apy),
+            "about":"Stake SOL with JitoSOL. Its value grows with staking rewards; take it out to cash any time.",
+            "iconUrl":JITO_ICON,"venueIconUrl":JITO_ICON
+        })));
+    }
     if options.is_empty() {
         return Err(aave
             .err()
             .or(lend.err())
+            .or(jito.err())
             .unwrap_or((StatusCode::BAD_GATEWAY, "no savings rate available".into())));
     }
     // Best rate first.
@@ -424,7 +513,7 @@ pub(super) async fn positions(
         let held = solana_wallet(&state, owner).await?;
         if held
             .iter()
-            .any(|(m, units, _)| *units > 0 && is_lend_share(m))
+            .any(|(m, units, _)| *units > 0 && LEND_MARKETS.iter().any(|(mint, _)| *mint == m))
         {
             for lend in jupiter_lend(&state).await? {
                 let units = lend_value(shares_of(&held, lend.share_mint), &lend);
@@ -434,6 +523,14 @@ pub(super) async fn positions(
                         "apyPct":format!("{:.2}",lend.apy)}));
                 }
             }
+        }
+        let jito_shares = shares_of(&held, JITO_MINT);
+        if jito_shares > 0 {
+            let market = jito_market(&state).await?;
+            let units = lend_value(jito_shares, &market);
+            positions.push(json!({"optionId":JITO_OPTION,"name":"SOL staking",
+                "venue":"Jito","amount":markets::format_units(jito_shares,9),
+                "value":money(units,&currency,rate),"apyPct":format!("{:.2}",market.apy)}));
         }
     }
     Ok(Json(json!({"positions":positions})))
@@ -447,7 +544,8 @@ pub(super) async fn quote(
     let share_mint = LEND_MARKETS
         .iter()
         .find(|(_, id)| *id == req.option_id)
-        .map(|(mint, _)| *mint);
+        .map(|(mint, _)| *mint)
+        .or_else(|| (req.option_id == JITO_OPTION).then_some(JITO_MINT));
     if req.option_id != OPTION_ID && share_mint.is_none() {
         return Err((StatusCode::NOT_FOUND, "unknown earn option".into()));
     }
@@ -469,12 +567,10 @@ pub(super) async fn quote(
     markets::check_limits(units, &currency, rate)?;
     // What can move: cash on the option's chain to put in, or what's in savings to take out.
     let (available, apy, held_shares, lend) = if let Some(mint) = share_mint {
-        let (held, markets) =
-            tokio::try_join!(solana_wallet(&state, &wallet), jupiter_lend(&state))?;
-        let lend = markets.into_iter().find(|m| m.share_mint == mint).ok_or((
-            StatusCode::BAD_GATEWAY,
-            "Jupiter Lend market unavailable".into(),
-        ))?;
+        let (held, lend) = tokio::try_join!(
+            solana_wallet(&state, &wallet),
+            market_for_mint(&state, mint)
+        )?;
         let shares = shares_of(&held, mint);
         let available = if deposit {
             shares_of(&held, markets::SOL_USDC_MINT)
@@ -732,8 +828,9 @@ async fn execute_lend(
             return Ok(Json(json!({
                 "intentId":intent_id,"kind":"earn_deposit",
                 "summary":[
-                    {"label":"Put in savings","value":markets::say_money(quote.units, &quote.currency, quote.rate)},
-                    {"label":"Where","value":"Jupiter Lend, on Solana"},
+                    {"label":if share_mint == JITO_MINT {"Stake SOL"} else {"Put in savings"},
+                     "value":markets::say_money(quote.units, &quote.currency, quote.rate)},
+                    {"label":"Where","value":if share_mint == JITO_MINT {"Jito"} else {"Jupiter Lend"}},
                     {"label":"Network fee","value":markets::say_money(fee, &quote.currency, quote.rate)}
                 ],
                 "transactions":[tx],
@@ -741,19 +838,19 @@ async fn execute_lend(
             })));
         }
     }
-    let asset = jupiter_lend(state)
-        .await?
-        .into_iter()
-        .find(|m| m.share_mint == share_mint)
-        .map(|m| m.asset)
-        .unwrap_or_else(|| "USDC".into());
+    let asset = market_for_mint(state, share_mint).await?.asset;
     if amount == 0 {
         return Err(bad("nothing to move"));
     }
     let (intent_id, transactions, _) =
         markets::plan_jupiter_swap(state, owner, wallet, input, output, amount).await?;
+    let staking = share_mint == JITO_MINT;
     let amount = if quote.all {
-        "Everything in savings".into()
+        if staking {
+            "Everything staked".into()
+        } else {
+            "Everything in savings".into()
+        }
     } else {
         markets::say_money(quote.units, &quote.currency, quote.rate)
     };
@@ -761,9 +858,9 @@ async fn execute_lend(
         "intentId":intent_id,
         "kind":if quote.deposit {"earn_deposit"} else {"earn_withdraw"},
         "summary":[
-            {"label":if quote.deposit {"Put in savings"} else {"Take out of savings"},"value":amount},
-            {"label":"Where","value":format!("Jupiter Lend ({asset}), on Solana")},
-            {"label":"Rate","value":"Variable, set by Jupiter Lend"}
+            {"label":if staking {if quote.deposit {"Stake SOL"} else {"Unstake SOL"}} else if quote.deposit {"Put in savings"} else {"Take out of savings"},"value":amount},
+            {"label":"Where","value":if staking {"Jito".to_owned()} else {format!("Jupiter Lend ({asset})")}},
+            {"label":"Rate","value":if staking {"Variable, set by Jito"} else {"Variable, set by Jupiter Lend"}}
         ],
         "transactions":transactions,
         "expiresAtUnixMs":now() + 45_000

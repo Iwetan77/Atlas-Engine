@@ -206,6 +206,29 @@ pub(super) async fn balance(
             .checked_add(units)
             .ok_or((StatusCode::BAD_GATEWAY, "balance overflow".into()))?;
     }
+    let jito_units = held
+        .iter()
+        .filter(|(mint, _, _)| mint == earn::JITO_MINT)
+        .map(|(_, units, _)| *units)
+        .sum::<u128>();
+    if jito_units > 0 {
+        let value_usdc = earn::jito_staked_value(&state, &held).await?;
+        total = total
+            .checked_add(value_usdc)
+            .ok_or((StatusCode::BAD_GATEWAY, "portfolio value overflow".into()))?;
+        holdings.push(Holding {
+            asset_id: earn::JITO_MINT.into(),
+            symbol: "JitoSOL".into(),
+            name: "SOL staking".into(),
+            kind: "crypto".into(),
+            chain: "solana".into(),
+            amount: markets::format_units(jito_units, 9),
+            value: money(value_usdc, &currency, rate)?,
+            value_usd: usd(value_usdc),
+            location: "earn",
+            icon_url: Some(earn::JITO_ICON.into()),
+        });
+    }
     for (mint, units, decimals) in &held {
         if earn::is_lend_share(mint) {
             continue;
