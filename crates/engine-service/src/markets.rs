@@ -1406,7 +1406,7 @@ pub(super) async fn signed(
                 status.tx_ids.push(result.signature);
                 status.stage = "settle".into();
                 status.state = "filled".into();
-                keep_trade(&state, &intent_id, &current, &status, paid, got).await;
+                keep_trade(&state.trades, &intent_id, &current, &status, paid, got).await;
             }
             Err(error) => {
                 status.stage = "settle".into();
@@ -1493,7 +1493,7 @@ pub(super) async fn intent_status(
         // The swap is the last transaction; what reached the wallet is in its Transfer logs.
         if let Some(trade) = &current.trade {
             let got = received_units(&last_receipt, &trade.receive_token, &current.wallet);
-            keep_trade(&state, &intent_id, &current, &status, None, got).await;
+            keep_trade(&state.trades, &intent_id, &current, &status, None, got).await;
         }
     }
     state
@@ -1510,7 +1510,7 @@ pub(super) async fn intent_status(
 // A filled spot trade goes into the trade book (the spot positions). Failing to keep it never
 // fails the trade the user already made.
 async fn keep_trade(
-    state: &AppState,
+    book: &positions::TradeBook,
     intent_id: &str,
     intent: &StoredIntent,
     status: &IntentStatus,
@@ -1537,7 +1537,7 @@ async fn keep_trade(
         tx_id: status.tx_ids.last().cloned(),
         filled_at_ms: now(),
     };
-    if let Err((_, error)) = state.trades.record(&trade).await {
+    if let Err((_, error)) = book.record(&trade).await {
         eprintln!("could not keep trade {intent_id}: {error}");
     }
 }
@@ -1577,6 +1577,51 @@ fn received_units(receipt: &Value, token: &str, wallet: &str) -> Option<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn spot_intent(side: &str, pay: u128, get: u128) -> StoredIntent {
+        StoredIntent {
+            owner: "did:privy:a".into(),
+            wallet: "0x1111111111111111111111111111111111111111".into(),
+            chain: "solana".into(),
+            expected: Vec::new(),
+            request_id: None,
+            status: IntentStatus {
+                intent_id: format!("intent-{side}"),
+                stage: "settle".into(),
+                state: "filled".into(),
+                tx_ids: vec!["sig".into()],
+                error: None,
+            },
+            trade: Some(PlannedTrade {
+                asset_id: "bonk".into(),
+                side: side.into(),
+                pay_units: pay,
+                get_units: get,
+                receive_token: String::new(),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn kept_trades_put_tokens_and_usdc_on_the_right_side() {
+        let book = positions::TradeBook::default();
+        // A buy pays USDC and gets tokens; the venue's filled amounts beat the quote's.
+        let buy = spot_intent("buy", 10_000_000, 900);
+        keep_trade(&book, "intent-buy", &buy, &buy.status, None, Some(1_000)).await;
+        // A sell pays tokens and gets USDC; with nothing reported, the quote stands.
+        let sell = spot_intent("sell", 400, 5_000_000);
+        keep_trade(&book, "intent-sell", &sell, &sell.status, None, None).await;
+        // Kept once, however many times the status is polled.
+        keep_trade(&book, "intent-sell", &sell, &sell.status, None, None).await;
+        // Sends and Earn plans have no trade to keep.
+        let mut send = spot_intent("buy", 1, 1);
+        send.trade = None;
+        keep_trade(&book, "intent-send", &send, &send.status, None, None).await;
+        let p = &positions::fold(&book.for_user("did:privy:a").await.unwrap())["bonk"];
+        assert_eq!(p.units, 600);
+        assert_eq!(p.cost, 6_000_000);
+        assert_eq!(p.realized, 1_000_000);
+    }
+
     #[test]
     fn received_units_reads_transfers_into_the_wallet() {
         let wallet = "0x1111111111111111111111111111111111111111";

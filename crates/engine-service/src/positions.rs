@@ -87,7 +87,7 @@ impl TradeBook {
         Ok(())
     }
 
-    async fn for_user(&self, user_id: &str) -> Result<Vec<Trade>, ApiError> {
+    pub(super) async fn for_user(&self, user_id: &str) -> Result<Vec<Trade>, ApiError> {
         let mut trades = if let Some(pg) = &self.postgres {
             let rows = pg
                 .query(
