@@ -117,12 +117,15 @@ impl LayerswapClient {
 
     /// Creates a Solana → Base USDC swap from the user's Solana wallet to their Base wallet. The
     /// deposit is one Solana transaction (base64) for the user to sign; its fee payer is the user.
+    /// With `refuel`, part of it (about $0.50) arrives as native ETH on Base: gas for the wallet,
+    /// paid from the user's own cash.
     pub async fn solana_to_base(
         &self,
         solana_owner: &str,
         base_address: &str,
         amount_units: u128,
         reference: &str,
+        refuel: bool,
     ) -> Result<SolanaDeposit, LayerswapError> {
         self.solana_to(
             "BASE_MAINNET",
@@ -130,6 +133,7 @@ impl LayerswapClient {
             base_address,
             amount_units,
             reference,
+            refuel,
         )
         .await
     }
@@ -148,6 +152,7 @@ impl LayerswapClient {
             paradex_account,
             amount_units,
             reference,
+            false,
         )
         .await
     }
@@ -159,6 +164,7 @@ impl LayerswapClient {
         destination_address: &str,
         amount_units: u128,
         reference: &str,
+        refuel: bool,
     ) -> Result<SolanaDeposit, LayerswapError> {
         let amount: serde_json::Number = usdc_decimal(amount_units)
             .parse()
@@ -175,7 +181,7 @@ impl LayerswapClient {
                 "destination_network":destination_network,"destination_token":"USDC",
                 "amount":amount,"source_address":solana_owner,
                 "destination_address":destination_address,
-                "use_deposit_address":false,"reference_id":reference
+                "use_deposit_address":false,"reference_id":reference,"refuel":refuel
             }))
             .send()
             .await?;
@@ -508,6 +514,7 @@ mod tests {
                 "0x845c22a46398E0a702733e556bEB6aFcB2E92132",
                 5_000_000,
                 "atlas-live-check",
+                true,
             )
             .await
             .unwrap();

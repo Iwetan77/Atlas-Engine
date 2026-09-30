@@ -705,7 +705,7 @@ pub(super) async fn sui_holdings(
 }
 
 // Networks people can deposit from besides Base and Solana (which use their own wallets): each is a
-// 1Click asset that becomes USDC in the user's Base wallet, their balance.
+// 1Click asset that becomes USDC in the user's Solana wallet, their balance.
 // (id, label, network, asset, 1Click asset id)
 const DEPOSIT_NETWORKS: &[(&str, &str, &str, &str, &str)] = &[
     (
@@ -767,6 +767,8 @@ const DEPOSIT_NETWORKS: &[(&str, &str, &str, &str, &str)] = &[
 ];
 // How long a deposit address waits for the money.
 const DEPOSIT_WINDOW_SECS: u64 = 2 * 60 * 60;
+// Deposits from other networks land as USDC on Solana, where Atlas never needs to pay gas.
+const SOLANA_USDC_1CLICK: &str = "nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near";
 
 pub(super) async fn deposit_networks() -> Json<Value> {
     Json(
@@ -805,9 +807,9 @@ pub(super) async fn deposit_quote(
         .find(|(id, ..)| *id == req.network_id)
         .ok_or((StatusCode::NOT_FOUND, "unknown deposit network".into()))?;
     let wallet = user
-        .evm_wallet
-        .as_deref()
-        .filter(|w| is_evm(w))
+        .solana_wallet
+        .clone()
+        .filter(|w| !w.is_empty())
         .ok_or_else(|| conflict("Your wallet is still being set up. Try again in a moment."))?;
     let tokens = state.near.tokens().await?;
     let origin = tokens
@@ -839,9 +841,9 @@ pub(super) async fn deposit_quote(
     let amount = units.to_string();
     let request = QuoteRequest::flex_deposit(
         asset_id,
-        BASE_USDC_1CLICK,
+        SOLANA_USDC_1CLICK,
         &amount,
-        wallet,
+        &wallet,
         &refund_to,
         &deadline,
     );

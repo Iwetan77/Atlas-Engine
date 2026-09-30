@@ -1830,11 +1830,17 @@ pub(super) async fn plan_solana_transfer(
     Ok((intent_id, transactions))
 }
 
-// The Base gas tank. Below this much ETH a Base plan starts with a refill from the user's USDC;
-// at or above it the wallet pays its own gas (a Base transaction costs about 0.000002 ETH).
-const BASE_GAS_FLOOR_WEI: u128 = 5_000_000_000_000; // 0.000005 ETH
-                                                    // A refill: $0.50 of USDC becomes about 0.0002 ETH, enough for dozens of transactions.
+// The Base gas tank, paid by the user, never by Atlas. At or above the floor the wallet pays its own
+// gas (a Base transaction costs about 0.000002 ETH). Below the refill mark (but above the floor) a
+// plan starts with a USDC → ETH refill the tank still pays for itself. An empty tank is filled by
+// Layerswap's refuel on a hop from Solana, where Jupiter pays the gas.
+// 0.000005 ETH, and 0.00004 ETH.
+const BASE_GAS_FLOOR_WEI: u128 = 5_000_000_000_000;
+const BASE_GAS_REFILL_AT_WEI: u128 = 40_000_000_000_000;
+// A refill: $0.50 of USDC becomes about 0.0002 ETH, enough for dozens of transactions.
 const BASE_GAS_REFILL_USDC: u128 = 500_000;
+// What Layerswap's refuel turns into ETH on an empty tank's first hop from Solana.
+const BASE_REFUEL_USDC: u128 = 500_000;
 
 async fn base_eth(state: &AppState, wallet: &str) -> Option<u128> {
     let result = base_rpc(&state.markets, "eth_getBalance", json!([wallet, "latest"]))
@@ -1858,7 +1864,11 @@ pub(super) async fn base_gas_refill(
     wallet: &str,
     reserve: u128,
 ) -> Vec<(String, String)> {
-    if wallet_pays_gas(state, wallet).await {
+    // Only while the tank can still pay for its own refill, and only when it's getting low.
+    let Some(eth) = base_eth(state, wallet).await else {
+        return Vec::new();
+    };
+    if !(BASE_GAS_FLOOR_WEI..BASE_GAS_REFILL_AT_WEI).contains(&eth) {
         return Vec::new();
     }
     let usdc = state
@@ -1937,26 +1947,40 @@ pub(super) async fn cash_for_base(
     currency: &str,
     rate: u128,
 ) -> Result<Option<(u128, u128)>, ApiError> {
+    cash_for_base_with(state, evm, solana, needed, currency, rate, false).await
+}
+
+// The same; with `refuel` the hop always happens and carries ETH for an empty gas tank on top.
+pub(super) async fn cash_for_base_with(
+    state: &AppState,
+    evm: &str,
+    solana: Option<&str>,
+    needed: u128,
+    currency: &str,
+    rate: u128,
+    refuel: bool,
+) -> Result<Option<(u128, u128)>, ApiError> {
     let base_cash = state
         .markets
         .base
         .balance_of(BASE_USDC, evm)
         .await
         .map_err(unavailable)?;
-    if base_cash >= needed {
+    if base_cash >= needed && !refuel {
         return Ok(None);
     }
     let sol_cash = match solana {
         Some(owner) => solana_cash(state, owner).await,
         None => 0,
     };
-    let shortfall = (needed - base_cash).max(1_000_000);
+    let shortfall = needed.saturating_sub(base_cash).max(1_000_000);
     let fee = state
         .layerswap
         .solana_to_base_fee(shortfall)
         .await
         .map_err(|_| unavailable("Couldn't move cash from Solana right now; try again shortly"))?;
-    let send = shortfall + fee + shortfall / 100 + 50_000;
+    let refuel_cost = if refuel { BASE_REFUEL_USDC } else { 0 };
+    let send = shortfall + fee + shortfall / 100 + 50_000 + refuel_cost;
     if sol_cash < send {
         return Err(not_enough_cash(base_cash + sol_cash, currency, rate));
     }
@@ -2014,15 +2038,30 @@ pub(super) async fn plan_base_with_cash(
             )
             .collect()
     };
-    // A low gas tank is refilled from the user's USDC first (only when Base holds it already).
+    // A low gas tank refills itself from the user's USDC first; an empty one gets ETH on a hop from
+    // Solana (Layerswap refuel) when there's Solana cash to hop.
     let refill = base_gas_refill(state, &evm, needed).await;
     let txs = if refill.is_empty() {
         txs
     } else {
         refill.iter().cloned().chain(txs).collect()
     };
-    let Some((send, fee)) =
-        cash_for_base(state, &evm, solana.as_deref(), needed, currency, rate).await?
+    let empty_tank = !wallet_pays_gas(state, &evm).await;
+    let refuel = empty_tank
+        && match solana.as_deref() {
+            Some(owner) => solana_cash(state, owner).await >= 2_000_000,
+            None => false,
+        };
+    let Some((send, fee)) = cash_for_base_with(
+        state,
+        &evm,
+        solana.as_deref(),
+        needed,
+        currency,
+        rate,
+        refuel,
+    )
+    .await?
     else {
         let transactions = as_base(&txs);
         let intent_id = state.markets.register_base_txs(owner, evm, txs).await?;
@@ -2035,7 +2074,7 @@ pub(super) async fn plan_base_with_cash(
     let intent_id = id("intent");
     let deposit = state
         .layerswap
-        .solana_to_base(&sol, &evm, send, &intent_id)
+        .solana_to_base(&sol, &evm, send, &intent_id, refuel)
         .await
         .map_err(unavailable)?;
     // The Solana deposit pays its own fee; a low wallet gets its tank topped up first.
