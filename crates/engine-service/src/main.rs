@@ -215,6 +215,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/v1/me", get(social::me))
         .route("/v1/me/handle", post(social::set_handle))
+        .route("/v1/me/avatar", post(social::set_avatar))
         .route("/v1/users/resolve", get(social::resolve_user))
         .route("/v1/offramp/banks", get(social::banks))
         .route("/v1/offramp/resolve", post(social::resolve_bank))
@@ -425,6 +426,9 @@ async fn register_movement(
     *state.movement.lock().map_err(internal)? = Some(record);
     Ok(StatusCode::NO_CONTENT)
 }
+
+// Display currencies Atlas prices in. FX comes from Frankfurter with Coinbase as the fallback.
+pub(crate) const DISPLAY_CURRENCIES: [&str; 7] = ["USD", "NGN", "EUR", "GBP", "ZAR", "KES", "GHS"];
 
 fn usd(base_units: u128) -> String {
     format!("{}.{:06}", base_units / 1_000_000, base_units % 1_000_000)

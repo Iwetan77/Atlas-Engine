@@ -23,6 +23,9 @@ pub(super) struct SocialState {
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Ledger {
     handles: HashMap<String, HandleRecord>,
+    // Profile photos by user id, as small data URLs.
+    #[serde(default)]
+    avatars: HashMap<String, String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -170,6 +173,11 @@ impl SocialState {
                 user_id TEXT NOT NULL UNIQUE,
                 display_name TEXT,
                 evm_wallet TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS atlas_avatars (
+                user_id TEXT PRIMARY KEY,
+                image TEXT NOT NULL,
+                updated_at BIGINT NOT NULL
             )",
                 )
                 .await?;
@@ -204,6 +212,59 @@ impl SocialState {
         } else {
             Err(unavailable("permanent handle storage is not configured"))
         }
+    }
+    async fn avatar(&self, user_id: &str) -> Result<Option<String>, ApiError> {
+        if let Some(pg) = &self.postgres {
+            let row = pg
+                .query_opt(
+                    "SELECT image FROM atlas_avatars WHERE user_id=$1",
+                    &[&user_id],
+                )
+                .await
+                .map_err(internal)?;
+            return Ok(row.map(|r| r.get("image")));
+        }
+        Ok(self
+            .ledger
+            .lock()
+            .map_err(internal)?
+            .avatars
+            .get(user_id)
+            .cloned())
+    }
+    async fn set_avatar(&self, user_id: &str, image: Option<&str>) -> Result<(), ApiError> {
+        if let Some(pg) = &self.postgres {
+            match image {
+                Some(image) => {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_err(internal)?
+                        .as_millis() as i64;
+                    pg.execute(
+                        "INSERT INTO atlas_avatars (user_id,image,updated_at) VALUES ($1,$2,$3)
+                         ON CONFLICT (user_id) DO UPDATE SET image=EXCLUDED.image, updated_at=EXCLUDED.updated_at",
+                        &[&user_id, &image, &now],
+                    )
+                    .await
+                    .map_err(internal)?;
+                }
+                None => {
+                    pg.execute("DELETE FROM atlas_avatars WHERE user_id=$1", &[&user_id])
+                        .await
+                        .map_err(internal)?;
+                }
+            }
+            return Ok(());
+        }
+        let mut ledger = self.ledger.lock().map_err(internal)?;
+        match image {
+            Some(image) => ledger.avatars.insert(user_id.into(), image.into()),
+            None => ledger.avatars.remove(user_id),
+        };
+        if let Some(path) = &self.path {
+            fs::write(path, serde_json::to_vec(&*ledger).map_err(internal)?).map_err(internal)?;
+        }
+        Ok(())
     }
     async fn find_user(&self, user_id: &str) -> Result<Option<HandleRecord>, ApiError> {
         if let Some(pg) = &self.postgres {
@@ -283,10 +344,54 @@ pub(super) async fn me(
     let user = app_balance::verified_wallets(&state, &headers).await?;
     state.social.require_storage()?;
     let record = state.social.find_user(&user.user_id).await?;
+    let avatar = state.social.avatar(&user.user_id).await?;
 
     Ok(Json(
-        json!({"userId":user.user_id,"handle":record.as_ref().map(|r|&r.handle),"displayName":record.and_then(|r|r.display_name)}),
+        json!({"userId":user.user_id,"handle":record.as_ref().map(|r|&r.handle),"displayName":record.and_then(|r|r.display_name),"avatar":avatar}),
     ))
+}
+
+#[derive(Deserialize)]
+pub(super) struct AvatarBody {
+    image: Option<String>,
+}
+// Profile photos come from the app already cropped and shrunk; keep them small.
+const AVATAR_MAX_CHARS: usize = 150_000;
+
+fn valid_avatar(image: &str) -> bool {
+    let Some(payload) = image
+        .strip_prefix("data:image/jpeg;base64,")
+        .or_else(|| image.strip_prefix("data:image/png;base64,"))
+    else {
+        return false;
+    };
+    image.len() <= AVATAR_MAX_CHARS
+        && payload.len() > 100
+        && payload.len() % 4 == 0
+        && payload
+            .trim_end_matches('=')
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+}
+
+// Sets (or, with `image: null`, removes) the signed-in user's profile photo.
+pub(super) async fn set_avatar(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AvatarBody>,
+) -> Result<Json<Value>, ApiError> {
+    let user = app_balance::verified_wallets(&state, &headers).await?;
+    state.social.require_storage()?;
+    if let Some(image) = &body.image {
+        if !valid_avatar(image) {
+            return Err(bad("photo must be a JPEG or PNG under about 110 KB"));
+        }
+    }
+    state
+        .social
+        .set_avatar(&user.user_id, body.image.as_deref())
+        .await?;
+    Ok(Json(json!({"avatar":body.image})))
 }
 pub(super) async fn set_handle(
     State(state): State<AppState>,
@@ -431,10 +536,7 @@ pub(super) async fn send_quote(
             return Err(unavailable("cash-link escrow is not configured"));
         }
     };
-    if !matches!(
-        req.amount.currency.as_str(),
-        "USD" | "NGN" | "KES" | "GHS" | "ZAR"
-    ) {
+    if !DISPLAY_CURRENCIES.contains(&req.amount.currency.as_str()) {
         return Err(bad("unsupported display currency"));
     }
     let rate = app_balance::fx_rate(&req.amount.currency).await?;
@@ -562,6 +664,20 @@ pub(super) async fn claim(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn avatars_must_be_small_images() {
+        let jpeg = format!("data:image/jpeg;base64,{}", "A".repeat(400));
+        assert!(valid_avatar(&jpeg));
+        assert!(!valid_avatar("data:image/gif;base64,AAAA"));
+        assert!(!valid_avatar(&format!(
+            "data:image/png;base64,{}",
+            "A".repeat(200_000)
+        )));
+        assert!(!valid_avatar(&format!(
+            "data:image/png;base64,{}<script>",
+            "A".repeat(400)
+        )));
+    }
     use super::*;
     #[test]
     fn handle_validation() {

@@ -244,7 +244,7 @@ fn unavailable(message: &str) -> ApiError {
 }
 fn checked_currency(query: CurrencyQuery) -> Result<String, ApiError> {
     let currency = query.currency.unwrap_or_else(|| "USD".into());
-    if matches!(currency.as_str(), "USD" | "NGN" | "KES" | "GHS" | "ZAR") {
+    if DISPLAY_CURRENCIES.contains(&currency.as_str()) {
         Ok(currency)
     } else {
         Err(bad("unsupported display currency"))

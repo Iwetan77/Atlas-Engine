@@ -56,7 +56,7 @@ pub(super) async fn balance(
     headers: HeaderMap,
 ) -> Result<Json<AppBalanceResponse>, ApiError> {
     let currency = query.currency.unwrap_or_else(|| "USD".into());
-    if !matches!(currency.as_str(), "USD" | "NGN" | "KES" | "GHS" | "ZAR") {
+    if !DISPLAY_CURRENCIES.contains(&currency.as_str()) {
         return Err((
             StatusCode::BAD_REQUEST,
             "unsupported display currency".into(),
@@ -184,19 +184,39 @@ pub(super) async fn balance(
             None => held.push((markets::SOL_MINT.into(), native_sol, 9)),
         }
     }
-    let listed: Vec<(&markets::Asset, u128)> = held
-        .iter()
-        .filter_map(|(mint, units, decimals)| {
-            catalog
-                .iter()
-                .find(|a| a.chain == "solana" && &a.token == mint && a.decimals == *decimals)
-                .map(|asset| (asset, *units))
-        })
-        .collect();
+    let mut listed: Vec<(markets::Asset, u128)> = Vec::new();
+    let mut unlisted = Vec::new();
+    for (mint, units, decimals) in &held {
+        match catalog
+            .iter()
+            .find(|a| a.chain == "solana" && &a.token == mint && a.decimals == *decimals)
+        {
+            Some(asset) => listed.push((asset.clone(), *units)),
+            None if mint != markets::SOL_USDC_MINT => {
+                unlisted.push((mint.clone(), *units, *decimals))
+            }
+            None => {}
+        }
+    }
+    // Tokens bought by pasting their address aren't in the catalog. Look up a few held ones; the
+    // same liquidity bar as pasting keeps worthless airdrops out.
+    for (mint, units, decimals) in unlisted.into_iter().take(15) {
+        if let Ok(Some(asset)) = markets::pasted_token(&state.markets, &mint).await {
+            if asset.decimals == decimals {
+                listed.push((asset, units));
+            }
+        }
+    }
     let mints: Vec<String> = listed.iter().map(|(a, _)| a.token.clone()).collect();
+    // Unlisted tokens Jupiter can't price are skipped rather than failing the balance.
+    let unpriced_ok = |asset: &markets::Asset| !asset.verified;
     let prices = markets::usd_prices(&state.markets, &mints).await?;
-    for (asset, units) in listed {
+    for (asset, units) in &listed {
+        let (asset, units) = (asset, *units);
         let Some((usd, _)) = prices.get(&asset.token) else {
+            if unpriced_ok(asset) {
+                continue;
+            }
             return Err((
                 StatusCode::BAD_GATEWAY,
                 format!("no live price for {}", asset.symbol),

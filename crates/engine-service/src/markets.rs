@@ -13,11 +13,13 @@ use std::{
 };
 
 const SOL_USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+pub(super) const SOL_USDC_MINT: &str = SOL_USDC;
 pub(super) const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const BRETT: &str = "0x532f27101965dd16442E59d40670FaF5eBB142E4";
 const AAPLC: &str = "0xb200000000000000000000C2e324d24d7eEcd1fb";
 const JUPITER_VERIFIED: &str = "https://lite-api.jup.ag/tokens/v2/tag?query=verified";
 const JUPITER_PRICES: &str = "https://lite-api.jup.ag/price/v3";
+const JUPITER_SEARCH: &str = "https://lite-api.jup.ag/tokens/v2/search";
 // Liquid enough that an order of up to $10,000 (the quote cap) routes without wrecking the price.
 const MIN_LIQUIDITY_USD: f64 = 100_000.0;
 const CATALOG_TTL: Duration = Duration::from_secs(30 * 60);
@@ -40,6 +42,8 @@ pub(super) struct Asset {
     // 24h traded volume in USD, for ranking. xStocks carry a share multiplier that must stay 1.
     pub(super) volume_24h: f64,
     pub(super) xstock: bool,
+    // False only for tokens found by pasting their address (Jupiter hasn't verified them).
+    pub(super) verified: bool,
 }
 
 // Base assets route through fixed Uniswap V3 pools, so they stay a short fixed list.
@@ -55,6 +59,7 @@ fn base_assets() -> Vec<Asset> {
         icon_url: None,
         volume_24h: 0.0,
         xstock: false,
+        verified: true,
     };
     vec![
         base(
@@ -77,6 +82,13 @@ fn base_assets() -> Vec<Asset> {
     ]
 }
 
+// Classic memes Jupiter doesn't tag as memes.
+const CLASSIC_MEMES: &[&str] = &[
+    "DOGE", "PEPE", "SHIB", "FLOKI", "WIF", "POPCAT", "BONK", "MEW", "FARTCOIN",
+];
+// A token pasted by address is tradable if at least this much liquidity backs it.
+const MIN_PASTED_LIQUIDITY_USD: f64 = 5_000.0;
+
 // One Jupiter token as a tradable Solana asset, or None if Atlas shouldn't list it: only verified,
 // liquid tokens; stablecoins, liquid-staking and yield tokens belong to cash and Earn, not Trade.
 fn solana_asset(token: &Value) -> Option<Asset> {
@@ -86,6 +98,19 @@ fn solana_asset(token: &Value) -> Option<Asset> {
     if token["liquidity"].as_f64().unwrap_or(0.0) < MIN_LIQUIDITY_USD {
         return None;
     }
+    token_asset(token, true)
+}
+
+// Any Jupiter token someone pasted the address of: unverified allowed (flagged in the app), but it
+// still needs real liquidity to trade.
+fn pasted_asset(token: &Value) -> Option<Asset> {
+    if token["liquidity"].as_f64().unwrap_or(0.0) < MIN_PASTED_LIQUIDITY_USD {
+        return None;
+    }
+    token_asset(token, token["isVerified"].as_bool() == Some(true))
+}
+
+fn token_asset(token: &Value, verified: bool) -> Option<Asset> {
     let mint = token["id"].as_str()?;
     let symbol = token["symbol"].as_str().filter(|s| !s.is_empty())?;
     let name = token["name"].as_str().unwrap_or(symbol);
@@ -96,16 +121,29 @@ fn solana_asset(token: &Value) -> Option<Asset> {
         .unwrap_or_default();
     let has = |tag: &str| tags.contains(&tag);
     let upper = symbol.to_ascii_uppercase();
+    // Pool shares and leveraged wrappers (JLP "Jupiter Perps", Hylo's xSOL) aren't assets to trade here.
+    let derivative = name.contains("Perps")
+        || name.contains("Leveraged")
+        || name.ends_with(" LP")
+        || upper == "JLP";
     if mint == SOL_USDC
         || ["stable", "lst", "yield", "yb", "jup-lend-earn"]
             .iter()
             .any(|t| has(t))
         || upper.contains("USD")
         || upper.contains("EUR")
+        || derivative
     {
         return None;
     }
     let xstock = has("xstocks") || name.ends_with("xStock");
+    // Launchpad coins (pump.fun, bonk.fun, stonkfun, LaunchLab, Meteora DBC…) are memes even when
+    // Jupiter doesn't tag them; their mints often end in the launchpad's suffix.
+    let launched = token["firstPool"]["launchpad"]
+        .as_str()
+        .is_some_and(|l| !l.is_empty())
+        || mint.ends_with("pump")
+        || mint.ends_with("bonk");
     // Tokenized equities come from several issuers (xStocks, Backpack Securities, Tessera), not all
     // tagged "stocks" on Jupiter.
     let kind = if xstock
@@ -122,7 +160,7 @@ fn solana_asset(token: &Value) -> Option<Asset> {
         || name.contains(" Securities")
     {
         "stock"
-    } else if has("meme") {
+    } else if has("meme") || launched || CLASSIC_MEMES.contains(&upper.as_str()) {
         "meme"
     } else {
         "crypto"
@@ -152,7 +190,50 @@ fn solana_asset(token: &Value) -> Option<Asset> {
         icon_url: token["icon"].as_str().map(str::to_owned),
         volume_24h: volume,
         xstock,
+        verified,
     })
+}
+
+// A Solana mint address as typed into search: 32–44 base58 characters.
+pub(super) fn looks_like_mint(text: &str) -> bool {
+    (32..=44).contains(&text.len())
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() && !matches!(b, b'0' | b'O' | b'I' | b'l'))
+}
+
+// A token by its address, for anything the catalog doesn't list: Jupiter's token search, cached.
+pub(super) async fn pasted_token(
+    state: &MarketState,
+    mint: &str,
+) -> Result<Option<Asset>, ApiError> {
+    if let Some((at, asset)) = state.pasted.lock().map_err(internal)?.get(mint) {
+        if at.elapsed() < CATALOG_TTL {
+            return Ok(asset.clone());
+        }
+    }
+    let tokens: Vec<Value> = state
+        .http
+        .get(JUPITER_SEARCH)
+        .query(&[("query", mint)])
+        .send()
+        .await
+        .map_err(unavailable)?
+        .error_for_status()
+        .map_err(unavailable)?
+        .json()
+        .await
+        .map_err(unavailable)?;
+    let asset = tokens
+        .iter()
+        .find(|t| t["id"].as_str() == Some(mint))
+        .and_then(pasted_asset);
+    state
+        .pasted
+        .lock()
+        .map_err(internal)?
+        .insert(mint.to_owned(), (Instant::now(), asset.clone()));
+    Ok(asset)
 }
 
 // Every asset Atlas trades: the Base list plus Jupiter's verified Solana catalog, refreshed every
@@ -183,13 +264,17 @@ pub(super) async fn catalog(state: &MarketState) -> Result<Arc<Vec<Asset>>, ApiE
                 .ok_or_else(|| unavailable(format!("Jupiter token list unavailable: {error}")));
         }
     };
+    let mut solana: Vec<Asset> = tokens.iter().filter_map(solana_asset).collect();
+    // One row per symbol within a kind (there are two WBTCs, for one): the most traded wins.
+    solana.sort_by(|a, b| b.volume_24h.total_cmp(&a.volume_24h));
+    let mut symbols = std::collections::HashSet::new();
+    let mut mints = std::collections::HashSet::new();
     let mut assets = base_assets();
-    let mut seen = std::collections::HashSet::new();
-    for token in &tokens {
-        if let Some(asset) = solana_asset(token) {
-            if seen.insert(asset.id.clone()) {
-                assets.push(asset);
-            }
+    for asset in solana {
+        if mints.insert(asset.id.clone())
+            && symbols.insert((asset.symbol.to_ascii_uppercase(), asset.kind.clone()))
+        {
+            assets.push(asset);
         }
     }
     let assets = Arc::new(assets);
@@ -198,12 +283,15 @@ pub(super) async fn catalog(state: &MarketState) -> Result<Arc<Vec<Asset>>, ApiE
 }
 
 pub(super) async fn find_asset(state: &MarketState, id: &str) -> Result<Asset, ApiError> {
-    catalog(state)
-        .await?
-        .iter()
-        .find(|a| a.id == id)
-        .cloned()
-        .ok_or((StatusCode::NOT_FOUND, "unsupported asset".into()))
+    if let Some(asset) = catalog(state).await?.iter().find(|a| a.id == id) {
+        return Ok(asset.clone());
+    }
+    if looks_like_mint(id) {
+        if let Some(asset) = pasted_token(state, id).await? {
+            return Ok(asset);
+        }
+    }
+    Err((StatusCode::NOT_FOUND, "unsupported asset".into()))
 }
 
 // Live USD price and 24h change for Solana mints, from Jupiter, 50 at a time, shared for 15 seconds.
@@ -259,6 +347,7 @@ pub(super) struct MarketState {
     quotes: Arc<Mutex<HashMap<String, StoredQuote>>>,
     intents: Arc<Mutex<HashMap<String, StoredIntent>>>,
     catalog: Arc<Mutex<Option<(Instant, Arc<Vec<Asset>>)>>>,
+    pasted: Arc<Mutex<HashMap<String, (Instant, Option<Asset>)>>>,
     prices: Arc<Mutex<HashMap<String, (Instant, f64, Option<f64>)>>>,
     multipliers: Arc<Mutex<HashMap<String, (Instant, bool)>>>,
     chart_pools: Arc<Mutex<HashMap<String, (Instant, String)>>>,
@@ -345,6 +434,7 @@ impl MarketState {
             quotes: Arc::new(Mutex::new(HashMap::new())),
             intents: Arc::new(Mutex::new(HashMap::new())),
             catalog: Arc::new(Mutex::new(None)),
+            pasted: Arc::new(Mutex::new(HashMap::new())),
             prices: Arc::new(Mutex::new(HashMap::new())),
             multipliers: Arc::new(Mutex::new(HashMap::new())),
             chart_pools: Arc::new(Mutex::new(HashMap::new())),
@@ -418,7 +508,7 @@ fn unavailable(error: impl std::fmt::Display) -> ApiError {
     (StatusCode::BAD_GATEWAY, error.to_string())
 }
 fn checked_currency(currency: &str) -> Result<(), ApiError> {
-    if matches!(currency, "USD" | "NGN" | "KES" | "GHS" | "ZAR") {
+    if DISPLAY_CURRENCIES.contains(&currency) {
         Ok(())
     } else {
         Err(bad("unsupported display currency"))
@@ -622,8 +712,23 @@ pub(super) async fn assets(
         _ => return Err(bad("unsupported asset category")),
     };
     let rate = app_balance::fx_rate(&currency).await?;
-    let query = q.q.unwrap_or_default().trim().to_ascii_lowercase();
+    let raw = q.q.unwrap_or_default();
+    let raw = raw.trim();
+    let query = raw.to_ascii_lowercase();
     let catalog = catalog(&state.markets).await?;
+    // A pasted token address finds that token, listed or not, whatever chip is selected.
+    let by_address = looks_like_mint(raw);
+    let pasted: Vec<Asset> = if by_address {
+        match catalog.iter().find(|a| a.token == raw) {
+            Some(listed) => vec![listed.clone()],
+            None => pasted_token(&state.markets, raw)
+                .await?
+                .into_iter()
+                .collect(),
+        }
+    } else {
+        Vec::new()
+    };
     let rank = |a: &Asset| -> u8 {
         let (symbol, name) = (a.symbol.to_ascii_lowercase(), a.name.to_ascii_lowercase());
         if symbol == query {
@@ -636,15 +741,19 @@ pub(super) async fn assets(
             3
         }
     };
-    let mut picked: Vec<&Asset> = catalog
-        .iter()
-        .filter(|a| kind.is_none_or(|k| a.kind == k))
-        .filter(|a| {
-            query.is_empty()
-                || a.symbol.to_ascii_lowercase().contains(&query)
-                || a.name.to_ascii_lowercase().contains(&query)
-        })
-        .collect();
+    let mut picked: Vec<&Asset> = if by_address {
+        pasted.iter().collect()
+    } else {
+        catalog
+            .iter()
+            .filter(|a| kind.is_none_or(|k| a.kind == k))
+            .filter(|a| {
+                query.is_empty()
+                    || a.symbol.to_ascii_lowercase().contains(&query)
+                    || a.name.to_ascii_lowercase().contains(&query)
+            })
+            .collect()
+    };
     // Most traded first (a search puts close name matches ahead of that).
     picked.sort_by(|a, b| {
         let by_match = if query.is_empty() { 0 } else { rank(a) }.cmp(&if query.is_empty() {
@@ -685,7 +794,7 @@ pub(super) async fn assets(
                 None,
             )
         };
-        result.push(json!({"assetId":a.id,"symbol":a.symbol,"name":a.name,"kind":a.kind,"price":price,"change24hPct":change,"iconUrl":a.icon_url}));
+        result.push(json!({"assetId":a.id,"symbol":a.symbol,"name":a.name,"kind":a.kind,"price":price,"change24hPct":change,"iconUrl":a.icon_url,"verified":a.verified}));
     }
     Ok(Json(json!({"assets":result})))
 }
@@ -1465,6 +1574,62 @@ mod tests {
         .unwrap();
         assert_eq!((sol.name.as_str(), sol.kind.as_str()), ("Solana", "crypto"));
         assert_eq!(base_assets().len(), 3);
+        // Pool shares and leveraged wrappers aren't listed; launchpad coins are memes.
+        assert!(solana_asset(&token(
+            "jlp",
+            "JLP",
+            "Jupiter Perps",
+            &["verified", "defi"],
+            true,
+            5e8
+        ))
+        .is_none());
+        assert!(solana_asset(&token(
+            "xsol",
+            "xSOL",
+            "Hylo Leveraged SOL",
+            &["verified"],
+            true,
+            5e6
+        ))
+        .is_none());
+        let mut cate = token(
+            "CATEmint1111111111111111111111pump",
+            "CATE",
+            "Cate",
+            &["verified"],
+            true,
+            5e5,
+        );
+        assert_eq!(solana_asset(&cate).unwrap().kind, "meme");
+        cate["id"] = json!("ZCATmint");
+        cate["firstPool"] = json!({"launchpad":"stonkfun"});
+        assert_eq!(solana_asset(&cate).unwrap().kind, "meme");
+        assert_eq!(
+            solana_asset(&token("doge", "DOGE", "Dogecoin", &["verified"], true, 5e6))
+                .unwrap()
+                .kind,
+            "meme"
+        );
+        // A pasted address may be unverified (flagged), but never dead.
+        let pasted = pasted_asset(&token(
+            "anon",
+            "ANON",
+            "Anon",
+            &["unknown"],
+            false,
+            20_000.0,
+        ))
+        .unwrap();
+        assert!(!pasted.verified);
+        assert!(pasted_asset(&token("dead", "DEAD", "Dead", &["unknown"], false, 50.0)).is_none());
+        assert!(looks_like_mint(
+            "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+        ));
+        assert!(!looks_like_mint("bonk"));
+        assert!(!looks_like_mint(
+            "0x532f27101965dd16442E59d40670FaF5eBB142E4"
+        ));
     }
     // Network: the real Jupiter verified list through the real filter.
     // cargo test -p engine-service live_jupiter_catalog -- --ignored --nocapture
