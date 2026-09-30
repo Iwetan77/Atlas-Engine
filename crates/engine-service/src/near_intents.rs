@@ -29,7 +29,6 @@ struct StoredQuote {
     amount: u128,
     minimum_out: u128,
     currency: String,
-    display_amount: String,
     expires: u64,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -515,7 +514,6 @@ pub(super) async fn quote(
             amount,
             minimum_out: minimum,
             currency: req.amount.currency.clone(),
-            display_amount: req.amount.amount,
             expires,
         },
     );
@@ -643,13 +641,16 @@ pub(super) async fn execute(
             },
         )
         .await?;
+    let rate = app_balance::fx_rate(&stored.currency).await?;
+    let mut chain = stored.asset.blockchain.clone();
+    if let Some(first) = chain.get_mut(..1) {
+        first.make_ascii_uppercase();
+    }
     Ok(Json(json!({"intentId":intent_id,"kind":"buy",
-        "summary":[{"label":"Pay","value":format!("{} USDC",markets::format_units(stored.amount,6))},
-        {"label":"Receive (estimated)","value":format!("{} {}",markets::format_units(
+        "summary":[{"label":"You pay","value":markets::say_money(stored.amount,&stored.currency,rate)},
+        {"label":"You get (about)","value":format!("{} {}",markets::format_units(
             fresh.amount_out.parse().map_err(internal)?,stored.asset.decimals),stored.asset.symbol)},
-        {"label":"Destination","value":stored.asset.blockchain},
-        {"label":"Requested value","value":stored.display_amount},
-        {"label":"Display currency","value":stored.currency}],
+        {"label":"Lands on","value":chain}],
         "transactions":[{"chain":"base","chainId":8453,"to":tx.to,"data":tx.data,"value":"0"}],
         "expiresAtUnixMs":expires})))
 }

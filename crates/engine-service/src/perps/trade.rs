@@ -548,21 +548,21 @@ pub(crate) async fn execute_quote(
         .iter()
         .map(|f| json!({"chain":"base","chainId":8453,"to":f.to,"data":f.data,"value":"0"}))
         .collect();
+    let margin = match markets::parse_micros(&quote.margin) {
+        Ok(micros) => markets::say_micros(micros, &quote.currency),
+        Err(_) => format!("{} {}", quote.margin, quote.currency),
+    };
     let mut summary = vec![
         json!({"label":"Market","value":quote.market}),
-        json!({"label":"Side","value":quote.side}),
+        json!({"label":"Side","value":if quote.side == "long" {"Long"} else {"Short"}}),
         json!({"label":"Size","value":quote.size}),
         json!({"label":"Leverage","value":format!("{}x",quote.leverage)}),
-        json!({"label":"Margin","value":format!("{} {}",quote.margin,quote.currency)}),
+        json!({"label":"Margin","value":margin}),
     ];
     if let Some(f) = &funding {
-        summary.push(
-            json!({"label":"Moved from your balance to Paradex","value":format!(
-                "{}.{:06} USDC",
-                f.amount_units / 1_000_000,
-                f.amount_units % 1_000_000
-            )}),
-        );
+        let rate = app_balance::fx_rate(&quote.currency).await?;
+        summary.push(json!({"label":"Moved from your balance to Paradex",
+            "value":markets::say_money(f.amount_units, &quote.currency, rate)}));
     }
     summary.push(json!({"label":"Liquidation price","value":"Shown once open"}));
     let status = markets::IntentStatus {
@@ -821,10 +821,18 @@ pub(crate) async fn execute_close(
             },
         )
         .await?;
+    // Paradex prices are in USD; the sheet shows their currency.
+    let rate = app_balance::fx_rate(&quote.currency).await?;
+    let exit_price = match quote.price.parse::<f64>() {
+        Ok(usd) if usd.is_finite() && usd > 0.0 => {
+            markets::say_micros((usd * rate as f64) as u128, &quote.currency)
+        }
+        _ => format!("{} USD", quote.price),
+    };
     Ok(Json(
         json!({"intentId":intent_id,"kind":"perp_close","summary":[
         {"label":"Market","value":quote.market},{"label":"Action","value":"Close position"},
-        {"label":"Size","value":quote.size},{"label":"Estimated exit price","value":format!("{} USD",quote.price)}
+        {"label":"Size","value":quote.size},{"label":"Estimated exit price","value":exit_price}
     ],"transactions":[],"expiresAtUnixMs":expires}),
     ))
 }

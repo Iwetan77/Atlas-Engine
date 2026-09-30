@@ -57,6 +57,9 @@ struct EarnQuote {
     shares: u128,
     // Withdraw everything, principal and interest, rather than a fixed amount.
     all: bool,
+    // What the confirm sheet speaks in.
+    currency: String,
+    rate: u128,
     expires: u64,
 }
 
@@ -526,6 +529,8 @@ pub(super) async fn quote(
             units,
             shares,
             all,
+            currency: currency.clone(),
+            rate,
             expires,
         },
     );
@@ -623,7 +628,7 @@ pub(super) async fn execute(
     let amount = if quote.all {
         "Everything in savings".into()
     } else {
-        format!("{} USDC", usdc(quote.units))
+        markets::say_money(quote.units, &quote.currency, quote.rate)
     };
     Ok(Json(json!({
         "intentId":intent_id,
@@ -668,7 +673,7 @@ async fn execute_lend(
     let amount = if quote.all {
         "Everything in savings".into()
     } else {
-        format!("{} USDC", usdc(quote.units))
+        markets::say_money(quote.units, &quote.currency, quote.rate)
     };
     Ok(Json(json!({
         "intentId":intent_id,

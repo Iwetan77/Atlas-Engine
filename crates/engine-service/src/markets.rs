@@ -469,7 +469,6 @@ struct StoredQuote {
     asset: Asset,
     side: String,
     currency: String,
-    display_amount: String,
     input_units: u128,
     output_units: u128,
 
@@ -847,7 +846,10 @@ fn group_digits(n: u128) -> String {
 }
 // Money in a sentence people read, in their own currency: "₦1,504.69".
 pub(super) fn say_money(usdc_units: u128, currency: &str, rate: u128) -> String {
-    let micros = usdc_units.saturating_mul(rate) / 1_000_000;
+    say_micros(usdc_units.saturating_mul(rate) / 1_000_000, currency)
+}
+// An amount already in their currency, in micros (6 decimals): "₦15,000.00".
+pub(super) fn say_micros(micros: u128, currency: &str) -> String {
     format!(
         "{}{}.{:02}",
         currency_symbol(currency),
@@ -1486,7 +1488,6 @@ pub(super) async fn quote(
             asset: a.clone(),
             side: req.side.clone(),
             currency: req.amount.currency.clone(),
-            display_amount: req.amount.amount,
             input_units: actual_in,
             output_units: actual_out,
             expires,
@@ -1687,19 +1688,18 @@ pub(super) async fn execute_quote(
     }
     let intent_id = id("intent");
     let expires = now() + if a.chain == "base" { 120_000 } else { 45_000 };
-    let receive = if stored.side == "buy" {
-        format!("{} {}", format_units(output, a.decimals), a.symbol)
+    // The confirm sheet speaks their currency: cash as money, the asset as tokens.
+    let rate = app_balance::fx_rate(&stored.currency).await?;
+    let summary = if stored.side == "buy" {
+        json!([
+            {"label":"You pay","value":say_money(stored.input_units, &stored.currency, rate)},
+            {"label":"You get (about)","value":format!("{} {}", format_units(output, a.decimals), a.symbol)},
+        ])
     } else {
-        format!("{} USDC", format_units(output, 6))
-    };
-    let pay = if stored.side == "buy" {
-        format!("{} USDC", format_units(stored.input_units, 6))
-    } else {
-        format!(
-            "{} {}",
-            format_units(stored.input_units, a.decimals),
-            a.symbol
-        )
+        json!([
+            {"label":"You sell","value":format!("{} {}", format_units(stored.input_units, a.decimals), a.symbol)},
+            {"label":"You get (about)","value":say_money(output, &stored.currency, rate)},
+        ])
     };
     let status = IntentStatus {
         intent_id: intent_id.clone(),
@@ -1734,7 +1734,7 @@ pub(super) async fn execute_quote(
         )
         .await?;
     Ok(Json(
-        json!({"intentId":intent_id,"kind":stored.side,"summary":[{"label":"Pay","value":pay},{"label":"Receive (estimated)","value":receive},{"label":"Display currency","value":stored.currency},{"label":"Requested value","value":stored.display_amount}],"transactions":transactions,"expiresAtUnixMs":expires}),
+        json!({"intentId":intent_id,"kind":stored.side,"summary":summary,"transactions":transactions,"expiresAtUnixMs":expires}),
     ))
 }
 

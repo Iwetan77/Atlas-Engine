@@ -101,16 +101,6 @@ fn now() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
-fn format_usdc(units: u128) -> String {
-    let mut amount = format!("{}.{:06}", units / 1_000_000, units % 1_000_000);
-    while amount.ends_with('0') {
-        amount.pop();
-    }
-    if amount.ends_with('.') {
-        amount.pop();
-    }
-    amount
-}
 fn invalid_handle(handle: &str) -> bool {
     !(3..=20).contains(&handle.len())
         || !handle
@@ -626,7 +616,6 @@ pub(super) async fn execute_send(
         )
         .map_err(internal)?;
     let rate = app_balance::fx_rate(&quote.currency).await?;
-    let amount = money_usdc(quote.usdc_units, &quote.currency, rate)?;
     // A repeated execute gets the same plan back.
     if let Some(plan) = state
         .social
@@ -657,7 +646,7 @@ pub(super) async fn execute_send(
     if let Some(plan) = &stored.plan {
         return Ok(Json(plan.clone()));
     }
-    let plan = json!({"intentId":intent_id,"kind":"send","summary":[{"label":"Send to","value":quote.label},{"label":"Amount","value":format!("{} USDC",format_usdc(quote.usdc_units))},{"label":"Display value","value":format!("{} {}",amount["amount"].as_str().unwrap_or(""),quote.currency)}],"transactions":[{"chain":"base","chainId":8453,"to":tx.to,"data":tx.data,"value":"0"}],"expiresAtUnixMs":now()+120_000});
+    let plan = json!({"intentId":intent_id,"kind":"send","summary":[{"label":"Send to","value":quote.label},{"label":"Amount","value":markets::say_money(quote.usdc_units,&quote.currency,rate)}],"transactions":[{"chain":"base","chainId":8453,"to":tx.to,"data":tx.data,"value":"0"}],"expiresAtUnixMs":now()+120_000});
     stored.plan = Some(plan.clone());
     Ok(Json(plan))
 }
