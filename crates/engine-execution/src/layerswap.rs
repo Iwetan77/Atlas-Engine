@@ -124,6 +124,42 @@ impl LayerswapClient {
         amount_units: u128,
         reference: &str,
     ) -> Result<SolanaDeposit, LayerswapError> {
+        self.solana_to(
+            "BASE_MAINNET",
+            solana_owner,
+            base_address,
+            amount_units,
+            reference,
+        )
+        .await
+    }
+
+    /// Solana USDC straight into the user's Paradex account (perps margin paid with Solana cash).
+    pub async fn solana_to_paradex(
+        &self,
+        solana_owner: &str,
+        paradex_account: &str,
+        amount_units: u128,
+        reference: &str,
+    ) -> Result<SolanaDeposit, LayerswapError> {
+        self.solana_to(
+            "PARADEX_MAINNET",
+            solana_owner,
+            paradex_account,
+            amount_units,
+            reference,
+        )
+        .await
+    }
+
+    async fn solana_to(
+        &self,
+        destination_network: &str,
+        solana_owner: &str,
+        destination_address: &str,
+        amount_units: u128,
+        reference: &str,
+    ) -> Result<SolanaDeposit, LayerswapError> {
         let amount: serde_json::Number = usdc_decimal(amount_units)
             .parse()
             .map_err(|_| LayerswapError::InvalidResponse("amount"))?;
@@ -136,9 +172,9 @@ impl LayerswapClient {
             .post(url)
             .json(&json!({
                 "source_network":"SOLANA_MAINNET","source_token":"USDC",
-                "destination_network":"BASE_MAINNET","destination_token":"USDC",
+                "destination_network":destination_network,"destination_token":"USDC",
                 "amount":amount,"source_address":solana_owner,
-                "destination_address":base_address,
+                "destination_address":destination_address,
                 "use_deposit_address":false,"reference_id":reference
             }))
             .send()

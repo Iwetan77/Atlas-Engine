@@ -1644,7 +1644,11 @@ const GAS_TOPUP_USDC: u128 = 500_000;
 // A gasless $0.50 USDC → SOL swap (Jupiter's market makers pay its fee) when the wallet is below the
 // floor and has the USDC to spare beyond `reserve` (what the main step spends). Returns the Jupiter
 // request and its transaction, or None when no top-up is needed or none can be made.
-async fn gas_topup(state: &AppState, owner: &str, reserve: u128) -> Option<(String, String)> {
+pub(super) async fn gas_topup(
+    state: &AppState,
+    owner: &str,
+    reserve: u128,
+) -> Option<(String, String)> {
     gas_topup_below(state, owner, reserve, GAS_FLOOR_LAMPORTS).await
 }
 
@@ -1677,6 +1681,13 @@ async fn gas_topup_below(
         return None;
     }
     Some((order.request_id, order.transaction?))
+}
+
+// Lands a signed gas top-up by its Jupiter request (perps funding uses this directly).
+pub(super) async fn land_gas_topup(state: &AppState, request_id: &str, signed_tx: &str) {
+    if let Err(error) = state.markets.jupiter.execute(request_id, signed_tx).await {
+        eprintln!("gas top-up didn't land: {error}");
+    }
 }
 
 // Runs the gas top-up the user signed (index 0) before their main Solana transaction. A failed

@@ -185,6 +185,9 @@ struct Quote {
     // account already holds enough.
     #[serde(default)]
     funding_units: u128,
+    // The margin comes from Solana cash (Base was short).
+    #[serde(default)]
+    funding_from_solana: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Funding {
@@ -194,6 +197,12 @@ struct Funding {
     amount_units: u128,
     #[serde(default)]
     tx_hash: Option<String>,
+    // Paid from Solana: the app signs a Solana deposit the engine lands (tx_hash is its signature),
+    // with a gas top-up first when the wallet needs one.
+    #[serde(default)]
+    solana: bool,
+    #[serde(default)]
+    gas_request_id: Option<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Intent {
@@ -415,6 +424,7 @@ pub(crate) async fn quotes(
     let needed = margin
         .checked_add(fee)
         .ok_or((StatusCode::BAD_REQUEST, "margin too large".into()))?;
+    let mut funding_from_solana = false;
     let funding_units = if collateral >= needed {
         0
     } else if trading_env()? == "prod" {
@@ -426,7 +436,19 @@ pub(crate) async fn quotes(
             .await
             .map_err(internal)?;
         if available < usdc_units {
-            return Err(markets::short_of_cash());
+            // One balance: Solana cash can fund the margin straight into Paradex.
+            let solana = app_balance::verified_wallets(&state, &headers)
+                .await?
+                .solana_wallet
+                .filter(|w| !w.is_empty());
+            let solana_cash = match &solana {
+                Some(owner) => markets::solana_cash(&state, owner).await,
+                None => 0,
+            };
+            if solana_cash < usdc_units {
+                return Err(markets::short_of_cash());
+            }
+            funding_from_solana = true;
         }
         usdc_units
     } else {
@@ -455,6 +477,7 @@ pub(crate) async fn quotes(
             currency: currency.clone(),
             margin: body.margin.amount.clone(),
             funding_units,
+            funding_from_solana,
         },
     );
     let funding = if funding_units > 0 {
@@ -518,7 +541,42 @@ pub(crate) async fn execute_quote(
         ));
     }
     let intent_id = new_id("open");
-    let funding = if quote.funding_units > 0 {
+    let mut solana_plan: Vec<Value> = Vec::new();
+    let funding = if quote.funding_units > 0 && quote.funding_from_solana {
+        let solana = app_balance::verified_wallets(&state, &headers)
+            .await?
+            .solana_wallet
+            .filter(|w| !w.is_empty())
+            .ok_or((
+                StatusCode::CONFLICT,
+                "Privy Solana wallet is not ready".into(),
+            ))?;
+        let deposit = state
+            .layerswap
+            .solana_to_paradex(&solana, &quote.account, quote.funding_units, &intent_id)
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Couldn't set up the move to Paradex: {error}"),
+                )
+            })?;
+        let gas = markets::gas_topup(&state, &solana, quote.funding_units).await;
+        if let Some((_, gas_tx)) = &gas {
+            solana_plan.push(json!({"chain":"solana","transaction":gas_tx,"submit":"engine"}));
+        }
+        solana_plan
+            .push(json!({"chain":"solana","transaction":deposit.transaction,"submit":"engine"}));
+        Some(Funding {
+            swap_id: deposit.swap_id,
+            to: String::new(),
+            data: String::new(),
+            amount_units: deposit.amount_units,
+            tx_hash: None,
+            solana: true,
+            gas_request_id: gas.map(|(id, _)| id),
+        })
+    } else if quote.funding_units > 0 {
         let deposit = state
             .layerswap
             .base_to_paradex(
@@ -540,14 +598,20 @@ pub(crate) async fn execute_quote(
             data: deposit.data,
             amount_units: deposit.amount_units,
             tx_hash: None,
+            solana: false,
+            gas_request_id: None,
         })
     } else {
         None
     };
-    let transactions: Vec<Value> = funding
-        .iter()
-        .map(|f| json!({"chain":"base","chainId":8453,"to":f.to,"data":f.data,"value":"0"}))
-        .collect();
+    let transactions: Vec<Value> = if !solana_plan.is_empty() {
+        solana_plan
+    } else {
+        funding
+            .iter()
+            .map(|f| json!({"chain":"base","chainId":8453,"to":f.to,"data":f.data,"value":"0"}))
+            .collect()
+    };
     let margin = match markets::parse_micros(&quote.margin) {
         Ok(micros) => markets::say_micros(micros, &quote.currency),
         Err(_) => format!("{} {}", quote.margin, quote.currency),
@@ -717,6 +781,7 @@ pub(crate) async fn close_quote(
             currency: currency.into(),
             margin: format_units(basis),
             funding_units: 0,
+            funding_from_solana: false,
         },
     );
     Ok(Json(json!({"quoteId":quote_id,"positionId":position_id,
@@ -1140,7 +1205,31 @@ pub(crate) async fn signed(
         .ok_or((StatusCode::NOT_FOUND, "perps intent not found".into()))?;
     // A funded plan has exactly one app transaction: the Base transfer to Paradex. It's checked
     // against the plan (sender, contract, calldata, receipt) before anything waits on it.
-    let funding_tx = if planned.funding.is_some() {
+    let funding_tx = if let Some(funding) = planned.funding.as_ref().filter(|f| f.solana) {
+        // Paid from Solana: [gas top-up?, deposit], signed in the app, landed here.
+        let main = usize::from(funding.gas_request_id.is_some());
+        if !body.sent.is_empty() || body.signed.len() != main + 1 || body.signed[main].index != main
+        {
+            return Err(bad("expected the transfer to Paradex"));
+        }
+        if planned.status.stage != "validate" {
+            return Ok(Json(planned.status));
+        }
+        if let (Some(gas_id), true) = (&funding.gas_request_id, main == 1) {
+            markets::land_gas_topup(&state, gas_id, &body.signed[0].transaction).await;
+        }
+        let signature = state
+            .solana_mainnet
+            .send_signed(&body.signed[main].transaction)
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("Moving your margin didn't go through: {error}"),
+                )
+            })?;
+        Some(signature)
+    } else if planned.funding.is_some() {
         let [sent] = body.sent.as_slice() else {
             return Err(bad("expected the transfer to Paradex"));
         };
@@ -1228,6 +1317,7 @@ pub(crate) async fn planned_funding(
         .await?
         .filter(|i| i.quote.owner == owner && i.status.stage == "validate")
         .and_then(|i| i.funding)
+        .filter(|f| !f.solana)
         .map(|f| (f.to, f.data)))
 }
 pub(crate) fn is_tx_hash(value: &str) -> bool {
@@ -1245,7 +1335,19 @@ async fn await_funding(state: &AppState, intent: &Intent) -> Result<(), String> 
         .ok_or("No transfer to Paradex was reported; nothing was ordered")?;
     let deadline = tokio::time::Instant::now() + FUNDING_LIMIT;
     let pause = || tokio::time::sleep(std::time::Duration::from_secs(4));
-    loop {
+    while funding.solana {
+        if tokio::time::Instant::now() > deadline {
+            return Err("Your transfer to Paradex hasn't confirmed; nothing was ordered".into());
+        }
+        match state.solana_mainnet.signature_status(hash).await {
+            Ok(Some(Ok(()))) => break,
+            Ok(Some(Err(_))) => {
+                return Err("Your transfer to Paradex failed, so nothing left your balance and nothing was ordered".into());
+            }
+            _ => pause().await,
+        }
+    }
+    while !funding.solana {
         if tokio::time::Instant::now() > deadline {
             return Err(
                 "Your transfer to Paradex hasn't confirmed on Base; nothing was ordered".into(),
@@ -1519,6 +1621,7 @@ mod tests {
                 currency: "USD".into(),
                 margin: "20".into(),
                 funding_units: 0,
+                funding_from_solana: false,
             },
             client_id: "perp-open-1".into(),
             order_id: None,
