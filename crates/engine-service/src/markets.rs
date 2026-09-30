@@ -681,6 +681,24 @@ pub(super) struct ChartQuery {
     currency: Option<String>,
 }
 const GECKOTERMINAL: &str = "https://api.geckoterminal.com/api/v2/networks/";
+const JUPITER_CHARTS: &str = "https://datapi.jup.ag/v2/charts/";
+
+// Jupiter chart candles: {"candles":[{"time": unix seconds, "close": usd, ...}]}, oldest first.
+fn jupiter_closes(body: &Value) -> Vec<(u64, f64)> {
+    let mut points: Vec<(u64, f64)> = body["candles"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(|c| {
+                    let close = c["close"].as_f64().filter(|v| v.is_finite() && *v > 0.0)?;
+                    Some((c["time"].as_u64()? * 1000, close))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    points.sort_by_key(|(ms, _)| *ms);
+    points
+}
 
 // Price history for an asset's detail screen, from on-chain trades in its deepest pool
 // (GeckoTerminal). Display only: `points` are [unix ms, price in the display currency], oldest first.
@@ -694,12 +712,13 @@ pub(super) async fn chart(
     let currency = q.currency.unwrap_or_else(|| "NGN".into());
     checked_currency(&currency)?;
     let range = q.range.unwrap_or_else(|| "1D".into());
-    // GeckoTerminal allows ~30 calls a minute, so longer ranges are cached longer.
-    let (timeframe, aggregate, limit, ttl) = match range.as_str() {
-        "1D" => ("minute", 15, 96, Duration::from_secs(60)),
-        "1W" => ("hour", 1, 168, Duration::from_secs(300)),
-        "1M" => ("hour", 4, 180, Duration::from_secs(900)),
-        "1Y" => ("day", 1, 365, Duration::from_secs(3600)),
+    // (Jupiter interval, GeckoTerminal timeframe + aggregate, candles, cache). Longer ranges change
+    // slowly and are cached longer.
+    let (interval, timeframe, aggregate, limit, ttl) = match range.as_str() {
+        "1D" => ("15_MINUTE", "minute", 15, 96, Duration::from_secs(60)),
+        "1W" => ("1_HOUR", "hour", 1, 168, Duration::from_secs(300)),
+        "1M" => ("4_HOUR", "hour", 4, 180, Duration::from_secs(900)),
+        "1Y" => ("1_DAY", "day", 1, 365, Duration::from_secs(3600)),
         _ => return Err(bad("range must be 1D, 1W, 1M or 1Y")),
     };
     let asset = find_asset(&state.markets, &asset_id).await?;
@@ -721,16 +740,43 @@ pub(super) async fn chart(
     let points = match cached {
         Some(points) => points,
         None => {
-            let pool = deepest_pool(&state.markets, network, &asset.token).await?;
-            let body: Value = gecko(
-                &state.markets,
-                &format!(
-                    "{network}/pools/{pool}/ohlcv/{timeframe}?aggregate={aggregate}&limit={limit}&currency=usd&token={}",
-                    asset.token
-                ),
-            )
-            .await?;
-            let points = Arc::new(ohlcv_closes(&body));
+            // Solana: Jupiter's chart data (what jup.ag draws). Base: GeckoTerminal, whose free
+            // limit is per IP and often spent on shared hosts, so it may be unavailable.
+            let points = if network == "solana" {
+                let url = format!(
+                    "{JUPITER_CHARTS}{}?interval={interval}&to={}&candles={limit}&type=price",
+                    asset.token,
+                    now()
+                );
+                let body: Value = state
+                    .markets
+                    .http
+                    .get(url)
+                    .send()
+                    .await
+                    .map_err(unavailable)?
+                    .error_for_status()
+                    .map_err(|e| unavailable(format!("price history unavailable: {e}")))?
+                    .json()
+                    .await
+                    .map_err(unavailable)?;
+                jupiter_closes(&body)
+            } else {
+                let pool = deepest_pool(&state.markets, network, &asset.token).await?;
+                let body: Value = gecko(
+                    &state.markets,
+                    &format!(
+                        "{network}/pools/{pool}/ohlcv/{timeframe}?aggregate={aggregate}&limit={limit}&currency=usd&token={}",
+                        asset.token
+                    ),
+                )
+                .await?;
+                ohlcv_closes(&body)
+            };
+            if points.is_empty() {
+                return Err(unavailable("no price history for this asset yet"));
+            }
+            let points = Arc::new(points);
             state
                 .markets
                 .charts
@@ -1441,6 +1487,18 @@ mod tests {
         assert!(!assets
             .iter()
             .any(|a| a.symbol.to_ascii_uppercase().contains("USD")));
+    }
+    #[test]
+    fn jupiter_chart_candles_become_points() {
+        let body = json!({"candles":[
+            {"time":1790755200,"open":1.0,"high":1.0,"low":1.0,"close":354.57,"volume":1.0},
+            {"time":1790754300,"close":"bad"},
+            {"time":1790753400,"close":354.2}
+        ]});
+        assert_eq!(
+            jupiter_closes(&body),
+            vec![(1790753400000, 354.2), (1790755200000, 354.57)]
+        );
     }
     #[test]
     fn chart_points_are_oldest_first_and_skip_bad_candles() {
