@@ -425,6 +425,8 @@ pub(super) struct MarketState {
     multipliers: Arc<Mutex<HashMap<String, (Instant, bool)>>>,
     chart_pools: Arc<Mutex<HashMap<String, (Instant, String)>>>,
     charts: ChartCache,
+    // Spot, send and Earn intents outlive a restart here; without DATABASE_URL they stay in `intents`.
+    postgres: Option<Arc<tokio_postgres::Client>>,
 }
 type ChartCache = Arc<Mutex<HashMap<String, (Instant, Arc<Vec<(u64, f64)>>)>>>;
 #[derive(Clone)]
@@ -439,7 +441,7 @@ struct StoredQuote {
 
     expires: u64,
 }
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct StoredIntent {
     owner: String,
     wallet: String,
@@ -450,7 +452,7 @@ struct StoredIntent {
     // Set for spot buys and sells, so the fill can be kept as a trade.
     trade: Option<PlannedTrade>,
 }
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct PlannedTrade {
     asset_id: String,
     side: String,
@@ -524,27 +526,124 @@ impl MarketState {
             multipliers: Arc::new(Mutex::new(HashMap::new())),
             chart_pools: Arc::new(Mutex::new(HashMap::new())),
             charts: Arc::new(Mutex::new(HashMap::new())),
+            postgres: None,
         })
+    }
+    pub(super) async fn with_database(mut self) -> Result<Self, Box<dyn std::error::Error>> {
+        if let Ok(url) = env::var("DATABASE_URL") {
+            let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
+            tokio::spawn(async move {
+                if let Err(error) = connection.await {
+                    eprintln!("intents database connection ended: {error}");
+                }
+            });
+            client
+                .batch_execute(
+                    "CREATE TABLE IF NOT EXISTS atlas_intents (
+                    intent_id TEXT PRIMARY KEY,
+                    owner TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    updated_at_ms BIGINT NOT NULL
+                )",
+                )
+                .await?;
+            self.postgres = Some(Arc::new(client));
+        }
+        Ok(self)
+    }
+    async fn insert_intent(&self, id: &str, intent: &StoredIntent) -> Result<(), ApiError> {
+        if let Some(pg) = &self.postgres {
+            let payload = serde_json::to_string(intent).map_err(internal)?;
+            pg.execute(
+                "INSERT INTO atlas_intents (intent_id,owner,payload,stage,updated_at_ms) VALUES ($1,$2,$3,$4,$5)",
+                &[&id, &intent.owner, &payload, &intent.status.stage, &now_i64()],
+            )
+            .await
+            .map_err(internal)?;
+        } else {
+            self.intents
+                .lock()
+                .map_err(internal)?
+                .insert(id.into(), intent.clone());
+        }
+        Ok(())
+    }
+    async fn get_intent(&self, id: &str) -> Result<Option<StoredIntent>, ApiError> {
+        if let Some(pg) = &self.postgres {
+            let row = pg
+                .query_opt(
+                    "SELECT payload FROM atlas_intents WHERE intent_id=$1",
+                    &[&id],
+                )
+                .await
+                .map_err(internal)?;
+            return row
+                .map(|r| serde_json::from_str(r.get::<_, &str>(0)).map_err(internal))
+                .transpose();
+        }
+        Ok(self.intents.lock().map_err(internal)?.get(id).cloned())
+    }
+    async fn save_intent(&self, id: &str, intent: &StoredIntent) -> Result<(), ApiError> {
+        if let Some(pg) = &self.postgres {
+            let payload = serde_json::to_string(intent).map_err(internal)?;
+            pg.execute(
+                "UPDATE atlas_intents SET payload=$2,stage=$3,updated_at_ms=$4 WHERE intent_id=$1",
+                &[&id, &payload, &intent.status.stage, &now_i64()],
+            )
+            .await
+            .map_err(internal)?;
+        } else {
+            self.intents
+                .lock()
+                .map_err(internal)?
+                .insert(id.into(), intent.clone());
+        }
+        Ok(())
+    }
+    // Moves a Solana intent from validate to execute exactly once, so a repeated /signed can't hand
+    // Jupiter the same order twice. False if another request already did.
+    async fn claim_execution(&self, id: &str, intent: &StoredIntent) -> Result<bool, ApiError> {
+        let mut claimed = intent.clone();
+        claimed.status.stage = "execute".into();
+        if let Some(pg) = &self.postgres {
+            let payload = serde_json::to_string(&claimed).map_err(internal)?;
+            let rows = pg
+                .execute(
+                    "UPDATE atlas_intents SET payload=$2,stage='execute',updated_at_ms=$3
+                     WHERE intent_id=$1 AND stage='validate'",
+                    &[&id, &payload, &now_i64()],
+                )
+                .await
+                .map_err(internal)?;
+            return Ok(rows == 1);
+        }
+        let mut intents = self.intents.lock().map_err(internal)?;
+        match intents.get_mut(id) {
+            Some(stored) if stored.status.stage == "validate" => {
+                stored.status.stage = "execute".into();
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 }
 
 impl MarketState {
     // The Base transactions Atlas planned for this user's intent, while it's still awaiting them.
-    pub(super) fn planned_base_txs(
+    pub(super) async fn planned_base_txs(
         &self,
         intent_id: &str,
         owner: &str,
     ) -> Result<Vec<(String, String)>, ApiError> {
         Ok(self
-            .intents
-            .lock()
-            .map_err(internal)?
-            .get(intent_id)
+            .get_intent(intent_id)
+            .await?
             .filter(|i| i.owner == owner && i.chain == "base" && i.status.stage == "validate")
-            .map(|i| i.expected.clone())
+            .map(|i| i.expected)
             .unwrap_or_default())
     }
-    pub(super) fn register_base_transfer(
+    pub(super) async fn register_base_transfer(
         &self,
         owner: String,
         wallet: String,
@@ -552,9 +651,10 @@ impl MarketState {
         data: String,
     ) -> Result<String, ApiError> {
         self.register_base_txs(owner, wallet, vec![(to, data)])
+            .await
     }
     // A plan of Base transactions the user sends in order; /signed and status check each against it.
-    pub(super) fn register_base_txs(
+    pub(super) async fn register_base_txs(
         &self,
         owner: String,
         wallet: String,
@@ -568,9 +668,9 @@ impl MarketState {
             tx_ids: Vec::new(),
             error: None,
         };
-        self.intents.lock().map_err(internal)?.insert(
-            intent_id.clone(),
-            StoredIntent {
+        self.insert_intent(
+            &intent_id,
+            &StoredIntent {
                 owner,
                 wallet,
                 chain: "base".into(),
@@ -582,7 +682,8 @@ impl MarketState {
                 status,
                 trade: None,
             },
-        );
+        )
+        .await?;
         Ok(intent_id)
     }
 }
@@ -591,6 +692,9 @@ fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+fn now_i64() -> i64 {
+    i64::try_from(now()).unwrap_or(i64::MAX)
 }
 fn id(prefix: &str) -> String {
     format!(
@@ -1365,28 +1469,31 @@ pub(super) async fn execute_quote(
         tx_ids: Vec::new(),
         error: None,
     };
-    state.markets.intents.lock().map_err(internal)?.insert(
-        intent_id.clone(),
-        StoredIntent {
-            owner: user.user_id,
-            wallet,
-            chain: a.chain.clone(),
-            expected,
-            request_id,
-            status,
-            trade: Some(PlannedTrade {
-                asset_id: a.id.clone(),
-                side: stored.side.clone(),
-                pay_units: stored.input_units,
-                get_units: output,
-                receive_token: if stored.side == "buy" {
-                    a.token.to_ascii_lowercase()
-                } else {
-                    BASE_USDC.to_ascii_lowercase()
-                },
-            }),
-        },
-    );
+    state
+        .markets
+        .insert_intent(
+            &intent_id,
+            &StoredIntent {
+                owner: user.user_id,
+                wallet,
+                chain: a.chain.clone(),
+                expected,
+                request_id,
+                status,
+                trade: Some(PlannedTrade {
+                    asset_id: a.id.clone(),
+                    side: stored.side.clone(),
+                    pay_units: stored.input_units,
+                    get_units: output,
+                    receive_token: if stored.side == "buy" {
+                        a.token.to_ascii_lowercase()
+                    } else {
+                        BASE_USDC.to_ascii_lowercase()
+                    },
+                }),
+            },
+        )
+        .await?;
     Ok(Json(
         json!({"intentId":intent_id,"kind":stored.side,"summary":[{"label":"Pay","value":pay},{"label":"Receive (estimated)","value":receive},{"label":"Display currency","value":stored.currency},{"label":"Requested value","value":stored.display_amount}],"transactions":transactions,"expiresAtUnixMs":expires}),
     ))
@@ -1436,11 +1543,8 @@ pub(super) async fn signed(
     let user = app_balance::verified_wallets(&state, &headers).await?;
     let current = state
         .markets
-        .intents
-        .lock()
-        .map_err(internal)?
-        .get(&intent_id)
-        .cloned()
+        .get_intent(&intent_id)
+        .await?
         .ok_or((StatusCode::NOT_FOUND, "intent not found".into()))?;
     if current.owner != user.user_id {
         return Err((
@@ -1468,15 +1572,9 @@ pub(super) async fn signed(
         if !body.sent.is_empty() || body.signed.len() != 1 || body.signed[0].index != 0 {
             return Err(bad("signed report does not match Jupiter execution plan"));
         }
-        {
-            let mut intents = state.markets.intents.lock().map_err(internal)?;
-            let stored = intents
-                .get_mut(&intent_id)
-                .ok_or((StatusCode::NOT_FOUND, "intent not found".into()))?;
-            if stored.status.stage != "validate" {
-                return Ok(Json(stored.status.clone()));
-            }
-            stored.status.stage = "execute".into();
+        if !state.markets.claim_execution(&intent_id, &current).await? {
+            let latest = state.markets.get_intent(&intent_id).await?;
+            return Ok(Json(latest.map_or(current.status, |i| i.status)));
         }
         let request_id = current
             .request_id
@@ -1507,14 +1605,9 @@ pub(super) async fn signed(
             }
         }
     }
-    state
-        .markets
-        .intents
-        .lock()
-        .map_err(internal)?
-        .get_mut(&intent_id)
-        .ok_or((StatusCode::NOT_FOUND, "intent not found".into()))?
-        .status = status.clone();
+    let mut updated = current;
+    updated.status = status.clone();
+    state.markets.save_intent(&intent_id, &updated).await?;
     Ok(Json(status))
 }
 
@@ -1532,11 +1625,8 @@ pub(super) async fn intent_status(
     let user = app_balance::verified_wallets(&state, &headers).await?;
     let current = state
         .markets
-        .intents
-        .lock()
-        .map_err(internal)?
-        .get(&intent_id)
-        .cloned()
+        .get_intent(&intent_id)
+        .await?
         .ok_or((StatusCode::NOT_FOUND, "intent not found".into()))?;
     if current.owner != user.user_id {
         return Err((
@@ -1591,14 +1681,9 @@ pub(super) async fn intent_status(
             keep_trade(&state.trades, &intent_id, &current, &status, None, got).await;
         }
     }
-    state
-        .markets
-        .intents
-        .lock()
-        .map_err(internal)?
-        .get_mut(&intent_id)
-        .ok_or((StatusCode::NOT_FOUND, "intent not found".into()))?
-        .status = status.clone();
+    let mut updated = current;
+    updated.status = status.clone();
+    state.markets.save_intent(&intent_id, &updated).await?;
     Ok(Json(status))
 }
 
@@ -1694,6 +1779,63 @@ mod tests {
                 receive_token: String::new(),
             }),
         }
+    }
+
+    #[test]
+    fn stored_intents_survive_the_database_round_trip() {
+        // Token units past u64 (memecoins with 9+ decimals) must come back exact.
+        let mut intent = spot_intent("buy", 10_000_000, 40_000_000_000_000_000_000);
+        intent.expected = vec![("0xpool".into(), "0xdata".into())];
+        intent.request_id = Some("jup-req".into());
+        let json = serde_json::to_string(&intent).unwrap();
+        let back: StoredIntent = serde_json::from_str(&json).unwrap();
+        let trade = back.trade.unwrap();
+        assert_eq!(trade.get_units, 40_000_000_000_000_000_000);
+        assert_eq!(trade.pay_units, 10_000_000);
+        assert_eq!(back.expected, intent.expected);
+        assert_eq!(back.request_id.as_deref(), Some("jup-req"));
+        assert_eq!(back.status.tx_ids, vec!["sig".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_solana_order_is_claimed_for_execution_once() {
+        let markets = MarketState::new().unwrap();
+        let mut intent = spot_intent("buy", 1, 1);
+        intent.status.stage = "validate".into();
+        intent.status.state = "pending".into();
+        markets.insert_intent("intent-1", &intent).await.unwrap();
+        assert!(markets.claim_execution("intent-1", &intent).await.unwrap());
+        assert!(!markets.claim_execution("intent-1", &intent).await.unwrap());
+        assert!(!markets.claim_execution("missing", &intent).await.unwrap());
+        let stored = markets.get_intent("intent-1").await.unwrap().unwrap();
+        assert_eq!(stored.status.stage, "execute");
+        // Base plans are readable by the relay only while they still await the user's transactions.
+        let base_id = markets
+            .register_base_txs(
+                "did:privy:a".into(),
+                "0xwallet".into(),
+                vec![("0xPool".into(), "0xDATA".into())],
+            )
+            .await
+            .unwrap();
+        let planned = markets
+            .planned_base_txs(&base_id, "did:privy:a")
+            .await
+            .unwrap();
+        assert_eq!(planned, vec![("0xpool".to_string(), "0xdata".to_string())]);
+        assert!(markets
+            .planned_base_txs(&base_id, "did:privy:b")
+            .await
+            .unwrap()
+            .is_empty());
+        let mut sent = markets.get_intent(&base_id).await.unwrap().unwrap();
+        sent.status.stage = "settle".into();
+        markets.save_intent(&base_id, &sent).await.unwrap();
+        assert!(markets
+            .planned_base_txs(&base_id, "did:privy:a")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

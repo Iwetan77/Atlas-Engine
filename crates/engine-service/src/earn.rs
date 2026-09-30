@@ -339,7 +339,8 @@ pub(super) async fn execute(
     }
     let intent_id = state
         .markets
-        .register_base_txs(owner, wallet, txs.clone())?;
+        .register_base_txs(owner, wallet, txs.clone())
+        .await?;
     let transactions: Vec<Value> = txs
         .iter()
         .map(|(to, data)| json!({"chain":"base","chainId":8453,"to":to,"data":data,"value":"0"}))

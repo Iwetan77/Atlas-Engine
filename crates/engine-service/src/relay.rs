@@ -52,7 +52,8 @@ pub(super) async fn evm(
     } else {
         state
             .markets
-            .planned_base_txs(&req.intent_id, &user.user_id)?
+            .planned_base_txs(&req.intent_id, &user.user_id)
+            .await?
     };
     if !planned.iter().any(|(t, d)| *t == to && *d == data) {
         return Err((

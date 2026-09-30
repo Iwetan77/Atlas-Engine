@@ -179,7 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?,
         auth,
         network: AtlasNetwork::from_env()?,
-        markets: markets::MarketState::new()?,
+        markets: markets::MarketState::new()?.with_database().await?,
         near: near_intents::NearState::new().await?,
         paradex: engine_execution::perps::ParadexClient::new(
             &env::var("PARADEX_ENV").unwrap_or_else(|_| "prod".into()),

@@ -626,19 +626,36 @@ pub(super) async fn execute_send(
         .map_err(internal)?;
     let rate = app_balance::fx_rate(&quote.currency).await?;
     let amount = money_usdc(quote.usdc_units, &quote.currency, rate)?;
+    // A repeated execute gets the same plan back.
+    if let Some(plan) = state
+        .social
+        .quotes
+        .lock()
+        .map_err(internal)?
+        .get(&quote_id)
+        .ok_or((StatusCode::NOT_FOUND, "send quote not found".into()))?
+        .plan
+        .clone()
+    {
+        return Ok(Json(plan));
+    }
+    let intent_id = state
+        .markets
+        .register_base_transfer(
+            user.user_id,
+            quote.sender_wallet,
+            tx.to.clone(),
+            tx.data.clone(),
+        )
+        .await?;
     let mut quotes = state.social.quotes.lock().map_err(internal)?;
     let stored = quotes
         .get_mut(&quote_id)
         .ok_or((StatusCode::NOT_FOUND, "send quote not found".into()))?;
+    // Two executes racing: the first plan stands (the other intent is never signed).
     if let Some(plan) = &stored.plan {
         return Ok(Json(plan.clone()));
     }
-    let intent_id = state.markets.register_base_transfer(
-        user.user_id,
-        quote.sender_wallet,
-        tx.to.clone(),
-        tx.data.clone(),
-    )?;
     let plan = json!({"intentId":intent_id,"kind":"send","summary":[{"label":"Send to","value":quote.label},{"label":"Amount","value":format!("{} USDC",format_usdc(quote.usdc_units))},{"label":"Display value","value":format!("{} {}",amount["amount"].as_str().unwrap_or(""),quote.currency)}],"transactions":[{"chain":"base","chainId":8453,"to":tx.to,"data":tx.data,"value":"0"}],"expiresAtUnixMs":now()+120_000});
     stored.plan = Some(plan.clone());
     Ok(Json(plan))
