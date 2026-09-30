@@ -52,17 +52,14 @@ pub(super) struct AppBalanceResponse {
 
 const ARC_USDC: &str = "0x3600000000000000000000000000000000000000";
 
-async fn arc_balance(wallet: &str, network: AtlasNetwork) -> Result<u128, ApiError> {
+async fn arc_balance(wallet: &str) -> Result<u128, ApiError> {
     if wallet.len() != 42
         || !wallet.starts_with("0x")
         || !wallet[2..].bytes().all(|b| b.is_ascii_hexdigit())
     {
         return Err((StatusCode::BAD_REQUEST, "Wallet address is invalid".into()));
     }
-    let (default_rpc, expected_chain) = match network {
-        AtlasNetwork::Mainnet => ("https://rpc.mainnet.arc.io", "0x13b2"),
-        AtlasNetwork::Testnet => ("https://rpc.testnet.arc.network", "0x4cef52"),
-    };
+    let (default_rpc, expected_chain) = ("https://rpc.mainnet.arc.io", "0x13b2");
     let rpc = std::env::var("ATLAS_ARC_RPC_URL").unwrap_or_else(|_| default_rpc.into());
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(8))
@@ -139,45 +136,23 @@ pub(super) async fn balance(
             StatusCode::CONFLICT,
             "Privy Solana wallet is not ready".into(),
         ))?;
-    let (base_usdc, solana_usdc) = match state.network {
-        AtlasNetwork::Mainnet => {
-            state
-                .solana_mainnet
-                .assert_network()
-                .await
-                .map_err(internal)?;
-            let (base, solana) = tokio::join!(
-                state
-                    .markets
-                    .base
-                    .balance_of(engine_execution::swaps::uniswap::BASE_USDC, &evm),
-                state.solana_mainnet.owner_mint_balance(
-                    &solana_owner,
-                    engine_execution::solana::MAINNET_USDC_MINT,
-                    6,
-                ),
-            );
-            (base.map_err(internal)?, solana.map_err(internal)?)
-        }
-        AtlasNetwork::Testnet => {
-            state.solana.assert_network().await.map_err(internal)?;
-            let target = DepositTarget {
-                user_id: user.user_id.clone(),
-                wallet_address: evm.clone(),
-                token_contract: "0x036CbD53842c5426634e7929541eC2318f3dCF7e".into(),
-                chain_id: 84532,
-            };
-            let (base, solana) = tokio::join!(
-                state.scanner.wallet_token_balance(&target),
-                state.solana.owner_mint_balance(
-                    &solana_owner,
-                    engine_execution::solana::DEVNET_USDC_MINT,
-                    6,
-                ),
-            );
-            (base.map_err(internal)?, solana.map_err(internal)?)
-        }
-    };
+    state
+        .solana_mainnet
+        .assert_network()
+        .await
+        .map_err(internal)?;
+    let (base, solana) = tokio::join!(
+        state
+            .markets
+            .base
+            .balance_of(engine_execution::swaps::uniswap::BASE_USDC, &evm),
+        state.solana_mainnet.owner_mint_balance(
+            &solana_owner,
+            engine_execution::solana::MAINNET_USDC_MINT,
+            6,
+        ),
+    );
+    let (base_usdc, solana_usdc) = (base.map_err(internal)?, solana.map_err(internal)?);
     let rate = fx_rate(&currency).await?;
     let mut holdings = Vec::new();
     add_holding(&mut holdings, "base", "wallet", base_usdc, &currency, rate)?;
@@ -189,26 +164,16 @@ pub(super) async fn balance(
         &currency,
         rate,
     )?;
-    let arc_usdc = arc_balance(&evm, state.network).await?;
+    // Arc cash counts; if Arc can't be read right now, the rest of the balance still shows.
+    let arc_usdc = arc_balance(&evm).await.unwrap_or_else(|(_, error)| {
+        eprintln!("Arc balance unavailable: {error}");
+        0
+    });
     add_holding(&mut holdings, "arc", "wallet", arc_usdc, &currency, rate)?;
     let mut total = base_usdc
         .checked_add(solana_usdc)
         .and_then(|cash| cash.checked_add(arc_usdc))
         .ok_or((StatusCode::BAD_GATEWAY, "balance overflow".into()))?;
-
-    if state.network == AtlasNetwork::Testnet {
-        let as_of_unix_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(internal)?
-            .as_millis();
-        return Ok(Json(AppBalanceResponse {
-            total: money(total, &currency, rate)?,
-            total_usd: usd(total),
-            pending: None,
-            holdings,
-            as_of_unix_ms,
-        }));
-    }
 
     // Savings on Aave are cash that's earning: they count, labelled as being in Earn.
     let savings = earn::savings_units(&state, &evm).await?;
