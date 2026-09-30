@@ -194,21 +194,16 @@ pub(super) async fn balance(
     }
     let mut listed: Vec<(markets::Asset, u128)> = Vec::new();
     let mut unlisted = Vec::new();
-    // Savings on Jupiter Lend (jlUSDC) are cash that's earning, like Aave on Base.
-    let lend_shares: u128 = held
-        .iter()
-        .filter(|(mint, _, _)| mint == earn::JL_USDC)
-        .map(|(_, units, _)| *units)
-        .sum();
-    if lend_shares > 0 {
-        let units = earn::lend_savings_units(&state, lend_shares).await?;
+    // Savings on Jupiter Lend are cash that's earning, like Aave on Base.
+    let units = earn::lend_savings_units(&state, &held).await?;
+    if units > 0 {
         add_holding(&mut holdings, "solana", "earn", units, &currency, rate)?;
         total = total
             .checked_add(units)
             .ok_or((StatusCode::BAD_GATEWAY, "balance overflow".into()))?;
     }
     for (mint, units, decimals) in &held {
-        if mint == earn::JL_USDC {
+        if earn::is_lend_share(mint) {
             continue;
         }
         match catalog

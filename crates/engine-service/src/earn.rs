@@ -1,6 +1,7 @@
 //! Earn: savings where the cash already is. USDC on Base goes to Aave v3 (plain Base transactions);
-//! USDC on Solana goes to Jupiter Lend (one Jupiter swap into jlUSDC and back out). Both earn the
-//! venue's variable rate and settle through the same intent flow as trades.
+//! USDC on Solana goes to one of Jupiter Lend's dollar or euro markets (one Jupiter swap into its
+//! share token and back out to USDC). All earn the venue's variable rate and settle through the same
+//! intent flow as trades.
 use super::*;
 use axum::extract::{Path, Query};
 use serde_json::{json, Value};
@@ -13,9 +14,31 @@ const AAVE_POOL: &str = "0xa238dd80c259a72e81d7e4664a9801593f98d1c5";
 // aBasUSDC: Aave's receipt for supplied USDC. Its balance grows as interest accrues.
 const AAVE_USDC: &str = "0x4e65fe4dba92790696d040ac24aa414708f5c0ab";
 const OPTION_ID: &str = "aave-usdc-base";
-const LEND_OPTION_ID: &str = "jupiter-usdc-solana";
-// jlUSDC: Jupiter Lend's receipt for USDC supplied on Solana. Each share is worth more USDC over time.
-pub(super) const JL_USDC: &str = "9BEcn9aPEmhSPbPQeFGjidRiEKki46fVQDyPpSQXPA2D";
+// Jupiter Lend markets Atlas offers: (share token, option id). Only cash-like assets Jupiter routes
+// into from USDC and back out to USDC (checked 2026-09-30: jlWSOL can't be swapped into, jlUSDG had
+// no way back out). Each share is worth more of its asset over time.
+const LEND_MARKETS: &[(&str, &str)] = &[
+    (
+        "9BEcn9aPEmhSPbPQeFGjidRiEKki46fVQDyPpSQXPA2D",
+        "jupiter-usdc-solana",
+    ),
+    (
+        "Cmn4v2wipYV41dkakDvCgFJpxhtaaKt11NyWV8pjSE8A",
+        "jupiter-usdt-solana",
+    ),
+    (
+        "7GxATsNMnaC88vdwd2t3mwrFuQwwGvmYPrUQ4D6FotXk",
+        "jupiter-jupusd-solana",
+    ),
+    (
+        "j14XLJZSVMcUYpAfajdZRpnfHUpJieZHS4aPektLWvh",
+        "jupiter-usds-solana",
+    ),
+    (
+        "GcV9tEj62VncGithz4o4N9x6HWXARxuRgEAYk9zahNA8",
+        "jupiter-eurc-solana",
+    ),
+];
 const JUPITER_LEND_TOKENS: &str = "https://lite-api.jup.ag/lend/v1/earn/tokens";
 const QUOTE_MS: u64 = 60_000;
 const APY_TTL: Duration = Duration::from_secs(300);
@@ -24,12 +47,13 @@ const SECONDS_PER_YEAR: f64 = 31_536_000.0;
 #[derive(Clone)]
 struct EarnQuote {
     owner: String,
-    option_id: &'static str,
+    // Jupiter Lend: the market's share token. None for Aave.
+    share_mint: Option<&'static str>,
     // The wallet on the option's chain.
     wallet: String,
     deposit: bool,
     units: u128,
-    // Jupiter Lend withdrawals: the jlUSDC shares to hand back.
+    // Jupiter Lend withdrawals: the shares to hand back.
     shares: u128,
     // Withdraw everything, principal and interest, rather than a fixed amount.
     all: bool,
@@ -40,16 +64,24 @@ struct EarnQuote {
 pub(super) struct EarnState {
     quotes: Arc<Mutex<HashMap<String, EarnQuote>>>,
     apy: Arc<Mutex<Option<(Instant, f64)>>>,
-    lend: Arc<Mutex<Option<(Instant, Lend)>>>,
+    lend: Arc<Mutex<Option<(Instant, Vec<Lend>)>>>,
     http: reqwest::Client,
 }
 
-// Jupiter Lend's USDC market right now: its yearly rate and what one jlUSDC share is worth.
-#[derive(Clone, Copy, Debug, PartialEq)]
+// One Jupiter Lend market right now: its yearly rate and what a share is worth.
+#[derive(Clone, Debug, PartialEq)]
 struct Lend {
+    option_id: &'static str,
+    share_mint: &'static str,
+    // The asset lent: "USDC", "USDT", "EURC"…
+    asset: String,
     apy: f64,
-    // USDC units per 1,000,000 shares (both have 6 decimals).
+    // Asset units per whole share (10^share_decimals share units).
     assets_per_share: u128,
+    share_decimals: u32,
+    asset_decimals: u32,
+    // USD per whole asset; USDC is the cash unit, so exactly 1.
+    asset_price: f64,
 }
 
 #[derive(Deserialize)]
@@ -165,24 +197,42 @@ pub(super) async fn savings_units(state: &AppState, wallet: &str) -> Result<u128
         .map_err(internal)
 }
 
-fn lend_rate(tokens: &Value) -> Option<Lend> {
-    let t = tokens
-        .as_array()?
+fn lend_markets(tokens: &Value) -> Vec<Lend> {
+    let Some(list) = tokens.as_array() else {
+        return Vec::new();
+    };
+    LEND_MARKETS
         .iter()
-        .find(|t| t["address"].as_str() == Some(JL_USDC))?;
-    // totalRate is in basis points: the supply rate plus any rewards.
-    let bps: f64 = t["totalRate"].as_str()?.parse().ok()?;
-    let assets_per_share: u128 = t["convertToAssets"].as_str()?.parse().ok()?;
-    (assets_per_share > 0 && bps.is_finite()).then_some(Lend {
-        apy: bps / 100.0,
-        assets_per_share,
-    })
+        .filter_map(|(mint, option_id)| {
+            let t = list.iter().find(|t| t["address"].as_str() == Some(mint))?;
+            // totalRate is in basis points: the supply rate plus any rewards.
+            let bps: f64 = t["totalRate"].as_str()?.parse().ok()?;
+            let assets_per_share: u128 = t["convertToAssets"].as_str()?.parse().ok()?;
+            let asset = t["asset"]["symbol"].as_str()?.to_owned();
+            let asset_price = if t["assetAddress"].as_str() == Some(markets::SOL_USDC_MINT) {
+                1.0
+            } else {
+                t["asset"]["price"].as_str()?.parse().ok()?
+            };
+            let lend = Lend {
+                option_id,
+                share_mint: mint,
+                asset,
+                apy: bps / 100.0,
+                assets_per_share,
+                share_decimals: u32::try_from(t["decimals"].as_u64()?).ok()?,
+                asset_decimals: u32::try_from(t["asset"]["decimals"].as_u64()?).ok()?,
+                asset_price,
+            };
+            (assets_per_share > 0 && bps.is_finite() && asset_price > 0.0).then_some(lend)
+        })
+        .collect()
 }
 
-async fn jupiter_lend(state: &AppState) -> Result<Lend, ApiError> {
-    if let Some((at, lend)) = *state.earn.lend.lock().map_err(internal)? {
+async fn jupiter_lend(state: &AppState) -> Result<Vec<Lend>, ApiError> {
+    if let Some((at, markets)) = state.earn.lend.lock().map_err(internal)?.as_ref() {
         if at.elapsed() < APY_TTL {
-            return Ok(lend);
+            return Ok(markets.clone());
         }
     }
     let tokens: Value = state
@@ -198,45 +248,87 @@ async fn jupiter_lend(state: &AppState) -> Result<Lend, ApiError> {
         .json()
         .await
         .map_err(internal)?;
-    let lend = lend_rate(&tokens).ok_or((
-        StatusCode::BAD_GATEWAY,
-        "Jupiter Lend rate unreadable".into(),
-    ))?;
-    *state.earn.lend.lock().map_err(internal)? = Some((Instant::now(), lend));
-    Ok(lend)
+    let markets = lend_markets(&tokens);
+    if markets.is_empty() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "Jupiter Lend rates unreadable".into(),
+        ));
+    }
+    *state.earn.lend.lock().map_err(internal)? = Some((Instant::now(), markets.clone()));
+    Ok(markets)
 }
 
-fn lend_value(shares: u128, lend: Lend) -> u128 {
-    shares.saturating_mul(lend.assets_per_share) / 1_000_000
+// What `shares` of a market are worth, in USDC units.
+fn lend_value(shares: u128, lend: &Lend) -> u128 {
+    let assets = shares.saturating_mul(lend.assets_per_share) / 10u128.pow(lend.share_decimals);
+    if lend.asset_price == 1.0 && lend.asset_decimals == 6 {
+        return assets;
+    }
+    (assets as f64 / 10f64.powi(lend.asset_decimals as i32) * lend.asset_price * 1_000_000.0)
+        as u128
 }
 
-// jlUSDC shares worth at least `units` USDC, never more than the user has.
-fn lend_shares_for(units: u128, held: u128, lend: Lend) -> u128 {
+// Shares worth at least `units` USDC, never more than the user has.
+fn lend_shares_for(units: u128, held: u128, lend: &Lend) -> u128 {
+    let per_share = lend_value(10u128.pow(lend.share_decimals), lend);
+    if per_share == 0 {
+        return held;
+    }
     units
-        .saturating_mul(1_000_000)
-        .div_ceil(lend.assets_per_share)
+        .saturating_mul(10u128.pow(lend.share_decimals))
+        .div_ceil(per_share)
         .min(held)
 }
 
-// What the user's jlUSDC is worth in USDC units, for the balance.
-pub(super) async fn lend_savings_units(state: &AppState, shares: u128) -> Result<u128, ApiError> {
-    Ok(lend_value(shares, jupiter_lend(state).await?))
+pub(super) fn is_lend_share(mint: &str) -> bool {
+    LEND_MARKETS.iter().any(|(m, _)| *m == mint)
 }
 
-// Plain USDC and jlUSDC shares in the user's Solana wallet.
-async fn solana_holdings(state: &AppState, owner: &str) -> Result<(u128, u128), ApiError> {
-    let held = state
+// What the user's Jupiter Lend shares (from a wallet read: mint, units, decimals) are worth in
+// USDC units, for the balance.
+pub(super) async fn lend_savings_units(
+    state: &AppState,
+    held: &[(String, u128, u32)],
+) -> Result<u128, ApiError> {
+    if !held
+        .iter()
+        .any(|(m, units, _)| *units > 0 && is_lend_share(m))
+    {
+        return Ok(0);
+    }
+    let markets = jupiter_lend(state).await?;
+    Ok(markets
+        .iter()
+        .map(|lend| lend_value(shares_of(held, lend.share_mint), lend))
+        .sum())
+}
+
+fn shares_of(held: &[(String, u128, u32)], mint: &str) -> u128 {
+    held.iter()
+        .filter(|(m, _, _)| m == mint)
+        .map(|(_, units, _)| *units)
+        .sum()
+}
+
+// Everything in the user's Solana wallet (mint, units, decimals).
+async fn solana_wallet(
+    state: &AppState,
+    owner: &str,
+) -> Result<Vec<(String, u128, u32)>, ApiError> {
+    state
         .solana_mainnet
         .owner_token_balances(owner)
         .await
-        .map_err(internal)?;
-    let sum = |mint: &str| {
-        held.iter()
-            .filter(|(m, _, _)| m == mint)
-            .map(|(_, units, _)| *units)
-            .sum::<u128>()
-    };
-    Ok((sum(markets::SOL_USDC_MINT), sum(JL_USDC)))
+        .map_err(internal)
+}
+
+fn lend_about(lend: &Lend) -> String {
+    match lend.asset.as_str() {
+        "USDC" => "Your USDC on Solana, lent on Jupiter Lend. Take it out any time.".into(),
+        "EURC" => "Your USDC on Solana becomes EURC (euro) lent on Jupiter Lend, so its value moves with the euro. It comes back as USDC.".into(),
+        asset => format!("Your USDC on Solana becomes {asset}, a dollar coin, lent on Jupiter Lend. It comes back as USDC. Take it out any time."),
+    }
 }
 
 fn money(units: u128, currency: &str, rate: u128) -> Value {
@@ -273,7 +365,7 @@ pub(super) async fn options(
 ) -> Result<Json<Value>, ApiError> {
     app_balance::verified_wallets(&state, &headers).await?;
     currency_of(q.currency)?;
-    // One venue being down doesn't hide the other; both down is an error.
+    // One venue being down doesn't hide the others; all down is an error.
     let (aave, lend) = tokio::join!(usdc_apy(&state), jupiter_lend(&state));
     let mut options: Vec<(f64, Value)> = Vec::new();
     if let Ok(apy) = aave {
@@ -283,11 +375,10 @@ pub(super) async fn options(
             "about":"Your USDC on Base, lent on Aave, the largest lending market. Take it out any time."
         })));
     }
-    if let Ok(lend) = &lend {
-        options.push((lend.apy, json!({
-            "optionId":LEND_OPTION_ID,"name":"USDC savings","venue":"Jupiter Lend","chain":"solana","asset":"USDC",
-            "apyPct":format!("{:.2}",lend.apy),
-            "about":"Your USDC on Solana, lent on Jupiter Lend. Take it out any time."
+    for market in lend.iter().flatten() {
+        options.push((market.apy, json!({
+            "optionId":market.option_id,"name":format!("{} savings",market.asset),"venue":"Jupiter Lend",
+            "chain":"solana","asset":market.asset,"apyPct":format!("{:.2}",market.apy),"about":lend_about(market)
         })));
     }
     if options.is_empty() {
@@ -320,12 +411,19 @@ pub(super) async fn positions(
         }
     }
     if let Some(owner) = user.solana_wallet.as_deref().filter(|w| !w.is_empty()) {
-        let (_, shares) = solana_holdings(&state, owner).await?;
-        if shares > 0 {
-            let lend = jupiter_lend(&state).await?;
-            let units = lend_value(shares, lend);
-            positions.push(json!({"optionId":LEND_OPTION_ID,"name":"USDC savings","venue":"Jupiter Lend","amount":usdc(units),
-                "value":money(units,&currency,rate),"apyPct":format!("{:.2}",lend.apy)}));
+        let held = solana_wallet(&state, owner).await?;
+        if held
+            .iter()
+            .any(|(m, units, _)| *units > 0 && is_lend_share(m))
+        {
+            for lend in jupiter_lend(&state).await? {
+                let units = lend_value(shares_of(&held, lend.share_mint), &lend);
+                if units > 0 {
+                    positions.push(json!({"optionId":lend.option_id,"name":format!("{} savings",lend.asset),
+                        "venue":"Jupiter Lend","amount":usdc(units),"value":money(units,&currency,rate),
+                        "apyPct":format!("{:.2}",lend.apy)}));
+                }
+            }
         }
     }
     Ok(Json(json!({"positions":positions})))
@@ -336,12 +434,14 @@ pub(super) async fn quote(
     headers: HeaderMap,
     Json(req): Json<QuoteRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let option_id = match req.option_id.as_str() {
-        OPTION_ID => OPTION_ID,
-        LEND_OPTION_ID => LEND_OPTION_ID,
-        _ => return Err((StatusCode::NOT_FOUND, "unknown earn option".into())),
-    };
-    let lend_option = option_id == LEND_OPTION_ID;
+    let share_mint = LEND_MARKETS
+        .iter()
+        .find(|(_, id)| *id == req.option_id)
+        .map(|(mint, _)| *mint);
+    if req.option_id != OPTION_ID && share_mint.is_none() {
+        return Err((StatusCode::NOT_FOUND, "unknown earn option".into()));
+    }
+    let lend_option = share_mint.is_some();
     let (owner, wallet) = if lend_option {
         solana_wallet_of(&state, &headers).await?
     } else {
@@ -358,13 +458,18 @@ pub(super) async fn quote(
     let mut units = display.saturating_mul(1_000_000) / rate;
     markets::check_limits(units, &currency, rate)?;
     // What can move: cash on the option's chain to put in, or what's in savings to take out.
-    let (available, apy, held_shares, lend) = if lend_option {
-        let ((cash, shares), lend) =
-            tokio::try_join!(solana_holdings(&state, &wallet), jupiter_lend(&state))?;
+    let (available, apy, held_shares, lend) = if let Some(mint) = share_mint {
+        let (held, markets) =
+            tokio::try_join!(solana_wallet(&state, &wallet), jupiter_lend(&state))?;
+        let lend = markets.into_iter().find(|m| m.share_mint == mint).ok_or((
+            StatusCode::BAD_GATEWAY,
+            "Jupiter Lend market unavailable".into(),
+        ))?;
+        let shares = shares_of(&held, mint);
         let available = if deposit {
-            cash
+            shares_of(&held, markets::SOL_USDC_MINT)
         } else {
-            lend_value(shares, lend)
+            lend_value(shares, &lend)
         };
         (available, lend.apy, shares, Some(lend))
     } else {
@@ -404,7 +509,7 @@ pub(super) async fn quote(
             },
         ));
     }
-    let shares = match lend {
+    let shares = match &lend {
         Some(_) if all => held_shares,
         Some(lend) if !deposit => lend_shares_for(units, held_shares, lend),
         _ => 0,
@@ -415,7 +520,7 @@ pub(super) async fn quote(
         quote_id.clone(),
         EarnQuote {
             owner,
-            option_id,
+            share_mint,
             wallet,
             deposit,
             units,
@@ -425,7 +530,7 @@ pub(super) async fn quote(
         },
     );
     Ok(Json(json!({
-        "quoteId":quote_id,"optionId":option_id,"action":req.action,
+        "quoteId":quote_id,"optionId":req.option_id,"action":req.action,
         "amount":money(units,&currency,rate),"usdc":usdc(units),"all":all,
         "apyPct":format!("{apy:.2}"),"expiresAtUnixMs":expires
     })))
@@ -445,7 +550,7 @@ pub(super) async fn execute(
         .get(&quote_id)
         .cloned()
         .ok_or((StatusCode::NOT_FOUND, "earn quote not found".into()))?;
-    let (owner, wallet) = if quote.option_id == LEND_OPTION_ID {
+    let (owner, wallet) = if quote.share_mint.is_some() {
         solana_wallet_of(&state, &headers).await?
     } else {
         wallet_of(&state, &headers).await?
@@ -462,8 +567,8 @@ pub(super) async fn execute(
             "quote expired; request a fresh one".into(),
         ));
     }
-    if quote.option_id == LEND_OPTION_ID {
-        return execute_lend(&state, quote, owner, wallet).await;
+    if let Some(mint) = quote.share_mint {
+        return execute_lend(&state, &quote, mint, owner, wallet).await;
     }
     let usdc_token = engine_execution::swaps::uniswap::BASE_USDC.to_ascii_lowercase();
     let mut txs: Vec<(String, String)> = Vec::new();
@@ -533,19 +638,26 @@ pub(super) async fn execute(
     })))
 }
 
-// Into Jupiter Lend is a Jupiter swap USDC → jlUSDC (Jupiter routes it as a Lend deposit, no fee);
-// out is jlUSDC → USDC. One Solana transaction either way.
+// Into Jupiter Lend is a Jupiter swap USDC → the market's share token (Jupiter routes it through the
+// asset into a Lend deposit); out is shares → USDC. One Solana transaction either way.
 async fn execute_lend(
     state: &AppState,
-    quote: EarnQuote,
+    quote: &EarnQuote,
+    share_mint: &str,
     owner: String,
     wallet: String,
 ) -> Result<Json<Value>, ApiError> {
     let (input, output, amount) = if quote.deposit {
-        (markets::SOL_USDC_MINT, JL_USDC, quote.units)
+        (markets::SOL_USDC_MINT, share_mint, quote.units)
     } else {
-        (JL_USDC, markets::SOL_USDC_MINT, quote.shares)
+        (share_mint, markets::SOL_USDC_MINT, quote.shares)
     };
+    let asset = jupiter_lend(state)
+        .await?
+        .into_iter()
+        .find(|m| m.share_mint == share_mint)
+        .map(|m| m.asset)
+        .unwrap_or_else(|| "USDC".into());
     if amount == 0 {
         return Err(bad("nothing to move"));
     }
@@ -563,7 +675,7 @@ async fn execute_lend(
         "kind":if quote.deposit {"earn_deposit"} else {"earn_withdraw"},
         "summary":[
             {"label":if quote.deposit {"Put in savings"} else {"Take out of savings"},"value":amount},
-            {"label":"Where","value":"Jupiter Lend, on Solana"},
+            {"label":"Where","value":format!("Jupiter Lend ({asset}), on Solana")},
             {"label":"Rate","value":"Variable, set by Jupiter Lend"}
         ],
         "transactions":[{"chain":"solana","transaction":transaction,"submit":"engine"}],
@@ -574,7 +686,7 @@ async fn execute_lend(
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Jupiter's live Lend list still has jlUSDC with a rate and share price we can read.
+    // Jupiter's live Lend list still has every market Atlas offers, with readable rates.
     #[tokio::test]
     #[ignore]
     async fn live_jupiter_lend() {
@@ -584,35 +696,47 @@ mod tests {
             .json()
             .await
             .unwrap();
-        let lend = lend_rate(&tokens).unwrap();
-        println!(
-            "jlUSDC: {:.2}% a year, 1 share = {} USDC",
-            lend.apy,
-            usdc(lend.assets_per_share)
-        );
-        assert!(lend.apy > 0.0 && lend.apy < 50.0);
-        assert!(lend.assets_per_share >= 1_000_000);
+        let markets = lend_markets(&tokens);
+        for m in &markets {
+            println!(
+                "{} {:.2}% a year, 1 share = {} USDC",
+                m.asset,
+                m.apy,
+                usdc(lend_value(10u128.pow(m.share_decimals), m))
+            );
+        }
+        assert_eq!(markets.len(), LEND_MARKETS.len());
+        assert!(markets.iter().all(|m| m.apy > 0.0 && m.apy < 50.0));
     }
     #[test]
     fn reads_jupiter_lend_and_converts_shares() {
+        let market = |address: &str, asset: &str, asset_address: &str, price: &str| {
+            json!({"address":address,"totalRate":"466","convertToAssets":"1062358","decimals":6,
+                "assetAddress":asset_address,"asset":{"symbol":asset,"decimals":6,"price":price}})
+        };
         let tokens = json!([
             {"address":"other","totalRate":"900","convertToAssets":"2000000"},
-            {"address":JL_USDC,"totalRate":"466","convertToAssets":"1062358"}
+            market(LEND_MARKETS[0].0, "USDC", markets::SOL_USDC_MINT, "0.9998"),
+            market(LEND_MARKETS[4].0, "EURC", "eurc", "1.10"),
         ]);
-        let lend = lend_rate(&tokens).unwrap();
-        assert!((lend.apy - 4.66).abs() < 1e-9);
-        // 10 jlUSDC are worth 10.62358 USDC.
-        assert_eq!(lend_value(10_000_000, lend), 10_623_580);
+        let found = lend_markets(&tokens);
+        assert_eq!(found.len(), 2);
+        let usdc_market = &found[0];
+        assert!((usdc_market.apy - 4.66).abs() < 1e-9);
+        // USDC is the cash unit: 10 jlUSDC are worth exactly 10.62358 USDC, whatever the quoted price.
+        assert_eq!(lend_value(10_000_000, usdc_market), 10_623_580);
+        // A euro market is worth its euros at the euro's dollar price.
+        assert_eq!(lend_value(10_000_000, &found[1]), 11_685_938);
         // Taking out 5 USDC hands back enough shares for at least 5 USDC, and never more than held.
-        let shares = lend_shares_for(5_000_000, 10_000_000, lend);
-        assert!(lend_value(shares, lend) >= 4_999_999);
-        assert!(lend_value(shares - 1, lend) < 5_000_000);
-        assert_eq!(lend_shares_for(50_000_000, 10_000_000, lend), 10_000_000);
-        assert!(lend_rate(&json!([])).is_none());
-        assert!(
-            lend_rate(&json!([{"address":JL_USDC,"totalRate":"466","convertToAssets":"0"}]))
-                .is_none()
+        let shares = lend_shares_for(5_000_000, 10_000_000, usdc_market);
+        assert!(lend_value(shares, usdc_market) >= 4_999_999);
+        assert!(lend_value(shares - 1, usdc_market) < 5_000_000);
+        assert_eq!(
+            lend_shares_for(50_000_000, 10_000_000, usdc_market),
+            10_000_000
         );
+        assert!(lend_markets(&json!([])).is_empty());
+        assert!(is_lend_share(LEND_MARKETS[2].0) && !is_lend_share("other"));
     }
     #[test]
     fn reads_aave_rate_and_encodes_calls() {
