@@ -27,15 +27,17 @@ struct Money {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Holding {
-    asset_id: &'static str,
-    symbol: &'static str,
-    name: &'static str,
-    kind: &'static str,
-    chain: &'static str,
+    asset_id: String,
+    symbol: String,
+    name: String,
+    kind: String,
+    chain: String,
     amount: String,
     value: Money,
     value_usd: String,
     location: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    icon_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -144,54 +146,68 @@ pub(super) async fn balance(
             .checked_add(units)
             .ok_or((StatusCode::BAD_GATEWAY, "balance overflow".into()))?;
     }
-    for asset in markets::ASSETS {
-        let units = if asset.chain == "base" {
-            state
-                .markets
-                .base
-                .balance_of(asset.token, &evm)
-                .await
-                .map_err(internal)?
-        } else if asset.symbol == "SOL" {
-            let (native, wrapped) = tokio::join!(
-                state.solana_mainnet.owner_sol_balance(&solana_owner),
-                state
-                    .solana_mainnet
-                    .owner_mint_balance(&solana_owner, asset.token, 9),
-            );
-            native
-                .map_err(internal)?
-                .checked_add(wrapped.map_err(internal)?)
-                .ok_or((StatusCode::BAD_GATEWAY, "SOL balance overflow".into()))?
-        } else {
-            state
-                .solana_mainnet
-                .owner_mint_balance(&solana_owner, asset.token, u64::from(asset.decimals))
-                .await
-                .map_err(internal)?
-        };
+    let catalog = markets::catalog(&state.markets).await?;
+    // Base assets: read each, valued through the same live venue route as the trade preview.
+    // Valuation is indicative; a missing route fails explicitly instead of an incomplete total.
+    for asset in catalog.iter().filter(|a| a.chain == "base") {
+        let units = state
+            .markets
+            .base
+            .balance_of(&asset.token, &evm)
+            .await
+            .map_err(internal)?;
         if units == 0 {
             continue;
         }
-        // Use the same live venue route as the trade preview. Valuation is indicative;
-        // a missing route fails explicitly instead of displaying an incomplete total.
         let (_, one_dollar_units, _) =
             markets::venue_quote(&state.markets, asset, "buy", 1_000_000).await?;
         let value_usdc = indicative_usdc_value(units, one_dollar_units)?;
         total = total
             .checked_add(value_usdc)
             .ok_or((StatusCode::BAD_GATEWAY, "portfolio value overflow".into()))?;
-        holdings.push(Holding {
-            asset_id: asset.id,
-            symbol: asset.symbol,
-            name: asset.name,
-            kind: asset.kind,
-            chain: asset.chain,
-            amount: markets::format_units(units, asset.decimals),
-            value: money(value_usdc, &currency, rate)?,
-            value_usd: usd(value_usdc),
-            location: "wallet",
-        });
+        holdings.push(catalog_holding(asset, units, value_usdc, &currency, rate)?);
+    }
+    // Solana: everything the wallet holds that Atlas lists (unlisted tokens, e.g. airdropped spam,
+    // are left out), valued at Jupiter's live USD price. SOL counts native plus wrapped.
+    let (held, native_sol) = tokio::join!(
+        state.solana_mainnet.owner_token_balances(&solana_owner),
+        state.solana_mainnet.owner_sol_balance(&solana_owner),
+    );
+    let mut held = held.map_err(internal)?;
+    let native_sol = native_sol.map_err(internal)?;
+    if native_sol > 0 {
+        match held
+            .iter_mut()
+            .find(|(mint, _, _)| mint == markets::SOL_MINT)
+        {
+            Some(entry) => entry.1 = entry.1.saturating_add(native_sol),
+            None => held.push((markets::SOL_MINT.into(), native_sol, 9)),
+        }
+    }
+    let listed: Vec<(&markets::Asset, u128)> = held
+        .iter()
+        .filter_map(|(mint, units, decimals)| {
+            catalog
+                .iter()
+                .find(|a| a.chain == "solana" && &a.token == mint && a.decimals == *decimals)
+                .map(|asset| (asset, *units))
+        })
+        .collect();
+    let mints: Vec<String> = listed.iter().map(|(a, _)| a.token.clone()).collect();
+    let prices = markets::usd_prices(&state.markets, &mints).await?;
+    for (asset, units) in listed {
+        let Some((usd, _)) = prices.get(&asset.token) else {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!("no live price for {}", asset.symbol),
+            ));
+        };
+        let value_usdc =
+            (units as f64 / 10f64.powi(asset.decimals as i32) * usd * 1_000_000.0) as u128;
+        total = total
+            .checked_add(value_usdc)
+            .ok_or((StatusCode::BAD_GATEWAY, "portfolio value overflow".into()))?;
+        holdings.push(catalog_holding(asset, units, value_usdc, &currency, rate)?);
     }
     let as_of_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -283,6 +299,27 @@ pub(super) async fn verified_wallets(
     Ok(user)
 }
 
+fn catalog_holding(
+    asset: &markets::Asset,
+    units: u128,
+    value_usdc: u128,
+    currency: &str,
+    rate: u128,
+) -> Result<Holding, ApiError> {
+    Ok(Holding {
+        asset_id: asset.id.clone(),
+        symbol: asset.symbol.clone(),
+        name: asset.name.clone(),
+        kind: asset.kind.clone(),
+        chain: asset.chain.clone(),
+        amount: markets::format_units(units, asset.decimals),
+        value: money(value_usdc, currency, rate)?,
+        value_usd: usd(value_usdc),
+        location: "wallet",
+        icon_url: asset.icon_url.clone(),
+    })
+}
+
 fn add_holding(
     holdings: &mut Vec<Holding>,
     chain: &'static str,
@@ -293,15 +330,16 @@ fn add_holding(
 ) -> Result<(), ApiError> {
     if units > 0 {
         holdings.push(Holding {
-            asset_id: "usdc",
-            symbol: "USDC",
-            name: "USD Coin",
-            kind: "cash",
-            chain,
+            asset_id: "usdc".into(),
+            symbol: "USDC".into(),
+            name: "USD Coin".into(),
+            kind: "cash".into(),
+            chain: chain.into(),
             amount: usd(units),
             value: money(units, currency, rate)?,
             value_usd: usd(units),
             location,
+            icon_url: None,
         });
     }
     Ok(())

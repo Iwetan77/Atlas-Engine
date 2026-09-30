@@ -9,90 +9,227 @@ use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const SOL_USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
-const BONK_MINT: &str = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263";
-const TSLAX_MINT: &str = "XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB";
+pub(super) const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const BRETT: &str = "0x532f27101965dd16442E59d40670FaF5eBB142E4";
 const AAPLC: &str = "0xb200000000000000000000C2e324d24d7eEcd1fb";
+const JUPITER_VERIFIED: &str = "https://lite-api.jup.ag/tokens/v2/tag?query=verified";
+const JUPITER_PRICES: &str = "https://lite-api.jup.ag/price/v3";
+// Liquid enough that an order of up to $10,000 (the quote cap) routes without wrecking the price.
+const MIN_LIQUIDITY_USD: f64 = 100_000.0;
+const CATALOG_TTL: Duration = Duration::from_secs(30 * 60);
+const PRICE_TTL: Duration = Duration::from_secs(15);
+const MULTIPLIER_TTL: Duration = Duration::from_secs(10 * 60);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Debug)]
 pub(super) struct Asset {
-    pub(super) id: &'static str,
-    pub(super) symbol: &'static str,
-    pub(super) name: &'static str,
-    pub(super) kind: &'static str,
-    pub(super) chain: &'static str,
-    pub(super) token: &'static str,
+    pub(super) id: String,
+    pub(super) symbol: String,
+    pub(super) name: String,
+    // crypto | meme | stock
+    pub(super) kind: String,
+    // base | solana
+    pub(super) chain: String,
+    pub(super) token: String,
     pub(super) decimals: u32,
-    pub(super) icon_url: Option<&'static str>,
+    pub(super) icon_url: Option<String>,
+    // 24h traded volume in USD, for ranking. xStocks carry a share multiplier that must stay 1.
+    pub(super) volume_24h: f64,
+    pub(super) xstock: bool,
 }
-pub(super) const ASSETS: [Asset; 6] = [
-    Asset {
-        id: "weth-base",
-        symbol: "WETH",
-        name: "Wrapped Ether",
-        kind: "crypto",
-        chain: "base",
-        token: BASE_WETH,
-        decimals: 18,
+
+// Base assets route through fixed Uniswap V3 pools, so they stay a short fixed list.
+fn base_assets() -> Vec<Asset> {
+    let base = |id: &str, symbol: &str, name: &str, kind: &str, token: &str, decimals: u32| Asset {
+        id: id.into(),
+        symbol: symbol.into(),
+        name: name.into(),
+        kind: kind.into(),
+        chain: "base".into(),
+        token: token.into(),
+        decimals,
         icon_url: None,
-    },
-    Asset {
-        id: "brett-base",
-        symbol: "BRETT",
-        name: "Brett",
-        kind: "meme",
-        chain: "base",
-        token: BRETT,
-        decimals: 18,
-        icon_url: None,
-    },
-    Asset {
-        id: "aaplc-base",
-        symbol: "AAPLc",
-        name: "Coinbase Wrapped Apple",
-        kind: "stock",
-        chain: "base",
-        token: AAPLC,
-        decimals: 8,
-        icon_url: None,
-    },
-    Asset {
-        id: "sol-solana",
-        symbol: "SOL",
-        name: "Solana",
-        kind: "crypto",
-        chain: "solana",
-        token: SOL_MINT,
-        decimals: 9,
-        icon_url: None,
-    },
-    Asset {
-        id: "tslax-solana",
-        symbol: "TSLAx",
-        name: "Tesla xStock",
-        kind: "stock",
-        chain: "solana",
-        token: TSLAX_MINT,
-        decimals: 8,
-        icon_url: None,
-    },
-    Asset {
-        id: "bonk-solana",
-        symbol: "BONK",
-        name: "Bonk",
-        kind: "meme",
-        chain: "solana",
-        token: BONK_MINT,
-        decimals: 5,
-        icon_url: None,
-    },
-];
+        volume_24h: 0.0,
+        xstock: false,
+    };
+    vec![
+        base(
+            "weth-base",
+            "WETH",
+            "Wrapped Ether",
+            "crypto",
+            BASE_WETH,
+            18,
+        ),
+        base("brett-base", "BRETT", "Brett", "meme", BRETT, 18),
+        base(
+            "aaplc-base",
+            "AAPLc",
+            "Coinbase Wrapped Apple",
+            "stock",
+            AAPLC,
+            8,
+        ),
+    ]
+}
+
+// One Jupiter token as a tradable Solana asset, or None if Atlas shouldn't list it: only verified,
+// liquid tokens; stablecoins, liquid-staking and yield tokens belong to cash and Earn, not Trade.
+fn solana_asset(token: &Value) -> Option<Asset> {
+    if token["isVerified"].as_bool() != Some(true) {
+        return None;
+    }
+    if token["liquidity"].as_f64().unwrap_or(0.0) < MIN_LIQUIDITY_USD {
+        return None;
+    }
+    let mint = token["id"].as_str()?;
+    let symbol = token["symbol"].as_str().filter(|s| !s.is_empty())?;
+    let name = token["name"].as_str().unwrap_or(symbol);
+    let decimals = u32::try_from(token["decimals"].as_u64()?).ok()?;
+    let tags: Vec<&str> = token["tags"]
+        .as_array()
+        .map(|tags| tags.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let has = |tag: &str| tags.contains(&tag);
+    let upper = symbol.to_ascii_uppercase();
+    if mint == SOL_USDC
+        || ["stable", "lst", "yield", "yb", "jup-lend-earn"]
+            .iter()
+            .any(|t| has(t))
+        || upper.contains("USD")
+        || upper.contains("EUR")
+    {
+        return None;
+    }
+    let xstock = has("xstocks") || name.ends_with("xStock");
+    let kind = if xstock || has("stocks") || has("equities") || has("prestocks") {
+        "stock"
+    } else if has("meme") {
+        "meme"
+    } else {
+        "crypto"
+    };
+    let volume = ["buyVolume", "sellVolume"]
+        .iter()
+        .map(|k| token["stats24h"][*k].as_f64().unwrap_or(0.0))
+        .sum();
+    let (symbol, name) = if mint == SOL_MINT {
+        ("SOL", "Solana")
+    } else {
+        (symbol, name)
+    };
+    Some(Asset {
+        id: mint.into(),
+        symbol: symbol.into(),
+        name: name.into(),
+        kind: kind.into(),
+        chain: "solana".into(),
+        token: mint.into(),
+        decimals,
+        icon_url: token["icon"].as_str().map(str::to_owned),
+        volume_24h: volume,
+        xstock,
+    })
+}
+
+// Every asset Atlas trades: the Base list plus Jupiter's verified Solana catalog, refreshed every
+// 30 minutes. If Jupiter is down, the last good catalog keeps serving.
+pub(super) async fn catalog(state: &MarketState) -> Result<Arc<Vec<Asset>>, ApiError> {
+    let cached = state.catalog.lock().map_err(internal)?.clone();
+    if let Some((at, assets)) = &cached {
+        if at.elapsed() < CATALOG_TTL {
+            return Ok(assets.clone());
+        }
+    }
+    let fetched: Result<Vec<Value>, reqwest::Error> = async {
+        state
+            .http
+            .get(JUPITER_VERIFIED)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await
+    }
+    .await;
+    let tokens = match fetched {
+        Ok(tokens) => tokens,
+        Err(error) => {
+            return cached
+                .map(|(_, assets)| assets)
+                .ok_or_else(|| unavailable(format!("Jupiter token list unavailable: {error}")));
+        }
+    };
+    let mut assets = base_assets();
+    let mut seen = std::collections::HashSet::new();
+    for token in &tokens {
+        if let Some(asset) = solana_asset(token) {
+            if seen.insert(asset.id.clone()) {
+                assets.push(asset);
+            }
+        }
+    }
+    let assets = Arc::new(assets);
+    *state.catalog.lock().map_err(internal)? = Some((Instant::now(), assets.clone()));
+    Ok(assets)
+}
+
+pub(super) async fn find_asset(state: &MarketState, id: &str) -> Result<Asset, ApiError> {
+    catalog(state)
+        .await?
+        .iter()
+        .find(|a| a.id == id)
+        .cloned()
+        .ok_or((StatusCode::NOT_FOUND, "unsupported asset".into()))
+}
+
+// Live USD price and 24h change for Solana mints, from Jupiter, 50 at a time, shared for 15 seconds.
+pub(super) async fn usd_prices(
+    state: &MarketState,
+    mints: &[String],
+) -> Result<HashMap<String, (f64, Option<f64>)>, ApiError> {
+    let mut result = HashMap::new();
+    let mut missing = Vec::new();
+    {
+        let cache = state.prices.lock().map_err(internal)?;
+        for mint in mints {
+            match cache.get(mint) {
+                Some((at, price, change)) if at.elapsed() < PRICE_TTL => {
+                    result.insert(mint.clone(), (*price, *change));
+                }
+                _ => missing.push(mint.clone()),
+            }
+        }
+    }
+    for chunk in missing.chunks(50) {
+        let body: Value = state
+            .http
+            .get(JUPITER_PRICES)
+            .query(&[("ids", chunk.join(","))])
+            .send()
+            .await
+            .map_err(unavailable)?
+            .error_for_status()
+            .map_err(unavailable)?
+            .json()
+            .await
+            .map_err(unavailable)?;
+        let mut cache = state.prices.lock().map_err(internal)?;
+        for mint in chunk {
+            let Some(price) = body[mint]["usdPrice"].as_f64().filter(|p| *p > 0.0) else {
+                continue;
+            };
+            let change = body[mint]["priceChange24h"].as_f64();
+            cache.insert(mint.clone(), (Instant::now(), price, change));
+            result.insert(mint.clone(), (price, change));
+        }
+    }
+    Ok(result)
+}
 
 #[derive(Clone)]
 pub(super) struct MarketState {
@@ -102,6 +239,9 @@ pub(super) struct MarketState {
     http: reqwest::Client,
     quotes: Arc<Mutex<HashMap<String, StoredQuote>>>,
     intents: Arc<Mutex<HashMap<String, StoredIntent>>>,
+    catalog: Arc<Mutex<Option<(Instant, Arc<Vec<Asset>>)>>>,
+    prices: Arc<Mutex<HashMap<String, (Instant, f64, Option<f64>)>>>,
+    multipliers: Arc<Mutex<HashMap<String, (Instant, bool)>>>,
 }
 #[derive(Clone)]
 struct StoredQuote {
@@ -176,9 +316,15 @@ impl MarketState {
             base: UniswapV3Client::new(rpc.clone())?,
             jupiter: JupiterClient::new(env::var("JUPITER_API_KEY").ok()),
             rpc,
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(20))
+                .user_agent("atlas-engine")
+                .build()?,
             quotes: Arc::new(Mutex::new(HashMap::new())),
             intents: Arc::new(Mutex::new(HashMap::new())),
+            catalog: Arc::new(Mutex::new(None)),
+            prices: Arc::new(Mutex::new(HashMap::new())),
+            multipliers: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 }
@@ -231,13 +377,6 @@ fn bad(message: &str) -> ApiError {
 }
 fn unavailable(error: impl std::fmt::Display) -> ApiError {
     (StatusCode::BAD_GATEWAY, error.to_string())
-}
-fn asset(id: &str) -> Result<Asset, ApiError> {
-    ASSETS
-        .iter()
-        .find(|a| a.id == id)
-        .copied()
-        .ok_or((StatusCode::NOT_FOUND, "unsupported asset".into()))
 }
 fn checked_currency(currency: &str) -> Result<(), ApiError> {
     if matches!(currency, "USD" | "NGN" | "KES" | "GHS" | "ZAR") {
@@ -331,20 +470,39 @@ fn unit_price(
         currency: currency.into(),
     })
 }
-fn quote_request(a: Asset, side: &str, input: u128) -> BaseSwapRequest {
+fn quote_request(a: &Asset, side: &str, input: u128) -> BaseSwapRequest {
     BaseSwapRequest {
-        source_token: if side == "buy" { BASE_USDC } else { a.token }.into(),
-        destination_token: if side == "buy" { a.token } else { BASE_USDC }.into(),
+        source_token: if side == "buy" { BASE_USDC } else { &a.token }.into(),
+        destination_token: if side == "buy" { &a.token } else { BASE_USDC }.into(),
         amount_base_units: input,
     }
 }
-async fn ensure_stock_units(state: &MarketState, a: Asset) -> Result<(), ApiError> {
-    if a.id != "tslax-solana" {
+// xStocks track a share count through a multiplier (splits, dividends). Atlas shows one token as one
+// share, so quotes pause for any xStock whose multiplier isn't 1 until that's handled.
+async fn ensure_stock_units(state: &MarketState, a: &Asset) -> Result<(), ApiError> {
+    if !a.xstock {
         return Ok(());
     }
+    if let Some((at, ok)) = state.multipliers.lock().map_err(internal)?.get(&a.symbol) {
+        if at.elapsed() < MULTIPLIER_TTL {
+            return if *ok {
+                Ok(())
+            } else {
+                Err(paused_stock(&a.symbol))
+            };
+        }
+    }
+    let mut url =
+        reqwest::Url::parse("https://api.xstocks.fi/api/v2/public/assets/").map_err(unavailable)?;
+    url.path_segments_mut()
+        .map_err(|_| unavailable("xStocks URL"))?
+        .pop_if_empty()
+        .push(&a.symbol)
+        .push("multiplier");
+    url.query_pairs_mut().append_pair("network", "Solana");
     let response: Value = state
         .http
-        .get("https://api.xstocks.fi/api/v2/public/assets/TSLAx/multiplier?network=Solana")
+        .get(url)
         .send()
         .await
         .map_err(unavailable)?
@@ -353,17 +511,27 @@ async fn ensure_stock_units(state: &MarketState, a: Asset) -> Result<(), ApiErro
         .json()
         .await
         .map_err(unavailable)?;
-    if response["currentMultiplier"] != 1 {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "TSLAx display multiplier changed; quotes are paused until adjusted".into(),
-        ));
+    let ok = response["currentMultiplier"] == 1;
+    state
+        .multipliers
+        .lock()
+        .map_err(internal)?
+        .insert(a.symbol.clone(), (Instant::now(), ok));
+    if ok {
+        Ok(())
+    } else {
+        Err(paused_stock(&a.symbol))
     }
-    Ok(())
+}
+fn paused_stock(symbol: &str) -> ApiError {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!("{symbol} display multiplier changed; quotes are paused until adjusted"),
+    )
 }
 pub(super) async fn venue_quote(
     state: &MarketState,
-    a: Asset,
+    a: &Asset,
     side: &str,
     input: u128,
 ) -> Result<(u128, u128, u32), ApiError> {
@@ -379,8 +547,8 @@ pub(super) async fn venue_quote(
         let q = state
             .jupiter
             .order(&JupiterOrderRequest {
-                input_mint: if side == "buy" { SOL_USDC } else { a.token }.into(),
-                output_mint: if side == "buy" { a.token } else { SOL_USDC }.into(),
+                input_mint: if side == "buy" { SOL_USDC } else { &a.token }.into(),
+                output_mint: if side == "buy" { &a.token } else { SOL_USDC }.into(),
                 amount_base_units: input.try_into().map_err(|_| bad("amount too large"))?,
                 taker: None,
             })
@@ -403,29 +571,96 @@ pub(super) async fn assets(
     let currency = q.currency.unwrap_or_else(|| "NGN".into());
     checked_currency(&currency)?;
     let category = q.category.unwrap_or_else(|| "popular".into());
-    if !matches!(category.as_str(), "popular" | "stocks" | "memes" | "crypto") {
-        return Err(bad("unsupported asset category"));
-    }
+    let kind = match category.as_str() {
+        "popular" => None,
+        "stocks" => Some("stock"),
+        "memes" => Some("meme"),
+        "crypto" => Some("crypto"),
+        _ => return Err(bad("unsupported asset category")),
+    };
     let rate = app_balance::fx_rate(&currency).await?;
-    let query = q.q.unwrap_or_default().to_ascii_lowercase();
-    let mut result = Vec::new();
-    for a in ASSETS {
-        if category != "popular"
-            && category != format!("{}s", a.kind)
-            && !(category == "crypto" && a.kind == "crypto")
-        {
-            continue;
+    let query = q.q.unwrap_or_default().trim().to_ascii_lowercase();
+    let catalog = catalog(&state.markets).await?;
+    let rank = |a: &Asset| -> u8 {
+        let (symbol, name) = (a.symbol.to_ascii_lowercase(), a.name.to_ascii_lowercase());
+        if symbol == query {
+            0
+        } else if symbol.starts_with(&query) {
+            1
+        } else if name.starts_with(&query) {
+            2
+        } else {
+            3
         }
-        if !query.is_empty()
-            && !a.name.to_ascii_lowercase().contains(&query)
-            && !a.symbol.to_ascii_lowercase().contains(&query)
-        {
-            continue;
-        }
-        let (_, out, _) = venue_quote(&state.markets, a, "buy", 1_000_000).await?;
-        result.push(json!({"assetId":a.id,"symbol":a.symbol,"name":a.name,"kind":a.kind,"price":unit_price(1_000_000,out,a.decimals,&currency,rate)?,"change24hPct":null,"iconUrl":a.icon_url}));
+    };
+    let mut picked: Vec<&Asset> = catalog
+        .iter()
+        .filter(|a| kind.is_none_or(|k| a.kind == k))
+        .filter(|a| {
+            query.is_empty()
+                || a.symbol.to_ascii_lowercase().contains(&query)
+                || a.name.to_ascii_lowercase().contains(&query)
+        })
+        .collect();
+    // Most traded first (a search puts close name matches ahead of that).
+    picked.sort_by(|a, b| {
+        let by_match = if query.is_empty() { 0 } else { rank(a) }.cmp(&if query.is_empty() {
+            0
+        } else {
+            rank(b)
+        });
+        by_match.then(b.volume_24h.total_cmp(&a.volume_24h))
+    });
+    picked.truncate(if !query.is_empty() {
+        30
+    } else if kind.is_none() {
+        40
+    } else {
+        60
+    });
+    let mints: Vec<String> = picked
+        .iter()
+        .filter(|a| a.chain == "solana")
+        .map(|a| a.token.clone())
+        .collect();
+    let prices = usd_prices(&state.markets, &mints).await?;
+    let mut result = Vec::with_capacity(picked.len());
+    for a in picked {
+        let (price, change) = if a.chain == "solana" {
+            // No live price, no row: never show a stale or guessed one.
+            let Some((usd, change)) = prices.get(&a.token) else {
+                continue;
+            };
+            (
+                money_from_usd(*usd, &currency, rate)?,
+                change.map(|c| format!("{c:.2}")),
+            )
+        } else {
+            let (_, out, _) = venue_quote(&state.markets, a, "buy", 1_000_000).await?;
+            (
+                json!(unit_price(1_000_000, out, a.decimals, &currency, rate)?),
+                None,
+            )
+        };
+        result.push(json!({"assetId":a.id,"symbol":a.symbol,"name":a.name,"kind":a.kind,"price":price,"change24hPct":change,"iconUrl":a.icon_url}));
     }
     Ok(Json(json!({"assets":result})))
+}
+
+// An indicative unit price from a floating USD price (display only; trades use venue quotes).
+fn money_from_usd(usd: f64, currency: &str, rate: u128) -> Result<Value, ApiError> {
+    if !usd.is_finite() || usd <= 0.0 {
+        return Err(unavailable("invalid venue price"));
+    }
+    let amount = usd * rate as f64 / 1_000_000.0;
+    let mut text = format!("{amount:.12}");
+    while text.ends_with('0') {
+        text.pop();
+    }
+    if text.ends_with('.') {
+        text.pop();
+    }
+    Ok(json!({"amount":text,"currency":currency}))
 }
 
 pub(super) async fn quote(
@@ -434,7 +669,7 @@ pub(super) async fn quote(
     Json(req): Json<QuoteRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let user = app_balance::verified_wallets(&state, &headers).await?;
-    let a = asset(&req.asset_id)?;
+    let a = find_asset(&state.markets, &req.asset_id).await?;
     if req.side != "buy" && req.side != "sell" {
         return Err(bad("side must be buy or sell"));
     }
@@ -451,7 +686,7 @@ pub(super) async fn quote(
     let input = if req.side == "buy" {
         usdc_units
     } else {
-        let (_, out, _) = venue_quote(&state.markets, a, "buy", 1_000_000).await?;
+        let (_, out, _) = venue_quote(&state.markets, &a, "buy", 1_000_000).await?;
         usdc_units
             .checked_mul(out)
             .ok_or_else(|| bad("amount too large"))?
@@ -461,7 +696,7 @@ pub(super) async fn quote(
         return Err(bad("amount too small for this asset"));
     }
     let (actual_in, actual_out, fee_units) =
-        venue_quote(&state.markets, a, &req.side, input).await?;
+        venue_quote(&state.markets, &a, &req.side, input).await?;
     let (asset_units, stable_units) = if req.side == "buy" {
         (actual_out, actual_in)
     } else {
@@ -502,7 +737,7 @@ pub(super) async fn quote(
         quote_id.clone(),
         StoredQuote {
             owner: user.user_id,
-            asset: a,
+            asset: a.clone(),
             side: req.side.clone(),
             currency: req.amount.currency.clone(),
             display_amount: req.amount.amount,
@@ -544,7 +779,7 @@ pub(super) async fn execute_quote(
         ));
     }
     let a = stored.asset;
-    ensure_stock_units(&state.markets, a).await?;
+    ensure_stock_units(&state.markets, &a).await?;
     let wallet = if a.chain == "base" {
         user.evm_wallet
     } else {
@@ -557,7 +792,7 @@ pub(super) async fn execute_quote(
     let mut request_id = None;
     let output: u128;
     if a.chain == "base" {
-        let request = quote_request(a, &stored.side, stored.input_units);
+        let request = quote_request(&a, &stored.side, stored.input_units);
         let fresh = state
             .markets
             .base
@@ -619,11 +854,11 @@ pub(super) async fn execute_quote(
                 input_mint: if stored.side == "buy" {
                     SOL_USDC
                 } else {
-                    a.token
+                    &a.token
                 }
                 .into(),
                 output_mint: if stored.side == "buy" {
-                    a.token
+                    &a.token
                 } else {
                     SOL_USDC
                 }
@@ -674,7 +909,7 @@ pub(super) async fn execute_quote(
         StoredIntent {
             owner: user.user_id,
             wallet,
-            chain: a.chain.into(),
+            chain: a.chain.clone(),
             expected,
             request_id,
             status,
@@ -879,30 +1114,154 @@ pub(super) async fn intent_status(
 mod tests {
     use super::*;
     #[test]
-    fn assets_without_bundled_logos_supply_an_icon_url() {
-        const BUNDLED: [&str; 10] = [
-            "AAPL", "BONK", "BRETT", "BTC", "ETH", "NVDA", "SOL", "TSLA", "USDC", "WIF",
-        ];
-        for asset in ASSETS {
-            let base = asset
-                .symbol
-                .strip_suffix('c')
-                .or_else(|| asset.symbol.strip_suffix('x'))
-                .unwrap_or(asset.symbol);
-            let base = match base {
-                "WETH" => "ETH",
-                "WBTC" => "BTC",
-                _ => base,
-            };
-            assert!(
-                BUNDLED.contains(&base)
-                    || asset
-                        .icon_url
-                        .is_some_and(|url| url.starts_with("https://")),
-                "{} needs a verified HTTPS icon URL",
-                asset.id
-            );
-        }
+    fn catalog_lists_only_verified_liquid_tradable_tokens() {
+        let token = |mint: &str,
+                     symbol: &str,
+                     name: &str,
+                     tags: &[&str],
+                     verified: bool,
+                     liquidity: f64| {
+            json!({"id":mint,"symbol":symbol,"name":name,"decimals":8,"isVerified":verified,
+                "liquidity":liquidity,"tags":tags,"icon":"https://example.com/i.png",
+                "stats24h":{"buyVolume":1000.0,"sellVolume":500.0}})
+        };
+        let nvdax = solana_asset(&token(
+            "NVDAmint",
+            "NVDAx",
+            "NVIDIA xStock",
+            &["verified", "xstocks"],
+            true,
+            5e6,
+        ))
+        .unwrap();
+        assert_eq!(
+            (nvdax.kind.as_str(), nvdax.xstock, nvdax.volume_24h),
+            ("stock", true, 1500.0)
+        );
+        // An impostor with the same symbol but no verification never lists.
+        assert!(solana_asset(&token(
+            "fake",
+            "TSLAx",
+            "Tesla xStock",
+            &["unknown"],
+            false,
+            5e6
+        ))
+        .is_none());
+        // Stablecoins and staking/yield tokens belong to cash and Earn, not Trade.
+        assert!(solana_asset(&token(
+            "usdg",
+            "USDG",
+            "Global Dollar",
+            &["verified", "stable"],
+            true,
+            5e6
+        ))
+        .is_none());
+        assert!(solana_asset(&token(
+            "jito",
+            "JitoSOL",
+            "Jito Staked SOL",
+            &["verified", "lst"],
+            true,
+            5e6
+        ))
+        .is_none());
+        assert!(solana_asset(&token(
+            "pyusd",
+            "PYUSD",
+            "PayPal USD",
+            &["verified"],
+            true,
+            5e6
+        ))
+        .is_none());
+        // Too thin to fill a real order.
+        assert!(
+            solana_asset(&token("thin", "THIN", "Thin", &["verified"], true, 5_000.0)).is_none()
+        );
+        assert_eq!(
+            solana_asset(&token(
+                "bonk",
+                "BONK",
+                "Bonk",
+                &["verified", "meme"],
+                true,
+                5e6
+            ))
+            .unwrap()
+            .kind,
+            "meme"
+        );
+        let sol = solana_asset(&token(
+            SOL_MINT,
+            "SOL",
+            "Wrapped SOL",
+            &["verified"],
+            true,
+            5e8,
+        ))
+        .unwrap();
+        assert_eq!((sol.name.as_str(), sol.kind.as_str()), ("Solana", "crypto"));
+        assert_eq!(base_assets().len(), 3);
+    }
+    // Network: the real Jupiter verified list through the real filter.
+    // cargo test -p engine-service live_jupiter_catalog -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn live_jupiter_catalog() {
+        let tokens: Vec<Value> = reqwest::Client::new()
+            .get(JUPITER_VERIFIED)
+            .header("user-agent", "atlas-engine")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let assets: Vec<Asset> = tokens.iter().filter_map(solana_asset).collect();
+        let count = |k: &str| assets.iter().filter(|a| a.kind == k).count();
+        println!(
+            "{} listed of {}: {} crypto, {} stock, {} meme",
+            assets.len(),
+            tokens.len(),
+            count("crypto"),
+            count("stock"),
+            count("meme")
+        );
+        let mut top: Vec<&Asset> = assets.iter().collect();
+        top.sort_by(|a, b| b.volume_24h.total_cmp(&a.volume_24h));
+        println!(
+            "top: {:?}",
+            top.iter()
+                .take(15)
+                .map(|a| a.symbol.as_str())
+                .collect::<Vec<_>>()
+        );
+        let tslax: Vec<&Asset> = assets.iter().filter(|a| a.symbol == "TSLAx").collect();
+        assert_eq!(tslax.len(), 1, "exactly one TSLAx, the verified one");
+        assert_eq!(
+            tslax[0].token,
+            "XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB"
+        );
+        assert!(assets
+            .iter()
+            .any(|a| a.token == SOL_MINT && a.name == "Solana"));
+        assert!(!assets
+            .iter()
+            .any(|a| a.symbol.to_ascii_uppercase().contains("USD")));
+    }
+    #[test]
+    fn indicative_prices_keep_small_values() {
+        assert_eq!(
+            money_from_usd(118.5, "USD", 1_000_000).unwrap()["amount"],
+            "118.5"
+        );
+        assert_eq!(
+            money_from_usd(0.0000037958, "NGN", 1_328_000_000).unwrap()["amount"],
+            "0.0050408224"
+        );
+        assert!(money_from_usd(0.0, "USD", 1_000_000).is_err());
     }
     #[test]
     fn money_and_price_keep_small_unit_precision() {

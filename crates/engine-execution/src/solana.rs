@@ -180,6 +180,58 @@ impl SolanaAtaPreflight {
         Ok(total)
     }
 
+    /// Every token this wallet holds, across the SPL Token and Token-2022 programs (tokenized stocks
+    /// use the latter), summed per mint: (mint, raw units, decimals).
+    pub async fn owner_token_balances(
+        &self,
+        owner_address: &str,
+    ) -> Result<Vec<(String, u128, u32)>, SolanaPreflightError> {
+        Pubkey::from_str(owner_address).map_err(|_| SolanaPreflightError::InvalidAddress)?;
+        let mut totals: std::collections::BTreeMap<String, (u128, u32)> = Default::default();
+        for program in [
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+            "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+        ] {
+            let response = self
+                .rpc(
+                    "getTokenAccountsByOwner",
+                    json!([owner_address, {"programId": program}, {"encoding": "jsonParsed", "commitment": "confirmed"}]),
+                )
+                .await?;
+            let accounts = response["value"]
+                .as_array()
+                .ok_or(SolanaPreflightError::InvalidResponse)?;
+            for account in accounts {
+                let info = &account["account"]["data"]["parsed"]["info"];
+                if info["owner"].as_str() != Some(owner_address) {
+                    return Err(SolanaPreflightError::InvalidResponse);
+                }
+                let (Some(mint), Some(amount), Some(decimals)) = (
+                    info["mint"].as_str(),
+                    info["tokenAmount"]["amount"].as_str(),
+                    info["tokenAmount"]["decimals"].as_u64(),
+                ) else {
+                    return Err(SolanaPreflightError::InvalidResponse);
+                };
+                let units: u128 = amount
+                    .parse()
+                    .map_err(|_| SolanaPreflightError::InvalidResponse)?;
+                let entry = totals
+                    .entry(mint.to_owned())
+                    .or_insert((0, decimals as u32));
+                entry.0 = entry
+                    .0
+                    .checked_add(units)
+                    .ok_or(SolanaPreflightError::InvalidResponse)?;
+            }
+        }
+        Ok(totals
+            .into_iter()
+            .filter(|(_, (units, _))| *units > 0)
+            .map(|(mint, (units, decimals))| (mint, units, decimals))
+            .collect())
+    }
+
     /// Read native SOL, including Jupiter outputs that unwrap wrapped SOL.
     pub async fn owner_sol_balance(
         &self,
