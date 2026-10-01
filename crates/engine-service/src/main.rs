@@ -5,6 +5,7 @@ mod app_balance;
 mod cashlinks;
 mod earn;
 mod gasless;
+mod hl;
 mod markets;
 mod near_intents;
 mod perps;
@@ -49,6 +50,7 @@ struct AppState {
     relay_link: engine_execution::relay_link::RelayClient,
     cow: engine_execution::cow::CowClient,
     links: cashlinks::LinkStore,
+    hl: hl::HlState,
     earn: earn::EarnState,
     social: social::SocialState,
     trades: positions::TradeBook,
@@ -118,6 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         relay_link: engine_execution::relay_link::RelayClient::new(env::var("RELAY_API_KEY").ok())?,
         cow: engine_execution::cow::CowClient::new()?,
         links: cashlinks::LinkStore::new().await?,
+        hl: hl::HlState::new().await?,
         earn: earn::EarnState::default(),
         social: social::SocialState::new().await?,
         trades: positions::TradeBook::new().await?,
@@ -128,32 +131,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if matches!(state.auth, AuthMode::LocalDemo) && !bind.ip().is_loopback() {
         return Err("demo auth bypass requires a loopback bind address".into());
     }
-    perps::keep_warm(state.clone());
+    // Perps run on Hyperliquid. ATLAS_PERPS_VENUE=paradex puts Paradex back, should Hyperliquid fail.
+    let perps_routes = if env::var("ATLAS_PERPS_VENUE").as_deref() == Ok("paradex") {
+        perps::keep_warm(state.clone());
+        Router::new()
+            .route(
+                "/v1/perps/onboarding",
+                get(perps::onboarding).post(perps::onboard),
+            )
+            .route("/v1/perps/markets", get(perps::markets))
+            .route("/v1/perps/positions", get(perps::positions))
+            .route("/v1/perps/quotes", post(perps::quotes))
+            .route(
+                "/v1/perps/quotes/{quote_id}/execute",
+                post(perps::execute_quote),
+            )
+            .route(
+                "/v1/perps/positions/{position_id}/close-quote",
+                post(perps::close_quote),
+            )
+            .route(
+                "/v1/perps/close-quotes/{quote_id}/execute",
+                post(perps::execute_close),
+            )
+    } else {
+        hl::keep_warm(state.clone());
+        Router::new()
+            .route(
+                "/v1/perps/onboarding",
+                get(hl::onboarding).post(hl::onboarding),
+            )
+            .route("/v1/perps/markets", get(hl::markets))
+            .route("/v1/perps/positions", get(hl::positions))
+            .route("/v1/perps/quotes", post(hl::quote))
+            .route("/v1/perps/quotes/{quote_id}/execute", post(hl::execute))
+            .route(
+                "/v1/perps/positions/{position_id}/close-quote",
+                post(hl::close_quote),
+            )
+            .route(
+                "/v1/perps/close-quotes/{quote_id}/execute",
+                post(hl::execute),
+            )
+    };
     let mut app = Router::new()
+        .merge(perps_routes)
         .route("/health", get(health))
         .route("/v1/balance", get(app_balance::balance))
         .route("/v1/assets", get(markets::assets))
         .route("/v1/assets/{asset_id}/chart", get(markets::chart))
-        .route(
-            "/v1/perps/onboarding",
-            get(perps::onboarding).post(perps::onboard),
-        )
-        .route("/v1/perps/markets", get(perps::markets))
-        .route("/v1/perps/positions", get(perps::positions))
         .route("/v1/positions/spot", get(positions::spot))
-        .route("/v1/perps/quotes", post(perps::quotes))
-        .route(
-            "/v1/perps/quotes/{quote_id}/execute",
-            post(perps::execute_quote),
-        )
-        .route(
-            "/v1/perps/positions/{position_id}/close-quote",
-            post(perps::close_quote),
-        )
-        .route(
-            "/v1/perps/close-quotes/{quote_id}/execute",
-            post(perps::execute_close),
-        )
         .route("/v1/me", get(social::me))
         .route("/v1/me/handle", post(social::set_handle))
         .route("/v1/me/avatar", post(social::set_avatar))

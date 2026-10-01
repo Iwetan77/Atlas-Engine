@@ -88,7 +88,7 @@ fn classify(symbol: &str, tags: &[&str]) -> (String, &'static str) {
 
 // Public logo CDNs: CoinCap by ticker for tokens, FMP for stock tickers. Commodities and indices
 // have no logo; the app falls back to initials (and does the same if a URL fails to load).
-fn icon_url(symbol: &str, category: &str) -> Option<String> {
+pub(super) fn icon_url(symbol: &str, category: &str) -> Option<String> {
     // kPEPE / kSHIB quote 1,000 tokens; the logo is the token's.
     let token = symbol
         .strip_prefix('k')

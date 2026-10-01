@@ -33,7 +33,8 @@ network loses money.
 5. **Unified cash.** If the cash is on the other chain, the plan moves the shortfall first and finishes
    the action once it lands, still behind that one confirm:
    - Base → Solana through **Relay** (seconds, about 3 cents, no Base gas);
-   - Solana → Base through **Layerswap** (with ETH for gas on the way when the wallet has none).
+   - Solana → Base through **Layerswap** (with ETH for gas on the way when the wallet has none);
+   - perps margin into **Hyperliquid** through Relay (gasless from Base, or one Solana transaction).
 6. **Gas is never Atlas's.** The user pays from their own USDC, and Privy sponsorship is never used:
    - Solana: Jupiter pays on gasless swaps, otherwise a gasless $0.50 USDC → SOL top-up goes first.
    - Base: USDC leaving Base needs no ETH (one signed authorization; the venue's relayer pays). A wallet with
@@ -60,7 +61,7 @@ network loses money.
 | **Relay** | Base → Solana cash moves (one EIP-3009 signature, the solver pays gas), and Atlas Link payouts. |
 | **Layerswap** | Solana → Base (with refuel), and perps margin to Paradex (gasless from Base). |
 | **CoW Protocol** | The Base gas tank: a USDC permit plus a USDC → ETH order, settled by a solver who pays the gas. |
-| **Paradex** | Perps: every market, margin from the balance, open/close with one confirm, candles for charts. |
+| **Hyperliquid** | Perps: 178 markets, margin moved in from the balance by Relay in the same confirm, open/close with one confirm, candles for charts. The account is the user's own wallet; trades are signed by a per-user agent the user approves once (it can trade, never withdraw). `ATLAS_PERPS_VENUE=paradex` switches back to Paradex. |
 | **Morpho, Aave, Jupiter Lend, Jito** | Earn: Morpho's three largest curated USDC vaults on Base (Gauntlet, Spark, Steakhouse), Aave USDC on Base, Jupiter Lend (USDC, USDT, JupUSD, USDS, EURC), SOL staking. Best rate first. |
 | **GeckoTerminal, CoinGecko, DexScreener** | Charts for coins beyond Jupiter; the CoinGecko listing that marks a searched coin verified (exact contract, per chain); Sui search. |
 | **Helius** | Solana RPC in production (any keyed RPC works). |
@@ -90,8 +91,8 @@ Atlas never holds user funds, and the engine can't move a user's money anywhere 
 - **Exact approvals**, never unlimited ones.
 - **Retries never double an action.** Intents are claimed once (Postgres), stages only move forward, and a
   repeated report returns the current status.
-- **Perps orders** use a Paradex trading key the user explicitly allowed; it can trade, not withdraw, and can
-  be revoked in the app.
+- **Perps orders** are signed by the user's Hyperliquid agent: derived per user, approved once by the user's
+  own wallet inside their first trade's confirm, able to trade but never withdraw or transfer.
 - **Unverified coins say so.** A coin found by search is verified only when CoinGecko lists that exact
   contract on its chain; look-alikes keep the warning.
 - **Errors are honest:** in the user's currency, and when nothing moved, they say nothing moved.
@@ -108,7 +109,7 @@ flowchart LR
   BRIDGE --> PRIVY[Privy]
   API --> JUP[Jupiter] & UNI[Uniswap v3] & ONECLICK[NEAR Intents 1Click]
   API --> RELAY[Relay] & LS[Layerswap] & COW[CoW Protocol]
-  API --> PDX[Paradex] & EARN[Morpho · Aave · Jupiter Lend · Jito]
+  API --> HL[Hyperliquid] & EARN[Morpho · Aave · Jupiter Lend · Jito]
   BRIDGE --> CETUS[Cetus / Sui]
   API --> RPC[(Solana · Base · Sui · NEAR · Monad · Arc RPCs)]
   API --> PG[(Postgres)]
@@ -119,11 +120,12 @@ crates/engine-service      The HTTP API: balance, markets, trades, perps, earn, 
   src/markets.rs           Catalog, quotes, plans, unified cash, gas tanks, intent state machine.
   src/near_intents.rs      1Click buys, deposits, Sui/NEAR/Monad holdings, charts and verification.
   src/earn.rs              Morpho, Aave, Jupiter Lend, Jito.
-  src/perps/               Paradex onboarding, trading, funding.
+  src/hl.rs                Hyperliquid perps: markets, positions, quotes, margin, orders.
+  src/perps/               Paradex (the fallback venue).
   src/gasless.rs           The user's session signs a checked authorization via the bridge.
   privy-bridge/            Node sidecar: Privy token checks and user-JWT signing (see Safety).
 crates/engine-execution    Venue clients: jupiter, uniswap, near_intents, relay_link, layerswap, cow,
-                           solana, perps (Paradex), gateway.
+                           hyperliquid, solana, perps (Paradex), gateway.
 crates/engine-core, engine-types, engine-discovery   Shared types and routing primitives.
 ```
 
@@ -239,8 +241,9 @@ Every ✅ has a live call or a reproducible check behind it.
 | Cetus SUI → DEEP route and swap build | ✅ live route; ⏳ funded |
 | Morpho vault rates and share values; Aave and Jupiter Lend rates | ✅ live |
 | Charts for Sui/NEAR/Monad coins (GeckoTerminal); CoinGecko verification (DEEP, WAL verified) | ✅ live |
-| Paradex markets and candles | ✅ live |
-| Paradex onboarding, margin moves and orders | ⏳ needs a funded account |
+| Hyperliquid order and agent-approval signing (the live exchange recovered the exact signer) | ✅ live |
+| Hyperliquid markets, account, candles; Relay into Hyperliquid from Base and Solana | ✅ live |
+| Hyperliquid funded open and close | ⏳ needs a funded wallet |
 | Atlas Links: payout quote from an escrow (0.5% room), escrow signing limited to Relay payouts | ✅ live quote + unit tests; ⏳ funded claim (needs the web app hosted) |
 | Funded mainnet flows: buy, sell, send, earn in/out, perps open/close, deposits | ⏳ needs a funded wallet |
 

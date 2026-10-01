@@ -1347,6 +1347,22 @@ pub(super) async fn chart(
     checked_currency(&currency)?;
     let range = q.range.unwrap_or_else(|| "1D".into());
     // Perps markets chart from Paradex's own candles.
+    // Hyperliquid markets ("NEAR-PERP") chart from its candles; Paradex's ("BTC-USD-PERP") from its own.
+    if asset_id.ends_with("-PERP") && !asset_id.ends_with("-USD-PERP") {
+        let closes = hl::closes(&state, &asset_id, &range).await?;
+        if closes.is_empty() {
+            return Err(unavailable("no price history for this market yet"));
+        }
+        let rate = app_balance::fx_rate(&currency).await?;
+        let scale = rate as f64 / 1_000_000.0;
+        let points: Vec<Value> = closes
+            .iter()
+            .map(|(ms, usd)| json!([ms, usd * scale]))
+            .collect();
+        return Ok(Json(
+            json!({"assetId":asset_id,"range":range,"currency":currency,"points":points}),
+        ));
+    }
     if asset_id.ends_with("-PERP") {
         return perp_chart(&state, &asset_id, &range, &currency).await;
     }
@@ -2777,6 +2793,9 @@ pub(super) async fn signed(
     if intent_id.starts_with("perp-") {
         return perps::trade::signed(state, intent_id, headers, body).await;
     }
+    if intent_id.starts_with("hl-") {
+        return hl::signed(state, intent_id, headers, body).await;
+    }
     let user = app_balance::verified_wallets(&state, &headers).await?;
     let current = state
         .markets
@@ -3013,6 +3032,9 @@ pub(super) async fn intent_status(
     }
     if intent_id.starts_with("perp-") {
         return perps::trade::status(state, intent_id, headers).await;
+    }
+    if intent_id.starts_with("hl-") {
+        return hl::status(state, intent_id, headers).await;
     }
     if intent_id.starts_with("cashlink-") {
         return cashlinks::status(state, headers, intent_id).await;
