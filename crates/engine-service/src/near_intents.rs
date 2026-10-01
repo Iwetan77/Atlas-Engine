@@ -58,18 +58,23 @@ struct SuiRecovery {
     currency: String,
     rate: u128,
 }
-// A paid Sui buy whose swap never started can be finished from the SUI already received: the
-// balance read failed (Sui switched off its old RPC), or a recovery stopped before signing.
-// Never replay a timeout, a submit error, or another ambiguous failure.
-const NOTHING_SIGNED: &str = "nothing was signed";
+// A paid Sui buy whose swap failed can be finished from the SUI already received, as long as
+// that SUI is still in the wallet: a swap that went through would have spent it. The wallet is
+// read on-chain before every resume, so the error's wording never decides it.
+const NOTHING_SENT: &str = "nothing was sent";
 fn recoverable_sui(i: &StoredIntent) -> bool {
     !i.sell_sui
         && i.status.state == "failed"
         && i.status.stage == "execute"
         && i.then_swap.as_ref().is_some_and(|s| s.network != "near")
-        && i.status.error.as_deref().is_some_and(|e| {
-            e.contains("Sui RPC suix_getBalance: Method not found") || e.contains(NOTHING_SIGNED)
-        })
+}
+// The reason a bridge call gave, short enough for a message ("Sui swap unavailable: " dropped).
+fn short_reason(reason: &str) -> String {
+    reason
+        .trim_start_matches("Sui swap unavailable: ")
+        .chars()
+        .take(140)
+        .collect()
 }
 // The second leg of an unlisted Sui buy.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1637,6 +1642,13 @@ async fn sui_recovery_quote(
         .as_str()
         .and_then(|s| s.parse::<u128>().ok())
         .ok_or_else(|| venue("Your asset balance is unavailable"))?;
+    // The SUI this buy received has to still be there: if it isn't, a swap already used it.
+    if held < swap.sui_in {
+        return Err(conflict(&format!(
+            "This purchase's SUI has already been used. Check your {} balance; don't pay again.",
+            swap.symbol
+        )));
+    }
     let input = held.saturating_sub(SUI_GAS_RESERVE).min(swap.sui_in);
     if input == 0 {
         return Err(conflict(
@@ -1759,19 +1771,35 @@ async fn resume_sui_buy(
             current.status.state = "filled".into();
             record_fill(state, id, &current, "buy", bought, current.amount, digest).await;
         }
-        // Stopped before signing (the price moved more than 3%, the quote ran out): the SUI is untouched
-        // and the buy can be finished again.
-        Err((_, reason)) if reason.contains(NOTHING_SIGNED) => {
-            eprintln!("intent {id}: Sui recovery stopped before signing: {reason}");
+        // Stopped before anything reached Sui (a price move, Privy refusing to sign…): the SUI is
+        // untouched and the buy can be finished again.
+        Err((_, reason)) if reason.contains(NOTHING_SENT) => {
+            eprintln!("intent {id}: Sui recovery stopped before sending: {reason}");
             current.status.state = "failed".into();
             current.status.error = Some(format!(
-                "The price moved before the swap, so {NOTHING_SIGNED} and nothing was spent. Your SUI is still in your Sui wallet: ask for {} again to finish.",
+                "Couldn't finish yet ({}). Nothing was sent: your SUI is still in your Sui wallet. Ask for {} again to retry.",
+                short_reason(&reason),
                 swap.symbol
             ));
         }
-        _ => {
+        Err((_, reason)) => {
+            eprintln!("intent {id}: Sui recovery may have been sent: {reason}");
             current.status.state = "failed".into();
-            current.status.error=Some("The remaining swap could not be verified. Do not pay again; check your asset balance before another attempt.".into());
+            current.status.error = Some(format!(
+                "The swap's result isn't known yet ({}). Don't pay again: check your {} balance in a minute.",
+                short_reason(&reason),
+                swap.symbol
+            ));
+        }
+        Ok(body) => {
+            let reason = body["error"].as_str().unwrap_or("swap failed").to_string();
+            eprintln!("intent {id}: Sui recovery swap failed on Sui: {reason}");
+            current.status.state = "failed".into();
+            current.status.error = Some(format!(
+                "The swap didn't go through on Sui ({}). Your SUI is still in your Sui wallet: ask for {} again to retry.",
+                short_reason(&reason),
+                swap.symbol
+            ));
         }
     }
     state.near.save_intent(id, current.clone()).await?;
@@ -4678,7 +4706,7 @@ pub(super) async fn next(
 mod tests {
 
     #[test]
-    fn only_the_known_pre_sign_balance_failure_can_resume() {
+    fn only_a_failed_sui_buy_can_resume_whatever_its_error() {
         let mut intent: StoredIntent = serde_json::from_value(json!({
             "owner":"o","wallet":"w","expected_to":"t","expected_data":"0x",
             "deposit_address":"d","deposit_memo":null,"expires":1,
@@ -4688,14 +4716,18 @@ mod tests {
                 "error":"Sui RPC suix_getBalance: Method not found"}
         })).unwrap();
         assert!(recoverable_sui(&intent));
+        assert_eq!(
+            short_reason("Sui swap unavailable: 400 Invalid JWT token provided; nothing was sent"),
+            "400 Invalid JWT token provided; nothing was sent"
+        );
         intent.status.state = "pending".into();
         assert!(!recoverable_sui(&intent));
         intent.status.state = "filled".into();
         assert!(!recoverable_sui(&intent));
+        // The wording no longer decides: the wallet's SUI is read on-chain before any resume.
         intent.status.state = "failed".into();
         intent.status.error = Some("submit timed out".into());
-        assert!(!recoverable_sui(&intent));
-        intent.status.error = Some("Sui RPC suix_getBalance: Method not found".into());
+        assert!(recoverable_sui(&intent));
         intent.then_swap.as_mut().unwrap().network = "near".into();
         assert!(!recoverable_sui(&intent));
         intent.then_swap.as_mut().unwrap().network = "sui".into();

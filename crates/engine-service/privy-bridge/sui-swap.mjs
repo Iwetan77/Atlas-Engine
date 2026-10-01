@@ -178,7 +178,14 @@ export async function swapFromSui({wallet, coinType, amount, reserve, rawSign, m
   const signatureHex = await rawSign(`0x${toHex(intentMessage(txBytes))}`);
   const signature = serializedSignature(signatureHex, publicKey);
   if (!(await publicKey.verifyTransaction(txBytes, signature))) throw new Error('Sui signature did not verify');
-  const result = await submit(txBytes,signature);
+  // From here the transaction may be on the network: a failure can't be called "nothing was sent".
+  let result;
+  try {
+    result = await submit(txBytes,signature);
+  } catch (error) {
+    error.maybeSent = true;
+    throw error;
+  }
   const ok = result?.effects?.status?.status === 'success';
   const received = (result?.balanceChanges ?? [])
     .filter((c) => sameCoin(c.coinType,coinType) && c.owner?.AddressOwner === wallet.address)

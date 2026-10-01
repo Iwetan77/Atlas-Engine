@@ -97,12 +97,21 @@ const server = createServer(async (request, response) => {
     // Signing as the user: Privy exchanges the user's identity token (not the access token) for a
     // key to their wallets. Only the same user's identity token is used; else the access token.
     let userJwt = accessToken;
+    // Which token signs as the user, logged by kind only (never the token), so a Privy refusal
+    // can be traced to a missing or rejected identity token.
+    let userJwtKind = 'access token (no identity token sent)';
     if (typeof input.identityToken === 'string' && input.identityToken) {
       try {
         const identity = await privy.utils().auth().verifyIdentityToken(input.identityToken);
-        if (identity?.id === userId) userJwt = input.identityToken;
-      } catch {
+        if (identity?.id === userId) {
+          userJwt = input.identityToken;
+          userJwtKind = 'identity token';
+        } else {
+          userJwtKind = 'access token (identity token is another user)';
+        }
+      } catch (error) {
         // An expired or foreign identity token: fall back to the access token.
+        userJwtKind = `access token (identity token rejected: ${String(error?.message ?? error).slice(0, 80)})`;
       }
     }
     let user;
@@ -281,7 +290,13 @@ const server = createServer(async (request, response) => {
         });
         send(response, 200, {userId, address: wallet.address, ...result});
       } catch (error) {
-        send(response, 502, {error: `Sui swap unavailable: ${error.message}`});
+        // Only a failure while submitting may have reached the network; anything earlier (a quote,
+        // the wallet check, Privy refusing to sign) sent nothing.
+        const reason = String(error?.message ?? error).slice(0, 300);
+        console.error(`[bridge] /sui/swap failed (signing with ${userJwtKind}): ${reason}`);
+        send(response, 502, {error: error?.maybeSent
+          ? `Sui swap unavailable: ${reason} (may have been sent)`
+          : `Sui swap unavailable: ${reason}; nothing was sent`});
       }
       return;
     }
