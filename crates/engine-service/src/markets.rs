@@ -560,6 +560,9 @@ pub(super) struct QuoteRequest {
     pub(super) asset_id: String,
     pub(super) side: String,
     pub(super) amount: Money,
+    // A sell of everything held (Max): the whole holding, whatever `amount` says it's worth.
+    #[serde(default)]
+    pub(super) all: bool,
 }
 #[derive(Clone, Deserialize, Serialize)]
 pub(super) struct Money {
@@ -1666,6 +1669,16 @@ pub(super) async fn quote(
     check_limits(usdc_units, &req.amount.currency, rate)?;
     let input = if req.side == "buy" {
         usdc_units
+    } else if req.all {
+        // Everything held; SOL keeps its gas tank (0.01 SOL) for the fees ahead.
+        let held = spot_available(&state, &a, "sell", &user)
+            .await
+            .ok_or_else(|| unavailable("Couldn't read your holding right now; try again"))?;
+        if a.token == SOL_MINT {
+            held.saturating_sub(10_000_000)
+        } else {
+            held
+        }
     } else {
         let (_, out, _) = venue_quote(&state.markets, &a, "buy", 1_000_000).await?;
         usdc_units
