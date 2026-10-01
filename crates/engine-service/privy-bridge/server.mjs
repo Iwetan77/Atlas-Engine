@@ -1,3 +1,4 @@
+import {coinBalance,walletBalances} from './sui-swap.mjs';
 import {prepareRef,commitRef,quoteRef,searchRef,tokenInfo,prepareCashout as prepareNearCashout,commitCashout as commitNearCashout,prepareSale as prepareNearSale,view as nearView} from './ref-swap.mjs';
 import {createServer} from 'node:http';
 import {createHash, randomUUID} from 'node:crypto';
@@ -58,12 +59,13 @@ const server = createServer(async (request, response) => {
   const hyperliquid = ['agent', 'approve', 'leverage', 'order', 'move', 'cashout'].includes(hlRoute);
   const refRoute = request.method === 'POST' && ['/near/ref/search','/near/ref/quote','/near/ref/prepare','/near/ref/commit','/near/ref/balance','/near/cashout/prepare','/near/cashout/commit','/near/sell/prepare','/near/sell/commit'].includes(request.url);
   const suiSale = request.method === 'POST' && ['/sui/sale/quote','/sui/sale/prepare','/sui/sale/commit'].includes(request.url);
+  const suiBalanceRead=request.method==='POST' && ['/sui/balance','/sui/balances'].includes(request.url);
   const suiQuote = request.method === 'POST' && request.url === '/sui/quote';
   const suiSwap = request.method === 'POST' && request.url === '/sui/swap';
   const suiCashoutPrepare = request.method === 'POST' && request.url === '/sui/cashout/prepare';
   const suiCashoutCommit = request.method === 'POST' && request.url === '/sui/cashout/commit';
   if (!verifyOnly && !ensureWallet && !signAuthorization && !signEscrow && !hyperliquid && !suiQuote &&
-      !suiSwap && !suiSale && !refRoute && !suiCashoutPrepare && !suiCashoutCommit) {
+      !suiBalanceRead && !suiSwap && !suiSale && !refRoute && !suiCashoutPrepare && !suiCashoutCommit) {
     response.writeHead(404).end();
     return;
   }
@@ -158,6 +160,14 @@ const server = createServer(async (request, response) => {
           send(response,200,{userId,address:wallet.address,...q,metadata:await tokenInfo(input.token)});
         }
       }catch{send(response,409,{error:'Swap changed or could not complete; check your asset balance'});}
+      return;
+    }
+    if(suiBalanceRead){
+      try{
+        const wallet=await ensureReceivingWallet(userId,'sui');
+        if(request.url==='/sui/balances')send(response,200,{userId,address:wallet.address,result:await walletBalances(wallet.address)});
+        else send(response,200,{userId,address:wallet.address,result:{totalBalance:(await coinBalance(wallet.address,input.coinType)).toString()}});
+      }catch{send(response,503,{error:'Your asset balance is temporarily unavailable'});}
       return;
     }
     if (suiSale) {

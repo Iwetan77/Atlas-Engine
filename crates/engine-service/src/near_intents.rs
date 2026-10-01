@@ -890,6 +890,18 @@ async fn near_coin_held(state: &AppState, contract: &str, account: &str) -> Resu
 const WRAP_NEAR: &str = "wrap.near";
 // What the user holds on Sui from Atlas buys (SUI left for gas included), valued in USD:
 // (asset id, symbol, name, decimals, units, USDC units, icon). Nothing to read, nothing asked.
+fn sui_coin_key(value: &str) -> String {
+    match value.split_once("::") {
+        Some((address, rest)) => format!(
+            "{}::{rest}",
+            address
+                .trim_start_matches("0x")
+                .trim_start_matches('0')
+                .to_ascii_lowercase()
+        ),
+        None => value.into(),
+    }
+}
 pub(super) async fn sui_holdings(
     state: &AppState,
     headers: &HeaderMap,
@@ -904,23 +916,20 @@ pub(super) async fn sui_holdings(
         return Ok(Vec::new());
     };
     let owner = destination(state, headers, sui, user).await?;
-    let balances: Value = state
-        .near
-        .icon_http
-        .post("https://fullnode.mainnet.sui.io:443")
-        .json(&json!({"jsonrpc":"2.0","id":1,"method":"suix_getAllBalances","params":[owner]}))
-        .send()
-        .await
-        .map_err(venue)?
-        .json()
-        .await
-        .map_err(venue)?;
+    let balances = bridge(state, headers, "/sui/balances", json!({})).await?;
+    if balances["address"].as_str() != Some(&owner) {
+        return Err(venue("Balance wallet did not match"));
+    }
     let held = |coin: &str| -> u128 {
         balances["result"]
             .as_array()
             .into_iter()
             .flatten()
-            .filter(|b| b["coinType"].as_str() == Some(coin))
+            .filter(|b| {
+                b["coinType"]
+                    .as_str()
+                    .is_some_and(|t| sui_coin_key(t) == sui_coin_key(coin))
+            })
             .filter_map(|b| b["totalBalance"].as_str()?.parse::<u128>().ok())
             .sum()
     };
@@ -2505,19 +2514,10 @@ async fn sui_coin_sell_quote(
     let (symbol, name, decimals, icon_url) = sui_meta(&state, coin)
         .await
         .ok_or_else(|| venue("Asset details unavailable"))?;
-    let body: Value = state
-        .near
-        .icon_http
-        .post("https://fullnode.mainnet.sui.io:443")
-        .json(&json!({"jsonrpc":"2.0","id":1,"method":"suix_getBalance","params":[recipient,coin]}))
-        .send()
-        .await
-        .map_err(venue)?
-        .error_for_status()
-        .map_err(venue)?
-        .json()
-        .await
-        .map_err(venue)?;
+    let body = bridge(&state, &headers, "/sui/balance", json!({"coinType":coin})).await?;
+    if body["address"].as_str() != Some(&recipient) {
+        return Err(venue("Balance wallet did not match"));
+    }
     let held = body["result"]["totalBalance"]
         .as_str()
         .and_then(|v| v.parse::<u128>().ok())
@@ -2913,20 +2913,16 @@ async fn sui_sell_quote(
     if amount == 0 || amount > u64::MAX as u128 {
         return Err(bad("amount is outside the supported range"));
     }
-    let balance: Value = state
-        .near
-        .icon_http
-        .post("https://fullnode.mainnet.sui.io:443")
-        .json(&json!({"jsonrpc":"2.0","id":1,"method":"suix_getBalance",
-            "params":[sui_wallet,"0x2::sui::SUI"]}))
-        .send()
-        .await
-        .map_err(venue)?
-        .error_for_status()
-        .map_err(venue)?
-        .json()
-        .await
-        .map_err(venue)?;
+    let balance = bridge(
+        &state,
+        &headers,
+        "/sui/balance",
+        json!({"coinType":"0x2::sui::SUI"}),
+    )
+    .await?;
+    if balance["address"].as_str() != Some(&sui_wallet) {
+        return Err(venue("Balance wallet did not match"));
+    }
     let held = balance["result"]["totalBalance"]
         .as_str()
         .and_then(|raw| raw.parse::<u128>().ok())
@@ -4396,6 +4392,18 @@ pub(super) async fn next(
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn grpc_coin_addresses_match_short_catalog_addresses() {
+        assert_eq!(
+            super::sui_coin_key("0x2::sui::SUI"),
+            super::sui_coin_key(&format!("0x{:0>64}::sui::SUI", "2"))
+        );
+        assert_ne!(
+            super::sui_coin_key("0x2::sui::SUI"),
+            super::sui_coin_key("0x3::sui::SUI")
+        );
+    }
+
     use super::*;
     #[test]
     #[ignore = "live dry Ref quotes; no signing"]

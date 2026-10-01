@@ -6,7 +6,7 @@ import {toSerializedSignature} from '@mysten/sui/cryptography';
 import {SuiGrpcClient} from '@mysten/sui/grpc';
 import {Ed25519PublicKey} from '@mysten/sui/keypairs/ed25519';
 import {Transaction} from '@mysten/sui/transactions';
-import {fromBase58, fromBase64, toBase64, toHex} from '@mysten/sui/utils';
+import {fromBase58, fromBase64, toHex, normalizeStructTag} from '@mysten/sui/utils';
 
 export const SUI = '0x2::sui::SUI';
 const FULLNODE = process.env.SUI_FULLNODE_URL ?? 'https://fullnode.mainnet.sui.io:443';
@@ -19,15 +19,31 @@ function client() {
   return grpc;
 }
 
-async function rpc(method, params) {
-  const response = await fetch(FULLNODE, {
-    method: 'POST',
-    headers: {'content-type': 'application/json'},
-    body: JSON.stringify({jsonrpc: '2.0', id: 1, method, params}),
-  });
-  const body = await response.json();
-  if (body.error) throw new Error(`Sui RPC ${method}: ${body.error.message ?? 'error'}`);
-  return body.result;
+export async function coinBalance(owner, coinType = SUI) {
+  const {balance}=await client().getBalance({owner,coinType});
+  if(!/^[0-9]+$/.test(balance?.balance??''))throw new Error('Sui balance unavailable');
+  return BigInt(balance.balance);
+}
+export async function walletBalances(owner) {
+  const result=[];let cursor;
+  do {
+    const page=await client().listBalances({owner,cursor,limit:100});
+    result.push(...page.balances.map(b=>({coinType:b.coinType,totalBalance:b.balance})));
+    if(!page.hasNextPage)break;
+    if(!page.cursor||page.cursor===cursor)throw new Error('Sui balance pagination failed');
+    cursor=page.cursor;
+  }while(true);
+  return result;
+}
+function sameCoin(a,b){try{return normalizeStructTag(a)===normalizeStructTag(b);}catch{return false;}}
+export function executionResult(result){
+  const tx=result.Transaction??result.FailedTransaction;
+  if(!tx?.digest||typeof tx.status?.success!=='boolean')throw new Error('Sui execution outcome unavailable');
+  return {digest:tx.digest,effects:{status:{status:tx.status.success?'success':'failure',error:tx.status.error?.message??'transaction failed'}},
+    balanceChanges:(tx.balanceChanges??[]).map(c=>({coinType:c.coinType,owner:{AddressOwner:c.address},amount:c.amount}))};
+}
+async function submit(txBytes,signature){
+  return executionResult(await client().executeTransaction({transaction:txBytes,signatures:[signature],include:{balanceChanges:true,effects:true}}));
 }
 
 // Sui signs blake2b256(intent || transaction bytes); the intent for a transaction is [0, 0, 0].
@@ -83,8 +99,8 @@ export async function quoteSale(coinType, amount, sender) {
 
 export async function prepareSale({intentId,wallet,userId,userJwt,accessToken,identityToken}) {
   const scope = await salePermission({intentId,wallet,userId,accessToken,identityToken});
-  const held = await rpc('suix_getBalance',[wallet.address,scope.coinType]);
-  if (BigInt(scope.amount) <= 0n || BigInt(scope.amount) > BigInt(held?.totalBalance ?? 0)) {
+  const held = await coinBalance(wallet.address,scope.coinType);
+  if (BigInt(scope.amount) <= 0n || BigInt(scope.amount) > held) {
     throw new Error('the sell amount exceeds your holding');
   }
   if (await suiBalance(wallet.address) < 20000000n) throw new Error('not enough for the network fee');
@@ -99,8 +115,8 @@ export async function commitSale({saleId,scope,wallet,userId,userJwt,rawSign}) {
     throw new Error('sale wallet changed');
   }
   const {scope:approved,data:router} = sales.take(saleId,scope,userJwt);
-  const held = await rpc('suix_getBalance',[wallet.address,approved.coinType]);
-  if (BigInt(held?.totalBalance ?? 0) < BigInt(approved.amount)) throw new Error('holding changed');
+  const held = await coinBalance(wallet.address,approved.coinType);
+  if (held < BigInt(approved.amount)) throw new Error('holding changed');
   const publicKey = walletPublicKey(wallet.public_key,wallet.address);
   const aggregator = new AggregatorClient({signer:wallet.address,client:client(),env:Env.Mainnet});
   const txb = new Transaction();
@@ -110,22 +126,20 @@ export async function commitSale({saleId,scope,wallet,userId,userJwt,rawSign}) {
   if (Date.now() >= approved.expiresAtUnixMs) throw new Error('sale expired');
   const signature = serializedSignature(await rawSign(`0x${toHex(intentMessage(txBytes))}`),publicKey);
   if (!(await publicKey.verifyTransaction(txBytes,signature))) throw new Error('signature did not verify');
-  const result = await rpc('sui_executeTransactionBlock',[
-    toBase64(txBytes),[signature],{showEffects:true,showBalanceChanges:true},'WaitForLocalExecution']);
+  const result = await submit(txBytes,signature);
   return saleEffects(result,wallet.address);
 }
 
 // The wallet's net SUI credit includes gas. Never send an estimated output to 1Click.
 export function saleEffects(result, owner) {
   const ok = result?.effects?.status?.status === 'success';
-  const out = (result?.balanceChanges ?? []).filter(c => c.coinType === SUI && c.owner?.AddressOwner === owner)
+  const out = (result?.balanceChanges ?? []).filter(c => sameCoin(c.coinType,SUI) && c.owner?.AddressOwner === owner)
     .reduce((sum,c) => sum + BigInt(c.amount),0n);
   return {ok,digest:result?.digest,amountOut:out > 0n ? out.toString() : '0',error:ok ? null : 'sale did not settle'};
 }
 
 export async function suiBalance(address) {
-  const result = await rpc('suix_getBalance', [address, SUI]);
-  return BigInt(result?.totalBalance ?? '0');
+  return coinBalance(address,SUI);
 }
 
 // Swaps up to `amount` MIST (never touching the last `reserve`, kept for gas) into `coinType`.
@@ -145,12 +159,10 @@ export async function swapFromSui({wallet, coinType, amount, reserve, rawSign}) 
   const signatureHex = await rawSign(`0x${toHex(intentMessage(txBytes))}`);
   const signature = serializedSignature(signatureHex, publicKey);
   if (!(await publicKey.verifyTransaction(txBytes, signature))) throw new Error('Sui signature did not verify');
-  const result = await rpc('sui_executeTransactionBlock', [
-    toBase64(txBytes), [signature], {showEffects: true, showBalanceChanges: true}, 'WaitForLocalExecution',
-  ]);
+  const result = await submit(txBytes,signature);
   const ok = result?.effects?.status?.status === 'success';
   const received = (result?.balanceChanges ?? [])
-    .filter((c) => c.coinType === coinType && c.owner?.AddressOwner === wallet.address)
+    .filter((c) => sameCoin(c.coinType,coinType) && c.owner?.AddressOwner === wallet.address)
     .reduce((sum, c) => sum + BigInt(c.amount), 0n);
   return {digest: result?.digest, ok, error: ok ? null : result?.effects?.status?.error ?? 'swap failed',
     amountIn: input.toString(), amountOut: received.toString()};
@@ -173,9 +185,7 @@ export async function transferSui({wallet, recipient, amount, reserve, rawSign})
   const signatureHex = await rawSign(`0x${toHex(intentMessage(txBytes))}`);
   const signature = serializedSignature(signatureHex, publicKey);
   if (!(await publicKey.verifyTransaction(txBytes, signature))) throw new Error('Sui signature did not verify');
-  const result = await rpc('sui_executeTransactionBlock', [
-    toBase64(txBytes), [signature], {showEffects: true, showBalanceChanges: true}, 'WaitForLocalExecution',
-  ]);
+  const result = await submit(txBytes,signature);
   const ok = result?.effects?.status?.status === 'success';
   return {digest: result?.digest, ok, error: ok ? null : result?.effects?.status?.error ?? 'transfer failed',
     amountIn: input.toString(), recipient};

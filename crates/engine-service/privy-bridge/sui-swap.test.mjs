@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {Ed25519Keypair} from '@mysten/sui/keypairs/ed25519';
 import {blake2b} from '@noble/hashes/blake2b';
-import {intentMessage, serializedSignature, walletPublicKey, prepareSuiCashout, saleEffects} from './sui-swap.mjs';
+import {intentMessage, serializedSignature, walletPublicKey, prepareSuiCashout, saleEffects, executionResult} from './sui-swap.mjs';
 
 test('a raw ed25519 signature over blake2b(intent || tx) becomes a Sui signature that verifies', async () => {
   const keypair = new Ed25519Keypair();
@@ -59,4 +59,20 @@ test('sale effects use only the signed wallet net SUI credit, never the estimate
     {coinType:'coin',owner:{AddressOwner:'mine'},amount:'-100'}]};
   assert.equal(saleEffects(result,'mine').amountOut,'999000');
   result.effects.status.status='failure';assert.equal(saleEffects(result,'mine').ok,false);
+});
+
+test('gRPC execution counts canonical SUI credits and preserves failed outcomes', () => {
+  const tx = {digest:'confirmed',status:{success:true,error:null},balanceChanges:[
+    {coinType:'0x'+'0'.repeat(63)+'2::sui::SUI',address:'mine',amount:'1257151707'},
+    {coinType:'0x2::sui::SUI',address:'other',amount:'9000000000'}
+  ]};
+  const result = executionResult({Transaction:tx});
+  assert.equal(saleEffects(result,'mine').amountOut,'1257151707');
+  assert.equal(saleEffects(result,'mine').ok,true);
+  tx.status={success:false,error:{message:'out of gas'}};
+  const failed=executionResult({FailedTransaction:tx});
+  assert.equal(saleEffects(failed,'mine').ok,false);
+  assert.equal(failed.effects.status.error,'out of gas');
+  assert.throws(()=>executionResult({}),/outcome unavailable/);
+  assert.throws(()=>executionResult({Transaction:{digest:'unknown'}}),/outcome unavailable/);
 });
