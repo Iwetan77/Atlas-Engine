@@ -236,6 +236,11 @@ async fn health() -> Json<serde_json::Value> {
             "solana": host("ATLAS_SOLANA_MAINNET_RPC_URL", "https://api.mainnet-beta.solana.com"),
             "base": host("ATLAS_BASE_MAINNET_RPC_URL", "https://base-rpc.publicnode.com"),
         },
+        // Which optional partner keys are set (never the keys themselves).
+        "keys": {
+            "nearIntents": env::var("NEAR_INTENTS_API_KEY").is_ok_and(|k| !k.trim().is_empty()),
+            "relay": env::var("RELAY_API_KEY").is_ok_and(|k| !k.trim().is_empty()),
+        },
     }))
 }
 
