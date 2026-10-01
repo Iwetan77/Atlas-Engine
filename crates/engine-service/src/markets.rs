@@ -3518,12 +3518,23 @@ async fn base_buy_after_move(
         .ok_or_else(|| unavailable("intent has no trade"))?;
     let asset = find_asset(&state.markets, &plan.asset_id).await?;
     let wallet = intent.wallet.clone();
-    let cash = state
-        .markets
-        .base
-        .balance_of(BASE_USDC, &wallet)
-        .await
-        .map_err(unavailable)?;
+    // Relay reports the move done as it fills; Base nodes can be a block behind, so give the cash
+    // (and any gas with it) a few seconds to show.
+    let mut cash = 0;
+    for attempt in 0..6 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        cash = state
+            .markets
+            .base
+            .balance_of(BASE_USDC, &wallet)
+            .await
+            .map_err(unavailable)?;
+        if cash >= plan.pay_units && wallet_pays_gas(state, &wallet).await {
+            break;
+        }
+    }
     let amount = plan.pay_units.min(cash);
     if amount == 0 {
         return Err((
