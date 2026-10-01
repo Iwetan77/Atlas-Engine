@@ -1615,11 +1615,14 @@ pub(super) async fn assets(
     } else {
         Vec::new()
     };
-    // Base coins trending on GeckoTerminal join the list (and its search).
+    // Base coins trending on GeckoTerminal join the list (and its search), unless GeckoTerminal is
+    // slow: search answers in seconds with what it has.
     let trending_base = if by_address {
         Arc::default()
     } else {
-        base_trending(&state).await
+        tokio::time::timeout(SEARCH_SOURCE_LIMIT, base_trending(&state))
+            .await
+            .unwrap_or_default()
     };
     let rank = |a: &Asset| -> u8 {
         let (symbol, name) = (a.symbol.to_ascii_lowercase(), a.name.to_ascii_lowercase());
@@ -1687,11 +1690,15 @@ pub(super) async fn assets(
         let (markets, a) = (state.markets.clone(), (*a).clone());
         quotes.spawn(async move { (a.token.clone(), base_rate(&markets, &a).await) });
     }
-    while let Some(done) = quotes.join_next().await {
-        if let Ok((token, Some(rate))) = done {
-            base_rates.insert(token, rate);
+    // A Base coin whose price doesn't come back in time is left out rather than holding the list.
+    let _ = tokio::time::timeout(SEARCH_SOURCE_LIMIT * 2, async {
+        while let Some(done) = quotes.join_next().await {
+            if let Ok((token, Some(rate))) = done {
+                base_rates.insert(token, rate);
+            }
         }
-    }
+    })
+    .await;
     let mut result = Vec::with_capacity(picked.len());
     for a in picked {
         let (price, change) = if a.chain == "solana" {
@@ -1716,13 +1723,23 @@ pub(super) async fn assets(
     }
     // Coins on other chains through 1Click; when it's down, search still answers with the rest.
     if !raw.is_empty() && kind.is_none_or(|k| k == "crypto") {
-        match near_intents::search_assets(&state, raw, &currency, rate).await {
-            Ok(found) => result.extend(found),
-            Err(error) => eprintln!("1Click search unavailable: {}", error.1),
+        let found = tokio::time::timeout(
+            SEARCH_SOURCE_LIMIT * 2,
+            near_intents::search_assets(&state, raw, &currency, rate),
+        )
+        .await;
+        match found {
+            Ok(Ok(found)) => result.extend(found),
+            Ok(Err(error)) => eprintln!("1Click search unavailable: {}", error.1),
+            Err(_) => eprintln!("1Click search too slow; answered without it"),
         }
     }
     Ok(Json(json!({"assets":result})))
 }
+
+// How long one optional source (trending lists, prices for a few Base coins, other chains' search)
+// may hold a search or a list before it's answered without that source.
+const SEARCH_SOURCE_LIMIT: Duration = Duration::from_secs(2);
 
 #[derive(Deserialize)]
 pub(super) struct ChartQuery {
