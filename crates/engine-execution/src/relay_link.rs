@@ -14,6 +14,14 @@ use crate::swaps::uniswap::BASE_USDC;
 const API: &str = "https://api.relay.link/";
 const BASE_CHAIN_ID: u64 = 8453;
 const SOLANA_CHAIN_ID: u64 = 792703809;
+// Hyperliquid's chain id on Relay, and its USDC (8 decimals there; 6 on Base and Solana).
+const HYPERLIQUID_CHAIN_ID: u64 = 1337;
+const HYPERLIQUID_USDC: &str = "0x00000000000000000000000000000000";
+// Relay's Solana deposit program, and the compute-budget program a deposit may also use.
+const SOLANA_DEPOSIT_PROGRAMS: [&str; 2] = [
+    "99vQwtBwYtrqqD9YSXbdum3KBdxPAVxYTaQ3cfnJSrN2",
+    "ComputeBudget111111111111111111111111111111",
+];
 // Relay's receiver on Base: the only account that can redeem the user's authorization (the Privy
 // bridge pins it too).
 const RECEIVER: &str = "0xccc88a9d1b4ed6b0eaba998850414b24f1c315be";
@@ -36,6 +44,45 @@ pub struct RelayClient {
     http: Client,
     base: Url,
     api_key: Option<String>,
+}
+
+/// Where a move lands: the chain, its USDC, the recipient, and how many of its units make one of
+/// Base's (Hyperliquid's USDC has 8 decimals, Base's and Solana's 6).
+#[derive(Clone, Copy)]
+struct Dest<'a> {
+    chain: u64,
+    currency: &'a str,
+    recipient: &'a str,
+    scale: u128,
+}
+
+fn solana_dest(owner: &str) -> Dest<'_> {
+    Dest {
+        chain: SOLANA_CHAIN_ID,
+        currency: MAINNET_USDC_MINT,
+        recipient: owner,
+        scale: 1,
+    }
+}
+
+fn hyperliquid_dest(account: &str) -> Dest<'_> {
+    Dest {
+        chain: HYPERLIQUID_CHAIN_ID,
+        currency: HYPERLIQUID_USDC,
+        recipient: account,
+        scale: 100,
+    }
+}
+
+/// A Solana → Hyperliquid move: Relay's deposit instructions for the user's Solana wallet to sign
+/// (the engine builds the transaction), moving `amount_in_units` so `amount_out_units` lands.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SolanaMove {
+    pub request_id: String,
+    pub instructions: Vec<Value>,
+    pub lookup_tables: Vec<String>,
+    pub amount_in_units: u128,
+    pub amount_out_units: u128,
 }
 
 /// How a move is sized: exactly this much lands, or exactly this much leaves (all of it).
@@ -82,8 +129,46 @@ impl RelayClient {
         solana_owner: &str,
         amount_out_units: u128,
     ) -> Result<GaslessMove, RelayError> {
-        self.move_to_solana(evm, solana_owner, Exact::Out(amount_out_units))
+        self.gasless_move(evm, solana_dest(solana_owner), Exact::Out(amount_out_units))
             .await
+    }
+
+    /// Base USDC from `evm` into its own Hyperliquid account, gasless, so exactly
+    /// `amount_out_units` (6 decimals) lands there.
+    pub async fn base_to_hyperliquid(
+        &self,
+        evm: &str,
+        amount_out_units: u128,
+    ) -> Result<GaslessMove, RelayError> {
+        self.gasless_move(evm, hyperliquid_dest(evm), Exact::Out(amount_out_units))
+            .await
+    }
+
+    /// Solana USDC from `solana_owner` into the Hyperliquid account `evm`, so exactly
+    /// `amount_out_units` (6 decimals) lands there.
+    pub async fn solana_to_hyperliquid(
+        &self,
+        solana_owner: &str,
+        evm: &str,
+        amount_out_units: u128,
+    ) -> Result<SolanaMove, RelayError> {
+        let url = self
+            .base
+            .join("quote/v2")
+            .map_err(|_| RelayError::InvalidResponse("URL"))?;
+        let response = self
+            .with_key(self.http.post(url))
+            .json(&json!({
+                "user":solana_owner,"recipient":evm,"refundTo":solana_owner,
+                "originChainId":SOLANA_CHAIN_ID,"destinationChainId":HYPERLIQUID_CHAIN_ID,
+                "originCurrency":MAINNET_USDC_MINT,"destinationCurrency":HYPERLIQUID_USDC,
+                "amount":(amount_out_units * 100).to_string(),"tradeType":"EXACT_OUTPUT",
+                "slippageTolerance":"50"
+            }))
+            .send()
+            .await?;
+        let body = checked(response).await?;
+        parse_solana_move(&body, solana_owner, evm, amount_out_units)
     }
 
     /// The same, sending exactly `amount_in_units` (everything an address holds); what lands is
@@ -94,18 +179,18 @@ impl RelayClient {
         solana_owner: &str,
         amount_in_units: u128,
     ) -> Result<GaslessMove, RelayError> {
-        self.move_to_solana(evm, solana_owner, Exact::In(amount_in_units))
+        self.gasless_move(evm, solana_dest(solana_owner), Exact::In(amount_in_units))
             .await
     }
 
-    async fn move_to_solana(
+    async fn gasless_move(
         &self,
         evm: &str,
-        solana_owner: &str,
+        dest: Dest<'_>,
         exact: Exact,
     ) -> Result<GaslessMove, RelayError> {
         let (amount, trade_type) = match exact {
-            Exact::Out(units) => (units, "EXACT_OUTPUT"),
+            Exact::Out(units) => (units * dest.scale, "EXACT_OUTPUT"),
             Exact::In(units) => (units, "EXACT_INPUT"),
         };
         let url = self
@@ -115,9 +200,9 @@ impl RelayClient {
         let response = self
             .with_key(self.http.post(url))
             .json(&json!({
-                "user":evm,"recipient":solana_owner,"refundTo":evm,
-                "originChainId":BASE_CHAIN_ID,"destinationChainId":SOLANA_CHAIN_ID,
-                "originCurrency":BASE_USDC.to_ascii_lowercase(),"destinationCurrency":MAINNET_USDC_MINT,
+                "user":evm,"recipient":dest.recipient,"refundTo":evm,
+                "originChainId":BASE_CHAIN_ID,"destinationChainId":dest.chain,
+                "originCurrency":BASE_USDC.to_ascii_lowercase(),"destinationCurrency":dest.currency,
                 "amount":amount.to_string(),"tradeType":trade_type,"usePermit":true,
                 // Dollars to dollars: 0.5% is room enough (Relay's default is wider).
                 "slippageTolerance":"50"
@@ -125,7 +210,7 @@ impl RelayClient {
             .send()
             .await?;
         let body = checked(response).await?;
-        parse_gasless_move(&body, evm, solana_owner, exact)
+        parse_gasless_move(&body, evm, dest, exact)
     }
 
     /// Hands Relay the user's signed authorization; its solver then makes the move.
@@ -186,10 +271,23 @@ fn units(value: &Value) -> Option<u128> {
     value.as_str()?.parse().ok()
 }
 
+// Whether Relay's quote lands USDC at `dest`.
+fn lands_at(details: &Value, dest: Dest<'_>) -> bool {
+    let out = &details["currencyOut"]["currency"];
+    let recipient = details["recipient"].as_str().unwrap_or_default();
+    text(&out["chainId"]) == dest.chain.to_string()
+        && text(&out["address"]) == dest.currency.to_ascii_lowercase()
+        && if dest.chain == SOLANA_CHAIN_ID {
+            recipient == dest.recipient
+        } else {
+            recipient.eq_ignore_ascii_case(dest.recipient)
+        }
+}
+
 fn parse_gasless_move(
     body: &Value,
     evm: &str,
-    solana_owner: &str,
+    dest: Dest<'_>,
     exact: Exact,
 ) -> Result<GaslessMove, RelayError> {
     let invalid = RelayError::InvalidResponse;
@@ -228,14 +326,13 @@ fn parse_gasless_move(
     let (money_in, money_out) = (&details["currencyIn"], &details["currencyOut"]);
     if text(&money_in["currency"]["chainId"]) != BASE_CHAIN_ID.to_string()
         || text(&money_in["currency"]["address"]) != BASE_USDC.to_ascii_lowercase()
-        || text(&money_out["currency"]["chainId"]) != SOLANA_CHAIN_ID.to_string()
-        || money_out["currency"]["address"].as_str() != Some(MAINNET_USDC_MINT)
-        || details["recipient"].as_str() != Some(solana_owner)
+        || !lands_at(details, dest)
     {
-        return Err(invalid("not USDC from Base to this Solana wallet"));
+        return Err(invalid("not USDC from Base to this recipient"));
     }
     let amount_in_units = units(&money_in["amount"]).ok_or(invalid("amount in"))?;
-    let least_out = units(&money_out["minimumAmount"]).ok_or(invalid("amount out"))?;
+    // In Base's units (6 decimals) whatever the destination's.
+    let least_out = units(&money_out["minimumAmount"]).ok_or(invalid("amount out"))? / dest.scale;
     // What's promised to land: the asked amount, or (sending all of it) the quote's minimum.
     let amount_out_units = match exact {
         Exact::Out(asked) if least_out < asked => {
@@ -274,6 +371,73 @@ fn parse_gasless_move(
         amount_out_units,
         typed_data,
         api: api.into(),
+    })
+}
+
+fn parse_solana_move(
+    body: &Value,
+    solana_owner: &str,
+    evm: &str,
+    amount_out_units: u128,
+) -> Result<SolanaMove, RelayError> {
+    let invalid = RelayError::InvalidResponse;
+    let [step] = body["steps"].as_array().map(Vec::as_slice).unwrap_or(&[]) else {
+        return Err(invalid("expected one step"));
+    };
+    let [item] = step["items"].as_array().map(Vec::as_slice).unwrap_or(&[]) else {
+        return Err(invalid("expected one transaction"));
+    };
+    let request_id = step["requestId"]
+        .as_str()
+        .filter(|id| id.starts_with("0x") && id.len() == 66)
+        .ok_or(invalid("request id"))?;
+    let instructions = item["data"]["instructions"]
+        .as_array()
+        .filter(|list| !list.is_empty())
+        .ok_or(invalid("instructions"))?;
+    // Only Relay's deposit program (and compute budget), and only the user signs.
+    for ix in instructions {
+        if !SOLANA_DEPOSIT_PROGRAMS.contains(&ix["programId"].as_str().unwrap_or_default()) {
+            return Err(invalid("unknown program"));
+        }
+        let keys = ix["keys"].as_array().ok_or(invalid("instruction keys"))?;
+        if keys.iter().any(|k| {
+            k["isSigner"].as_bool() == Some(true) && k["pubkey"].as_str() != Some(solana_owner)
+        }) {
+            return Err(invalid("another signer"));
+        }
+    }
+    let lookup_tables = item["data"]["addressLookupTableAddresses"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(|a| a.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let details = &body["details"];
+    let money_in = &details["currencyIn"];
+    if step["kind"].as_str() != Some("transaction")
+        || text(&money_in["currency"]["chainId"]) != SOLANA_CHAIN_ID.to_string()
+        || money_in["currency"]["address"].as_str() != Some(MAINNET_USDC_MINT)
+        || !lands_at(details, hyperliquid_dest(evm))
+    {
+        return Err(invalid("not USDC from Solana to this Hyperliquid account"));
+    }
+    let amount_in_units = units(&money_in["amount"]).ok_or(invalid("amount in"))?;
+    let least_out = units(&details["currencyOut"]["minimumAmount"]).ok_or(invalid("amount out"))?;
+    if least_out < amount_out_units * 100 {
+        return Err(invalid("less would land than asked"));
+    }
+    if amount_in_units > amount_out_units + amount_out_units / 50 + 500_000 {
+        return Err(invalid("fee too high"));
+    }
+    Ok(SolanaMove {
+        request_id: request_id.into(),
+        instructions: instructions.clone(),
+        lookup_tables,
+        amount_in_units,
+        amount_out_units,
     })
 }
 
@@ -317,7 +481,13 @@ mod tests {
 
     #[test]
     fn a_move_is_one_authorization_for_exactly_what_lands() {
-        let quote = parse_gasless_move(&live_quote(), EVM, SOLANA, Exact::Out(5_000_000)).unwrap();
+        let quote = parse_gasless_move(
+            &live_quote(),
+            EVM,
+            solana_dest(SOLANA),
+            Exact::Out(5_000_000),
+        )
+        .unwrap();
         assert_eq!(quote.amount_in_units, 5_035_780);
         assert_eq!(quote.api, "swap");
         let message = &quote.typed_data["message"];
@@ -326,18 +496,24 @@ mod tests {
         assert_eq!(message["validBefore"], "1790807024");
         assert_eq!(quote.typed_data["domain"]["chainId"], 8453);
         // Asked for more than the quote lands, or for another wallet: refused.
-        assert!(parse_gasless_move(&live_quote(), EVM, SOLANA, Exact::Out(6_000_000)).is_err());
         assert!(parse_gasless_move(
             &live_quote(),
             EVM,
-            "Other1111111111111111111111111111",
+            solana_dest(SOLANA),
+            Exact::Out(6_000_000)
+        )
+        .is_err());
+        assert!(parse_gasless_move(
+            &live_quote(),
+            EVM,
+            solana_dest("Other1111111111111111111111111111"),
             Exact::Out(5_000_000)
         )
         .is_err());
         assert!(parse_gasless_move(
             &live_quote(),
             "0x0000000000000000000000000000000000000001",
-            SOLANA,
+            solana_dest(SOLANA),
             Exact::Out(5_000_000)
         )
         .is_err());
@@ -345,10 +521,22 @@ mod tests {
 
     #[test]
     fn sending_everything_promises_the_quotes_minimum() {
-        let quote = parse_gasless_move(&live_quote(), EVM, SOLANA, Exact::In(5_035_780)).unwrap();
+        let quote = parse_gasless_move(
+            &live_quote(),
+            EVM,
+            solana_dest(SOLANA),
+            Exact::In(5_035_780),
+        )
+        .unwrap();
         assert_eq!(quote.amount_in_units, 5_035_780);
         assert_eq!(quote.amount_out_units, 5_000_000);
-        assert!(parse_gasless_move(&live_quote(), EVM, SOLANA, Exact::In(9_000_000)).is_err());
+        assert!(parse_gasless_move(
+            &live_quote(),
+            EVM,
+            solana_dest(SOLANA),
+            Exact::In(9_000_000)
+        )
+        .is_err());
     }
 
     #[test]
@@ -363,7 +551,7 @@ mod tests {
                 };
             }
             *at = value;
-            parse_gasless_move(&quote, EVM, SOLANA, Exact::Out(5_000_000)).is_err()
+            parse_gasless_move(&quote, EVM, solana_dest(SOLANA), Exact::Out(5_000_000)).is_err()
         };
         let sign = ["steps", "0", "items", "0", "data", "sign"];
         let with = |tail: &[&'static str]| [&sign[..], tail].concat();
@@ -397,7 +585,7 @@ mod tests {
         let mut two = live_quote();
         let step = two["steps"][0].clone();
         two["steps"] = json!([step.clone(), step]);
-        assert!(parse_gasless_move(&two, EVM, SOLANA, Exact::Out(5_000_000)).is_err());
+        assert!(parse_gasless_move(&two, EVM, solana_dest(SOLANA), Exact::Out(5_000_000)).is_err());
     }
 
     #[test]
@@ -433,6 +621,32 @@ mod tests {
             .await
             .unwrap();
         println!("5.05 USDC sent, {} lands", all.amount_out_units);
+        // Into a Hyperliquid account: gasless from Base, or a built Solana transaction.
+        let hl = client.base_to_hyperliquid(EVM, 10_000_000).await.unwrap();
+        println!("Base → Hyperliquid: {} in for 10 USDC", hl.amount_in_units);
+        let from_solana = client
+            .solana_to_hyperliquid(SOLANA, EVM, 10_000_000)
+            .await
+            .unwrap();
+        println!(
+            "Solana → Hyperliquid: {} in for 10 USDC",
+            from_solana.amount_in_units
+        );
+        let rpc = crate::solana::SolanaAtaPreflight::new(
+            crate::solana::SolanaNetwork::Mainnet,
+            "https://api.mainnet-beta.solana.com",
+            "",
+        )
+        .unwrap();
+        let tx = rpc
+            .v0_transaction(
+                SOLANA,
+                &from_solana.instructions,
+                &from_solana.lookup_tables,
+            )
+            .await
+            .unwrap();
+        println!("deposit transaction: {} base64 chars", tx.len());
         assert_eq!(all.amount_in_units, 5_050_000);
         assert!(all.amount_out_units > 4_950_000);
     }

@@ -1,0 +1,325 @@
+//! Hyperliquid reads: the perps markets, an account's value and positions, its fills, candles, and
+//! which agents it has approved. Trading itself is signed in the Privy bridge (hyperliquid.mjs).
+//! An account is the user's own EVM address. No API key.
+use reqwest::{Client, Url};
+use serde_json::{json, Value};
+use std::time::Duration;
+
+const INFO: &str = "https://api.hyperliquid.xyz/info";
+
+#[derive(Debug, thiserror::Error)]
+pub enum HyperliquidError {
+    #[error("Hyperliquid request failed: {0}")]
+    Transport(#[from] reqwest::Error),
+    #[error("Hyperliquid returned an unexpected answer: {0}")]
+    InvalidResponse(&'static str),
+}
+
+#[derive(Clone)]
+pub struct HyperliquidClient {
+    http: Client,
+    info: Url,
+}
+
+/// One perps market right now. `asset` is the id orders use; `coin` names it ("BTC").
+#[derive(Clone, Debug, PartialEq)]
+pub struct Market {
+    pub coin: String,
+    pub asset: u32,
+    pub sz_decimals: u32,
+    pub max_leverage: u32,
+    pub mark: f64,
+    pub prev_day: f64,
+    // Per hour (Hyperliquid funds hourly).
+    pub funding: f64,
+    pub day_volume: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Position {
+    pub coin: String,
+    // Signed size: positive long, negative short.
+    pub size: f64,
+    pub entry: f64,
+    pub value: f64,
+    pub unrealized_pnl: f64,
+    pub return_on_equity: f64,
+    pub liquidation: Option<f64>,
+    pub margin: f64,
+    pub leverage: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Account {
+    // USDC (dollars): everything in the account, and what can leave it now.
+    pub value: f64,
+    pub withdrawable: f64,
+    pub positions: Vec<Position>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Fill {
+    pub coin: String,
+    pub time_ms: u64,
+    // The position before this fill: 0 means this fill opened it.
+    pub start_position: f64,
+    pub price: f64,
+    pub size: f64,
+    pub closed_pnl: f64,
+    pub fee: f64,
+}
+
+fn num(v: &Value) -> Option<f64> {
+    match v {
+        Value::String(s) => s.parse().ok(),
+        Value::Number(n) => n.as_f64(),
+        _ => None,
+    }
+    .filter(|x: &f64| x.is_finite())
+}
+
+impl HyperliquidClient {
+    pub fn new() -> Result<Self, HyperliquidError> {
+        Ok(Self {
+            http: Client::builder().timeout(Duration::from_secs(15)).build()?,
+            info: Url::parse(INFO).map_err(|_| HyperliquidError::InvalidResponse("URL"))?,
+        })
+    }
+
+    async fn info(&self, body: Value) -> Result<Value, HyperliquidError> {
+        Ok(self
+            .http
+            .post(self.info.clone())
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// Every live perps market.
+    pub async fn markets(&self) -> Result<Vec<Market>, HyperliquidError> {
+        parse_markets(&self.info(json!({"type":"metaAndAssetCtxs"})).await?)
+    }
+
+    pub async fn account(&self, user: &str) -> Result<Account, HyperliquidError> {
+        parse_account(
+            &self
+                .info(json!({"type":"clearinghouseState","user":user}))
+                .await?,
+        )
+    }
+
+    /// The account's latest fills, newest first.
+    pub async fn fills(&self, user: &str) -> Result<Vec<Fill>, HyperliquidError> {
+        let body = self.info(json!({"type":"userFills","user":user})).await?;
+        Ok(body
+            .as_array()
+            .ok_or(HyperliquidError::InvalidResponse("fills"))?
+            .iter()
+            .filter_map(|f| {
+                Some(Fill {
+                    coin: f["coin"].as_str()?.to_string(),
+                    time_ms: f["time"].as_u64()?,
+                    start_position: num(&f["startPosition"])?,
+                    price: num(&f["px"])?,
+                    size: num(&f["sz"])?,
+                    closed_pnl: num(&f["closedPnl"]).unwrap_or(0.0),
+                    fee: num(&f["fee"]).unwrap_or(0.0),
+                })
+            })
+            .collect())
+    }
+
+    /// Closing prices: (open time ms, close) per candle, oldest first.
+    pub async fn closes(
+        &self,
+        coin: &str,
+        interval: &str,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> Result<Vec<(u64, f64)>, HyperliquidError> {
+        let body = self
+            .info(
+                json!({"type":"candleSnapshot","req":{"coin":coin,"interval":interval,
+                "startTime":start_ms,"endTime":end_ms}}),
+            )
+            .await?;
+        Ok(body
+            .as_array()
+            .ok_or(HyperliquidError::InvalidResponse("candles"))?
+            .iter()
+            .filter_map(|c| Some((c["t"].as_u64()?, num(&c["c"])?)))
+            .collect())
+    }
+
+    /// The agents this account has approved (lowercase addresses).
+    pub async fn agents(&self, user: &str) -> Result<Vec<String>, HyperliquidError> {
+        let body = self.info(json!({"type":"extraAgents","user":user})).await?;
+        Ok(body
+            .as_array()
+            .ok_or(HyperliquidError::InvalidResponse("agents"))?
+            .iter()
+            .filter_map(|a| a["address"].as_str().map(str::to_ascii_lowercase))
+            .collect())
+    }
+}
+
+fn parse_markets(body: &Value) -> Result<Vec<Market>, HyperliquidError> {
+    let universe = body[0]["universe"]
+        .as_array()
+        .ok_or(HyperliquidError::InvalidResponse("markets"))?;
+    let ctxs = body[1]
+        .as_array()
+        .ok_or(HyperliquidError::InvalidResponse("market prices"))?;
+    Ok(universe
+        .iter()
+        .zip(ctxs)
+        .enumerate()
+        .filter(|(_, (meta, _))| !meta["isDelisted"].as_bool().unwrap_or(false))
+        .filter_map(|(index, (meta, ctx))| {
+            Some(Market {
+                coin: meta["name"].as_str()?.to_string(),
+                asset: u32::try_from(index).ok()?,
+                sz_decimals: u32::try_from(meta["szDecimals"].as_u64()?).ok()?,
+                max_leverage: u32::try_from(meta["maxLeverage"].as_u64()?).ok()?,
+                mark: num(&ctx["markPx"]).filter(|p| *p > 0.0)?,
+                prev_day: num(&ctx["prevDayPx"]).unwrap_or(0.0),
+                funding: num(&ctx["funding"]).unwrap_or(0.0),
+                day_volume: num(&ctx["dayNtlVlm"]).unwrap_or(0.0),
+            })
+        })
+        .collect())
+}
+
+fn parse_account(body: &Value) -> Result<Account, HyperliquidError> {
+    let value = num(&body["marginSummary"]["accountValue"])
+        .ok_or(HyperliquidError::InvalidResponse("account value"))?;
+    let positions = body["assetPositions"]
+        .as_array()
+        .ok_or(HyperliquidError::InvalidResponse("positions"))?
+        .iter()
+        .filter_map(|p| {
+            let p = &p["position"];
+            let size = num(&p["szi"])?;
+            (size != 0.0).then_some(())?;
+            Some(Position {
+                coin: p["coin"].as_str()?.to_string(),
+                size,
+                entry: num(&p["entryPx"])?,
+                value: num(&p["positionValue"]).unwrap_or(0.0),
+                unrealized_pnl: num(&p["unrealizedPnl"]).unwrap_or(0.0),
+                return_on_equity: num(&p["returnOnEquity"]).unwrap_or(0.0),
+                liquidation: num(&p["liquidationPx"]),
+                margin: num(&p["marginUsed"]).unwrap_or(0.0),
+                leverage: u32::try_from(p["leverage"]["value"].as_u64().unwrap_or(1)).unwrap_or(1),
+            })
+        })
+        .collect();
+    Ok(Account {
+        value,
+        withdrawable: num(&body["withdrawable"]).unwrap_or(0.0),
+        positions,
+    })
+}
+
+/// A price Hyperliquid accepts: at most 5 significant figures and (6 − size decimals) decimals.
+pub fn order_price(price: f64, sz_decimals: u32) -> String {
+    let decimals = 6u32.saturating_sub(sz_decimals) as i32;
+    let magnitude = if price > 0.0 {
+        price.log10().floor() as i32 + 1
+    } else {
+        1
+    };
+    let places = (5 - magnitude).clamp(0, decimals);
+    trim(format!("{price:.*}", places as usize))
+}
+
+/// A size rounded down to the market's size decimals.
+pub fn order_size(size: f64, sz_decimals: u32) -> String {
+    let scale = 10f64.powi(sz_decimals as i32);
+    trim(format!(
+        "{:.*}",
+        sz_decimals as usize,
+        (size * scale).floor() / scale
+    ))
+}
+
+fn trim(text: String) -> String {
+    if text.contains('.') {
+        text.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        text
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_markets_and_skips_delisted_ones() {
+        let body = json!([
+            {"universe":[{"name":"BTC","szDecimals":5,"maxLeverage":40},
+                {"name":"OLD","szDecimals":0,"maxLeverage":3,"isDelisted":true},
+                {"name":"NEAR","szDecimals":1,"maxLeverage":10}]},
+            [{"markPx":"83547.0","prevDayPx":"82000.0","funding":"0.0000125","dayNtlVlm":"2914300000"},
+             {"markPx":"1.0"},
+             {"markPx":"5.3423","prevDayPx":"5.1","funding":"-0.00001","dayNtlVlm":"348700000"}]
+        ]);
+        let markets = parse_markets(&body).unwrap();
+        assert_eq!(markets.len(), 2);
+        assert_eq!(markets[1].coin, "NEAR");
+        // The asset id is the position in the full list, delisted ones included.
+        assert_eq!(markets[1].asset, 2);
+        assert_eq!(markets[1].sz_decimals, 1);
+    }
+
+    #[test]
+    fn reads_an_account_with_a_position() {
+        // Shape from Hyperliquid's live API on 2026-10-01.
+        let body = json!({"marginSummary":{"accountValue":"20000.5"},"withdrawable":"372.7",
+            "assetPositions":[{"type":"oneWay","position":{"coin":"BTC","szi":"-2.10308",
+                "leverage":{"type":"cross","value":10},"entryPx":"84020.4","positionValue":"175745.98",
+                "unrealizedPnl":"-955.8","returnOnEquity":"-0.054","liquidationPx":"75172.78",
+                "marginUsed":"19627.77"}},
+                {"type":"oneWay","position":{"coin":"ETH","szi":"0.0","entryPx":"1"}}]});
+        let account = parse_account(&body).unwrap();
+        assert_eq!(account.positions.len(), 1);
+        let p = &account.positions[0];
+        assert_eq!(p.size, -2.10308);
+        assert_eq!(p.leverage, 10);
+        assert_eq!(p.liquidation, Some(75172.78));
+        assert_eq!(account.withdrawable, 372.7);
+    }
+
+    #[test]
+    fn prices_and_sizes_fit_the_exchange_rules() {
+        assert_eq!(order_price(83547.42, 5), "83547");
+        assert_eq!(order_price(5.34237, 1), "5.3424");
+        assert_eq!(order_price(0.0042713, 0), "0.004271");
+        assert_eq!(order_price(1234.5678, 2), "1234.6");
+        assert_eq!(order_size(2.00987, 1), "2");
+        assert_eq!(order_size(0.0132999, 4), "0.0132");
+        assert_eq!(order_size(12.0, 0), "12");
+    }
+
+    // Network: live markets and BTC candles.
+    // cargo test -p engine-execution live_hyperliquid -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn live_hyperliquid_markets() {
+        let client = HyperliquidClient::new().unwrap();
+        let markets = client.markets().await.unwrap();
+        println!("{} markets", markets.len());
+        let near = markets.iter().find(|m| m.coin == "NEAR").unwrap();
+        println!("{near:?}");
+        let now = 1_790_830_000_000;
+        let closes = client
+            .closes("BTC", "1h", now - 86_400_000, now)
+            .await
+            .unwrap();
+        assert!(closes.len() > 20);
+    }
+}

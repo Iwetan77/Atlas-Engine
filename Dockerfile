@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 WORKDIR /app/privy-bridge
 COPY crates/engine-service/privy-bridge/package.json crates/engine-service/privy-bridge/package-lock.json ./
 RUN npm ci --omit=dev
-COPY crates/engine-service/privy-bridge/server.mjs crates/engine-service/privy-bridge/paradex-onboarding.mjs crates/engine-service/privy-bridge/signer-config.mjs crates/engine-service/privy-bridge/trade-subkey.mjs crates/engine-service/privy-bridge/sui-swap.mjs crates/engine-service/privy-bridge/base-authorization.mjs ./
+COPY crates/engine-service/privy-bridge/server.mjs crates/engine-service/privy-bridge/paradex-onboarding.mjs crates/engine-service/privy-bridge/signer-config.mjs crates/engine-service/privy-bridge/trade-subkey.mjs crates/engine-service/privy-bridge/sui-swap.mjs crates/engine-service/privy-bridge/base-authorization.mjs crates/engine-service/privy-bridge/hyperliquid.mjs ./
 COPY --from=rust-build /src/target/release/engine-service /usr/local/bin/engine-service
 COPY scripts/run-render.sh /usr/local/bin/run-render
 RUN chmod 755 /usr/local/bin/run-render

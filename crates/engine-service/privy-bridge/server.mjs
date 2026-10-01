@@ -5,6 +5,8 @@ import {authMessage, onboardingMessage, subkeyRegistrationMessage, recoverOnboar
 import {deriveTradeSubkey, signSubkeyAuth, signParadexOrder} from './trade-subkey.mjs';
 import {quoteSwap, swapFromSui, prepareSuiCashout, transferSui} from './sui-swap.mjs';
 import {checkSignature, signable, signForEscrow} from './base-authorization.mjs';
+import {agentFor, approveAction, approveTypedData, checkApproval, leverageAction, orderAction, post as hlPost,
+  signAsAgent} from './hyperliquid.mjs';
 
 const SUI_COIN_TYPE = /^0x[0-9a-fA-F]{1,64}::[A-Za-z_][A-Za-z0-9_]*::[A-Za-z_][A-Za-z0-9_]*$/;
 const POSITIVE_INTEGER = /^[1-9][0-9]{0,30}$/;
@@ -18,6 +20,13 @@ const privy = new PrivyClient({appId, appSecret});
 const signer = parseSignerConfig(process.env);
 const port = Number(process.env.PRIVY_BRIDGE_PORT ?? 3101);
 if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('invalid bridge port');
+
+// Hyperliquid wants a fresh nonce per action: milliseconds, never repeated even within one.
+let lastNonce = 0;
+function nextNonce() {
+  lastNonce = Math.max(Date.now(), lastNonce + 1);
+  return lastNonce;
+}
 
 function send(response, status, body) {
   response.writeHead(status, {'content-type': 'application/json'});
@@ -82,12 +91,15 @@ const server = createServer(async (request, response) => {
   const relayEvm = request.method === 'POST' && request.url === '/relay/evm-transaction';
   const signAuthorization = request.method === 'POST' && request.url === '/evm/sign-authorization';
   const signEscrow = request.method === 'POST' && request.url === '/escrow/sign-authorization';
+  const hlRoute = request.method === 'POST' && request.url.startsWith('/hyperliquid/') ?
+    request.url.slice('/hyperliquid/'.length) : null;
+  const hyperliquid = ['agent', 'approve', 'leverage', 'order'].includes(hlRoute);
   const suiQuote = request.method === 'POST' && request.url === '/sui/quote';
   const suiSwap = request.method === 'POST' && request.url === '/sui/swap';
   const suiCashoutPrepare = request.method === 'POST' && request.url === '/sui/cashout/prepare';
   const suiCashoutCommit = request.method === 'POST' && request.url === '/sui/cashout/commit';
   if (!verifyOnly && !ensureWallet && !signOnboarding && !signAuth && !checkSigner &&
-      !registerSubkey && !authSubkey && !signOrder && !relayEvm && !signAuthorization && !signEscrow && !suiQuote &&
+      !registerSubkey && !authSubkey && !signOrder && !relayEvm && !signAuthorization && !signEscrow && !hyperliquid && !suiQuote &&
       !suiSwap && !suiCashoutPrepare && !suiCashoutCommit) {
     response.writeHead(404).end();
     return;
@@ -293,6 +305,29 @@ const server = createServer(async (request, response) => {
         send(response, 502, {error: String(error?.message ?? error).slice(0, 200)});
       }
       return;
+    }
+    // Hyperliquid, for the user's own account (their EVM wallet): their Atlas agent signs trades; their
+    // own session signs only the one-time approval of that agent (hyperliquid.mjs).
+    if (hyperliquid) {
+      const agent = agentFor(appSecret, userId, evmWallet);
+      const answer = (result) => send(response, 200, {userId, walletAddress: evmWallet, agentAddress: agent.address, result});
+      try {
+        if (hlRoute === 'agent') return answer(null);
+        const nonce = nextNonce();
+        if (hlRoute === 'approve') {
+          const signed = await privy.wallets().ethereum().signTypedData(evm.id, {
+            params: {typed_data: approveTypedData(agent.address, nonce)},
+            authorization_context: {user_jwts: [accessToken]},
+          });
+          const signature = checkApproval(agent.address, nonce, signed.signature, evmWallet);
+          return answer(await hlPost({action: approveAction(agent.address, nonce), nonce, signature}));
+        }
+        const action = hlRoute === 'order' ? orderAction(input) : leverageAction(input);
+        return answer(await hlPost({action, nonce, signature: signAsAgent(agent.key, action, nonce), vaultAddress: null}));
+      } catch (error) {
+        send(response, 502, {error: String(error?.message ?? error).slice(0, 200)});
+        return;
+      }
     }
     let status;
     try {

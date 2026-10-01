@@ -429,6 +429,97 @@ impl SolanaAtaPreflight {
         Ok((STANDARD.encode(bytes), creates))
     }
 
+    /// An unsigned v0 transaction paid by `payer`, base64: what a venue hands over as instructions
+    /// (`{programId, keys: [{pubkey, isSigner, isWritable}], data: hex}`) and lookup tables to use,
+    /// for the user to sign (Relay's Solana deposits).
+    pub async fn v0_transaction(
+        &self,
+        payer: &str,
+        instructions: &[Value],
+        lookup_tables: &[String],
+    ) -> Result<String, SolanaPreflightError> {
+        use solana_sdk::{
+            instruction::{AccountMeta, Instruction},
+            message::{v0, AddressLookupTableAccount, VersionedMessage},
+            signature::Signature,
+            transaction::VersionedTransaction,
+        };
+        let invalid = || SolanaPreflightError::InvalidResponse;
+        let key = |v: &Value| {
+            v.as_str()
+                .and_then(|s| Pubkey::from_str(s).ok())
+                .ok_or_else(invalid)
+        };
+        let payer = Pubkey::from_str(payer).map_err(|_| invalid())?;
+        let mut built = Vec::with_capacity(instructions.len());
+        for ix in instructions {
+            let accounts = ix["keys"]
+                .as_array()
+                .ok_or_else(invalid)?
+                .iter()
+                .map(|k| {
+                    Ok(AccountMeta {
+                        pubkey: key(&k["pubkey"])?,
+                        is_signer: k["isSigner"].as_bool().ok_or_else(invalid)?,
+                        is_writable: k["isWritable"].as_bool().ok_or_else(invalid)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, SolanaPreflightError>>()?;
+            let data = ix["data"].as_str().ok_or_else(invalid)?;
+            let data = (0..data.len())
+                .step_by(2)
+                .map(|i| {
+                    data.get(i..i + 2)
+                        .and_then(|b| u8::from_str_radix(b, 16).ok())
+                })
+                .collect::<Option<Vec<u8>>>()
+                .ok_or_else(invalid)?;
+            built.push(Instruction {
+                program_id: key(&ix["programId"])?,
+                accounts,
+                data,
+            });
+        }
+        let mut tables = Vec::with_capacity(lookup_tables.len());
+        for table in lookup_tables {
+            let address = Pubkey::from_str(table).map_err(|_| invalid())?;
+            let info = self
+                .rpc("getAccountInfo", json!([table, {"encoding":"base64"}]))
+                .await?;
+            let raw = info["value"]["data"][0].as_str().ok_or_else(invalid)?;
+            let bytes = STANDARD.decode(raw).map_err(|_| invalid())?;
+            // A lookup table's addresses follow its 56-byte header, 32 bytes each.
+            let addresses = bytes
+                .get(56..)
+                .ok_or_else(invalid)?
+                .chunks_exact(32)
+                .map(|c| Pubkey::try_from(c).map_err(|_| invalid()))
+                .collect::<Result<Vec<_>, _>>()?;
+            tables.push(AddressLookupTableAccount {
+                key: address,
+                addresses,
+            });
+        }
+        let blockhash = self
+            .rpc("getLatestBlockhash", json!([{"commitment":"confirmed"}]))
+            .await?;
+        let hash = Hash::from_str(
+            blockhash["value"]["blockhash"]
+                .as_str()
+                .ok_or_else(invalid)?,
+        )
+        .map_err(|_| invalid())?;
+        let message =
+            v0::Message::try_compile(&payer, &built, &tables, hash).map_err(|_| invalid())?;
+        let signers = usize::from(message.header.num_required_signatures);
+        let transaction = VersionedTransaction {
+            signatures: vec![Signature::default(); signers],
+            message: VersionedMessage::V0(message),
+        };
+        let bytes = bincode::serialize(&transaction).map_err(|_| invalid())?;
+        Ok(STANDARD.encode(bytes))
+    }
+
     /// None while a signature hasn't landed; Some(Ok) once confirmed, Some(Err) if it failed.
     pub async fn signature_status(
         &self,
