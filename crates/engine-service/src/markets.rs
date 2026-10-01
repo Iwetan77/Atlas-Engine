@@ -3014,6 +3014,9 @@ pub(super) async fn intent_status(
     if intent_id.starts_with("perp-") {
         return perps::trade::status(state, intent_id, headers).await;
     }
+    if intent_id.starts_with("cashlink-") {
+        return cashlinks::status(state, headers, intent_id).await;
+    }
     let user = app_balance::verified_wallets(&state, &headers).await?;
     let current = state
         .markets

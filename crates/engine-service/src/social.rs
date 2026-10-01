@@ -50,6 +50,8 @@ struct SendQuote {
     usdc_units: u128,
     expires: u64,
     plan: Option<Value>,
+    // An Atlas Link: its escrow, the note, and what the claimer gets (`usdc_units` adds the claim fee).
+    link: Option<(String, Option<String>, u128)>,
 }
 #[derive(Deserialize)]
 pub(super) struct HandleBody {
@@ -88,11 +90,9 @@ enum Destination {
     },
     Cashlink {
         message: Option<String>,
+        // The link's escrow address, made on the sender's phone with the link's secret.
+        escrow: Option<String>,
     },
-}
-#[derive(Deserialize)]
-pub(super) struct ClaimBody {
-    secret: String,
 }
 #[derive(Deserialize)]
 struct Money {
@@ -526,6 +526,7 @@ pub(super) async fn send_quote(
         StatusCode::CONFLICT,
         "Privy Ethereum wallet is not ready".into(),
     ))?;
+    let mut link: Option<(String, Option<String>)> = None;
     let (recipient, recipient_solana, label) = match req.destination {
         Destination::Atlas { handle } => {
             let record = state
@@ -550,9 +551,19 @@ pub(super) async fn send_quote(
             let _ = (bank_code, account_number);
             return Err(unavailable("Daya off-ramp is not configured"));
         }
-        Destination::Cashlink { message } => {
-            let _ = message;
-            return Err(unavailable("cash-link escrow is not configured"));
+        Destination::Cashlink { message, escrow } => {
+            let escrow = escrow
+                .as_deref()
+                .and_then(cashlinks::escrow_id)
+                .ok_or_else(|| bad("a link needs its escrow address"))?;
+            if state.links.get(&escrow).await?.is_some() {
+                return Err(bad("this link already exists"));
+            }
+            let note = message
+                .map(|m| m.trim().chars().take(80).collect::<String>())
+                .filter(|m| !m.is_empty());
+            link = Some((escrow.clone(), note));
+            (escrow, None, "Atlas Link".to_string())
         }
     };
     if !DISPLAY_CURRENCIES.contains(&req.amount.currency.as_str()) {
@@ -560,11 +571,18 @@ pub(super) async fn send_quote(
     }
     let rate = app_balance::fx_rate(&req.amount.currency).await?;
     let amount = parse_micros(&req.amount.amount)?;
-    let usdc_units = amount
+    let gift_units = amount
         .checked_mul(1_000_000)
         .ok_or_else(|| bad("amount too large"))?
         / rate;
-    markets::check_limits(usdc_units, &req.amount.currency, rate)?;
+    markets::check_limits(gift_units, &req.amount.currency, rate)?;
+    // A link also carries the few cents that pay out its claim, so the friend gets it all.
+    let fee_units = if link.is_some() {
+        cashlinks::CLAIM_FEE_UNITS
+    } else {
+        0
+    };
+    let usdc_units = gift_units + fee_units;
     // One balance. Friends are paid on the chain the cash is on: Base, or Solana straight to their
     // Solana wallet. Only when neither chain holds it all does cash move first; short on both, say so.
     let base_cash = state
@@ -607,11 +625,14 @@ pub(super) async fn send_quote(
             usdc_units,
             expires,
             plan: None,
+            link: link.map(|(escrow, note)| (escrow, note, gift_units)),
         },
     );
-    let actual = money_usdc(usdc_units, &req.amount.currency, rate)?;
+    let send = money_usdc(usdc_units, &req.amount.currency, rate)?;
+    let receive = money_usdc(gift_units, &req.amount.currency, rate)?;
+    let fee = money_usdc(fee_units, &req.amount.currency, rate)?;
     Ok(Json(
-        json!({"quoteId":quote_id,"destinationLabel":label,"send":actual,"receive":actual,"fee":{"amount":"0","currency":req.amount.currency},"eta":"After confirmation","expiresAtUnixMs":expires}),
+        json!({"quoteId":quote_id,"destinationLabel":label,"send":send,"receive":receive,"fee":fee,"eta":"After confirmation","expiresAtUnixMs":expires}),
     ))
 }
 pub(super) async fn execute_send(
@@ -686,14 +707,19 @@ pub(super) async fn execute_send(
         _ => None,
     };
     let (intent_id, transactions, fee) = if let Some((from, to)) = solana_route {
-        let (intent_id, transactions) =
-            markets::plan_solana_transfer(&state, user.user_id, from, &to, quote.usdc_units)
-                .await?;
+        let (intent_id, transactions) = markets::plan_solana_transfer(
+            &state,
+            user.user_id.clone(),
+            from,
+            &to,
+            quote.usdc_units,
+        )
+        .await?;
         (intent_id, transactions, None)
     } else {
         markets::plan_base_with_cash(
             &state,
-            user.user_id,
+            user.user_id.clone(),
             quote.sender_wallet.clone(),
             user.solana_wallet.clone().filter(|w| !w.is_empty()),
             vec![(tx.to.clone(), tx.data.clone())],
@@ -703,6 +729,42 @@ pub(super) async fn execute_send(
         )
         .await?
     };
+    // An Atlas Link is recorded once its plan exists (the escrow is its id; a repeat finds it).
+    if let Some((escrow, note, gift)) = &quote.link {
+        let sender = state.social.find_user(&user.user_id).await?;
+        let created = now();
+        let recorded = state
+            .links
+            .insert(&cashlinks::Link {
+                escrow: escrow.clone(),
+                owner: user.user_id.clone(),
+                sender_name: sender.as_ref().and_then(|r| r.display_name.clone()),
+                sender_handle: sender.map(|r| r.handle),
+                amount_units: *gift,
+                currency: quote.currency.clone(),
+                message: note.clone(),
+                state: "open".into(),
+                created_ms: created,
+                expires_ms: created + cashlinks::LINK_DAYS * 24 * 60 * 60 * 1000,
+                claim_started_ms: 0,
+                request_id: None,
+                claimer: None,
+            })
+            .await?;
+        if !recorded {
+            if let Some(plan) = state
+                .social
+                .quotes
+                .lock()
+                .map_err(internal)?
+                .get(&quote_id)
+                .and_then(|q| q.plan.clone())
+            {
+                return Ok(Json(plan));
+            }
+            return Err(bad("this link already exists"));
+        }
+    }
     let mut quotes = state.social.quotes.lock().map_err(internal)?;
     let stored = quotes
         .get_mut(&quote_id)
@@ -715,6 +777,14 @@ pub(super) async fn execute_send(
         json!({"label":"Send to","value":quote.label}),
         json!({"label":"Amount","value":markets::say_money(quote.usdc_units,&quote.currency,rate)}),
     ];
+    if let Some((_, note, gift)) = &quote.link {
+        summary[1] =
+            json!({"label":"They get","value":markets::say_money(*gift,&quote.currency,rate)});
+        summary.push(json!({"label":"Claim fee","value":markets::say_money(cashlinks::CLAIM_FEE_UNITS,&quote.currency,rate)}));
+        if let Some(note) = note {
+            summary.push(json!({"label":"Note","value":note}));
+        }
+    }
     if let Some(fee) = fee {
         summary.push(
             json!({"label":"Network fee","value":markets::say_money(fee,&quote.currency,rate)}),
@@ -724,25 +794,6 @@ pub(super) async fn execute_send(
     stored.plan = Some(plan.clone());
     Ok(Json(plan))
 }
-pub(super) async fn cashlink(
-    State(_state): State<AppState>,
-    Path(_id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    Err(unavailable("cash-link escrow is not configured"))
-}
-pub(super) async fn claim(
-    State(state): State<AppState>,
-    Path(_id): Path<String>,
-    headers: HeaderMap,
-    Json(body): Json<ClaimBody>,
-) -> Result<Json<Value>, ApiError> {
-    app_balance::verified_wallets(&state, &headers).await?;
-    if body.secret.is_empty() {
-        return Err((StatusCode::FORBIDDEN, "invalid cash-link secret".into()));
-    }
-    Err(unavailable("cash-link escrow is not configured"))
-}
-
 #[cfg(test)]
 mod tests {
     #[test]

@@ -38,6 +38,13 @@ pub struct RelayClient {
     api_key: Option<String>,
 }
 
+/// How a move is sized: exactly this much lands, or exactly this much leaves (all of it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Exact {
+    Out(u128),
+    In(u128),
+}
+
 /// A Base → Solana move waiting for the user's signature. `typed_data` (checked, standard EIP-712
 /// shape) is what their wallet signs; `amount_in_units` leaves Base so that exactly
 /// `amount_out_units` lands on Solana.
@@ -75,6 +82,32 @@ impl RelayClient {
         solana_owner: &str,
         amount_out_units: u128,
     ) -> Result<GaslessMove, RelayError> {
+        self.move_to_solana(evm, solana_owner, Exact::Out(amount_out_units))
+            .await
+    }
+
+    /// The same, sending exactly `amount_in_units` (everything an address holds); what lands is
+    /// that less Relay's fee.
+    pub async fn base_to_solana_all(
+        &self,
+        evm: &str,
+        solana_owner: &str,
+        amount_in_units: u128,
+    ) -> Result<GaslessMove, RelayError> {
+        self.move_to_solana(evm, solana_owner, Exact::In(amount_in_units))
+            .await
+    }
+
+    async fn move_to_solana(
+        &self,
+        evm: &str,
+        solana_owner: &str,
+        exact: Exact,
+    ) -> Result<GaslessMove, RelayError> {
+        let (amount, trade_type) = match exact {
+            Exact::Out(units) => (units, "EXACT_OUTPUT"),
+            Exact::In(units) => (units, "EXACT_INPUT"),
+        };
         let url = self
             .base
             .join("quote/v2")
@@ -85,12 +118,14 @@ impl RelayClient {
                 "user":evm,"recipient":solana_owner,"refundTo":evm,
                 "originChainId":BASE_CHAIN_ID,"destinationChainId":SOLANA_CHAIN_ID,
                 "originCurrency":BASE_USDC.to_ascii_lowercase(),"destinationCurrency":MAINNET_USDC_MINT,
-                "amount":amount_out_units.to_string(),"tradeType":"EXACT_OUTPUT","usePermit":true
+                "amount":amount.to_string(),"tradeType":trade_type,"usePermit":true,
+                // Dollars to dollars: 0.5% is room enough (Relay's default is wider).
+                "slippageTolerance":"50"
             }))
             .send()
             .await?;
         let body = checked(response).await?;
-        parse_gasless_move(&body, evm, solana_owner, amount_out_units)
+        parse_gasless_move(&body, evm, solana_owner, exact)
     }
 
     /// Hands Relay the user's signed authorization; its solver then makes the move.
@@ -155,7 +190,7 @@ fn parse_gasless_move(
     body: &Value,
     evm: &str,
     solana_owner: &str,
-    amount_out_units: u128,
+    exact: Exact,
 ) -> Result<GaslessMove, RelayError> {
     let invalid = RelayError::InvalidResponse;
     let [step] = body["steps"].as_array().map(Vec::as_slice).unwrap_or(&[]) else {
@@ -200,9 +235,18 @@ fn parse_gasless_move(
         return Err(invalid("not USDC from Base to this Solana wallet"));
     }
     let amount_in_units = units(&money_in["amount"]).ok_or(invalid("amount in"))?;
-    if units(&money_out["minimumAmount"]).is_none_or(|least| least < amount_out_units) {
-        return Err(invalid("less would land than asked"));
-    }
+    let least_out = units(&money_out["minimumAmount"]).ok_or(invalid("amount out"))?;
+    // What's promised to land: the asked amount, or (sending all of it) the quote's minimum.
+    let amount_out_units = match exact {
+        Exact::Out(asked) if least_out < asked => {
+            return Err(invalid("less would land than asked"));
+        }
+        Exact::Out(asked) => asked,
+        Exact::In(sent) if sent != amount_in_units => {
+            return Err(invalid("amount sent differs from the quote"));
+        }
+        Exact::In(_) => least_out,
+    };
     // A move costs cents; anything past 2% + $0.50 is a quote to refuse, not to sign.
     if amount_in_units > amount_out_units + amount_out_units / 50 + 500_000 {
         return Err(invalid("fee too high"));
@@ -273,7 +317,7 @@ mod tests {
 
     #[test]
     fn a_move_is_one_authorization_for_exactly_what_lands() {
-        let quote = parse_gasless_move(&live_quote(), EVM, SOLANA, 5_000_000).unwrap();
+        let quote = parse_gasless_move(&live_quote(), EVM, SOLANA, Exact::Out(5_000_000)).unwrap();
         assert_eq!(quote.amount_in_units, 5_035_780);
         assert_eq!(quote.api, "swap");
         let message = &quote.typed_data["message"];
@@ -282,21 +326,29 @@ mod tests {
         assert_eq!(message["validBefore"], "1790807024");
         assert_eq!(quote.typed_data["domain"]["chainId"], 8453);
         // Asked for more than the quote lands, or for another wallet: refused.
-        assert!(parse_gasless_move(&live_quote(), EVM, SOLANA, 6_000_000).is_err());
+        assert!(parse_gasless_move(&live_quote(), EVM, SOLANA, Exact::Out(6_000_000)).is_err());
         assert!(parse_gasless_move(
             &live_quote(),
             EVM,
             "Other1111111111111111111111111111",
-            5_000_000
+            Exact::Out(5_000_000)
         )
         .is_err());
         assert!(parse_gasless_move(
             &live_quote(),
             "0x0000000000000000000000000000000000000001",
             SOLANA,
-            5_000_000
+            Exact::Out(5_000_000)
         )
         .is_err());
+    }
+
+    #[test]
+    fn sending_everything_promises_the_quotes_minimum() {
+        let quote = parse_gasless_move(&live_quote(), EVM, SOLANA, Exact::In(5_035_780)).unwrap();
+        assert_eq!(quote.amount_in_units, 5_035_780);
+        assert_eq!(quote.amount_out_units, 5_000_000);
+        assert!(parse_gasless_move(&live_quote(), EVM, SOLANA, Exact::In(9_000_000)).is_err());
     }
 
     #[test]
@@ -311,7 +363,7 @@ mod tests {
                 };
             }
             *at = value;
-            parse_gasless_move(&quote, EVM, SOLANA, 5_000_000).is_err()
+            parse_gasless_move(&quote, EVM, SOLANA, Exact::Out(5_000_000)).is_err()
         };
         let sign = ["steps", "0", "items", "0", "data", "sign"];
         let with = |tail: &[&'static str]| [&sign[..], tail].concat();
@@ -345,7 +397,7 @@ mod tests {
         let mut two = live_quote();
         let step = two["steps"][0].clone();
         two["steps"] = json!([step.clone(), step]);
-        assert!(parse_gasless_move(&two, EVM, SOLANA, 5_000_000).is_err());
+        assert!(parse_gasless_move(&two, EVM, SOLANA, Exact::Out(5_000_000)).is_err());
     }
 
     #[test]
@@ -375,5 +427,13 @@ mod tests {
             client.state(&quote.request_id).await.unwrap(),
             SwapState::Waiting
         );
+        // A link's payout: everything the escrow holds.
+        let all = client
+            .base_to_solana_all(EVM, SOLANA, 5_050_000)
+            .await
+            .unwrap();
+        println!("5.05 USDC sent, {} lands", all.amount_out_units);
+        assert_eq!(all.amount_in_units, 5_050_000);
+        assert!(all.amount_out_units > 4_950_000);
     }
 }

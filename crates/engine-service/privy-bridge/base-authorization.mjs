@@ -177,3 +177,26 @@ export function checkSignature(typed, signature, wallet) {
   const signer = '0x' + Buffer.from(keccak_256(publicKey.subarray(1)).subarray(12)).toString('hex');
   if (signer !== wallet.toLowerCase()) throw new Error('signed by another wallet');
 }
+
+// An Atlas Link's escrow: the key is the link's secret (32 bytes, 0x-hex), made on the sender's phone
+// and carried only in the link. Returns the key and its address.
+export function escrowKey(secret) {
+  if (!/^0x[0-9a-fA-F]{64}$/.test(secret ?? '')) throw new Error('invalid link secret');
+  const key = Buffer.from(secret.slice(2), 'hex');
+  if (!secp256k1.utils.isValidPrivateKey(key)) throw new Error('invalid link secret');
+  const address = '0x' + Buffer.from(keccak_256(secp256k1.getPublicKey(key, false).subarray(1)).subarray(12))
+    .toString('hex');
+  return {key, address};
+}
+
+// Signs for a link's escrow, and only a deposit authorization from it to a pinned receiver (Relay
+// paying the money out to whoever claimed it): nothing else can be signed with a link's secret.
+export function signForEscrow(typedData, secret, now = Math.floor(Date.now() / 1000)) {
+  const {key, address} = escrowKey(secret);
+  const typed = signable(typedData, address, now);
+  if (typed.primary_type !== 'ReceiveWithAuthorization') {
+    throw new Error('a link only pays out through a pinned receiver');
+  }
+  const signed = secp256k1.sign(typedDigest(typed), key);
+  return {address, signature: '0x' + signed.toCompactHex() + (27 + signed.recovery).toString(16)};
+}

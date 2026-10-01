@@ -39,7 +39,11 @@ network loses money.
    - Base: USDC leaving Base needs no ETH (one signed authorization; the venue's relayer pays). A wallet with
      no ETH first fills its tank with a gasless **CoW** order ($0.50 USDC → ETH, ~$0.004). With neither, the
      user is asked to add about $0.50.
-7. **Track records.** Every spot fill is kept, so each holding shows its average entry and gain or loss;
+7. **Atlas Links.** Money anyone can claim with a link. The sender's phone makes the link's secret (an EVM
+   key) and only its escrow address reaches the engine; the plan funds the escrow on Base. The friend opens
+   the link, signs in, and the bridge (given the secret they hold) signs one payout through Relay to their
+   Solana wallet, with no gas. The sender can take it back the same way; after 30 days only the sender can.
+8. **Track records.** Every spot fill is kept, so each holding shows its average entry and gain or loss;
    meme cards on Home are made from it.
 
 ---
@@ -53,7 +57,7 @@ network loses money.
 | **Uniswap v3** | A few Base assets. |
 | **NEAR Intents 1Click** | Buys on other chains (Sui, NEAR, Monad…), paid from Base cash or, when Base can't cover it, Solana cash; deposits from 23 networks and coins; SUI cashouts. |
 | **Cetus** | Sui coins 1Click doesn't list (DEEP…): 1Click delivers SUI, then Cetus swaps it in the user's own Sui wallet. |
-| **Relay** | Base → Solana cash moves: one EIP-3009 signature, the solver pays gas. |
+| **Relay** | Base → Solana cash moves (one EIP-3009 signature, the solver pays gas), and Atlas Link payouts. |
 | **Layerswap** | Solana → Base (with refuel), and perps margin to Paradex (gasless from Base). |
 | **CoW Protocol** | The Base gas tank: a USDC permit plus a USDC → ETH order, settled by a solver who pays the gas. |
 | **Paradex** | Perps: every market, margin from the balance, open/close with one confirm, candles for charts. |
@@ -76,7 +80,9 @@ Atlas never holds user funds, and the engine can't move a user's money anywhere 
   - a USDC `ReceiveWithAuthorization` from the user's wallet to a **pinned** receiver (Relay, Layerswap),
     for exactly the planned amount;
   - a USDC permit to CoW's vault relayer and a CoW order selling USDC for ETH **to the wallet itself**,
-    both capped at $2 and two hours.
+    both capped at $2 and two hours;
+  - for an Atlas Link, a payout from the link's own escrow to Relay's pinned receiver, signed with the secret
+    the claimer holds (the engine never stores it).
 - **Only planned transactions are relayed.** `POST /v1/relay/evm` sends a Base transaction only if it's
   byte-for-byte one the engine planned for that user's intent, and only once (idempotency key).
 - **Venue answers are checked before anything is planned:** deposit contracts, receivers, amounts, chain IDs
@@ -151,6 +157,7 @@ user's display currency.
 | GET | `/v1/earn/options`, `/v1/earn/positions` | Savings options and what's earning |
 | POST | `/v1/earn/quotes` → `/v1/earn/quotes/{id}/execute` | Put in / take out |
 | GET/POST | `/v1/me`, `/v1/me/handle`, `/v1/me/avatar`, `/v1/users/resolve` | Profile, @handles, photos |
+| GET · POST | `/v1/cashlinks/{escrow}` (public) · `/v1/cashlinks/{escrow}/claim` | An Atlas Link, and claiming it |
 | POST | `/v1/sends/quote` → `/v1/sends/quote/{id}/execute` | Send to a friend |
 | GET | `/v1/deposit/networks` · POST `/v1/deposit/quote` · GET `/v1/deposit/status` | Deposits from other networks |
 
@@ -234,6 +241,7 @@ Every ✅ has a live call or a reproducible check behind it.
 | Charts for Sui/NEAR/Monad coins (GeckoTerminal); CoinGecko verification (DEEP, WAL verified) | ✅ live |
 | Paradex markets and candles | ✅ live |
 | Paradex onboarding, margin moves and orders | ⏳ needs a funded account |
+| Atlas Links: payout quote from an escrow (0.5% room), escrow signing limited to Relay payouts | ✅ live quote + unit tests; ⏳ funded claim (needs the web app hosted) |
 | Funded mainnet flows: buy, sell, send, earn in/out, perps open/close, deposits | ⏳ needs a funded wallet |
 
 **Tests:** 82 Rust unit tests (engine-execution and engine-service) and 16 bridge tests, plus the live

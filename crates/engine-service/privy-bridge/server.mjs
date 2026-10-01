@@ -4,7 +4,7 @@ import {PrivyClient} from '@privy-io/node';
 import {authMessage, onboardingMessage, subkeyRegistrationMessage, recoverOnboardingPublicKey} from './paradex-onboarding.mjs';
 import {deriveTradeSubkey, signSubkeyAuth, signParadexOrder} from './trade-subkey.mjs';
 import {quoteSwap, swapFromSui, prepareSuiCashout, transferSui} from './sui-swap.mjs';
-import {checkSignature, signable} from './base-authorization.mjs';
+import {checkSignature, signable, signForEscrow} from './base-authorization.mjs';
 
 const SUI_COIN_TYPE = /^0x[0-9a-fA-F]{1,64}::[A-Za-z_][A-Za-z0-9_]*::[A-Za-z_][A-Za-z0-9_]*$/;
 const POSITIVE_INTEGER = /^[1-9][0-9]{0,30}$/;
@@ -81,12 +81,13 @@ const server = createServer(async (request, response) => {
   const signOrder = request.method === 'POST' && request.url === '/paradex/order-signature';
   const relayEvm = request.method === 'POST' && request.url === '/relay/evm-transaction';
   const signAuthorization = request.method === 'POST' && request.url === '/evm/sign-authorization';
+  const signEscrow = request.method === 'POST' && request.url === '/escrow/sign-authorization';
   const suiQuote = request.method === 'POST' && request.url === '/sui/quote';
   const suiSwap = request.method === 'POST' && request.url === '/sui/swap';
   const suiCashoutPrepare = request.method === 'POST' && request.url === '/sui/cashout/prepare';
   const suiCashoutCommit = request.method === 'POST' && request.url === '/sui/cashout/commit';
   if (!verifyOnly && !ensureWallet && !signOnboarding && !signAuth && !checkSigner &&
-      !registerSubkey && !authSubkey && !signOrder && !relayEvm && !signAuthorization && !suiQuote &&
+      !registerSubkey && !authSubkey && !signOrder && !relayEvm && !signAuthorization && !signEscrow && !suiQuote &&
       !suiSwap && !suiCashoutPrepare && !suiCashoutCommit) {
     response.writeHead(404).end();
     return;
@@ -128,6 +129,17 @@ const server = createServer(async (request, response) => {
     const solanaWallet = wallets.find((account) => account.chain_type === 'solana')?.address ?? null;
     if (verifyOnly) {
       send(response, 200, {userId, evmWallet, solanaWallet});
+      return;
+    }
+    // Claiming an Atlas Link: the claimer is signed in, and the link's secret pays out its escrow,
+    // only through a pinned receiver (base-authorization.mjs).
+    if (signEscrow) {
+      try {
+        const signed = signForEscrow(input.typedData, input.secret);
+        send(response, 200, {userId, escrow: signed.address, signature: signed.signature});
+      } catch (error) {
+        send(response, 400, {error: `invalid link payout: ${error.message}`});
+      }
       return;
     }
     // A cashout can only land in the verified user's own Base wallet. Prepare stores the

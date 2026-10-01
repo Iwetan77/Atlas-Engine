@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {secp256k1} from '@noble/curves/secp256k1';
 import {keccak_256} from '@noble/hashes/sha3';
-import {checkSignature, domainSeparator, signable, typedDigest} from './base-authorization.mjs';
+import {checkSignature, domainSeparator, escrowKey, signable, signForEscrow, typedDigest} from './base-authorization.mjs';
 
 const key = new Uint8Array(32);
 key[31] = 7;
@@ -109,4 +109,20 @@ test('CoW gets at most a gas top-up, sold for ETH to this wallet, briefly', () =
   refuse({...order(), domain: {...COW_DOMAIN, verifyingContract: '0x0000000000000000000000000000000000000007'}},
     /not something/);
   refuse({...order(), primaryType: 'toString'}, /not something/);
+});
+
+test('a link secret signs only a payout from its own escrow to a pinned receiver', () => {
+  const secret = '0x' + '11'.repeat(32);
+  const {address} = escrowKey(secret);
+  const payout = deposit({from: address, to: '0xccc88a9d1b4ed6b0eaba998850414b24f1c315be'});
+  const signed = signForEscrow(payout, secret, NOW);
+  assert.equal(signed.address, address);
+  checkSignature(signable(payout, address, NOW), signed.signature, address);
+  // Not from the escrow, not to a pinned receiver, or not a payout at all: refused.
+  assert.throws(() => signForEscrow(deposit(), secret, NOW), /this wallet/);
+  assert.throws(() => signForEscrow(deposit({from: address, to: '0x0000000000000000000000000000000000000009'}),
+    secret, NOW), /receiver/);
+  assert.throws(() => signForEscrow(permit({owner: address}), secret, NOW), /pinned receiver/);
+  assert.throws(() => escrowKey('0x12'), /secret/);
+  assert.throws(() => escrowKey('0x' + '00'.repeat(32)), /secret/);
 });

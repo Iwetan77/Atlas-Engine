@@ -2,6 +2,7 @@
 //! account is available only when the operator explicitly enables local demo mode.
 
 mod app_balance;
+mod cashlinks;
 mod earn;
 mod gasless;
 mod markets;
@@ -47,6 +48,7 @@ struct AppState {
     layerswap: engine_execution::layerswap::LayerswapClient,
     relay_link: engine_execution::relay_link::RelayClient,
     cow: engine_execution::cow::CowClient,
+    links: cashlinks::LinkStore,
     earn: earn::EarnState,
     social: social::SocialState,
     trades: positions::TradeBook,
@@ -115,6 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         layerswap: engine_execution::layerswap::LayerswapClient::new()?,
         relay_link: engine_execution::relay_link::RelayClient::new(env::var("RELAY_API_KEY").ok())?,
         cow: engine_execution::cow::CowClient::new()?,
+        links: cashlinks::LinkStore::new().await?,
         earn: earn::EarnState::default(),
         social: social::SocialState::new().await?,
         trades: positions::TradeBook::new().await?,
@@ -162,8 +165,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/sends/quote/{quote_id}/execute",
             post(social::execute_send),
         )
-        .route("/v1/cashlinks/{link_id}", get(social::cashlink))
-        .route("/v1/cashlinks/{link_id}/claim", post(social::claim))
+        .route("/v1/cashlinks/{link_id}", get(cashlinks::get))
+        .route("/v1/cashlinks/{link_id}/claim", post(cashlinks::claim))
         .route("/v1/quotes", post(markets::quote))
         .route(
             "/v1/quotes/{quote_id}/execute",
