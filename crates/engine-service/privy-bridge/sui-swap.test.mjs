@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {Ed25519Keypair} from '@mysten/sui/keypairs/ed25519';
 import {blake2b} from '@noble/hashes/blake2b';
-import {intentMessage, serializedSignature, walletPublicKey, prepareSuiCashout} from './sui-swap.mjs';
+import {intentMessage, serializedSignature, walletPublicKey, prepareSuiCashout, saleEffects} from './sui-swap.mjs';
 
 test('a raw ed25519 signature over blake2b(intent || tx) becomes a Sui signature that verifies', async () => {
   const keypair = new Ed25519Keypair();
@@ -51,4 +51,12 @@ test('cashout quote binds the same user wallets and rejects output below the app
   } finally {
     globalThis.fetch = original;
   }
+});
+test('sale effects use only the signed wallet net SUI credit, never the estimated quote',()=>{
+  const result={digest:'tx',effects:{status:{status:'success'}},balanceChanges:[
+    {coinType:'0x2::sui::SUI',owner:{AddressOwner:'mine'},amount:'999000'},
+    {coinType:'0x2::sui::SUI',owner:{AddressOwner:'other'},amount:'1000000'},
+    {coinType:'coin',owner:{AddressOwner:'mine'},amount:'-100'}]};
+  assert.equal(saleEffects(result,'mine').amountOut,'999000');
+  result.effects.status.status='failure';assert.equal(saleEffects(result,'mine').ok,false);
 });

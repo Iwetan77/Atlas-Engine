@@ -1,7 +1,8 @@
+import {prepareRef,commitRef,quoteRef,searchRef,tokenInfo,prepareCashout as prepareNearCashout,commitCashout as commitNearCashout,view as nearView} from './ref-swap.mjs';
 import {createServer} from 'node:http';
 import {createHash, randomUUID} from 'node:crypto';
 import {PrivyClient} from '@privy-io/node';
-import {quoteSwap, swapFromSui, prepareSuiCashout, transferSui} from './sui-swap.mjs';
+import {quoteSwap, swapFromSui, prepareSuiCashout, transferSui, quoteSale, prepareSale, commitSale} from './sui-swap.mjs';
 import {checkSignature, signable, signForEscrow} from './base-authorization.mjs';
 import {agentFor, approveAction, approveTypedData, checkApproval, leverageAction, moveAction, orderAction,
   post as hlPost, signAsAgent} from './hyperliquid.mjs';
@@ -55,12 +56,14 @@ const server = createServer(async (request, response) => {
   const hlRoute = request.method === 'POST' && request.url.startsWith('/hyperliquid/') ?
     request.url.slice('/hyperliquid/'.length) : null;
   const hyperliquid = ['agent', 'approve', 'leverage', 'order', 'move', 'cashout'].includes(hlRoute);
+  const refRoute = request.method === 'POST' && ['/near/ref/search','/near/ref/quote','/near/ref/prepare','/near/ref/commit','/near/ref/balance','/near/cashout/prepare','/near/cashout/commit'].includes(request.url);
+  const suiSale = request.method === 'POST' && ['/sui/sale/quote','/sui/sale/prepare','/sui/sale/commit'].includes(request.url);
   const suiQuote = request.method === 'POST' && request.url === '/sui/quote';
   const suiSwap = request.method === 'POST' && request.url === '/sui/swap';
   const suiCashoutPrepare = request.method === 'POST' && request.url === '/sui/cashout/prepare';
   const suiCashoutCommit = request.method === 'POST' && request.url === '/sui/cashout/commit';
   if (!verifyOnly && !ensureWallet && !signAuthorization && !signEscrow && !hyperliquid && !suiQuote &&
-      !suiSwap && !suiCashoutPrepare && !suiCashoutCommit) {
+      !suiSwap && !suiSale && !refRoute && !suiCashoutPrepare && !suiCashoutCommit) {
     response.writeHead(404).end();
     return;
   }
@@ -71,6 +74,11 @@ const server = createServer(async (request, response) => {
       if (body.length > 8192) throw new Error('request too large');
     }
     const input = JSON.parse(body);
+    if(refRoute && request.url === '/near/ref/search') {
+      try { send(response,200,{assets:await searchRef(input.query)}); }
+      catch { send(response,503,{error:'Asset details unavailable'}); }
+      return;
+    }
     const accessToken = input.accessToken;
     if (typeof accessToken !== 'string' || !accessToken) throw new Error('token required');
     let claims;
@@ -125,19 +133,66 @@ const server = createServer(async (request, response) => {
       }
       return;
     }
+    if(refRoute){
+      try{
+        const wallet=await ensureReceivingWallet(userId,'near');
+        if(request.url==='/near/cashout/prepare'){
+          send(response,200,{userId,address:wallet.address,...await prepareNearCashout({wallet,userId,userJwt,evmWallet,solanaWallet,amount:input.amount,minimumOut:input.minimumOut})});
+        }else if(request.url==='/near/cashout/commit'){
+          const result=await commitNearCashout({cashoutId:input.cashoutId,scope:input.scope,wallet,userId,userJwt,
+            rawSign:async bytes=>(await privy.wallets().rawSign(wallet.id,{params:{bytes,encoding:'hex',hash_function:'sha256'},authorization_context:{user_jwts:[userJwt]}})).signature});
+          send(response,200,{userId,address:wallet.address,...result});
+        }else if(request.url==='/near/ref/prepare'){
+          send(response,200,{userId,address:wallet.address,...await prepareRef({intentId:input.intentId,wallet,userId,userJwt,accessToken,identityToken:input.identityToken})});
+        }else if(request.url==='/near/ref/commit'){
+          const result=await commitRef({saleId:input.saleId,scope:input.scope,wallet,userId,userJwt,
+            rawSign:async bytes=>(await privy.wallets().rawSign(wallet.id,{params:{bytes,encoding:'hex',hash_function:'sha256'},authorization_context:{user_jwts:[userJwt]}})).signature});
+          send(response,200,{userId,address:wallet.address,...result});
+        }else if(request.url==='/near/ref/balance'){
+          send(response,200,{userId,address:wallet.address,amount:await nearView(input.token,'ft_balance_of',{account_id:wallet.address})});
+        }else{
+          const q=await quoteRef(input.token,input.amount,input.sell===true);
+          send(response,200,{userId,address:wallet.address,...q,metadata:await tokenInfo(input.token)});
+        }
+      }catch{send(response,409,{error:'Swap changed or could not complete; check your asset balance'});}
+      return;
+    }
+    if (suiSale) {
+      try {
+        const wallet = await ensureReceivingWallet(userId,'sui');
+        if (request.url === '/sui/sale/quote') {
+          if (!SUI_COIN_TYPE.test(input.coinType ?? '') || !POSITIVE_INTEGER.test(String(input.amount ?? ''))) {
+            throw new Error('invalid sale');
+          }
+          const route = await quoteSale(input.coinType,input.amount,wallet.address);
+          send(response,200,{userId,address:wallet.address,amountOut:route.amountOut.toString()});
+        } else if (request.url === '/sui/sale/prepare') {
+          const prepared = await prepareSale({intentId:input.intentId,wallet,userId,userJwt,accessToken,identityToken:input.identityToken});
+          send(response,200,{userId,address:wallet.address,...prepared});
+        } else {
+          const result = await commitSale({saleId:input.saleId,scope:input.scope,wallet,userId,userJwt,
+            rawSign:async bytes => (await privy.wallets().rawSign(wallet.id,{
+              params:{bytes,encoding:'hex',hash_function:'blake2b256'},
+              authorization_context:{user_jwts:[userJwt]},
+            })).signature});
+          send(response,200,{userId,address:wallet.address,...result});
+        }
+      } catch { send(response,409,{error:'Sale changed or could not complete; check your asset balance'}); }
+      return;
+    }
     // A cashout can only land in the verified user's own Base wallet. Prepare stores the
     // venue-issued deposit address so the engine can persist it before commit moves SUI.
     if (suiCashoutPrepare || suiCashoutCommit) {
       try {
         const wallet = await ensureReceivingWallet(userId, 'sui');
         if (suiCashoutPrepare) {
-          if (!evmWallet || !POSITIVE_INTEGER.test(String(input.amount ?? '')) ||
+          if ((!evmWallet && !solanaWallet) || !POSITIVE_INTEGER.test(String(input.amount ?? '')) ||
               !POSITIVE_INTEGER.test(String(input.minimumOut ?? ''))) {
             send(response, 400, {error: 'invalid cashout request'});
             return;
           }
           const quote = await prepareSuiCashout({
-            wallet, evmWallet, amount: input.amount, minimumOut: input.minimumOut,
+            wallet, evmWallet, solanaWallet, amount: input.amount, minimumOut: input.minimumOut,
           });
           for (const [id, prepared] of preparedCashouts) {
             if (prepared.expires <= Date.now()) preparedCashouts.delete(id);

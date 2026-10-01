@@ -166,6 +166,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/v1/intents/{intent_id}/signed", post(markets::signed))
         .route(
+            "/v1/intents/{intent_id}/sale-permission",
+            post(near_intents::sale_permission),
+        )
+        .route(
             "/v1/intents/{intent_id}/next",
             get(markets::next_transactions),
         )

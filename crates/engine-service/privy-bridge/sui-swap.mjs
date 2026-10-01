@@ -1,5 +1,6 @@
 // Swaps SUI in a user's own Privy Sui wallet into another Sui coin (Cetus aggregator), signed with
 // Privy rawSign under the user's own login token: no server key can move the wallet on its own.
+import {PreparedSales, salePermission} from './prepared-sale.mjs';
 import {AggregatorClient, Env} from '@cetusprotocol/aggregator-sdk';
 import {toSerializedSignature} from '@mysten/sui/cryptography';
 import {SuiGrpcClient} from '@mysten/sui/grpc';
@@ -11,6 +12,7 @@ export const SUI = '0x2::sui::SUI';
 const FULLNODE = process.env.SUI_FULLNODE_URL ?? 'https://fullnode.mainnet.sui.io:443';
 const SLIPPAGE = 0.01;
 
+const sales = new PreparedSales();
 let grpc;
 function client() {
   grpc ??= new SuiGrpcClient({network: 'mainnet', baseUrl: FULLNODE});
@@ -66,6 +68,59 @@ export async function quoteSwap(coinType, amount, sender) {
   const router = await aggregator.findRouters({from: SUI, target: coinType, amount: String(amount), byAmountIn: true});
   if (!router || router.insufficientLiquidity || router.error) throw new Error('no Sui route for this coin');
   return router;
+}
+
+export async function quoteSale(coinType, amount, sender) {
+  if (!/^0x[0-9a-fA-F]{1,64}::[A-Za-z_][A-Za-z0-9_]*::[A-Za-z_][A-Za-z0-9_]*$/.test(coinType) ||
+      coinType === SUI || BigInt(amount) <= 0n) throw new Error('invalid sale');
+  const aggregator = new AggregatorClient({signer:sender,client:client(),env:Env.Mainnet});
+  const route = await aggregator.findRouters({from:coinType,target:SUI,amount:String(amount),byAmountIn:true});
+  if (!route || route.error || route.insufficientLiquidity || BigInt(route.amountOut ?? 0) <= 0n) {
+    throw new Error('no sale route');
+  }
+  return route;
+}
+
+export async function prepareSale({intentId,wallet,userId,userJwt,accessToken,identityToken}) {
+  const scope = await salePermission({intentId,wallet,userId,accessToken,identityToken});
+  const held = await rpc('suix_getBalance',[wallet.address,scope.coinType]);
+  if (BigInt(scope.amount) <= 0n || BigInt(scope.amount) > BigInt(held?.totalBalance ?? 0)) {
+    throw new Error('the sell amount exceeds your holding');
+  }
+  if (await suiBalance(wallet.address) < 20000000n) throw new Error('not enough for the network fee');
+  const router = await quoteSale(scope.coinType,scope.amount,wallet.address);
+  if (BigInt(router.amountOut)*99n/100n < BigInt(scope.minimumOut)) throw new Error('sale price changed');
+  return {saleId:sales.put(scope,userJwt,router),scope};
+}
+
+// Scope is loaded from the confirmed engine intent and consumed once before signing.
+export async function commitSale({saleId,scope,wallet,userId,userJwt,rawSign}) {
+  if (scope.userId !== userId || scope.walletId !== wallet.id || scope.address !== wallet.address) {
+    throw new Error('sale wallet changed');
+  }
+  const {scope:approved,data:router} = sales.take(saleId,scope,userJwt);
+  const held = await rpc('suix_getBalance',[wallet.address,approved.coinType]);
+  if (BigInt(held?.totalBalance ?? 0) < BigInt(approved.amount)) throw new Error('holding changed');
+  const publicKey = walletPublicKey(wallet.public_key,wallet.address);
+  const aggregator = new AggregatorClient({signer:wallet.address,client:client(),env:Env.Mainnet});
+  const txb = new Transaction();
+  txb.setSender(wallet.address);
+  await aggregator.fastRouterSwap({router,txb,slippage:SLIPPAGE});
+  const txBytes = await txb.build({client:client()});
+  if (Date.now() >= approved.expiresAtUnixMs) throw new Error('sale expired');
+  const signature = serializedSignature(await rawSign(`0x${toHex(intentMessage(txBytes))}`),publicKey);
+  if (!(await publicKey.verifyTransaction(txBytes,signature))) throw new Error('signature did not verify');
+  const result = await rpc('sui_executeTransactionBlock',[
+    toBase64(txBytes),[signature],{showEffects:true,showBalanceChanges:true},'WaitForLocalExecution']);
+  return saleEffects(result,wallet.address);
+}
+
+// The wallet's net SUI credit includes gas. Never send an estimated output to 1Click.
+export function saleEffects(result, owner) {
+  const ok = result?.effects?.status?.status === 'success';
+  const out = (result?.balanceChanges ?? []).filter(c => c.coinType === SUI && c.owner?.AddressOwner === owner)
+    .reduce((sum,c) => sum + BigInt(c.amount),0n);
+  return {ok,digest:result?.digest,amountOut:out > 0n ? out.toString() : '0',error:ok ? null : 'sale did not settle'};
 }
 
 export async function suiBalance(address) {
@@ -127,15 +182,16 @@ export async function transferSui({wallet, recipient, amount, reserve, rawSign})
 }
 // A prepare step obtains the only allowed destination from 1Click for this same user's Base
 // wallet. The engine persists this address before the commit step signs any Sui transaction.
-export async function prepareSuiCashout({wallet, evmWallet, amount, minimumOut}) {
-  if (!/^0x[0-9a-fA-F]{40}$/.test(evmWallet)) throw new Error('invalid cash wallet');
+export async function prepareSuiCashout({wallet, evmWallet, solanaWallet, amount, minimumOut}) {
+  if (!solanaWallet && !/^0x[0-9a-fA-F]{40}$/.test(evmWallet)) throw new Error('invalid cash wallet');
   const input = BigInt(amount);
   if (input <= 0n || BigInt(minimumOut) <= 0n) throw new Error('invalid cashout amount');
   const quoteRequest = {
     dry: false, swapType: 'EXACT_INPUT', slippageTolerance: 100,
     originAsset: 'nep141:sui.omft.near', depositType: 'ORIGIN_CHAIN',
-    destinationAsset: 'nep141:base-0x833589fcd6edb6e08f4c7c32d4f71b54bda02913.omft.near',
-    amount: input.toString(), recipient: evmWallet, recipientType: 'DESTINATION_CHAIN',
+    destinationAsset: solanaWallet ? 'nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near'
+      : 'nep141:base-0x833589fcd6edb6e08f4c7c32d4f71b54bda02913.omft.near',
+    amount: input.toString(), recipient: solanaWallet ?? evmWallet, recipientType: 'DESTINATION_CHAIN',
     refundTo: wallet.address, refundType: 'ORIGIN_CHAIN',
     deadline: new Date(Date.now() + 240_000).toISOString(),
   };

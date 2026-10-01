@@ -1,0 +1,64 @@
+{
+  "capturedAt": "2026-10-01T16:30:58.730Z",
+  "cetus": {
+    "coinType": "0xdeeb7a4662eec9f2f3def03fb937a663dddaa2e215b8078a284d026b7946c270::deep::DEEP",
+    "amountIn": "100000000",
+    "amountOut": "1930538783"
+  },
+  "request": {
+    "dry": true,
+    "swapType": "EXACT_INPUT",
+    "slippageTolerance": 100,
+    "originAsset": "nep141:sui.omft.near",
+    "depositType": "ORIGIN_CHAIN",
+    "destinationAsset": "nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near",
+    "amount": "1891233395",
+    "recipient": "So11111111111111111111111111111111111111112",
+    "recipientType": "DESTINATION_CHAIN",
+    "refundTo": "0x1111111111111111111111111111111111111111111111111111111111111111",
+    "refundType": "ORIGIN_CHAIN",
+    "deadline": "2026-10-01T16:33:57.238Z"
+  },
+  "oneClick": {
+    "quote": {
+      "amountIn": "1891233395",
+      "amountInFormatted": "1.891233395",
+      "amountInUsd": "2.193830738200",
+      "minAmountIn": "1891233395",
+      "amountOut": "2179412",
+      "amountOutFormatted": "2.179412",
+      "amountOutUsd": "2.179189699976",
+      "minAmountOut": "2157617",
+      "timeEstimate": 24,
+      "refundFee": "5000000",
+      "withdrawFee": "10167"
+    },
+    "quoteRequest": {
+      "dry": true,
+      "depositMode": "SIMPLE",
+      "swapType": "EXACT_INPUT",
+      "slippageTolerance": 100,
+      "originAsset": "nep141:sui.omft.near",
+      "depositType": "ORIGIN_CHAIN",
+      "destinationAsset": "nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near",
+      "amount": "1891233395",
+      "refundTo": "0x1111111111111111111111111111111111111111111111111111111111111111",
+      "refundType": "ORIGIN_CHAIN",
+      "recipient": "So11111111111111111111111111111111111111112",
+      "recipientType": "DESTINATION_CHAIN",
+      "deadline": "2026-10-01T16:33:57.238Z",
+      "confidentiality": "public",
+      "quoteWaitingTimeMs": 0,
+      "insured": false,
+      "appFees": [
+        {
+          "recipient": "5880ad2b362620fadf759cbceb1cd5737ce8c6ed7fb8e9942881e6731f9247dd",
+          "fee": 20
+        }
+      ]
+    },
+    "signature": "ed25519:32eydZFsDnmEFCLFFsp12CCCFxosaPR9ZHNrKySwLPTBv1DG1tg9jdVpXn3BMbqBFP27vNMujp7SX84t2dtDMvs8",
+    "timestamp": "2026-10-01T16:30:59.084Z",
+    "correlationId": "2f65db12-8399-4664-be3b-7846acb1ab3d"
+  }
+}
