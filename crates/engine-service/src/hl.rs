@@ -3,10 +3,12 @@
 //! Solana transaction the user signs); then the user's Atlas agent (approved once, by their own
 //! wallet, inside that confirmation) sets leverage and places an immediate-or-cancel order. The
 //! agent can trade, never withdraw. A close sends the money it freed back to the user's cash in the
-//! same confirmation (Relay, signed by the user's own session through the bridge).
+//! same confirmation (Relay, signed by the user's own session through the bridge). Stocks,
+//! commodities, indices and currencies come from the `xyz` dex, which keeps its own margin: the agent
+//! moves margin between the user's own balances there (`agentSendAsset` can't pay anyone else).
 use super::*;
 use axum::extract::Query;
-use engine_execution::hyperliquid::{order_price, order_size, Market};
+use engine_execution::hyperliquid::{order_price, order_size, Market, DEXES};
 use serde_json::{json, Value};
 
 const QUOTE_MS: u64 = 45_000;
@@ -28,6 +30,100 @@ const MEMES: [&str; 22] = [
     "kPEPE", "kBONK", "kSHIB", "kFLOKI", "kNEIRO", "DOGE", "WIF", "POPCAT", "FARTCOIN", "PENGU",
     "TRUMP", "MOODENG", "PNUT", "BRETT", "GOAT", "SPX", "MEW", "BOME", "TURBO", "MOG", "MEME",
     "PUMP",
+];
+// The `xyz` dex: names we can give with confidence, and every market that isn't a stock (anything
+// not here keeps its ticker and counts as a stock).
+const XYZ_MARKETS: &[(&str, &str, &str)] = &[
+    ("XYZ100", "Nasdaq-100 (XYZ100)", "index"),
+    ("SP500", "S&P 500", "index"),
+    ("JP225", "Nikkei 225", "index"),
+    ("KR200", "KOSPI 200", "index"),
+    ("NIFTY", "Nifty 50", "index"),
+    ("IBOV", "Ibovespa", "index"),
+    ("VIX", "VIX volatility index", "index"),
+    ("GOLD", "Gold", "commodity"),
+    ("SILVER", "Silver", "commodity"),
+    ("PLATINUM", "Platinum", "commodity"),
+    ("PALLADIUM", "Palladium", "commodity"),
+    ("COPPER", "Copper", "commodity"),
+    ("ALUMINIUM", "Aluminium", "commodity"),
+    ("URANIUM", "Uranium", "commodity"),
+    ("CL", "Crude oil (WTI)", "commodity"),
+    ("BRENTOIL", "Brent crude", "commodity"),
+    ("NATGAS", "Natural gas", "commodity"),
+    ("HO", "Heating oil", "commodity"),
+    ("TTF", "Dutch TTF gas", "commodity"),
+    ("CORN", "Corn", "commodity"),
+    ("WHEAT", "Wheat", "commodity"),
+    ("EUR", "Euro", "currency"),
+    ("GBP", "British pound", "currency"),
+    ("JPY", "Japanese yen", "currency"),
+    ("KRW", "Korean won", "currency"),
+    ("DXY", "US dollar index", "currency"),
+    ("TSLA", "Tesla", "stock"),
+    ("NVDA", "Nvidia", "stock"),
+    ("AAPL", "Apple", "stock"),
+    ("MSFT", "Microsoft", "stock"),
+    ("GOOGL", "Alphabet", "stock"),
+    ("AMZN", "Amazon", "stock"),
+    ("META", "Meta Platforms", "stock"),
+    ("NFLX", "Netflix", "stock"),
+    ("ORCL", "Oracle", "stock"),
+    ("AMD", "AMD", "stock"),
+    ("INTC", "Intel", "stock"),
+    ("MU", "Micron", "stock"),
+    ("TSM", "TSMC", "stock"),
+    ("AVGO", "Broadcom", "stock"),
+    ("QCOM", "Qualcomm", "stock"),
+    ("AMAT", "Applied Materials", "stock"),
+    ("ASML", "ASML", "stock"),
+    ("ARM", "Arm Holdings", "stock"),
+    ("MRVL", "Marvell", "stock"),
+    ("SNDK", "Sandisk", "stock"),
+    ("WDC", "Western Digital", "stock"),
+    ("DELL", "Dell", "stock"),
+    ("IBM", "IBM", "stock"),
+    ("NOW", "ServiceNow", "stock"),
+    ("NET", "Cloudflare", "stock"),
+    ("CRWD", "CrowdStrike", "stock"),
+    ("PLTR", "Palantir", "stock"),
+    ("HOOD", "Robinhood", "stock"),
+    ("COIN", "Coinbase", "stock"),
+    ("MSTR", "Strategy", "stock"),
+    ("CRCL", "Circle", "stock"),
+    ("CRWV", "CoreWeave", "stock"),
+    ("NBIS", "Nebius", "stock"),
+    ("RDDT", "Reddit", "stock"),
+    ("RIVN", "Rivian", "stock"),
+    ("RKLB", "Rocket Lab", "stock"),
+    ("GME", "GameStop", "stock"),
+    ("BABA", "Alibaba", "stock"),
+    ("COST", "Costco", "stock"),
+    ("LLY", "Eli Lilly", "stock"),
+    ("MRNA", "Moderna", "stock"),
+    ("HIMS", "Hims & Hers", "stock"),
+    ("DKNG", "DraftKings", "stock"),
+    ("EBAY", "eBay", "stock"),
+    ("ZM", "Zoom", "stock"),
+    ("BX", "Blackstone", "stock"),
+    ("CVX", "Chevron", "stock"),
+    ("GEV", "GE Vernova", "stock"),
+    ("NOK", "Nokia", "stock"),
+    ("BB", "BlackBerry", "stock"),
+    ("BE", "Bloom Energy", "stock"),
+    ("LITE", "Lumentum", "stock"),
+    ("SMSN", "Samsung Electronics", "stock"),
+    ("SKHX", "SK Hynix", "stock"),
+    ("SOFTBANK", "SoftBank", "stock"),
+    ("HYUNDAI", "Hyundai Motor", "stock"),
+    ("KIOXIA", "Kioxia", "stock"),
+    ("SPCX", "SpaceX", "stock"),
+    ("EWY", "iShares MSCI South Korea ETF", "stock"),
+    ("EWJ", "iShares MSCI Japan ETF", "stock"),
+    ("EWZ", "iShares MSCI Brazil ETF", "stock"),
+    ("EWT", "iShares MSCI Taiwan ETF", "stock"),
+    ("SMH", "VanEck Semiconductor ETF", "stock"),
+    ("TLT", "iShares 20+ Year Treasury Bond ETF", "stock"),
 ];
 
 #[derive(Clone)]
@@ -58,6 +154,14 @@ struct HlQuote {
     // A close: what it frees (margin ± PnL − fee), in dollars.
     #[serde(default)]
     receive_usd: f64,
+    // The dex holding the market's margin ("" for Hyperliquid's own), USDC units the agent moves
+    // into it before an open, and whether its margin is per position only.
+    #[serde(default)]
+    dex: String,
+    #[serde(default)]
+    dex_units: u128,
+    #[serde(default)]
+    isolated: bool,
     expires: u64,
 }
 
@@ -199,6 +303,10 @@ fn venue(error: impl std::fmt::Display) -> ApiError {
 fn market_id(coin: &str) -> String {
     format!("{coin}-PERP")
 }
+// "xyz:TSLA" → ("xyz", "TSLA"); Hyperliquid's own "BTC" → ("", "BTC").
+fn split_coin(coin: &str) -> (&str, &str) {
+    coin.split_once(':').unwrap_or(("", coin))
+}
 fn coin_of(market_id: &str) -> Option<&str> {
     market_id.strip_suffix("-PERP").filter(|c| !c.is_empty())
 }
@@ -220,10 +328,34 @@ fn cashout_fee(usd: f64) -> f64 {
     0.025 + usd * 0.0004
 }
 fn category(coin: &str) -> &'static str {
-    if MEMES.contains(&coin) {
-        "meme"
+    describe(coin).1
+}
+// A market's display name and category.
+fn describe(coin: &str) -> (String, &'static str) {
+    // Hyperliquid's own coins: a name where one is known ("Bitcoin"), so search finds it.
+    let named = |ticker: &str| {
+        perps::KNOWN_MARKETS
+            .iter()
+            .find(|(t, _, _)| *t == ticker)
+            .map_or(ticker.into(), |(_, name, _)| (*name).into())
+    };
+    match split_coin(coin) {
+        ("", ticker) if MEMES.contains(&ticker) => (named(ticker), "meme"),
+        ("", ticker) => (named(ticker), "crypto"),
+        (_, ticker) => XYZ_MARKETS
+            .iter()
+            .find(|(t, _, _)| *t == ticker)
+            .map_or((ticker.into(), "stock"), |(_, name, kind)| {
+                ((*name).into(), *kind)
+            }),
+    }
+}
+// Margin in, from what's already there: the USDC units (6 decimals) still to bring, with 1¢ to spare.
+fn shortfall(needed: f64, have: f64) -> u128 {
+    if have >= needed {
+        0
     } else {
-        "crypto"
+        ((needed - have) * 1_000_000.0).ceil() as u128 + 10_000
     }
 }
 
@@ -318,11 +450,12 @@ pub(super) async fn markets(
     let rows: Vec<Value> = list
         .iter()
         .map(|m| {
-            let kind = category(&m.coin);
+            let (name, kind) = describe(&m.coin);
+            let symbol = split_coin(&m.coin).1;
             let change =
                 (m.prev_day > 0.0).then(|| format!("{:.2}", (m.mark / m.prev_day - 1.0) * 100.0));
-            json!({"marketId":market_id(&m.coin),"symbol":m.coin,"name":m.coin,"category":kind,
-                "iconUrl":perps::icon_url(&m.coin, kind),"markPrice":money(m.mark,&currency,rate),
+            json!({"marketId":market_id(&m.coin),"symbol":symbol,"name":name,"category":kind,
+                "iconUrl":perps::icon_url(symbol, kind),"markPrice":money(m.mark,&currency,rate),
                 "change24hPct":change,"maxLeverage":m.max_leverage,
                 // Hyperliquid funds hourly; the app shows the 8-hour rate.
                 "fundingRate8hPct":format!("{:.4}", m.funding * 8.0 * 100.0),
@@ -339,14 +472,23 @@ pub(super) async fn positions(
 ) -> Result<Json<Value>, ApiError> {
     let (_, wallet) = wallet_of(&state, &headers).await?;
     currency_of(q.currency)?;
-    let (account, fills, markets) = tokio::try_join!(
+    let (main, on_dex, fills, markets) = tokio::try_join!(
         async { state.hl.client.account(&wallet).await.map_err(venue) },
+        async {
+            state
+                .hl
+                .client
+                .account_on(&wallet, DEXES[0].0)
+                .await
+                .map_err(venue)
+        },
         async { state.hl.client.fills(&wallet).await.map_err(venue) },
         markets_now(&state)
     )?;
-    let rows: Vec<Value> = account
+    let rows: Vec<Value> = main
         .positions
         .iter()
+        .chain(&on_dex.positions)
         .map(|p| {
             let mark = markets
                 .iter()
@@ -367,8 +509,9 @@ pub(super) async fn positions(
                 })
                 .unwrap_or_else(now);
             let kind = category(&p.coin);
+            let symbol = split_coin(&p.coin).1;
             json!({"positionId":p.coin,"openedAtUnixMs":opened,"marketId":market_id(&p.coin),
-                "symbol":p.coin,"iconUrl":perps::icon_url(&p.coin, kind),
+                "symbol":symbol,"iconUrl":perps::icon_url(symbol, kind),
                 "side":if p.size > 0.0 {"long"} else {"short"},"leverage":p.leverage,
                 "size":trim(p.size.abs()),"entryPrice":usd(p.entry),"markPrice":usd(mark),
                 "liquidationPrice":p.liquidation.map(usd),"margin":usd(p.margin),
@@ -379,10 +522,15 @@ pub(super) async fn positions(
     Ok(Json(json!({"positions":rows})))
 }
 
-// The user's Hyperliquid account value in USDC units (6 decimals), for the Atlas balance.
+// The user's Hyperliquid account value in USDC units (6 decimals), for the Atlas balance: their own
+// perps and the `xyz` dex together.
 pub(super) async fn account_value(state: &AppState, wallet: &str) -> Option<u128> {
-    let account = state.hl.client.account(wallet).await.ok()?;
-    (account.value > 0.0).then(|| (account.value * 1_000_000.0).floor() as u128)
+    let (main, on_dex) = tokio::join!(
+        state.hl.client.account(wallet),
+        state.hl.client.account_on(wallet, DEXES[0].0)
+    );
+    let value = main.ok()?.value + on_dex.map_or(0.0, |a| a.value);
+    (value > 0.0).then(|| (value * 1_000_000.0).floor() as u128)
 }
 
 #[derive(Deserialize)]
@@ -431,14 +579,28 @@ pub(super) async fn quote(
     if size.parse::<f64>().unwrap_or(0.0) <= 0.0 {
         return Err(conflict("That's too small for this market. Add margin."));
     }
-    let fee = notional * TAKER_FEE;
-    // What's already in the account covers it, or the rest moves in first (with a cushion for the fee).
+    let fee = notional * TAKER_FEE * m.fee_scale;
+    // What's already in the account covers it, or the rest moves in first (with a cushion for the
+    // fee). A dex's market takes its margin from that dex: what it lacks comes from the main balance.
     let account = state.hl.client.account(&wallet).await.unwrap_or_default();
     let needed = margin + fee * 2.0;
-    let short_units = if account.withdrawable >= needed {
-        0
+    let (dex_units, short_units) = if m.dex.is_empty() {
+        (0, shortfall(needed, account.withdrawable))
     } else {
-        ((needed - account.withdrawable) * 1_000_000.0).ceil() as u128 + 10_000
+        let on_dex = state
+            .hl
+            .client
+            .account_on(&wallet, &m.dex)
+            .await
+            .unwrap_or_default();
+        let dex_units = shortfall(needed, on_dex.withdrawable);
+        let from_main = dex_units as f64 / 1_000_000.0;
+        let short_units = if dex_units == 0 {
+            0
+        } else {
+            shortfall(from_main, account.withdrawable)
+        };
+        (dex_units, short_units)
     };
     let (funding_units, funding_from_solana) = if short_units == 0 {
         (0, false)
@@ -486,6 +648,9 @@ pub(super) async fn quote(
             funding_units,
             funding_from_solana,
             receive_usd: 0.0,
+            dex: m.dex.clone(),
+            dex_units,
+            isolated: m.isolated_only,
             expires,
         },
     );
@@ -517,7 +682,16 @@ pub(super) async fn close_quote(
     let (user, wallet) = wallet_of(&state, &headers).await?;
     let currency = currency_of(q.currency)?;
     let rate = app_balance::fx_rate(&currency).await?;
-    let account = state.hl.client.account(&wallet).await.map_err(venue)?;
+    let dex = split_coin(&position_id).0;
+    if !dex.is_empty() && !DEXES.iter().any(|(d, _)| *d == dex) {
+        return Err((StatusCode::NOT_FOUND, "no such position".into()));
+    }
+    let account = state
+        .hl
+        .client
+        .account_on(&wallet, dex)
+        .await
+        .map_err(venue)?;
     let position = account
         .positions
         .iter()
@@ -525,7 +699,7 @@ pub(super) async fn close_quote(
         .cloned()
         .ok_or((StatusCode::NOT_FOUND, "no such position".into()))?;
     let m = market(&state, &market_id(&position.coin)).await?;
-    let trade_fee = position.size.abs() * m.mark * TAKER_FEE;
+    let trade_fee = position.size.abs() * m.mark * TAKER_FEE * m.fee_scale;
     let pnl = position.unrealized_pnl - trade_fee;
     let freed = (position.margin + pnl).max(0.0);
     // What it frees comes back to cash (less Relay's cents); under $1 it stays in perps.
@@ -552,6 +726,9 @@ pub(super) async fn close_quote(
             funding_units: 0,
             funding_from_solana: false,
             receive_usd: freed,
+            dex: m.dex.clone(),
+            dex_units: 0,
+            isolated: m.isolated_only,
             expires,
         },
     );
@@ -641,11 +818,12 @@ pub(super) async fn execute(
     };
     let currency_rate = |q: &HlQuote| (q.size.clone(), q.leverage);
     let (size, leverage) = currency_rate(&quote);
+    let symbol = split_coin(&quote.coin).1;
     let mut summary = vec![
-        json!({"label":"Market","value":quote.coin}),
+        json!({"label":"Market","value":symbol}),
         json!({"label":"Action","value":if quote.close {"Close position".to_string()} else {
             format!("{} {}x", if quote.side == "long" {"Long"} else {"Short"}, leverage)}}),
-        json!({"label":"Size","value":format!("{size} {}", quote.coin)}),
+        json!({"label":"Size","value":format!("{size} {symbol}")}),
     ];
     if quote.funding_units > 0 {
         summary.push(json!({"label":"Margin moved to Hyperliquid",
@@ -807,12 +985,24 @@ async fn run(
         )?;
     }
     if !quote.close {
+        if quote.dex_units > 0 {
+            expect_ok(
+                bridge(
+                    state,
+                    headers,
+                    "move",
+                    json!({"from":"","to":quote.dex,"amount":quote.dex_units.to_string()}),
+                )
+                .await?,
+                "margin move",
+            )?;
+        }
         expect_ok(
             bridge(
                 state,
                 headers,
                 "leverage",
-                json!({"asset":quote.asset,"leverage":quote.leverage}),
+                json!({"asset":quote.asset,"leverage":quote.leverage,"isolated":quote.isolated}),
             )
             .await?,
             "leverage",
@@ -860,6 +1050,28 @@ async fn move_to_cash(
     headers: &HeaderMap,
     quote: &HlQuote,
 ) -> Result<(), String> {
+    // A dex's margin comes back to the main balance first (the agent, to the same account only).
+    if !quote.dex.is_empty() {
+        let on_dex = state
+            .hl
+            .client
+            .account_on(&quote.wallet, &quote.dex)
+            .await
+            .map_err(|e| e.to_string())?;
+        let units = cashout_units(&on_dex, quote.receive_usd);
+        if units >= 10_000 {
+            expect_ok(
+                bridge(
+                    state,
+                    headers,
+                    "move",
+                    json!({"from":quote.dex,"to":"","amount":units.to_string()}),
+                )
+                .await?,
+                "margin move",
+            )?;
+        }
+    }
     let account = state
         .hl
         .client
@@ -1038,6 +1250,17 @@ mod tests {
         assert_eq!(coin_of("NEAR"), None);
         assert_eq!(category("kPEPE"), "meme");
         assert_eq!(category("BTC"), "crypto");
+        assert_eq!(market_id("xyz:TSLA"), "xyz:TSLA-PERP");
+        assert_eq!(coin_of("xyz:TSLA-PERP"), Some("xyz:TSLA"));
+        assert_eq!(split_coin("xyz:TSLA"), ("xyz", "TSLA"));
+        assert_eq!(split_coin("BTC"), ("", "BTC"));
+        assert_eq!(describe("BTC"), ("Bitcoin".into(), "crypto"));
+        assert_eq!(describe("xyz:TSLA"), ("Tesla".into(), "stock"));
+        assert_eq!(describe("xyz:GOLD"), ("Gold".into(), "commodity"));
+        assert_eq!(describe("xyz:EUR"), ("Euro".into(), "currency"));
+        assert_eq!(describe("xyz:SP500").1, "index");
+        // Unknown tickers on the dex keep their name and count as stocks.
+        assert_eq!(describe("xyz:NEWCO"), ("NEWCO".into(), "stock"));
     }
 
     #[test]
@@ -1059,6 +1282,13 @@ mod tests {
             "approve"
         )
         .is_err());
+    }
+
+    #[test]
+    fn margin_moves_in_only_for_what_is_missing() {
+        assert_eq!(shortfall(10.0, 12.0), 0);
+        assert_eq!(shortfall(10.0, 10.0), 0);
+        assert_eq!(shortfall(10.0, 4.5), 5_510_000);
     }
 
     #[test]

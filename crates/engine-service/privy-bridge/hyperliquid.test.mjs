@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {secp256k1} from '@noble/curves/secp256k1';
 import {keccak_256} from '@noble/hashes/sha3';
-import {actionHash, agentDigest, agentFor, approveDigest, checkApproval, leverageAction, orderAction, signAsAgent,
+import {actionHash, agentDigest, agentFor, approveDigest, checkApproval, leverageAction, moveAction, orderAction,
+  signAsAgent,
   wire} from './hyperliquid.mjs';
 
 const recover = (digest, sig) => {
@@ -32,6 +33,30 @@ test('an order hashes exactly as Hyperliquid checks it, and its signature recove
   const sig = signAsAgent(agent.key, action, 1790000000000);
   assert.equal(recover(agentDigest(action, 1790000000000), sig), agent.address);
   assert.deepEqual(leverageAction({asset: 0, leverage: 10}), {type: 'updateLeverage', asset: 0, isCross: true, leverage: 10});
+});
+
+test('markets with margin per position only get isolated leverage', () => {
+  assert.deepEqual(leverageAction({asset: 110004, leverage: 5, isolated: true}),
+    {type: 'updateLeverage', asset: 110004, isCross: false, leverage: 5});
+  assert.throws(() => leverageAction({asset: 1, leverage: 5, isolated: 'yes'}), /invalid/);
+});
+
+test("margin moves only between the user's own dexes, in USDC, to their own wallet", () => {
+  const wallet = '0xAbC0000000000000000000000000000000000001';
+  // The shape the live exchange took on 2026-10-01 (it recovered the signing agent).
+  const action = moveAction({wallet, from: '', to: 'xyz', amount: '1500000'}, 1790000000000);
+  assert.deepEqual(Object.keys(action),
+    ['type', 'destination', 'sourceDex', 'destinationDex', 'token', 'amount', 'fromSubAccount', 'nonce']);
+  assert.equal(action.type, 'agentSendAsset');
+  assert.equal(action.destination, wallet.toLowerCase());
+  assert.equal(action.token, 'USDC:0x6d1e7cde53ba9467b783cb7c530ce054');
+  assert.equal(action.amount, '1.500000');
+  assert.equal(moveAction({wallet, from: 'xyz', to: '', amount: '42'}, 1).amount, '0.000042');
+  assert.throws(() => moveAction({wallet, from: '', to: 'flx', amount: '1'}, 1), /invalid/);
+  assert.throws(() => moveAction({wallet, from: 'xyz', to: 'xyz', amount: '1'}, 1), /invalid/);
+  assert.throws(() => moveAction({wallet, from: '', to: 'xyz', amount: '1.5'}, 1), /invalid/);
+  assert.throws(() => moveAction({wallet, from: '', to: 'xyz', amount: '0'}, 1), /invalid/);
+  assert.throws(() => moveAction({wallet: 'nobody', from: '', to: 'xyz', amount: '1'}, 1), /invalid/);
 });
 
 test('bad orders, leverage and numbers are refused', () => {

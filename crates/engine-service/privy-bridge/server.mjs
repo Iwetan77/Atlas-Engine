@@ -5,8 +5,8 @@ import {authMessage, onboardingMessage, subkeyRegistrationMessage, recoverOnboar
 import {deriveTradeSubkey, signSubkeyAuth, signParadexOrder} from './trade-subkey.mjs';
 import {quoteSwap, swapFromSui, prepareSuiCashout, transferSui} from './sui-swap.mjs';
 import {checkSignature, signable, signForEscrow} from './base-authorization.mjs';
-import {agentFor, approveAction, approveTypedData, checkApproval, leverageAction, orderAction, post as hlPost,
-  signAsAgent} from './hyperliquid.mjs';
+import {agentFor, approveAction, approveTypedData, checkApproval, leverageAction, moveAction, orderAction,
+  post as hlPost, signAsAgent} from './hyperliquid.mjs';
 import {cashOut} from './hyperliquid-cashout.mjs';
 
 const SUI_COIN_TYPE = /^0x[0-9a-fA-F]{1,64}::[A-Za-z_][A-Za-z0-9_]*::[A-Za-z_][A-Za-z0-9_]*$/;
@@ -94,7 +94,7 @@ const server = createServer(async (request, response) => {
   const signEscrow = request.method === 'POST' && request.url === '/escrow/sign-authorization';
   const hlRoute = request.method === 'POST' && request.url.startsWith('/hyperliquid/') ?
     request.url.slice('/hyperliquid/'.length) : null;
-  const hyperliquid = ['agent', 'approve', 'leverage', 'order', 'cashout'].includes(hlRoute);
+  const hyperliquid = ['agent', 'approve', 'leverage', 'order', 'move', 'cashout'].includes(hlRoute);
   const suiQuote = request.method === 'POST' && request.url === '/sui/quote';
   const suiSwap = request.method === 'POST' && request.url === '/sui/swap';
   const suiCashoutPrepare = request.method === 'POST' && request.url === '/sui/cashout/prepare';
@@ -352,7 +352,9 @@ const server = createServer(async (request, response) => {
           const signature = checkApproval(agent.address, nonce, signed.signature, evmWallet);
           return answer(await hlPost({action: approveAction(agent.address, nonce), nonce, signature}));
         }
-        const action = hlRoute === 'order' ? orderAction(input) : leverageAction(input);
+        const action = hlRoute === 'order' ? orderAction(input) :
+          hlRoute === 'move' ? moveAction({wallet: evmWallet, from: input.from, to: input.to, amount: input.amount}, nonce) :
+          leverageAction(input);
         return answer(await hlPost({action, nonce, signature: signAsAgent(agent.key, action, nonce), vaultAddress: null}));
       } catch (error) {
         send(response, 502, {error: String(error?.message ?? error).slice(0, 200)});

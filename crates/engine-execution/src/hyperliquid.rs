@@ -1,11 +1,15 @@
 //! Hyperliquid reads: the perps markets, an account's value and positions, its fills, candles, and
 //! which agents it has approved. Trading itself is signed in the Privy bridge (hyperliquid.mjs).
-//! An account is the user's own EVM address. No API key.
+//! An account is the user's own EVM address. No API key. Besides Hyperliquid's own perps, it lists
+//! the `xyz` dex (stocks, commodities, indices, currencies), which keeps its own margin per account.
 use reqwest::{Client, Url};
 use serde_json::{json, Value};
 use std::time::Duration;
 
 const INFO: &str = "https://api.hyperliquid.xyz/info";
+// Builder-deployed dexes Atlas lists, with their place in Hyperliquid's `perpDexs` list: their asset
+// ids are 100000 + place × 10000 + index (live check: `live_hyperliquid_markets`).
+pub const DEXES: [(&str, u32); 1] = [("xyz", 1)];
 
 #[derive(Debug, thiserror::Error)]
 pub enum HyperliquidError {
@@ -21,10 +25,12 @@ pub struct HyperliquidClient {
     info: Url,
 }
 
-/// One perps market right now. `asset` is the id orders use; `coin` names it ("BTC").
+/// One perps market right now. `asset` is the id orders use; `coin` names it ("BTC", "xyz:TSLA").
 #[derive(Clone, Debug, PartialEq)]
 pub struct Market {
     pub coin: String,
+    // "" for Hyperliquid's own perps, else the dex holding this market's margin.
+    pub dex: String,
     pub asset: u32,
     pub sz_decimals: u32,
     pub max_leverage: u32,
@@ -33,6 +39,9 @@ pub struct Market {
     // Per hour (Hyperliquid funds hourly).
     pub funding: f64,
     pub day_volume: f64,
+    // Margin only per position (no cross margin), and the taker fee as a multiple of the base fee.
+    pub isolated_only: bool,
+    pub fee_scale: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -98,17 +107,29 @@ impl HyperliquidClient {
             .await?)
     }
 
-    /// Every live perps market.
+    /// Every live perps market, Hyperliquid's own and the listed dexes'.
     pub async fn markets(&self) -> Result<Vec<Market>, HyperliquidError> {
-        parse_markets(&self.info(json!({"type":"metaAndAssetCtxs"})).await?)
+        let main = self.info(json!({"type":"metaAndAssetCtxs"}));
+        let (dex, place) = DEXES[0];
+        let other = self.info(json!({"type":"metaAndAssetCtxs","dex":dex}));
+        let (main, other) = tokio::try_join!(main, other)?;
+        let mut markets = parse_markets(&main, "", 0)?;
+        markets.extend(parse_markets(&other, dex, 100_000 + place * 10_000)?);
+        Ok(markets)
     }
 
+    /// The account on Hyperliquid's own perps.
     pub async fn account(&self, user: &str) -> Result<Account, HyperliquidError> {
-        parse_account(
-            &self
-                .info(json!({"type":"clearinghouseState","user":user}))
-                .await?,
-        )
+        self.account_on(user, "").await
+    }
+
+    /// The account's margin and positions on one dex ("" for Hyperliquid's own perps).
+    pub async fn account_on(&self, user: &str, dex: &str) -> Result<Account, HyperliquidError> {
+        let mut body = json!({"type":"clearinghouseState","user":user});
+        if !dex.is_empty() {
+            body["dex"] = json!(dex);
+        }
+        parse_account(&self.info(body).await?)
     }
 
     /// The account's latest fills, newest first.
@@ -166,7 +187,11 @@ impl HyperliquidClient {
     }
 }
 
-fn parse_markets(body: &Value) -> Result<Vec<Market>, HyperliquidError> {
+fn parse_markets(
+    body: &Value,
+    dex: &str,
+    first_asset: u32,
+) -> Result<Vec<Market>, HyperliquidError> {
     let universe = body[0]["universe"]
         .as_array()
         .ok_or(HyperliquidError::InvalidResponse("markets"))?;
@@ -179,15 +204,38 @@ fn parse_markets(body: &Value) -> Result<Vec<Market>, HyperliquidError> {
         .enumerate()
         .filter(|(_, (meta, _))| !meta["isDelisted"].as_bool().unwrap_or(false))
         .filter_map(|(index, (meta, ctx))| {
+            // A builder dex's fee multiple (Hyperliquid's rule), a tenth of it in growth mode.
+            let fee_scale = if dex.is_empty() {
+                1.0
+            } else {
+                let deployer = num(&meta["deployerFeeScale"]).unwrap_or(1.0);
+                let scale = if deployer < 1.0 {
+                    deployer + 1.0
+                } else {
+                    deployer * 2.0
+                };
+                if meta["growthMode"].as_str() == Some("enabled") {
+                    scale / 10.0
+                } else {
+                    scale
+                }
+            };
             Some(Market {
                 coin: meta["name"].as_str()?.to_string(),
-                asset: u32::try_from(index).ok()?,
+                dex: dex.to_string(),
+                asset: first_asset + u32::try_from(index).ok()?,
                 sz_decimals: u32::try_from(meta["szDecimals"].as_u64()?).ok()?,
                 max_leverage: u32::try_from(meta["maxLeverage"].as_u64()?).ok()?,
                 mark: num(&ctx["markPx"]).filter(|p| *p > 0.0)?,
                 prev_day: num(&ctx["prevDayPx"]).unwrap_or(0.0),
                 funding: num(&ctx["funding"]).unwrap_or(0.0),
                 day_volume: num(&ctx["dayNtlVlm"]).unwrap_or(0.0),
+                isolated_only: meta["onlyIsolated"].as_bool().unwrap_or(false)
+                    || matches!(
+                        meta["marginMode"].as_str(),
+                        Some("noCross" | "strictIsolated")
+                    ),
+                fee_scale,
             })
         })
         .collect())
@@ -268,12 +316,38 @@ mod tests {
              {"markPx":"1.0"},
              {"markPx":"5.3423","prevDayPx":"5.1","funding":"-0.00001","dayNtlVlm":"348700000"}]
         ]);
-        let markets = parse_markets(&body).unwrap();
+        let markets = parse_markets(&body, "", 0).unwrap();
         assert_eq!(markets.len(), 2);
         assert_eq!(markets[1].coin, "NEAR");
         // The asset id is the position in the full list, delisted ones included.
         assert_eq!(markets[1].asset, 2);
         assert_eq!(markets[1].sz_decimals, 1);
+        assert_eq!(markets[1].fee_scale, 1.0);
+        assert!(!markets[1].isolated_only);
+    }
+
+    #[test]
+    fn reads_a_builder_dex_with_its_asset_ids_fees_and_margin_rules() {
+        // Shape from the live `xyz` dex on 2026-10-01 (trimmed).
+        let body = json!([
+            {"universe":[{"szDecimals":3,"name":"xyz:TSLA","maxLeverage":20,"growthMode":"enabled",
+                    "deployerFeeScale":"1.0"},
+                {"szDecimals":4,"name":"xyz:GOLD","maxLeverage":25,"deployerFeeScale":"1.0"},
+                {"szDecimals":3,"name":"xyz:HOOD","maxLeverage":10,"onlyIsolated":true,
+                    "marginMode":"noCross","deployerFeeScale":"0.5"}],
+             "collateralToken":0},
+            [{"markPx":"356.8"},{"markPx":"4174.2"},{"markPx":"113.21"}]
+        ]);
+        let markets = parse_markets(&body, "xyz", 110_000).unwrap();
+        assert_eq!(
+            markets.iter().map(|m| m.asset).collect::<Vec<_>>(),
+            [110_000, 110_001, 110_002]
+        );
+        assert_eq!(markets[0].dex, "xyz");
+        assert!((markets[0].fee_scale - 0.2).abs() < 1e-9);
+        assert_eq!(markets[1].fee_scale, 2.0);
+        assert_eq!(markets[2].fee_scale, 1.5);
+        assert!(markets[2].isolated_only && !markets[1].isolated_only);
     }
 
     #[test]
@@ -315,6 +389,18 @@ mod tests {
         println!("{} markets", markets.len());
         let near = markets.iter().find(|m| m.coin == "NEAR").unwrap();
         println!("{near:?}");
+        let tsla = markets.iter().find(|m| m.coin == "xyz:TSLA").unwrap();
+        println!("{tsla:?}");
+        // The dexes sit where DEXES says, so their asset ids are right.
+        let dexes = client.info(json!({"type":"perpDexs"})).await.unwrap();
+        for (dex, place) in DEXES {
+            assert_eq!(dexes[place as usize]["name"], dex);
+        }
+        let account = client
+            .account_on("0x4838B106FCe9647Bdf1E7877BF73cE8B0BAD5f97", "xyz")
+            .await
+            .unwrap();
+        println!("xyz account {account:?}");
         let now = 1_790_830_000_000;
         let closes = client
             .closes("BTC", "1h", now - 86_400_000, now)

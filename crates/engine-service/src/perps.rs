@@ -11,7 +11,7 @@ const SCALE: u128 = 1_000_000_000_000;
 // Every perp Paradex lists is offered. Names for the ones we can name with confidence; anything else
 // keeps its ticker. Categories here override Paradex's tags, which lump stocks, commodities and
 // indices together as RWA (and call PAXG, tokenized gold, DEFI).
-const KNOWN_MARKETS: &[(&str, &str, &str)] = &[
+pub(super) const KNOWN_MARKETS: &[(&str, &str, &str)] = &[
     ("BTC", "Bitcoin", "crypto"),
     ("ETH", "Ethereum", "crypto"),
     ("SOL", "Solana", "crypto"),

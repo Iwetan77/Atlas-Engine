@@ -1,7 +1,8 @@
 // Hyperliquid perps for an Atlas user. The account is the user's own EVM wallet. Trades are signed by
 // an agent key Atlas derives per user, which the user approves once with their own wallet: an agent
-// can place and cancel orders and set leverage, never withdraw or transfer. Formats were checked
-// against the live exchange (it recovered exactly the signing addresses).
+// can place and cancel orders, set leverage and move margin between the account's own dexes, never
+// withdraw or pay anyone else. Formats were checked against the live exchange (it recovered exactly
+// the signing addresses).
 import {createHmac} from 'node:crypto';
 import {encode} from '@msgpack/msgpack';
 import {secp256k1} from '@noble/curves/secp256k1';
@@ -87,11 +88,30 @@ export function orderAction({asset, isBuy, price, size, reduceOnly}) {
   };
 }
 
-export function leverageAction({asset, leverage}) {
-  if (!ASSET(asset) || !Number.isInteger(leverage) || leverage < 1 || leverage > 100) {
+// Cross margin, or margin per position for markets that only allow that.
+export function leverageAction({asset, leverage, isolated = false}) {
+  if (!ASSET(asset) || !Number.isInteger(leverage) || leverage < 1 || leverage > 100 ||
+      typeof isolated !== 'boolean') {
     throw new Error('invalid leverage');
   }
-  return {type: 'updateLeverage', asset, isCross: true, leverage};
+  return {type: 'updateLeverage', asset, isCross: !isolated, leverage};
+}
+
+// The dexes margin may move between: Hyperliquid's own perps ("") and the stock dex.
+const DEXES = new Set(['', 'xyz']);
+const USDC_TOKEN = 'USDC:0x6d1e7cde53ba9467b783cb7c530ce054';
+
+// USDC (units, 6 decimals) from one of the account's dexes to another. Hyperliquid only lets an
+// agent send to the same account, and the destination here is always the user's own wallet.
+export function moveAction({wallet, from, to, amount}, nonce) {
+  if (!DEXES.has(from) || !DEXES.has(to) || from === to || !/^0x[0-9a-fA-F]{40}$/.test(wallet ?? '') ||
+      !/^[1-9][0-9]{0,15}$/.test(String(amount ?? ''))) {
+    throw new Error('invalid margin move');
+  }
+  const units = String(amount).padStart(7, '0');
+  // Field order matters: it's what gets hashed.
+  return {type: 'agentSendAsset', destination: wallet.toLowerCase(), sourceDex: from, destinationDex: to,
+    token: USDC_TOKEN, amount: `${units.slice(0, -6)}.${units.slice(-6)}`, fromSubAccount: '', nonce};
 }
 
 // The one thing the user's own wallet signs here: approving their Atlas agent, and no other key.
