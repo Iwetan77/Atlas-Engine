@@ -13,6 +13,9 @@ use crate::swaps::uniswap::BASE_USDC;
 
 const API: &str = "https://api.relay.link/";
 const BASE_CHAIN_ID: u64 = 8453;
+pub const ARC_CHAIN_ID: u64 = 5042;
+pub const ARC_USDC: &str = "0x3600000000000000000000000000000000000000";
+const ARC_DEPOSITORY: &str = "0x4cd00e387622c35bddb9b4c962c136462338bc31";
 const SOLANA_CHAIN_ID: u64 = 792703809;
 // Hyperliquid's chain id on Relay, and its USDC (8 decimals there; 6 on Base and Solana).
 const HYPERLIQUID_CHAIN_ID: u64 = 1337;
@@ -67,6 +70,15 @@ fn solana_dest(owner: &str) -> Dest<'_> {
     }
 }
 
+fn arc_dest(wallet: &str) -> Dest<'_> {
+    Dest {
+        chain: ARC_CHAIN_ID,
+        currency: ARC_USDC,
+        recipient: wallet,
+        scale: 1,
+    }
+}
+
 fn base_dest(wallet: &str) -> Dest<'_> {
     Dest {
         chain: BASE_CHAIN_ID,
@@ -116,7 +128,49 @@ pub struct GaslessMove {
     pub api: String,
 }
 
+/// Arc pays its network fee in native USDC; these are exact approval/deposit transactions.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArcMove {
+    pub request_id: String,
+    pub amount_in_units: u128,
+    pub amount_out_units: u128,
+    pub transactions: Vec<Value>,
+}
+
 impl RelayClient {
+    pub async fn base_to_arc(&self, evm: &str, out: u128) -> Result<GaslessMove, RelayError> {
+        self.gasless_move(evm, arc_dest(evm), Exact::Out(out)).await
+    }
+
+    pub async fn arc_to_base(&self, evm: &str, out: u128) -> Result<ArcMove, RelayError> {
+        self.arc_move(evm, base_dest(evm), out).await
+    }
+
+    pub async fn arc_to_solana(
+        &self,
+        evm: &str,
+        sol: &str,
+        out: u128,
+    ) -> Result<ArcMove, RelayError> {
+        self.arc_move(evm, solana_dest(sol), out).await
+    }
+
+    async fn arc_move(&self, evm: &str, dest: Dest<'_>, out: u128) -> Result<ArcMove, RelayError> {
+        let response = self.with_key(self.http.post(self.base.join("quote").map_err(|_| RelayError::InvalidResponse("URL"))?))
+            .json(&json!({"user":evm,"recipient":dest.recipient,"originChainId":ARC_CHAIN_ID,
+                "destinationChainId":dest.chain,"originCurrency":ARC_USDC,"destinationCurrency":dest.currency,
+                "amount":out.to_string(),"tradeType":"EXACT_OUTPUT","usePermit":false}))
+            .send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(RelayError::Rejected {
+                status,
+                reason: "cash move unavailable".into(),
+            });
+        }
+        parse_arc_move(&response.json().await?, evm, dest, out)
+    }
+
     pub fn new(api_key: Option<String>) -> Result<Self, RelayError> {
         Ok(Self {
             http: Client::builder().timeout(Duration::from_secs(20)).build()?,
@@ -494,6 +548,147 @@ fn parse_solana_move(
     })
 }
 
+fn parse_arc_move(
+    body: &Value,
+    evm: &str,
+    dest: Dest<'_>,
+    out: u128,
+) -> Result<ArcMove, RelayError> {
+    let invalid = RelayError::InvalidResponse;
+    let details = &body["details"];
+    let incoming = &details["currencyIn"];
+    let amount = units(&incoming["amount"]).ok_or(invalid("amount in"))?;
+    if out == 0
+        || amount < out
+        || amount > out.saturating_add(out / 50).saturating_add(500_000)
+        || text(&incoming["currency"]["chainId"]) != ARC_CHAIN_ID.to_string()
+        || text(&incoming["currency"]["address"]) != ARC_USDC
+        || incoming["currency"]["decimals"].as_u64() != Some(6)
+        || text(&details["sender"]) != evm.to_ascii_lowercase()
+        || !lands_at(details, dest)
+        || units(&details["currencyOut"]["minimumAmount"]).unwrap_or(0) < out
+    {
+        return Err(invalid("cash route changed"));
+    }
+    let request_id = body["requestId"]
+        .as_str()
+        .filter(|s| is_hash(s))
+        .ok_or(invalid("request id"))?;
+    let protocol = &body["protocol"]["v2"];
+    let order_id = protocol["orderId"]
+        .as_str()
+        .filter(|s| is_hash(s))
+        .ok_or(invalid("order id"))?;
+    let payment = &protocol["paymentDetails"];
+    if text(&payment["depository"]) != ARC_DEPOSITORY
+        || text(&payment["currency"]) != ARC_USDC
+        || units(&payment["amount"]) != Some(amount)
+        || payment["chainId"] != "arc"
+    {
+        return Err(invalid("deposit changed"));
+    }
+    let order = &protocol["orderData"];
+    let inputs = order["inputs"].as_array().ok_or(invalid("inputs"))?;
+    let outputs = order["output"]["payments"]
+        .as_array()
+        .ok_or(invalid("outputs"))?;
+    let chain = if dest.chain == BASE_CHAIN_ID {
+        "base"
+    } else {
+        "solana"
+    };
+    if inputs.len() != 1
+        || outputs.len() != 1
+        || order["output"]["chainId"] != chain
+        || !order["output"]["calls"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+        || !order["fees"].as_array().is_some_and(Vec::is_empty)
+        || inputs[0]["payment"]["chainId"] != "arc"
+        || text(&inputs[0]["payment"]["currency"]) != ARC_USDC
+        || units(&inputs[0]["payment"]["amount"]) != Some(amount)
+        || outputs[0]["recipient"].as_str() != Some(dest.recipient)
+        || text(&outputs[0]["currency"]) != dest.currency.to_ascii_lowercase()
+        || units(&outputs[0]["minimumAmount"]).unwrap_or(0) < out
+    {
+        return Err(invalid("order changed"));
+    }
+    let refunds = inputs[0]["refunds"].as_array().ok_or(invalid("refunds"))?;
+    if refunds.is_empty()
+        || refunds.iter().any(|r| match r["chainId"].as_str() {
+            Some("arc") => {
+                text(&r["recipient"]) != evm.to_ascii_lowercase()
+                    || text(&r["currency"]) != ARC_USDC
+            }
+            Some(c) if c == chain => {
+                r["recipient"].as_str() != Some(dest.recipient)
+                    || r["currency"].as_str().map(str::to_ascii_lowercase)
+                        != Some(dest.currency.to_ascii_lowercase())
+            }
+            _ => true,
+        })
+    {
+        return Err(invalid("refund wallet changed"));
+    }
+    let word = |address: &str| {
+        format!(
+            "{:0>64}",
+            address.trim_start_matches("0x").to_ascii_lowercase()
+        )
+    };
+    let approval = format!("0x095ea7b3{}{:064x}", word(ARC_DEPOSITORY), amount);
+    let deposit = format!(
+        "0xe8017952{}{}{:064x}{}",
+        word(evm),
+        word(ARC_USDC),
+        amount,
+        &order_id[2..]
+    );
+    let steps = body["steps"].as_array().ok_or(invalid("steps"))?;
+    if steps.is_empty() || steps.len() > 2 {
+        return Err(invalid("steps"));
+    }
+    let mut transactions = Vec::new();
+    for (index, step) in steps.iter().enumerate() {
+        let last = index + 1 == steps.len();
+        let expected_id = if last { "deposit" } else { "approve" };
+        let target = if last { ARC_DEPOSITORY } else { ARC_USDC };
+        let calldata = if last { &deposit } else { &approval };
+        let items = step["items"].as_array().ok_or(invalid("items"))?;
+        if step["id"] != expected_id
+            || step["kind"] != "transaction"
+            || step["requestId"] != request_id
+            || items.len() != 1
+        {
+            return Err(invalid("unexpected step"));
+        }
+        let tx = &items[0]["data"];
+        if text(&tx["from"]) != evm.to_ascii_lowercase()
+            || text(&tx["to"]) != target
+            || text(&tx["data"]) != *calldata
+            || text(&tx["value"]) != "0"
+            || tx["chainId"].as_u64() != Some(ARC_CHAIN_ID)
+        {
+            return Err(invalid("transaction changed"));
+        }
+        transactions.push(
+            json!({"chain":"arc","chainId":ARC_CHAIN_ID,"to":target,"data":calldata,"value":"0"}),
+        );
+    }
+    Ok(ArcMove {
+        request_id: request_id.into(),
+        amount_in_units: amount,
+        amount_out_units: out,
+        transactions,
+    })
+}
+
+fn is_hash(value: &str) -> bool {
+    value.len() == 66
+        && value.starts_with("0x")
+        && value[2..].bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 fn parse_state(body: &Value) -> SwapState {
     match body["status"].as_str().unwrap_or_default() {
         "success" => SwapState::Completed,
@@ -508,6 +703,62 @@ mod tests {
 
     const EVM: &str = "0x4838B106FCe9647Bdf1E7877BF73cE8B0BAD5f97";
     const SOLANA: &str = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM";
+
+    #[test]
+    fn arc_cash_pins_the_approval_deposit_and_recipient() {
+        let body: Value =
+            serde_json::from_str(include_str!("fixtures/relay-arc-base-tx.json")).unwrap();
+        let evm = body["details"]["sender"].as_str().unwrap();
+        let quote = parse_arc_move(&body, evm, base_dest(evm), 1_000_000).unwrap();
+        assert_eq!(quote.transactions.len(), 2);
+        assert_eq!(quote.amount_in_units, 1_024_294);
+        for path in [
+            vec!["details", "recipient"],
+            vec!["protocol", "v2", "paymentDetails", "depository"],
+        ] {
+            let mut bad = body.clone();
+            let mut at = &mut bad;
+            for key in path {
+                at = &mut at[key];
+            }
+            *at = json!("0x0000000000000000000000000000000000000001");
+            assert!(parse_arc_move(&bad, evm, base_dest(evm), 1_000_000).is_err());
+        }
+        for field in ["to", "data", "value", "chainId", "from"] {
+            let mut bad = body.clone();
+            bad["steps"][0]["items"][0]["data"][field] = json!("changed");
+            assert!(parse_arc_move(&bad, evm, base_dest(evm), 1_000_000).is_err());
+        }
+        let mut bad = body.clone();
+        bad["protocol"]["v2"]["orderData"]["inputs"][0]["refunds"][0]["recipient"] =
+            json!("another wallet");
+        assert!(parse_arc_move(&bad, evm, base_dest(evm), 1_000_000).is_err());
+    }
+
+    #[test]
+    fn base_cash_lands_on_arc_from_the_captured_quote() {
+        let body: Value =
+            serde_json::from_str(include_str!("fixtures/relay-base-arc.json")).unwrap();
+        let evm = body["details"]["recipient"].as_str().unwrap();
+        assert!(parse_gasless_move(&body, evm, arc_dest(evm), Exact::Out(1_000_000)).is_ok());
+    }
+
+    #[tokio::test]
+    #[ignore = "live Relay read-only quotes; no funds moved"]
+    async fn live_arc_cash_quotes() {
+        let client = RelayClient::new(None).unwrap();
+        let evm = "0xEe8646AF9e1DDA672716389aB64a7bD0Fd202ba7";
+        let inbound = client.base_to_arc(evm, 1_000_000).await.unwrap();
+        println!("LIVE DRY Base -> Arc: {} units in", inbound.amount_in_units);
+        let outbound = client.arc_to_base(evm, 1_000_000).await.unwrap();
+        println!(
+            "LIVE DRY Arc -> Base: {} units in, {} transactions",
+            outbound.amount_in_units,
+            outbound.transactions.len()
+        );
+        let sol = client.arc_to_solana(evm, SOLANA, 1_000_000).await.unwrap();
+        println!("LIVE DRY Arc -> Solana: {} units in", sol.amount_in_units);
+    }
 
     // Captured from Relay's live API on 2026-09-30 (exactly 5 USDC to land on Solana).
     fn live_quote() -> Value {
