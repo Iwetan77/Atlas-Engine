@@ -22,7 +22,7 @@ pub enum Venue {
     Circle,
     Jupiter,
     OneInch,
-    Paradex,
+    Hyperliquid,
     Jito,
     Marinade,
     Aave,

@@ -8,7 +8,6 @@ mod gasless;
 mod hl;
 mod markets;
 mod near_intents;
-mod perps;
 mod positions;
 mod social;
 
@@ -41,10 +40,6 @@ struct AppState {
     auth: AuthMode,
     markets: markets::MarketState,
     near: near_intents::NearState,
-    paradex: engine_execution::perps::ParadexClient,
-    paradex_tokens: Arc<Mutex<HashMap<String, (String, Instant)>>>,
-    perps_trade: perps::TradeState,
-    perp_cache: perps::PerpCache,
     layerswap: engine_execution::layerswap::LayerswapClient,
     relay_link: engine_execution::relay_link::RelayClient,
     cow: engine_execution::cow::CowClient,
@@ -109,12 +104,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auth,
         markets: markets::MarketState::new()?.with_database().await?,
         near: near_intents::NearState::new().await?,
-        paradex: engine_execution::perps::ParadexClient::new(
-            &env::var("PARADEX_ENV").unwrap_or_else(|_| "prod".into()),
-        )?,
-        paradex_tokens: Arc::new(Mutex::new(HashMap::new())),
-        perps_trade: perps::TradeState::new().await?,
-        perp_cache: perps::PerpCache::default(),
         layerswap: engine_execution::layerswap::LayerswapClient::new()?,
         relay_link: engine_execution::relay_link::RelayClient::new(env::var("RELAY_API_KEY").ok())?,
         cow: engine_execution::cow::CowClient::new()?,
@@ -130,49 +119,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if matches!(state.auth, AuthMode::LocalDemo) && !bind.ip().is_loopback() {
         return Err("demo auth bypass requires a loopback bind address".into());
     }
-    // Perps run on Hyperliquid. ATLAS_PERPS_VENUE=paradex puts Paradex back, should Hyperliquid fail.
-    let perps_routes = if env::var("ATLAS_PERPS_VENUE").as_deref() == Ok("paradex") {
-        perps::keep_warm(state.clone());
-        Router::new()
-            .route(
-                "/v1/perps/onboarding",
-                get(perps::onboarding).post(perps::onboard),
-            )
-            .route("/v1/perps/markets", get(perps::markets))
-            .route("/v1/perps/positions", get(perps::positions))
-            .route("/v1/perps/quotes", post(perps::quotes))
-            .route(
-                "/v1/perps/quotes/{quote_id}/execute",
-                post(perps::execute_quote),
-            )
-            .route(
-                "/v1/perps/positions/{position_id}/close-quote",
-                post(perps::close_quote),
-            )
-            .route(
-                "/v1/perps/close-quotes/{quote_id}/execute",
-                post(perps::execute_close),
-            )
-    } else {
-        hl::keep_warm(state.clone());
-        Router::new()
-            .route(
-                "/v1/perps/onboarding",
-                get(hl::onboarding).post(hl::onboarding),
-            )
-            .route("/v1/perps/markets", get(hl::markets))
-            .route("/v1/perps/positions", get(hl::positions))
-            .route("/v1/perps/quotes", post(hl::quote))
-            .route("/v1/perps/quotes/{quote_id}/execute", post(hl::execute))
-            .route(
-                "/v1/perps/positions/{position_id}/close-quote",
-                post(hl::close_quote),
-            )
-            .route(
-                "/v1/perps/close-quotes/{quote_id}/execute",
-                post(hl::execute),
-            )
-    };
+    // Perps run on Hyperliquid.
+    hl::keep_warm(state.clone());
+    let perps_routes = Router::new()
+        .route(
+            "/v1/perps/onboarding",
+            get(hl::onboarding).post(hl::onboarding),
+        )
+        .route("/v1/perps/markets", get(hl::markets))
+        .route("/v1/perps/positions", get(hl::positions))
+        .route("/v1/perps/quotes", post(hl::quote))
+        .route("/v1/perps/quotes/{quote_id}/execute", post(hl::execute))
+        .route(
+            "/v1/perps/positions/{position_id}/close-quote",
+            post(hl::close_quote),
+        )
+        .route(
+            "/v1/perps/close-quotes/{quote_id}/execute",
+            post(hl::execute),
+        );
     let mut app = Router::new()
         .merge(perps_routes)
         .route("/health", get(health))

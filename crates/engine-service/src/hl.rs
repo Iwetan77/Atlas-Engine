@@ -31,6 +31,47 @@ const MEMES: [&str; 22] = [
     "TRUMP", "MOODENG", "PNUT", "BRETT", "GOAT", "SPX", "MEW", "BOME", "TURBO", "MOG", "MEME",
     "PUMP",
 ];
+// Names for Hyperliquid's own coins where one is known, so search finds them ("Bitcoin").
+const COIN_NAMES: &[(&str, &str)] = &[
+    ("BTC", "Bitcoin"),
+    ("ETH", "Ethereum"),
+    ("SOL", "Solana"),
+    ("HYPE", "Hyperliquid"),
+    ("BNB", "BNB"),
+    ("SUI", "Sui"),
+    ("XRP", "XRP"),
+    ("AVAX", "Avalanche"),
+    ("LINK", "Chainlink"),
+    ("NEAR", "NEAR"),
+    ("TAO", "Bittensor"),
+    ("ADA", "Cardano"),
+    ("LTC", "Litecoin"),
+    ("UNI", "Uniswap"),
+    ("AAVE", "Aave"),
+    ("ENA", "Ethena"),
+    ("ETHFI", "ether.fi"),
+    ("JTO", "Jito"),
+    ("JUP", "Jupiter"),
+    ("KAITO", "Kaito"),
+    ("LDO", "Lido DAO"),
+    ("MORPHO", "Morpho"),
+    ("ONDO", "Ondo"),
+    ("PENDLE", "Pendle"),
+    ("PYTH", "Pyth Network"),
+    ("STRK", "Starknet"),
+    ("TRX", "TRON"),
+    ("XMR", "Monero"),
+    ("ZEC", "Zcash"),
+    ("MON", "Monad"),
+    ("XPL", "Plasma"),
+    ("WLFI", "World Liberty Financial"),
+    ("DOGE", "Dogecoin"),
+    ("PUMP", "Pump.fun"),
+    ("TRUMP", "Official Trump"),
+    ("kPEPE", "Pepe (per 1,000)"),
+    ("kSHIB", "Shiba Inu (per 1,000)"),
+    ("kBONK", "Bonk (per 1,000)"),
+];
 // The `xyz` dex: names we can give with confidence, and every market that isn't a stock (anything
 // not here keeps its ticker and counts as a stock).
 const XYZ_MARKETS: &[(&str, &str, &str)] = &[
@@ -332,12 +373,11 @@ fn category(coin: &str) -> &'static str {
 }
 // A market's display name and category.
 fn describe(coin: &str) -> (String, &'static str) {
-    // Hyperliquid's own coins: a name where one is known ("Bitcoin"), so search finds it.
     let named = |ticker: &str| {
-        perps::KNOWN_MARKETS
+        COIN_NAMES
             .iter()
-            .find(|(t, _, _)| *t == ticker)
-            .map_or(ticker.into(), |(_, name, _)| (*name).into())
+            .find(|(t, _)| *t == ticker)
+            .map_or(ticker.into(), |(_, name)| (*name).into())
     };
     match split_coin(coin) {
         ("", ticker) if MEMES.contains(&ticker) => (named(ticker), "meme"),
@@ -348,6 +388,25 @@ fn describe(coin: &str) -> (String, &'static str) {
             .map_or((ticker.into(), "stock"), |(_, name, kind)| {
                 ((*name).into(), *kind)
             }),
+    }
+}
+// Public logo CDNs: CoinCap by ticker for coins, FMP for stock tickers. Commodities, indices and
+// currencies have no logo; the app falls back to initials (and does the same if a URL fails to load).
+fn icon_url(symbol: &str, category: &str) -> Option<String> {
+    // kPEPE / kSHIB quote 1,000 tokens; the logo is the token's.
+    let token = symbol
+        .strip_prefix('k')
+        .filter(|rest| rest.chars().all(|c| c.is_ascii_uppercase()))
+        .unwrap_or(symbol);
+    match category {
+        "crypto" | "meme" => Some(format!(
+            "https://assets.coincap.io/assets/icons/{}@2x.png",
+            token.to_ascii_lowercase()
+        )),
+        "stock" => Some(format!(
+            "https://financialmodelingprep.com/image-stock/{symbol}.png"
+        )),
+        _ => None,
     }
 }
 // Margin in, from what's already there: the USDC units (6 decimals) still to bring, with 1¢ to spare.
@@ -455,7 +514,7 @@ pub(super) async fn markets(
             let change =
                 (m.prev_day > 0.0).then(|| format!("{:.2}", (m.mark / m.prev_day - 1.0) * 100.0));
             json!({"marketId":market_id(&m.coin),"symbol":symbol,"name":name,"category":kind,
-                "iconUrl":perps::icon_url(symbol, kind),"markPrice":money(m.mark,&currency,rate),
+                "iconUrl":icon_url(symbol, kind),"markPrice":money(m.mark,&currency,rate),
                 "change24hPct":change,"maxLeverage":m.max_leverage,
                 // Hyperliquid funds hourly; the app shows the 8-hour rate.
                 "fundingRate8hPct":format!("{:.4}", m.funding * 8.0 * 100.0),
@@ -511,7 +570,7 @@ pub(super) async fn positions(
             let kind = category(&p.coin);
             let symbol = split_coin(&p.coin).1;
             json!({"positionId":p.coin,"openedAtUnixMs":opened,"marketId":market_id(&p.coin),
-                "symbol":symbol,"iconUrl":perps::icon_url(symbol, kind),
+                "symbol":symbol,"iconUrl":icon_url(symbol, kind),
                 "side":if p.size > 0.0 {"long"} else {"short"},"leverage":p.leverage,
                 "size":trim(p.size.abs()),"entryPrice":usd(p.entry),"markPrice":usd(mark),
                 "liquidationPrice":p.liquidation.map(usd),"margin":usd(p.margin),
@@ -1255,6 +1314,16 @@ mod tests {
         assert_eq!(split_coin("xyz:TSLA"), ("xyz", "TSLA"));
         assert_eq!(split_coin("BTC"), ("", "BTC"));
         assert_eq!(describe("BTC"), ("Bitcoin".into(), "crypto"));
+        assert_eq!(describe("kPEPE"), ("Pepe (per 1,000)".into(), "meme"));
+        assert_eq!(
+            icon_url("kPEPE", "meme").as_deref(),
+            Some("https://assets.coincap.io/assets/icons/pepe@2x.png")
+        );
+        assert_eq!(
+            icon_url("TSLA", "stock").as_deref(),
+            Some("https://financialmodelingprep.com/image-stock/TSLA.png")
+        );
+        assert_eq!(icon_url("GOLD", "commodity"), None);
         assert_eq!(describe("xyz:TSLA"), ("Tesla".into(), "stock"));
         assert_eq!(describe("xyz:GOLD"), ("Gold".into(), "commodity"));
         assert_eq!(describe("xyz:EUR"), ("Euro".into(), "currency"));

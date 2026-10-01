@@ -1201,110 +1201,6 @@ const JUPITER_CHARTS: &str = "https://datapi.jup.ag/v2/charts/";
 const COINGECKO_BASE_CHART: &str = "https://api.coingecko.com/api/v3/coins/base/contract/";
 
 // Jupiter chart candles: {"candles":[{"time": unix seconds, "close": usd, ...}]}, oldest first.
-const HOUR_MS: u64 = 3_600_000;
-
-// Paradex candles for a perps market, as closing prices. Paradex serves up to hourly candles and 720
-// per request, so longer ranges are fetched in 30-day windows and thinned to about one point per
-// 4 hours (1M) or per day (1Y).
-async fn perp_chart(
-    state: &AppState,
-    market: &str,
-    range: &str,
-    currency: &str,
-) -> Result<Json<Value>, ApiError> {
-    let (resolution, span_ms, step, ttl) = match range {
-        "1D" => (15, 24 * HOUR_MS, 1, Duration::from_secs(60)),
-        "1W" => (60, 7 * 24 * HOUR_MS, 1, Duration::from_secs(300)),
-        "1M" => (60, 30 * 24 * HOUR_MS, 4, Duration::from_secs(900)),
-        "1Y" => (60, 365 * 24 * HOUR_MS, 24, Duration::from_secs(3600)),
-        _ => return Err(bad("range must be 1D, 1W, 1M or 1Y")),
-    };
-    let host = if perps::trading_env()? == "prod" {
-        "https://api.prod.paradex.trade"
-    } else {
-        "https://api.testnet.paradex.trade"
-    };
-    let key = format!("paradex:{market}:{range}");
-    let cached = state
-        .markets
-        .charts
-        .lock()
-        .map_err(internal)?
-        .get(&key)
-        .filter(|(at, _)| at.elapsed() < ttl)
-        .map(|(_, points)| points.clone());
-    let points = match cached {
-        Some(points) => points,
-        None => {
-            let end = now();
-            let mut start = end.saturating_sub(span_ms);
-            let mut closes = Vec::new();
-            while start < end {
-                let window_end = (start + 30 * 24 * HOUR_MS).min(end);
-                let body: Value = state
-                    .markets
-                    .http
-                    .get(format!("{host}/v1/markets/klines"))
-                    .query(&[
-                        ("symbol", market.to_string()),
-                        ("resolution", resolution.to_string()),
-                        ("start_at", start.to_string()),
-                        ("end_at", window_end.to_string()),
-                    ])
-                    .send()
-                    .await
-                    .map_err(unavailable)?
-                    .error_for_status()
-                    .map_err(|e| unavailable(format!("price history unavailable: {e}")))?
-                    .json()
-                    .await
-                    .map_err(unavailable)?;
-                closes.extend(paradex_closes(&body));
-                start = window_end;
-            }
-            closes.sort_by_key(|(ms, _)| *ms);
-            closes.dedup_by_key(|(ms, _)| *ms);
-            let thinned: Vec<(u64, f64)> = closes.iter().copied().step_by(step).collect();
-            if thinned.is_empty() {
-                return Err(unavailable("no price history for this market yet"));
-            }
-            let points = Arc::new(thinned);
-            state
-                .markets
-                .charts
-                .lock()
-                .map_err(internal)?
-                .insert(key, (Instant::now(), points.clone()));
-            points
-        }
-    };
-    let rate = app_balance::fx_rate(currency).await?;
-    let scale = rate as f64 / 1_000_000.0;
-    let series: Vec<Value> = points
-        .iter()
-        .map(|(ms, usd)| json!([ms, usd * scale]))
-        .collect();
-    Ok(Json(
-        json!({"assetId":market,"range":range,"currency":currency,"points":series}),
-    ))
-}
-
-// Paradex klines: [[time_ms, open, high, low, close, volume], ...] → (time, close).
-fn paradex_closes(body: &Value) -> Vec<(u64, f64)> {
-    body["results"]
-        .as_array()
-        .map(|rows| {
-            rows.iter()
-                .filter_map(|row| {
-                    let ms = row.get(0)?.as_u64()?;
-                    let close = row.get(4)?.as_f64().filter(|c| c.is_finite() && *c > 0.0)?;
-                    Some((ms, close))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn jupiter_closes(body: &Value) -> Vec<(u64, f64)> {
     let mut points: Vec<(u64, f64)> = body["candles"]
         .as_array()
@@ -1333,9 +1229,8 @@ pub(super) async fn chart(
     let currency = q.currency.unwrap_or_else(|| "NGN".into());
     checked_currency(&currency)?;
     let range = q.range.unwrap_or_else(|| "1D".into());
-    // Perps markets chart from Paradex's own candles.
-    // Hyperliquid markets ("NEAR-PERP") chart from its candles; Paradex's ("BTC-USD-PERP") from its own.
-    if asset_id.ends_with("-PERP") && !asset_id.ends_with("-USD-PERP") {
+    // Perps markets ("NEAR-PERP", "xyz:TSLA-PERP") chart from Hyperliquid's candles.
+    if asset_id.ends_with("-PERP") {
         let closes = hl::closes(&state, &asset_id, &range).await?;
         if closes.is_empty() {
             return Err(unavailable("no price history for this market yet"));
@@ -1349,9 +1244,6 @@ pub(super) async fn chart(
         return Ok(Json(
             json!({"assetId":asset_id,"range":range,"currency":currency,"points":points}),
         ));
-    }
-    if asset_id.ends_with("-PERP") {
-        return perp_chart(&state, &asset_id, &range, &currency).await;
     }
     // (Jupiter interval, GeckoTerminal timeframe + aggregate, candles, cache). Longer ranges change
     // slowly and are cached longer.
@@ -2984,9 +2876,6 @@ pub(super) async fn signed(
     if intent_id.starts_with("near-intent-") {
         return near_intents::signed(state, headers, intent_id, body).await;
     }
-    if intent_id.starts_with("perp-") {
-        return perps::trade::signed(state, intent_id, headers, body).await;
-    }
     if intent_id.starts_with("hl-") {
         return hl::signed(state, intent_id, headers, body).await;
     }
@@ -3223,9 +3112,6 @@ pub(super) async fn intent_status(
 ) -> Result<Json<IntentStatus>, ApiError> {
     if intent_id.starts_with("near-intent-") {
         return near_intents::status(state, headers, intent_id).await;
-    }
-    if intent_id.starts_with("perp-") {
-        return perps::trade::status(state, intent_id, headers).await;
     }
     if intent_id.starts_with("hl-") {
         return hl::status(state, intent_id, headers).await;
@@ -4261,13 +4147,6 @@ mod tests {
             .any(|(s, _)| *s == "WBTC" || *s == "xBTC" || *s == "WETH"));
         // Base WETH stays in the catalog (the balance values it) but off the Trade list.
         assert!(catalog.iter().any(|a| a.id == "weth-base" && !a.listed));
-    }
-    #[test]
-    fn paradex_candles_become_closes() {
-        let body = json!({"results":[[1790186400000u64,84312.9,84478.8,84162.4,84372.7,195400],
-            [1790190000000u64,84372.7,84569.2,84267.2,0,34140],"bad"]});
-        assert_eq!(paradex_closes(&body), vec![(1790186400000, 84372.7)]);
-        assert!(paradex_closes(&json!({"error":"x"})).is_empty());
     }
     #[test]
     fn jupiter_chart_candles_become_points() {

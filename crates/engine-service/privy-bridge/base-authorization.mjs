@@ -1,17 +1,15 @@
 // What the user's wallet may sign on Base in place of a transaction, and nothing wider. Each shape
 // is checked and rebuilt from scratch in Privy's typed-data format, so no unchecked field is signed:
 // - ReceiveWithAuthorization (EIP-3009): a gasless USDC deposit that only a pinned venue receiver
-//   (Relay, Layerswap) can redeem, for exactly the signed amount; the venue pays the gas.
+//   (Relay) can redeem, for exactly the signed amount; the venue pays the gas.
 // - Permit (EIP-2612): CoW's vault relayer may take at most a gas top-up's worth of USDC.
 // - Order: a CoW sale of at most that much USDC for ETH, paid to the wallet itself.
 import {secp256k1} from '@noble/curves/secp256k1';
 import {keccak_256} from '@noble/hashes/sha3';
 
 export const BASE_USDC = '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913';
-// The only accounts that may redeem a deposit authorization: Layerswap's gasless receiver and
-// Relay's receiver on Base.
+// The only account that may redeem a deposit authorization: Relay's receiver on Base.
 export const RECEIVERS = new Set([
-  '0x6351c235e6f7e08f80974009d01829e5a8250d62',
   '0xccc88a9d1b4ed6b0eaba998850414b24f1c315be',
 ]);
 // CoW Protocol on Base, and how it names native ETH.

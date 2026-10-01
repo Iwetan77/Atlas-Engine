@@ -1,8 +1,6 @@
 import {createServer} from 'node:http';
 import {createHash, randomUUID} from 'node:crypto';
 import {PrivyClient} from '@privy-io/node';
-import {authMessage, onboardingMessage, subkeyRegistrationMessage, recoverOnboardingPublicKey} from './paradex-onboarding.mjs';
-import {deriveTradeSubkey, signSubkeyAuth, signParadexOrder} from './trade-subkey.mjs';
 import {quoteSwap, swapFromSui, prepareSuiCashout, transferSui} from './sui-swap.mjs';
 import {checkSignature, signable, signForEscrow} from './base-authorization.mjs';
 import {agentFor, approveAction, approveTypedData, checkApproval, leverageAction, moveAction, orderAction,
@@ -12,13 +10,11 @@ import {cashOut} from './hyperliquid-cashout.mjs';
 const SUI_COIN_TYPE = /^0x[0-9a-fA-F]{1,64}::[A-Za-z_][A-Za-z0-9_]*::[A-Za-z_][A-Za-z0-9_]*$/;
 const POSITIVE_INTEGER = /^[1-9][0-9]{0,30}$/;
 const preparedCashouts = new Map();
-import {parseSignerConfig, walletHasSigner} from './signer-config.mjs';
 
 const appId = process.env.PRIVY_APP_ID;
 const appSecret = process.env.PRIVY_APP_SECRET;
 if (!appId || !appSecret) throw new Error('PRIVY_APP_ID and PRIVY_APP_SECRET are required');
 const privy = new PrivyClient({appId, appSecret});
-const signer = parseSignerConfig(process.env);
 const port = Number(process.env.PRIVY_BRIDGE_PORT ?? 3101);
 if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('invalid bridge port');
 
@@ -32,33 +28,6 @@ function nextNonce() {
 function send(response, status, body) {
   response.writeHead(status, {'content-type': 'application/json'});
   response.end(JSON.stringify(body));
-}
-
-let verifiedSigner = false;
-async function serverSigner() {
-  if (!signer) return null;
-  if (!verifiedSigner) {
-    const quorum = await privy.keyQuorums().get(signer.signerId);
-    if (quorum.authorization_threshold !== 1 ||
-        !quorum.authorization_keys?.some((key) => key.public_key === signer.publicKey)) {
-      throw new Error('Privy signer quorum does not match the authorization key');
-    }
-    verifiedSigner = true;
-  }
-  return signer;
-}
-
-async function signerStatus(evm, address) {
-  const configured = await serverSigner();
-  if (!configured) return {signer: null, signerAuthorized: false};
-  if (typeof evm.id !== 'string' || !evm.id) {
-    throw new Error('Privy embedded wallet ID unavailable');
-  }
-  const wallet = await privy.wallets().get(evm.id);
-  return {
-    signer: {signerId: configured.signerId, policyIds: configured.policyIds},
-    signerAuthorized: walletHasSigner(wallet, address, configured.signerId),
-  };
 }
 
 async function ensureReceivingWallet(userId, chainType) {
@@ -81,14 +50,6 @@ async function ensureReceivingWallet(userId, chainType) {
 const server = createServer(async (request, response) => {
   const verifyOnly = request.method === 'POST' && request.url === '/verify';
   const ensureWallet = request.method === 'POST' && request.url === '/wallet/ensure';
-  const signOnboarding = request.method === 'POST' &&
-    request.url === '/paradex/onboarding-signature';
-  const signAuth = request.method === 'POST' && request.url === '/paradex/auth-signature';
-  const checkSigner = request.method === 'POST' && request.url === '/paradex/signer-status';
-  const registerSubkey = request.method === 'POST' &&
-    request.url === '/paradex/subkey-registration-signature';
-  const authSubkey = request.method === 'POST' && request.url === '/paradex/subkey-auth-signature';
-  const signOrder = request.method === 'POST' && request.url === '/paradex/order-signature';
   const signAuthorization = request.method === 'POST' && request.url === '/evm/sign-authorization';
   const signEscrow = request.method === 'POST' && request.url === '/escrow/sign-authorization';
   const hlRoute = request.method === 'POST' && request.url.startsWith('/hyperliquid/') ?
@@ -98,8 +59,7 @@ const server = createServer(async (request, response) => {
   const suiSwap = request.method === 'POST' && request.url === '/sui/swap';
   const suiCashoutPrepare = request.method === 'POST' && request.url === '/sui/cashout/prepare';
   const suiCashoutCommit = request.method === 'POST' && request.url === '/sui/cashout/commit';
-  if (!verifyOnly && !ensureWallet && !signOnboarding && !signAuth && !checkSigner &&
-      !registerSubkey && !authSubkey && !signOrder && !signAuthorization && !signEscrow && !hyperliquid && !suiQuote &&
+  if (!verifyOnly && !ensureWallet && !signAuthorization && !signEscrow && !hyperliquid && !suiQuote &&
       !suiSwap && !suiCashoutPrepare && !suiCashoutCommit) {
     response.writeHead(404).end();
     return;
@@ -335,73 +295,8 @@ const server = createServer(async (request, response) => {
         return;
       }
     }
-    let status;
-    try {
-      status = await signerStatus(evm, evmWallet);
-    } catch {
-      send(response, 503, {error: 'Privy signer check unavailable'});
-      return;
-    }
-    if (checkSigner) {
-      send(response, 200, {userId, walletAddress: evmWallet, ...status});
-      return;
-    }
-    if (!status.signerAuthorized) {
-      send(response, 409, {error: 'embedded wallet has not granted server signing permission'});
-      return;
-    }
-    const environment = process.env.PARADEX_ENV ?? 'prod';
-    if (registerSubkey || authSubkey || signOrder) {
-      const subkey = deriveTradeSubkey(signer.privateKey, environment, userId, evmWallet);
-      if (registerSubkey) {
-        const message = subkeyRegistrationMessage(environment, evmWallet, subkey.publicKey);
-        const signed = await privy.wallets().ethereum().signMessage(evm.id, {
-          message,
-          authorization_context: {authorization_private_keys: [signer.privateKey]},
-        });
-        recoverOnboardingPublicKey(message, signed.signature, evmWallet);
-        send(response, 200, {userId, walletAddress: evmWallet, publicKey: subkey.publicKey,
-          signature: signed.signature, siweMessage: message});
-        return;
-      }
-      const accountAddress = input.accountAddress;
-      const chainId = input.chainId;
-      if (authSubkey) {
-        const proof = signSubkeyAuth(subkey, accountAddress, chainId,
-          Math.floor(Date.now() / 1000));
-        send(response, 200, {userId, walletAddress: evmWallet, publicKey: subkey.publicKey,
-          ...proof});
-        return;
-      }
-      const timestamp = Date.now();
-      const signature = signParadexOrder(subkey, accountAddress, chainId, input.order, timestamp);
-      send(response, 200, {userId, walletAddress: evmWallet, publicKey: subkey.publicKey,
-        signature, timestamp});
-      return;
-    }
-    const message = signOnboarding
-      ? onboardingMessage(environment, evmWallet)
-      : authMessage(environment, evmWallet);
-    let signed;
-    try {
-      signed = await privy.wallets().ethereum().signMessage(evm.id, {
-        message,
-        authorization_context: {authorization_private_keys: [signer.privateKey]},
-      });
-    } catch {
-      send(response, 409, {error: 'Privy could not sign with this wallet and policy'});
-      return;
-    }
-    const publicKey = recoverOnboardingPublicKey(message, signed.signature, evmWallet);
-    send(response, 200, {
-      userId,
-      walletAddress: evmWallet,
-      signature: signed.signature,
-      siweMessageBase64: Buffer.from(message, 'utf8').toString('base64'),
-      publicKey,
-    });
   } catch {
-    send(response, 400, {error: 'invalid onboarding request'});
+    send(response, 400, {error: 'invalid request'});
   }
 });
 server.listen(port, '127.0.0.1');

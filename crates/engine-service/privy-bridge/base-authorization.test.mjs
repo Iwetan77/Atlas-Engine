@@ -15,7 +15,7 @@ const COW_DOMAIN = {name: 'Gnosis Protocol', version: 'v2', chainId: 8453,
   verifyingContract: '0x9008d19f58aabd9ed0d60971565aa8510560ab41'};
 const field = (name, type) => ({name, type});
 
-// What Relay and Layerswap return for a gasless Base → Solana move.
+// What Relay returns for a gasless Base → Solana move.
 function deposit(message = {}) {
   return {
     types: {ReceiveWithAuthorization: [field('from', 'address'), field('to', 'address'),
@@ -23,7 +23,7 @@ function deposit(message = {}) {
       field('nonce', 'bytes32')]},
     primaryType: 'ReceiveWithAuthorization',
     domain: USDC_DOMAIN,
-    message: {from: wallet, to: '0x6351c235e6f7e08f80974009d01829e5a8250d62', value: '5000000',
+    message: {from: wallet, to: '0xccc88a9d1b4ed6b0eaba998850414b24f1c315be', value: '5000000',
       validAfter: '0', validBefore: '1790807789',
       nonce: '0xc5d45ec13b4d970bdd7cc5de84e783c807df2d1c645831e6d8b12717e7bdc87b', ...message},
   };
@@ -77,7 +77,6 @@ test('each shape is rebuilt in Privy format and its signature checked', () => {
     other[31] = 8;
     assert.throws(() => checkSignature(rebuilt, sign(rebuilt, other), wallet), /another wallet/);
   }
-  signable(deposit({to: '0xccc88a9d1b4ed6b0eaba998850414b24f1c315be'}), wallet, NOW);
 });
 
 test('deposits go only to pinned receivers, from this wallet', () => {
@@ -87,6 +86,8 @@ test('deposits go only to pinned receivers, from this wallet', () => {
   refuse({...deposit(), domain: {...USDC_DOMAIN, chainId: '1'}}, /not something/);
   refuse(deposit({from: '0x0000000000000000000000000000000000000002'}), /this wallet/);
   refuse(deposit({to: '0x0000000000000000000000000000000000000003'}), /receiver/);
+  // Layerswap's gasless receiver is no longer pinned.
+  refuse(deposit({to: '0x6351c235e6f7e08f80974009d01829e5a8250d62'}), /receiver/);
   refuse(deposit({value: '0'}), /invalid/);
   refuse(deposit({nonce: '0x12'}), /invalid/);
   refuse({...deposit(), primaryType: 'TransferWithAuthorization'}, /not something/);

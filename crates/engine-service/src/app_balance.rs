@@ -231,7 +231,7 @@ pub(super) async fn balance(
             .checked_add(savings)
             .ok_or((StatusCode::BAD_GATEWAY, "balance overflow".into()))?;
     }
-    // Margin on Hyperliquid (and any left on Paradex) is still the user's money: it counts, as perps.
+    // Margin on Hyperliquid is still the user's money: it counts, as perps.
     if let Some(units) = hl::account_value(&state, &evm).await {
         add_holding(
             &mut holdings,
@@ -241,12 +241,6 @@ pub(super) async fn balance(
             &currency,
             rate,
         )?;
-        total = total
-            .checked_add(units)
-            .ok_or((StatusCode::BAD_GATEWAY, "balance overflow".into()))?;
-    }
-    if let Some(units) = perps::paradex_account_value(&state, &headers, &user.user_id, &evm).await {
-        add_holding(&mut holdings, "paradex", "perps", units, &currency, rate)?;
         total = total
             .checked_add(units)
             .ok_or((StatusCode::BAD_GATEWAY, "balance overflow".into()))?;

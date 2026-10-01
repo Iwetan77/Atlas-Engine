@@ -1,6 +1,5 @@
-//! Layerswap moves USDC out of the user's Base wallet: into their Paradex account (perps margin) or
-//! to their Solana wallet (a Solana buy paid with Base cash), gasless when it can be. No API key:
-//! the public v2 API quotes, creates swaps and reports status.
+//! Layerswap moves USDC between the user's Base and Solana wallets (the fallback to Relay). No API
+//! key: the public v2 API quotes, creates swaps and reports status.
 use reqwest::{Client, Url};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -12,9 +11,6 @@ const API: &str = "https://api.layerswap.io/api/v2/";
 const BASE_CHAIN_ID: &str = "8453";
 // ERC-20 transfer(address,uint256).
 const TRANSFER_SELECTOR: &str = "a9059cbb";
-// Layerswap's gasless deposit receiver on Base: the only account that can redeem the user's
-// authorization (the Privy bridge pins it too).
-const GASLESS_RECEIVER: &str = "0x6351c235e6f7e08f80974009d01829e5a8250d62";
 
 #[derive(Debug, Error)]
 pub enum LayerswapError {
@@ -45,15 +41,6 @@ pub struct BaseDeposit {
     pub amount_units: u128,
 }
 
-/// A Base → Paradex swap funded without Base gas: the user's wallet signs one EIP-3009
-/// ReceiveWithAuthorization (see `gasless_authorization`) and Layerswap's relayer sends it, paying
-/// the gas; the gasless quote includes that cost.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GaslessDeposit {
-    pub swap_id: String,
-    pub amount_units: u128,
-}
-
 /// The one Solana transaction that funds a Solana → Base swap, unsigned, base64.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SolanaDeposit {
@@ -78,25 +65,6 @@ impl LayerswapClient {
         })
     }
 
-    /// Creates a Base → Paradex USDC swap and returns the deposit transaction to sign.
-    /// `amount_units` is USDC with 6 decimals; the reference ties the swap to an Atlas intent.
-    pub async fn base_to_paradex(
-        &self,
-        source_address: &str,
-        paradex_account: &str,
-        amount_units: u128,
-        reference: &str,
-    ) -> Result<BaseDeposit, LayerswapError> {
-        self.base_to(
-            "PARADEX_MAINNET",
-            source_address,
-            paradex_account,
-            amount_units,
-            reference,
-        )
-        .await
-    }
-
     /// Creates a Base → Solana USDC swap to the user's own Solana wallet.
     pub async fn base_to_solana(
         &self,
@@ -113,65 +81,6 @@ impl LayerswapClient {
             reference,
         )
         .await
-    }
-
-    /// Base → Paradex without Base gas.
-    pub async fn base_to_paradex_gasless(
-        &self,
-        source_address: &str,
-        paradex_account: &str,
-        amount_units: u128,
-        reference: &str,
-    ) -> Result<GaslessDeposit, LayerswapError> {
-        self.base_to_gasless(
-            "PARADEX_MAINNET",
-            source_address,
-            paradex_account,
-            amount_units,
-            reference,
-        )
-        .await
-    }
-
-    /// The typed data the user's wallet signs to fund a gasless swap, checked: Base USDC, from
-    /// `source_address`, to Layerswap's receiver, for exactly `amount_units`.
-    pub async fn gasless_authorization(
-        &self,
-        swap_id: &str,
-        source_address: &str,
-        amount_units: u128,
-    ) -> Result<Value, LayerswapError> {
-        let mut url = self
-            .base
-            .join(&format!("swaps/{swap_id}/deposit_actions"))
-            .map_err(|_| LayerswapError::InvalidResponse("URL"))?;
-        url.query_pairs_mut()
-            .append_pair("source_address", source_address);
-        let body = checked(self.http.get(url).send().await?).await?;
-        let actions = body["data"]
-            .as_array()
-            .ok_or(LayerswapError::InvalidResponse("deposit actions"))?;
-        gasless_typed_data(actions, source_address, amount_units)
-    }
-
-    /// Hands Layerswap the user's signed authorization; its relayer then makes the deposit.
-    pub async fn authorize(
-        &self,
-        swap_id: &str,
-        signer: &str,
-        signature: &str,
-    ) -> Result<(), LayerswapError> {
-        let url = self
-            .base
-            .join(&format!("swaps/{swap_id}/authorize"))
-            .map_err(|_| LayerswapError::InvalidResponse("URL"))?;
-        let response = self
-            .http
-            .post(url)
-            .json(&json!({"signature":signature,"signer_address":signer}))
-            .send()
-            .await?;
-        checked(response).await.map(|_| ())
     }
 
     /// Layerswap's total fee (USDC units, rounded up) to move `amount_units` of USDC Base → Solana,
@@ -206,25 +115,6 @@ impl LayerswapClient {
             amount_units,
             reference,
             refuel,
-        )
-        .await
-    }
-
-    /// Solana USDC straight into the user's Paradex account (perps margin paid with Solana cash).
-    pub async fn solana_to_paradex(
-        &self,
-        solana_owner: &str,
-        paradex_account: &str,
-        amount_units: u128,
-        reference: &str,
-    ) -> Result<SolanaDeposit, LayerswapError> {
-        self.solana_to(
-            "PARADEX_MAINNET",
-            solana_owner,
-            paradex_account,
-            amount_units,
-            reference,
-            false,
         )
         .await
     }
@@ -313,49 +203,6 @@ impl LayerswapClient {
             .await?;
         let body = checked(response).await?;
         parse_base_deposit(&body, amount_units)
-    }
-
-    async fn base_to_gasless(
-        &self,
-        destination_network: &str,
-        source_address: &str,
-        destination_address: &str,
-        amount_units: u128,
-        reference: &str,
-    ) -> Result<GaslessDeposit, LayerswapError> {
-        let amount: serde_json::Number = usdc_decimal(amount_units)
-            .parse()
-            .map_err(|_| LayerswapError::InvalidResponse("amount"))?;
-        let url = self
-            .base
-            .join("swaps")
-            .map_err(|_| LayerswapError::InvalidResponse("URL"))?;
-        let response = self
-            .http
-            .post(url)
-            .json(&json!({
-                "source_network":"BASE_MAINNET","source_token":"USDC",
-                "destination_network":destination_network,"destination_token":"USDC",
-                "amount":amount,"source_address":source_address,"refund_address":source_address,
-                "destination_address":destination_address,
-                "use_deposit_address":false,"use_gasless":true,"reference_id":reference
-            }))
-            .send()
-            .await?;
-        let body = checked(response).await?;
-        let swap_id = body["data"]["swap"]["id"]
-            .as_str()
-            .filter(|id| !id.is_empty())
-            .ok_or(LayerswapError::InvalidResponse("swap id"))?;
-        // Only plan around it once the authorization to sign is on offer and checks out.
-        let actions = body["data"]["deposit_actions"]
-            .as_array()
-            .ok_or(LayerswapError::InvalidResponse("deposit actions"))?;
-        gasless_typed_data(actions, source_address, amount_units)?;
-        Ok(GaslessDeposit {
-            swap_id: swap_id.into(),
-            amount_units,
-        })
     }
 
     pub async fn swap_state(&self, swap_id: &str) -> Result<SwapState, LayerswapError> {
@@ -447,43 +294,6 @@ fn parse_base_deposit(body: &Value, amount_units: u128) -> Result<BaseDeposit, L
     })
 }
 
-fn gasless_typed_data(
-    actions: &[Value],
-    source_address: &str,
-    amount_units: u128,
-) -> Result<Value, LayerswapError> {
-    let action = actions
-        .iter()
-        .find(|a| a["type"].as_str() == Some("sign"))
-        .ok_or(LayerswapError::InvalidResponse("no gasless authorization"))?;
-    let typed = &action["typed_data"];
-    let domain = &typed["domain"];
-    let message = &typed["message"];
-    let text = |v: &Value| match v {
-        Value::String(s) => s.to_ascii_lowercase(),
-        Value::Number(n) => n.to_string(),
-        _ => String::new(),
-    };
-    if action["signing_standard"].as_str() != Some("eip3009")
-        || typed["primaryType"].as_str() != Some("ReceiveWithAuthorization")
-        || text(&domain["chainId"]) != BASE_CHAIN_ID
-        || text(&domain["verifyingContract"]) != BASE_USDC.to_ascii_lowercase()
-    {
-        return Err(LayerswapError::InvalidResponse(
-            "not a Base USDC authorization",
-        ));
-    }
-    if text(&message["from"]) != source_address.to_ascii_lowercase()
-        || text(&message["to"]) != GASLESS_RECEIVER
-        || text(&message["value"]) != amount_units.to_string()
-    {
-        return Err(LayerswapError::InvalidResponse(
-            "authorization differs from the swap",
-        ));
-    }
-    Ok(typed.clone())
-}
-
 fn parse_solana_deposit(body: &Value, amount_units: u128) -> Result<SolanaDeposit, LayerswapError> {
     let data = &body["data"];
     let swap_id = data["swap"]["id"]
@@ -570,7 +380,7 @@ mod tests {
         assert!(quote_fee_units(&json!({"data":{}})).is_err());
     }
 
-    // Captured from Layerswap's live API on 2026-09-30 (a 20 USDC Base → Paradex swap).
+    // Captured from Layerswap's live API on 2026-09-30 (a 20 USDC swap out of Base).
     fn live_response() -> Value {
         json!({"data":{"swap":{"id":"52507d08-1caf-43c6-923d-bde9ba5efd80","status":"user_transfer_pending"},
             "deposit_actions":[{"type":"transfer","to_address":"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
@@ -610,59 +420,6 @@ mod tests {
         assert!(parse_base_deposit(&two, 20_000_000).is_err());
     }
 
-    // Captured from Layerswap's live API on 2026-09-30 (a gasless 5 USDC Base → Solana swap).
-    fn gasless_actions() -> Vec<Value> {
-        vec![
-            json!({"step":"sign","status":"action_required","signing_standard":"eip3009","type":"sign",
-            "to_address":"0x6351c235e6f7e08f80974009d01829e5a8250d62","amount_in_base_units":"0",
-            "typed_data":{"primaryType":"ReceiveWithAuthorization",
-                "domain":{"name":"USD Coin","version":"2","chainId":"8453",
-                    "verifyingContract":"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"},
-                "message":{"from":"0x4838b106fce9647bdf1e7877bf73ce8b0bad5f97",
-                    "to":"0x6351c235e6f7e08f80974009d01829e5a8250d62","value":"5000000","validAfter":"0",
-                    "validBefore":"1790807789",
-                    "nonce":"0xc5d45ec13b4d970bdd7cc5de84e783c807df2d1c645831e6d8b12717e7bdc87b"}}}),
-        ]
-    }
-
-    #[test]
-    fn a_gasless_deposit_is_one_authorization_for_the_asked_amount() {
-        let from = "0x4838B106FCe9647Bdf1E7877BF73cE8B0BAD5f97";
-        let typed = gasless_typed_data(&gasless_actions(), from, 5_000_000).unwrap();
-        assert_eq!(typed["message"]["value"], "5000000");
-        assert!(gasless_typed_data(&gasless_actions(), from, 4_000_000).is_err());
-        assert!(gasless_typed_data(
-            &gasless_actions(),
-            "0x0000000000000000000000000000000000000001",
-            5_000_000
-        )
-        .is_err());
-        let changed = |path: &[&str], value: Value| {
-            let mut actions = gasless_actions();
-            let mut at = &mut actions[0];
-            for key in path {
-                at = &mut at[*key];
-            }
-            *at = value;
-            gasless_typed_data(&actions, from, 5_000_000).is_err()
-        };
-        assert!(changed(
-            &["typed_data", "message", "to"],
-            json!("0x0000000000000000000000000000000000000002")
-        ));
-        assert!(changed(
-            &["typed_data", "domain", "verifyingContract"],
-            json!("0x0000000000000000000000000000000000000003")
-        ));
-        assert!(changed(&["typed_data", "domain", "chainId"], json!(1)));
-        assert!(changed(
-            &["typed_data", "primaryType"],
-            json!("TransferWithAuthorization")
-        ));
-        assert!(changed(&["signing_standard"], json!("permit2")));
-        assert!(changed(&["type"], json!("transfer")));
-    }
-
     #[test]
     fn swap_states() {
         let state = |status: &str| parse_swap_state(&json!({"data":{"swap":{"status":status}}}));
@@ -674,26 +431,6 @@ mod tests {
 
     // Network: creates (and abandons) a real swap record. Nothing moves without a deposit.
     // cargo test -p engine-execution live_layerswap -- --ignored --nocapture
-    #[tokio::test]
-    #[ignore]
-    async fn live_layerswap_base_to_paradex_deposit() {
-        let client = LayerswapClient::new().unwrap();
-        let deposit = client
-            .base_to_paradex(
-                "0x845c22a46398E0a702733e556bEB6aFcB2E92132",
-                "0x287dd502cd9e5e6267f1aeeaf577db69e7cf71b7fd8f29118de2e37104e17eb",
-                12_345_678,
-                "atlas-live-check",
-            )
-            .await
-            .unwrap();
-        println!("{deposit:?}");
-        assert_eq!(
-            client.swap_state(&deposit.swap_id).await.unwrap(),
-            SwapState::Waiting
-        );
-    }
-
     // A Base → Solana swap to a Solana wallet: one Base USDC transfer, and a fee we can read first.
     #[tokio::test]
     #[ignore]
@@ -726,27 +463,5 @@ mod tests {
             .await
             .unwrap();
         println!("solana deposit tx: {} chars", back.transaction.len());
-    }
-
-    // A gasless Base → Paradex swap: one authorization to sign, nothing sent until it's authorized.
-    #[tokio::test]
-    #[ignore]
-    async fn live_layerswap_gasless_deposit() {
-        let client = LayerswapClient::new().unwrap();
-        let from = "0x845c22a46398E0a702733e556bEB6aFcB2E92132";
-        let deposit = client
-            .base_to_paradex_gasless(
-                from,
-                "0x287dd502cd9e5e6267f1aeeaf577db69e7cf71b7fd8f29118de2e37104e17eb",
-                12_345_678,
-                "atlas-live-check",
-            )
-            .await
-            .unwrap();
-        let typed = client
-            .gasless_authorization(&deposit.swap_id, from, 12_345_678)
-            .await
-            .unwrap();
-        println!("{deposit:?}\n{typed}");
     }
 }

@@ -59,9 +59,9 @@ network loses money.
 | **NEAR Intents 1Click** | Buys on other chains (Sui, NEAR, Monad…), paid from Base cash or, when Base can't cover it, Solana cash; deposits from 23 networks and coins; SUI cashouts. |
 | **Cetus** | Sui coins 1Click doesn't list (DEEP…): 1Click delivers SUI, then Cetus swaps it in the user's own Sui wallet. |
 | **Relay** | Base → Solana cash moves (one EIP-3009 signature, the solver pays gas), and Atlas Link payouts. |
-| **Layerswap** | Solana → Base (with refuel), and perps margin to Paradex (gasless from Base). |
+| **Layerswap** | Solana → Base (with refuel), the fallback to Relay. |
 | **CoW Protocol** | The Base gas tank: a USDC permit plus a USDC → ETH order, settled by a solver who pays the gas. |
-| **Hyperliquid** | Perps: ~290 markets (its own crypto perps plus the `xyz` dex's stocks, commodities, indices and currencies), margin moved in from the balance by Relay in the same confirm, open/close with one confirm, money back to cash after a close, candles for charts. The account is the user's own wallet; trades are signed by a per-user agent the user approves once (it can trade, never withdraw). `ATLAS_PERPS_VENUE=paradex` switches back to Paradex. |
+| **Hyperliquid** | Perps: ~290 markets (its own crypto perps plus the `xyz` dex's stocks, commodities, indices and currencies), margin moved in from the balance by Relay in the same confirm, open/close with one confirm, money back to cash after a close, candles for charts. The account is the user's own wallet; trades are signed by a per-user agent the user approves once (it can trade, never withdraw). |
 | **Morpho, Aave, Jupiter Lend, Jito** | Earn: Morpho's three largest curated USDC vaults on Base (Gauntlet, Spark, Steakhouse), Aave USDC on Base, Jupiter Lend (USDC, USDT, JupUSD, USDS, EURC), SOL staking. Best rate first. |
 | **GeckoTerminal, CoinGecko, DexScreener** | Charts for coins beyond Jupiter; the CoinGecko listing that marks a searched coin verified (exact contract, per chain); Sui search. |
 | **Helius** | Solana RPC in production (any keyed RPC works). |
@@ -78,7 +78,7 @@ Atlas never holds user funds, and the engine can't move a user's money anywhere 
 - **Server-side signing is narrow and uses the user's own login.** The Privy bridge signs with the user's
   JWT, never an unrestricted server key, and only these shapes (`privy-bridge/base-authorization.mjs`), each
   rebuilt from checked fields and verified by recovering the signer:
-  - a USDC `ReceiveWithAuthorization` from the user's wallet to a **pinned** receiver (Relay, Layerswap),
+  - a USDC `ReceiveWithAuthorization` from the user's wallet to a **pinned** receiver (Relay),
     for exactly the planned amount;
   - a USDC permit to CoW's vault relayer and a CoW order selling USDC for ETH **to the wallet itself**,
     both capped at $2 and two hours;
@@ -122,12 +122,11 @@ crates/engine-service      The HTTP API: balance, markets, trades, perps, earn, 
   src/markets.rs           Catalog, quotes, plans, unified cash, gas tanks, intent state machine.
   src/near_intents.rs      1Click buys, deposits, Sui/NEAR/Monad holdings, charts and verification.
   src/earn.rs              Morpho, Aave, Jupiter Lend, Jito.
-  src/hl.rs                Hyperliquid perps: markets, positions, quotes, margin, orders.
-  src/perps/               Paradex (the fallback venue).
+  src/hl.rs                Hyperliquid perps: markets, positions, quotes, margin, orders, cash-out.
   src/gasless.rs           The user's session signs a checked authorization via the bridge.
   privy-bridge/            Node sidecar: Privy token checks and user-JWT signing (see Safety).
 crates/engine-execution    Venue clients: jupiter, uniswap, near_intents, relay_link, layerswap, cow,
-                           hyperliquid, solana, perps (Paradex), gateway.
+                           hyperliquid, solana, gateway.
 crates/engine-core, engine-types, engine-discovery   Shared types and routing primitives.
 ```
 
@@ -187,7 +186,6 @@ cargo run -p engine-service          # http://127.0.0.1:3000
 | `PRIVY_APP_ID`, `PRIVY_APP_SECRET` | The Privy bridge (server-side only) |
 | `PRIVY_BRIDGE_URL` | Where the engine reaches the bridge (the Docker image sets it) |
 | `DATABASE_URL` | Postgres: intents, trades, handles, avatars |
-| `PARADEX_ENV` | `prod` |
 | `ATLAS_SOLANA_MAINNET_RPC_URL` | A keyed Solana RPC, e.g. `https://mainnet.helius-rpc.com/?api-key=…`. The public endpoint rate-limits. Stray quotes or spaces are forgiven; an invalid value falls back to the public endpoint (see `/health`) |
 | `ATLAS_BASE_MAINNET_RPC_URL` | A keyed Base RPC (Alchemy, Coinbase Developer Platform…); public by default |
 | `ATLAS_MONAD_MAINNET_RPC_URL`, `ATLAS_NEAR_MAINNET_RPC_URL`, `ATLAS_ARC_RPC_URL`, `SUI_FULLNODE_URL` | RPC overrides (public by default) |
@@ -236,7 +234,7 @@ Every ✅ has a live call or a reproducible check behind it.
 | Jupiter catalog, quotes, gasless orders, charts; trending per kind | ✅ live |
 | Relay Base → Solana: exact-output quote, one EIP-3009 signature, fee ~$0.035 | ✅ live quotes; ⏳ funded move |
 | CoW gas top-up: permit pre-hook and order signature accepted by CoW's orderbook | ✅ (a throwaway key fails only on balance) |
-| Layerswap gasless deposit to Paradex; Solana → Base with refuel | ✅ live swaps created; ⏳ funded |
+| Layerswap Solana → Base with refuel | ✅ live swaps created; ⏳ funded |
 | Bridge signing shapes: USDC and CoW domain separators match chain; wider requests refused | ✅ unit tests |
 | 1Click buys from Solana and Base cash (SUI, NEAR, MON), 23 deposit options | ✅ dry quotes; ⏳ funded |
 | Cetus SUI → DEEP route and swap build | ✅ live route; ⏳ funded |
@@ -244,6 +242,8 @@ Every ✅ has a live call or a reproducible check behind it.
 | Charts for Sui/NEAR/Monad coins (GeckoTerminal); CoinGecko verification (DEEP, WAL verified) | ✅ live |
 | Hyperliquid order and agent-approval signing (the live exchange recovered the exact signer) | ✅ live |
 | Hyperliquid markets, account, candles; Relay into Hyperliquid from Base and Solana | ✅ live |
+| Hyperliquid cash-out: Relay's nonce mapping accepted, `sendAsset` and `agentSendAsset` signers recovered | ✅ live (throwaway keys, no money) |
+| Hyperliquid `xyz` dex: 110 markets, asset ids (110000 + index), per-dex accounts | ✅ live |
 | Hyperliquid funded open and close | ⏳ needs a funded wallet |
 | Atlas Links: payout quote from an escrow (0.5% room), escrow signing limited to Relay payouts | ✅ live quote + unit tests; ⏳ funded claim (needs the web app hosted) |
 | Funded mainnet flows: buy, sell, send, earn in/out, perps open/close, deposits | ⏳ needs a funded wallet |
