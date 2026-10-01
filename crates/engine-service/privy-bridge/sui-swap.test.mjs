@@ -86,3 +86,25 @@ test('recovery requires a live quote and enforces minimum after swap slippage',(
  assert.throws(()=>checkRecoveryQuote({...good,minimumOut:undefined}));
  assert.throws(()=>checkRecoveryQuote({...good,minimumOut:'0'}));
 });
+
+test("the request the device approves is byte for byte the one Privy's SDK sends for raw_sign", async () => {
+  const {createRequire} = await import('node:module');
+  const require = createRequire(import.meta.url);
+  const {generateKeyPairSync} = await import('node:crypto');
+  const auth = require(new URL('./node_modules/@privy-io/node/lib/authorization.js', import.meta.url).pathname);
+  const {rawSignRequest} = await import('./sui-swap.mjs');
+  const key = generateKeyPairSync('ec', {namedCurve: 'P-256'}).privateKey
+    .export({format: 'der', type: 'pkcs8'}).toString('base64');
+  const requestExpiry = Date.now() + 180000;
+  const {params, request} = rawSignRequest({appId: 'app-123', walletId: 'w-1', message: '0xabcd', requestExpiry});
+  // What the SDK signs when the bridge calls privy.wallets().rawSign(...) with these params.
+  const {headers} = await auth.prepareRequest(null, 'app-123', {
+    authorizationContext: {authorization_private_keys: [key]}, requestExpiry,
+    method: 'POST', url: 'https://api.privy.io/v1/wallets/w-1/raw_sign', body: {params},
+  });
+  // What the device signs: the request the engine hands it.
+  const device = auth.generateAuthorizationSignature({authorizationPrivateKey: key,
+    input: auth.formatRequestForAuthorizationSignature(structuredClone(request))});
+  assert.equal(device, headers['privy-authorization-signature']);
+  assert.equal(headers['privy-request-expiry'], String(requestExpiry));
+});

@@ -3,7 +3,7 @@ import {prepareRef,commitRef,quoteRef,searchRef,tokenInfo,prepareCashout as prep
 import {createServer} from 'node:http';
 import {createHash, randomUUID} from 'node:crypto';
 import {PrivyClient} from '@privy-io/node';
-import {quoteSwap, swapFromSui, prepareSuiCashout, transferSui, quoteSale, prepareSale, commitSale} from './sui-swap.mjs';
+import {quoteSwap, swapFromSui, buildSuiSwap, finishSuiSwap, rawSignRequest, prepareSuiCashout, transferSui, quoteSale, prepareSale, commitSale} from './sui-swap.mjs';
 import {checkSignature, signable, signForEscrow} from './base-authorization.mjs';
 import {agentFor, approveAction, approveTypedData, checkApproval, leverageAction, moveAction, orderAction,
   post as hlPost, signAsAgent} from './hyperliquid.mjs';
@@ -12,6 +12,8 @@ import {cashOut} from './hyperliquid-cashout.mjs';
 const SUI_COIN_TYPE = /^0x[0-9a-fA-F]{1,64}::[A-Za-z_][A-Za-z0-9_]*::[A-Za-z_][A-Za-z0-9_]*$/;
 const POSITIVE_INTEGER = /^[1-9][0-9]{0,30}$/;
 const preparedCashouts = new Map();
+// Sui swaps built and waiting for the user's device to approve their exact Privy request. One use each.
+const preparedSwaps = new Map();
 
 const appId = process.env.PRIVY_APP_ID;
 const appSecret = process.env.PRIVY_APP_SECRET;
@@ -62,10 +64,15 @@ const server = createServer(async (request, response) => {
   const suiBalanceRead=request.method==='POST' && ['/sui/balance','/sui/balances'].includes(request.url);
   const suiQuote = request.method === 'POST' && request.url === '/sui/quote';
   const suiSwap = request.method === 'POST' && request.url === '/sui/swap';
+  // The user's device approves the swap: prepare builds it and the exact request to sign; commit
+  // passes the device's authorization signature to Privy (no login token is exchanged).
+  const suiSwapPrepare = request.method === 'POST' && request.url === '/sui/swap/prepare';
+  const suiSwapCommit = request.method === 'POST' && request.url === '/sui/swap/commit';
   const suiCashoutPrepare = request.method === 'POST' && request.url === '/sui/cashout/prepare';
   const suiCashoutCommit = request.method === 'POST' && request.url === '/sui/cashout/commit';
   if (!verifyOnly && !ensureWallet && !signAuthorization && !signEscrow && !hyperliquid && !suiQuote &&
-      !suiBalanceRead && !suiSwap && !suiSale && !refRoute && !suiCashoutPrepare && !suiCashoutCommit) {
+      !suiBalanceRead && !suiSwap && !suiSale && !refRoute && !suiCashoutPrepare && !suiCashoutCommit &&
+      !suiSwapPrepare && !suiSwapCommit) {
     response.writeHead(404).end();
     return;
   }
@@ -249,6 +256,73 @@ const server = createServer(async (request, response) => {
         send(response, 200, {userId, address: wallet.address, ...result});
       } catch (error) {
         send(response, 502, {error: `Cashout unavailable: ${error.message}`});
+      }
+      return;
+    }
+    if (suiSwapPrepare || suiSwapCommit) {
+      let wallet;
+      try {
+        wallet = await ensureReceivingWallet(userId, 'sui');
+      } catch {
+        send(response, 503, {error: 'Privy Sui wallet unavailable; nothing was sent'});
+        return;
+      }
+      try {
+        if (suiSwapPrepare) {
+          if (!SUI_COIN_TYPE.test(input.coinType ?? '') || !POSITIVE_INTEGER.test(String(input.amount ?? ''))) {
+            send(response, 400, {error: 'invalid Sui swap request; nothing was sent'});
+            return;
+          }
+          if (input.expectedWallet !== undefined && input.expectedWallet !== wallet.address) {
+            throw new Error('Receiving wallet changed');
+          }
+          const reserve = POSITIVE_INTEGER.test(String(input.reserve ?? '')) ? input.reserve : '0';
+          const built = await buildSuiSwap({wallet, coinType: input.coinType, amount: input.amount, reserve,
+            minimumOut: input.minimumOut, expiresAtUnixMs: input.expiresAtUnixMs});
+          // Long enough to confirm on the phone; Privy refuses the request after this too.
+          const requestExpiry = Date.now() + 180_000;
+          const {params, request: signable} = rawSignRequest({appId, walletId: wallet.id, message: built.message,
+            requestExpiry, baseUrl: process.env.PRIVY_API_BASE_URL || 'https://api.privy.io'});
+          for (const [id, prepared] of preparedSwaps) if (prepared.requestExpiry <= Date.now()) preparedSwaps.delete(id);
+          if (preparedSwaps.size >= 1000) throw new Error('swap queue is full');
+          const prepareId = randomUUID();
+          preparedSwaps.set(prepareId, {userId, walletId: wallet.id, address: wallet.address, coinType: input.coinType,
+            txBytes: built.txBytes, input: built.input, params, requestExpiry});
+          send(response, 200, {userId, address: wallet.address, prepareId, request: signable,
+            amountIn: built.input.toString()});
+          return;
+        }
+        const prepared = preparedSwaps.get(input.prepareId);
+        if (!prepared || prepared.userId !== userId || prepared.walletId !== wallet.id ||
+            prepared.address !== wallet.address || prepared.requestExpiry <= Date.now()) {
+          send(response, 409, {error: 'swap approval expired or used; nothing was sent'});
+          return;
+        }
+        if (typeof input.signature !== 'string' || !/^[A-Za-z0-9+/=_-]{40,200}$/.test(input.signature)) {
+          send(response, 400, {error: 'invalid approval; nothing was sent'});
+          return;
+        }
+        preparedSwaps.delete(input.prepareId); // one use, even if the network response is lost
+        let signatureHex;
+        try {
+          const signed = await privy.wallets().rawSign(prepared.walletId, {
+            params: prepared.params,
+            request_expiry: prepared.requestExpiry,
+            authorization_context: {signatures: [input.signature]},
+          });
+          signatureHex = signed.signature;
+        } catch (error) {
+          throw new Error(`Privy refused the approval (${String(error?.message ?? error).slice(0, 120)}); nothing was signed`);
+        }
+        const result = await finishSuiSwap({wallet, coinType: prepared.coinType, txBytes: prepared.txBytes,
+          input: prepared.input, signatureHex});
+        send(response, 200, {userId, address: wallet.address, ...result});
+      } catch (error) {
+        const reason = String(error?.message ?? error).slice(0, 300);
+        console.error(`[bridge] ${request.url} failed: ${reason}`);
+        send(response, 502, {error: error?.maybeSent
+          ? `Sui swap unavailable: ${reason} (may have been sent)`
+          : `Sui swap unavailable: ${reason}${reason.includes('nothing was') ? '' : '; nothing was sent'}`});
       }
       return;
     }

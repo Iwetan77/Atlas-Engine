@@ -153,15 +153,13 @@ export function checkRecoveryQuote({minimumOut,expiresAtUnixMs,output}) {
 
 // Swaps up to `amount` MIST (never touching the last `reserve`, kept for gas) into `coinType`.
 // `rawSign(hexMessage)` signs with the user's authorization and returns the signature hex.
-export async function swapFromSui({wallet, coinType, amount, reserve, rawSign, minimumOut, expiresAtUnixMs}) {
-  const publicKey = walletPublicKey(wallet.public_key, wallet.address);
-  // Everything up to the signature can fail safely: say so, so a paid buy can be finished later.
-  let txBytes;
-  let input;
+// Builds the swap of up to `amount` MIST (never touching the last `reserve`, kept for gas) into
+// `coinType`, ready to sign. Nothing here can move money, so every failure says nothing was sent.
+export async function buildSuiSwap({wallet, coinType, amount, reserve, minimumOut, expiresAtUnixMs}) {
   try {
     const balance = await suiBalance(wallet.address);
     const spendable = balance > BigInt(reserve) ? balance - BigInt(reserve) : 0n;
-    input = BigInt(amount) < spendable ? BigInt(amount) : spendable;
+    const input = BigInt(amount) < spendable ? BigInt(amount) : spendable;
     if (input <= 0n) throw new Error('no SUI to swap yet');
     const router = await quoteSwap(coinType, input, wallet.address);
     checkRecoveryQuote({minimumOut,expiresAtUnixMs,output:router.amountOut.toString()});
@@ -169,16 +167,22 @@ export async function swapFromSui({wallet, coinType, amount, reserve, rawSign, m
     const txb = new Transaction();
     txb.setSender(wallet.address);
     await aggregator.fastRouterSwap({router, txb, slippage: SLIPPAGE});
-    txBytes = await txb.build({client: client()});
-    checkRecoveryQuote({minimumOut,expiresAtUnixMs,output:router.amountOut.toString()});
+    const txBytes = await txb.build({client: client()});
+    return {txBytes, input, message: `0x${toHex(intentMessage(txBytes))}`};
   } catch (error) {
     const reason = String(error?.message ?? error);
     throw new Error(reason.includes('nothing was signed') ? reason : `${reason}; nothing was signed`);
   }
-  const signatureHex = await rawSign(`0x${toHex(intentMessage(txBytes))}`);
+}
+
+// Sends a built swap once its signature is in, and reads what arrived. Only a failure while
+// submitting may have reached the network.
+export async function finishSuiSwap({wallet, coinType, txBytes, input, signatureHex}) {
+  const publicKey = walletPublicKey(wallet.public_key, wallet.address);
   const signature = serializedSignature(signatureHex, publicKey);
-  if (!(await publicKey.verifyTransaction(txBytes, signature))) throw new Error('Sui signature did not verify');
-  // From here the transaction may be on the network: a failure can't be called "nothing was sent".
+  if (!(await publicKey.verifyTransaction(txBytes, signature))) {
+    throw new Error('Sui signature did not verify; nothing was signed');
+  }
   let result;
   try {
     result = await submit(txBytes,signature);
@@ -194,8 +198,30 @@ export async function swapFromSui({wallet, coinType, amount, reserve, rawSign, m
     amountIn: input.toString(), amountOut: received.toString()};
 }
 
-// Send an exact amount of SUI to a 1Click deposit address. Privy signs only with the current
-// user's JWT; the server never holds a Sui key or signs on their behalf.
+// Swaps up to `amount` MIST into `coinType`. `rawSign(hexMessage)` signs with the user's authorization
+// and returns the signature hex.
+export async function swapFromSui({wallet, coinType, amount, reserve, rawSign, minimumOut, expiresAtUnixMs}) {
+  const {txBytes, input, message} = await buildSuiSwap({wallet, coinType, amount, reserve, minimumOut, expiresAtUnixMs});
+  const signatureHex = await rawSign(message);
+  return finishSuiSwap({wallet, coinType, txBytes, input, signatureHex});
+}
+
+// The exact Privy raw_sign request for `message`, as Privy's server SDK sends it: the user's device
+// signs this with their own authorization key, and the bridge passes that signature along.
+export function rawSignRequest({appId, walletId, message, requestExpiry, baseUrl = 'https://api.privy.io'}) {
+  const params = {bytes: message, encoding: 'hex', hash_function: 'blake2b256'};
+  return {
+    params,
+    request: {
+      version: 1,
+      method: 'POST',
+      url: `${baseUrl}/v1/wallets/${walletId}/raw_sign`,
+      body: {params},
+      headers: {'privy-app-id': appId, 'privy-request-expiry': String(requestExpiry)},
+    },
+  };
+}
+
 export async function transferSui({wallet, recipient, amount, reserve, rawSign}) {
   if (!/^0x[0-9a-fA-F]{64}$/.test(recipient)) throw new Error('invalid Sui recipient');
   const input = BigInt(amount);

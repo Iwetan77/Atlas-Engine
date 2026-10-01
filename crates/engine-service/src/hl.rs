@@ -612,6 +612,15 @@ pub(super) async fn quote(
     Json(req): Json<OpenRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let (user, wallet) = wallet_of(&state, &headers).await?;
+    // The first trade approves the user's agent by signing as them from the server, which Privy
+    // refuses for now; margin moved in before that would be stuck. Opening waits until it's fixed.
+    if !near_intents::SERVER_SIGNS_AS_USER {
+        return Err((
+            StatusCode::CONFLICT,
+            "Opening a position is paused for a short while, so nothing was charged. Your money is safe."
+                .into(),
+        ));
+    }
     if !matches!(req.side.as_str(), "long" | "short") {
         return Err(bad("side must be long or short"));
     }

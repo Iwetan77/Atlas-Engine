@@ -57,6 +57,9 @@ struct SuiRecovery {
     expires: u64,
     currency: String,
     rate: u128,
+    // The swap built when the user tapped Buy, waiting for their device's approval (bridge
+    // /sui/swap/prepare); /signed brings the approval and the bridge commits it.
+    prepare_id: Option<String>,
 }
 // A paid Sui buy whose swap failed can be finished from the SUI already received, as long as
 // that SUI is still in the wallet: a swap that went through would have spent it. The wallet is
@@ -67,6 +70,17 @@ fn recoverable_sui(i: &StoredIntent) -> bool {
         && i.status.state == "failed"
         && i.status.stage == "execute"
         && i.then_swap.as_ref().is_some_and(|s| s.network != "near")
+}
+// Privy refuses our server's request to sign as the user (both login tokens, 2026-10-01). Buys whose
+// later step signs that way would strand the money halfway (a paid DEEP buy stopped as SUI), so they're
+// refused up front until that step moves to the user's device approving it, as the finish-a-paid-buy
+// path already does.
+pub(super) const SERVER_SIGNS_AS_USER: bool = false;
+pub(super) const PAUSED_FOR_SIGNING: &str =
+    "Buying this is paused for a short while, so nothing was charged. Your money is safe.";
+// A bridge failure that happened before anything could reach Sui.
+fn nothing_sent(reason: &str) -> bool {
+    reason.contains(NOTHING_SENT) || reason.contains("nothing was signed")
 }
 // The reason a bridge call gave, short enough for a message ("Sui swap unavailable: " dropped).
 fn short_reason(reason: &str) -> String {
@@ -1688,6 +1702,7 @@ async fn sui_recovery_quote(
             expires,
             currency: req.amount.currency.clone(),
             rate,
+            prepare_id: None,
         },
     );
     Ok(Some(response))
@@ -1699,6 +1714,7 @@ async fn resume_sui_buy(
     id: &str,
     mut current: StoredIntent,
     recovery: SuiRecovery,
+    approval: String,
 ) -> Result<markets::IntentStatus, ApiError> {
     if current.owner != recovery.intent.owner {
         return Err((
@@ -1746,11 +1762,14 @@ async fn resume_sui_buy(
         .then_swap
         .as_ref()
         .ok_or_else(|| conflict("purchase cannot be resumed"))?;
-    let result=bridge(state,headers,"/sui/swap",json!({
-        "coinType":swap.coin_type,"amount":recovery.input.to_string(),"reserve":SUI_GAS_RESERVE.to_string(),
-        "expectedWallet":current.ref_wallet.as_ref().or(current.sui_wallet.as_ref()),"minimumOut":(recovery.expected * 97 / 100).to_string(),
-        "expiresAtUnixMs":recovery.expires
-    })).await;
+    // The user's device approved this exact swap; the bridge passes that to Privy and sends it.
+    let result = bridge(
+        state,
+        headers,
+        "/sui/swap/commit",
+        json!({"prepareId": recovery.prepare_id, "signature": approval}),
+    )
+    .await;
     match result {
         Ok(body)
             if body["ok"].as_bool() == Some(true)
@@ -1773,7 +1792,7 @@ async fn resume_sui_buy(
         }
         // Stopped before anything reached Sui (a price move, Privy refusing to sign…): the SUI is
         // untouched and the buy can be finished again.
-        Err((_, reason)) if reason.contains(NOTHING_SENT) => {
+        Err((_, reason)) if nothing_sent(&reason) => {
             eprintln!("intent {id}: Sui recovery stopped before sending: {reason}");
             current.status.state = "failed".into();
             current.status.error = Some(format!(
@@ -1818,6 +1837,9 @@ async fn sui_quote(
     }
     if let Some(recovery) = sui_recovery_quote(&state, &headers, &req, &user, coin).await? {
         return Ok(Json(recovery));
+    }
+    if !SERVER_SIGNS_AS_USER && sui_coin_key(coin) != sui_coin_key("0x2::sui::SUI") {
+        return Err(conflict(PAUSED_FOR_SIGNING));
     }
     let sui = state
         .near
@@ -1925,6 +1947,9 @@ async fn ref_buy_quote(
 ) -> Result<Json<Value>, ApiError> {
     if !near_account(coin) {
         return Err(bad("Invalid token contract"));
+    }
+    if !SERVER_SIGNS_AS_USER {
+        return Err(conflict(PAUSED_FOR_SIGNING));
     }
     let sui = state
         .near
@@ -3349,6 +3374,10 @@ pub(super) async fn quote(
         .into_iter()
         .find(|t| format!("near:{}", t.asset_id) == req.asset_id && supported(t))
         .ok_or((StatusCode::NOT_FOUND, "1Click asset not found".into()))?;
+    // Selling a NEAR coin signs as the user from the server: no buying one until that works.
+    if !SERVER_SIGNS_AS_USER && token.blockchain == "near" {
+        return Err(conflict(PAUSED_FOR_SIGNING));
+    }
     let destination = destination(&state, &headers, &token, &user).await?;
     let rate = app_balance::fx_rate(&req.amount.currency).await?;
     let micros = markets::parse_micros(&req.amount.amount)?;
@@ -3671,20 +3700,37 @@ pub(super) async fn execute(
             .then_swap
             .as_ref()
             .ok_or_else(|| conflict("purchase cannot be resumed"))?;
-        let plan = json!({"intentId":intent_id,"kind":"buy","transactions":[],
+        // Build the swap now; the user's device approves this exact Privy request in the confirm.
+        let prepared = bridge(
+            &state,
+            &headers,
+            "/sui/swap/prepare",
+            json!({"coinType":swap.coin_type,"amount":r.input.to_string(),
+                "reserve":SUI_GAS_RESERVE.to_string(),"minimumOut":(r.expected * 97 / 100).to_string(),
+                "expiresAtUnixMs":r.expires,
+                "expectedWallet":r.intent.ref_wallet.as_ref().or(r.intent.sui_wallet.as_ref())}),
+        )
+        .await?;
+        let (Some(prepare_id), true) = (
+            prepared["prepareId"].as_str().map(str::to_owned),
+            prepared["request"].is_object(),
+        ) else {
+            return Err(venue("Couldn't prepare the swap; nothing was spent"));
+        };
+        let expires = now() + 150_000;
+        let plan = json!({"intentId":intent_id,"kind":"buy",
+            "transactions":[{"chain":"privy","request":prepared["request"]}],
             "summary":[{"label":"Already paid","value":markets::say_money(r.intent.amount,&r.currency,r.rate)},
                 {"label":"New cash payment","value":markets::say_money(0,&r.currency,r.rate)},
                 {"label":"You get about","value":format!("{} {}",markets::format_units(r.expected,swap.decimals),swap.symbol)}],
-            "expiresAtUnixMs":r.expires});
+            "expiresAtUnixMs":expires});
+        let r = SuiRecovery {
+            expires,
+            prepare_id: Some(prepare_id),
+            ..r
+        };
+        // A newer confirm replaces an older one: only the latest prepared swap can be committed.
         let mut recoveries = state.near.recoveries.lock().map_err(internal)?;
-        if recoveries
-            .get(&intent_id)
-            .is_some_and(|r| r.expires > now())
-        {
-            return Err(conflict(
-                "A recovery confirmation is already open; finish it or wait for it to expire",
-            ));
-        }
         recoveries.remove(&quote_id);
         recoveries.insert(intent_id, r);
         return Ok(Json(plan));
@@ -4168,10 +4214,19 @@ pub(super) async fn signed(
         .get(&id)
         .cloned();
     if let Some(recovery) = recovery {
-        if !body.sent.is_empty() || !body.signed.is_empty() {
-            return Err(bad("recovery needs no new payment"));
+        // No new payment: only the device's approval of the prepared swap comes back.
+        let [approval] = body.signed.as_slice() else {
+            return Err(bad(
+                "finishing this buy needs one approval and no new payment",
+            ));
+        };
+        if !body.sent.is_empty() || approval.index != 0 {
+            return Err(bad(
+                "finishing this buy needs one approval and no new payment",
+            ));
         }
-        return resume_sui_buy(&state, &headers, &id, current, recovery)
+        let approval = approval.transaction.clone();
+        return resume_sui_buy(&state, &headers, &id, current, recovery, approval)
             .await
             .map(Json);
     }
