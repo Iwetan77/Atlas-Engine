@@ -118,7 +118,9 @@ pub(super) struct PerpMeta {
 
 // The catalog barely changes; prices are shared by every viewer for a few seconds.
 const CATALOG_TTL: Duration = Duration::from_secs(60 * 60);
-const PRICES_TTL: Duration = Duration::from_secs(15);
+// Refreshed in the background every 10s; a list older than a minute is fetched on the spot.
+const PRICES_TTL: Duration = Duration::from_secs(60);
+const REFRESH_EVERY: Duration = Duration::from_secs(10);
 const PRICE_FETCHES_AT_ONCE: usize = 16;
 
 type Cached<T> = Arc<Mutex<Option<(Instant, Arc<T>)>>>;
@@ -195,6 +197,28 @@ async fn perp_prices(
     if let Some(prices) = fresh(&state.perp_cache.prices, PRICES_TTL)? {
         return Ok(prices);
     }
+    fetch_prices(state, catalog).await
+}
+
+// Keeps the market list warm: Paradex answers one summary per market (about ten seconds for all of
+// them), so it's refreshed in the background and nobody opening Perps waits for it.
+pub(super) fn keep_warm(state: AppState) {
+    tokio::spawn(async move {
+        loop {
+            if let Ok(catalog) = perp_catalog(&state).await {
+                if let Err(error) = fetch_prices(&state, &catalog).await {
+                    eprintln!("perps prices not refreshed: {}", error.1);
+                }
+            }
+            tokio::time::sleep(REFRESH_EVERY).await;
+        }
+    });
+}
+
+async fn fetch_prices(
+    state: &AppState,
+    catalog: &[PerpMeta],
+) -> Result<Arc<HashMap<String, Value>>, ApiError> {
     let limit = Arc::new(tokio::sync::Semaphore::new(PRICE_FETCHES_AT_ONCE));
     let mut tasks = tokio::task::JoinSet::new();
     for meta in catalog {

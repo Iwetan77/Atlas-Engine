@@ -125,6 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if matches!(state.auth, AuthMode::LocalDemo) && !bind.ip().is_loopback() {
         return Err("demo auth bypass requires a loopback bind address".into());
     }
+    perps::keep_warm(state.clone());
     let mut app = Router::new()
         .route("/health", get(health))
         .route("/v1/balance", get(app_balance::balance))
