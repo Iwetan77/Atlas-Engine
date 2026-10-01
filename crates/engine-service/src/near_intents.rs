@@ -16,6 +16,7 @@ static NEXT: AtomicU64 = AtomicU64::new(1);
 pub(super) struct NearState {
     client: Client,
     quotes: Arc<Mutex<HashMap<String, StoredQuote>>>,
+    recoveries: Arc<Mutex<HashMap<String, SuiRecovery>>>,
     intents: Arc<Mutex<HashMap<String, StoredIntent>>>,
     tokens: Arc<Mutex<Option<(Instant, Vec<Token>)>>>,
     icons: Arc<Mutex<HashMap<String, String>>>,
@@ -47,6 +48,28 @@ struct StoredQuote {
     // The Atlas asset id traded (for the trade book), and a Monad sale (the phone sends the coin).
     asset_id: String,
     monad_sale: bool,
+}
+#[derive(Clone)]
+struct SuiRecovery {
+    intent: StoredIntent,
+    input: u128,
+    expected: u128,
+    expires: u64,
+    currency: String,
+    rate: u128,
+}
+// A paid Sui buy whose swap never started can be finished from the SUI already received: the
+// balance read failed (Sui switched off its old RPC), or a recovery stopped before signing.
+// Never replay a timeout, a submit error, or another ambiguous failure.
+const NOTHING_SIGNED: &str = "nothing was signed";
+fn recoverable_sui(i: &StoredIntent) -> bool {
+    !i.sell_sui
+        && i.status.state == "failed"
+        && i.status.stage == "execute"
+        && i.then_swap.as_ref().is_some_and(|s| s.network != "near")
+        && i.status.error.as_deref().is_some_and(|e| {
+            e.contains("Sui RPC suix_getBalance: Method not found") || e.contains(NOTHING_SIGNED)
+        })
 }
 // The second leg of an unlisted Sui buy.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -194,6 +217,7 @@ impl NearState {
         Ok(Self {
             client: Client::new(env::var("NEAR_INTENTS_API_KEY").ok())?,
             quotes: Arc::new(Mutex::new(HashMap::new())),
+            recoveries: Arc::new(Mutex::new(HashMap::new())),
             intents: Arc::new(Mutex::new(HashMap::new())),
             tokens: Arc::new(Mutex::new(None)),
             icons: Arc::new(Mutex::new(HashMap::new())),
@@ -1553,6 +1577,207 @@ async fn sui_meta(state: &AppState, coin: &str) -> Option<(String, String, u32, 
 
 // Buying an unlisted Sui coin: 1Click turns the Base USDC into SUI in the user's own Sui wallet
 // (keeping a little for gas), then Cetus swaps the rest into the coin once it lands.
+
+async fn sui_recovery_quote(
+    state: &AppState,
+    headers: &HeaderMap,
+    req: &markets::QuoteRequest,
+    user: &app_balance::VerifiedWallets,
+    coin: &str,
+) -> Result<Option<Value>, ApiError> {
+    let intents: Vec<StoredIntent> = if let Some(pg) = &state.near.postgres {
+        pg.query(
+            "SELECT payload FROM atlas_near_intents WHERE owner=$1 AND stage='execute'",
+            &[&user.user_id],
+        )
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .map(|row| serde_json::from_str(row.get::<_, &str>(0)).map_err(internal))
+        .collect::<Result<_, _>>()?
+    } else {
+        state
+            .near
+            .intents
+            .lock()
+            .map_err(internal)?
+            .values()
+            .filter(|i| i.owner == user.user_id)
+            .cloned()
+            .collect()
+    };
+    let Some(intent) = intents.into_iter().find(|i| {
+        i.status.stage == "execute"
+            && i.status.state != "filled"
+            && i.then_swap
+                .as_ref()
+                .is_some_and(|s| sui_coin_key(&s.coin_type) == sui_coin_key(coin))
+    }) else {
+        return Ok(None);
+    };
+    if !recoverable_sui(&intent) {
+        return Err(conflict("Your previous purchase needs checking before another payment. Check your asset balance; do not pay again."));
+    }
+    let swap = intent
+        .then_swap
+        .as_ref()
+        .ok_or_else(|| conflict("purchase cannot be resumed"))?;
+    let balance = bridge(state, headers, "/sui/balance", json!({})).await?;
+    if balance["address"].as_str()
+        != intent
+            .ref_wallet
+            .as_deref()
+            .or(intent.sui_wallet.as_deref())
+    {
+        return Err(conflict(
+            "receiving wallet changed; purchase was not resumed",
+        ));
+    }
+    let held = balance["result"]["totalBalance"]
+        .as_str()
+        .and_then(|s| s.parse::<u128>().ok())
+        .ok_or_else(|| venue("Your asset balance is unavailable"))?;
+    let input = held.saturating_sub(SUI_GAS_RESERVE).min(swap.sui_in);
+    if input == 0 {
+        return Err(conflict(
+            "The funds from this purchase are no longer available to finish it",
+        ));
+    }
+    let routed = bridge(
+        state,
+        headers,
+        "/sui/quote",
+        json!({"coinType":coin,"amount":input.to_string()}),
+    )
+    .await?;
+    let expected = routed["amountOut"]
+        .as_str()
+        .and_then(|s| s.parse::<u128>().ok())
+        .filter(|v| *v > 0)
+        .ok_or_else(|| venue("A fresh price is unavailable; nothing else was spent"))?;
+    let rate = app_balance::fx_rate(&req.amount.currency).await?;
+    let quote_id = id("q");
+    let expires = now() + 30_000;
+    let response = json!({"quoteId":quote_id,"assetId":req.asset_id,"side":"buy",
+        "pay":{"amount":"0","symbol":"USDC","value":money(0,&req.amount.currency,rate)},
+        "receive":{"amount":markets::format_units(expected,swap.decimals),"symbol":swap.symbol,
+            "value":money(intent.amount,&req.amount.currency,rate)},
+        "price":unit_price(intent.amount,expected,swap.decimals,&req.amount.currency,rate),
+        "fee":money(0,&req.amount.currency,rate),"expiresAtUnixMs":expires,
+        "warning":"Finish your already-paid purchase. No new cash payment; network fees come from the received funds."});
+    let mut recoveries = state.near.recoveries.lock().map_err(internal)?;
+    recoveries.retain(|_, r| r.expires > now());
+    recoveries.insert(
+        quote_id,
+        SuiRecovery {
+            intent,
+            input,
+            expected,
+            expires,
+            currency: req.amount.currency.clone(),
+            rate,
+        },
+    );
+    Ok(Some(response))
+}
+
+async fn resume_sui_buy(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+    mut current: StoredIntent,
+    recovery: SuiRecovery,
+) -> Result<markets::IntentStatus, ApiError> {
+    if current.owner != recovery.intent.owner {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "purchase belongs to another user".into(),
+        ));
+    }
+    if !recoverable_sui(&current) {
+        return Ok(current.status);
+    }
+    if recovery.expires <= now() {
+        return Err(conflict("quote expired; request a fresh quote"));
+    }
+    let before = current
+        .status
+        .error
+        .clone()
+        .ok_or_else(|| conflict("purchase cannot be resumed"))?;
+    // Claim before any signing; a lost response is never permission to submit another swap.
+    current.status.state = "pending".into();
+    current.status.error = None;
+    let after = serde_json::to_string(&current).map_err(internal)?;
+    let claimed = if let Some(pg) = &state.near.postgres {
+        pg.execute("UPDATE atlas_near_intents SET payload=$3 WHERE intent_id=$1 AND stage='execute' AND payload::jsonb->'status'->>'state'='failed' AND payload::jsonb->'status'->>'error'=$2",
+            &[&id,&before,&after]).await.map_err(internal)?==1
+    } else {
+        let mut intents = state.near.intents.lock().map_err(internal)?;
+        if intents.get(id).is_some_and(recoverable_sui) {
+            intents.insert(id.into(), current.clone());
+            true
+        } else {
+            false
+        }
+    };
+    if !claimed {
+        return Ok(state
+            .near
+            .get_intent(id)
+            .await?
+            .ok_or_else(|| conflict("purchase changed"))?
+            .status);
+    }
+    state.near.recoveries.lock().map_err(internal)?.remove(id);
+    let swap = current
+        .then_swap
+        .as_ref()
+        .ok_or_else(|| conflict("purchase cannot be resumed"))?;
+    let result=bridge(state,headers,"/sui/swap",json!({
+        "coinType":swap.coin_type,"amount":recovery.input.to_string(),"reserve":SUI_GAS_RESERVE.to_string(),
+        "expectedWallet":current.ref_wallet.as_ref().or(current.sui_wallet.as_ref()),"minimumOut":(recovery.expected * 97 / 100).to_string(),
+        "expiresAtUnixMs":recovery.expires
+    })).await;
+    match result {
+        Ok(body)
+            if body["ok"].as_bool() == Some(true)
+                && body["amountOut"]
+                    .as_str()
+                    .and_then(|s| s.parse::<u128>().ok())
+                    .is_some_and(|n| n > 0) =>
+        {
+            let bought = body["amountOut"]
+                .as_str()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let digest = body["digest"].as_str().map(str::to_owned);
+            if let Some(tx) = &digest {
+                current.status.tx_ids.push(tx.clone());
+            }
+            current.status.stage = "settle".into();
+            current.status.state = "filled".into();
+            record_fill(state, id, &current, "buy", bought, current.amount, digest).await;
+        }
+        // Stopped before signing (the price moved more than 3%, the quote ran out): the SUI is untouched
+        // and the buy can be finished again.
+        Err((_, reason)) if reason.contains(NOTHING_SIGNED) => {
+            eprintln!("intent {id}: Sui recovery stopped before signing: {reason}");
+            current.status.state = "failed".into();
+            current.status.error = Some(format!(
+                "The price moved before the swap, so {NOTHING_SIGNED} and nothing was spent. Your SUI is still in your Sui wallet: ask for {} again to finish.",
+                swap.symbol
+            ));
+        }
+        _ => {
+            current.status.state = "failed".into();
+            current.status.error=Some("The remaining swap could not be verified. Do not pay again; check your asset balance before another attempt.".into());
+        }
+    }
+    state.near.save_intent(id, current.clone()).await?;
+    Ok(current.status)
+}
+
 async fn sui_quote(
     state: AppState,
     headers: HeaderMap,
@@ -1562,6 +1787,9 @@ async fn sui_quote(
 ) -> Result<Json<Value>, ApiError> {
     if !sui_coin_type(coin) {
         return Err(bad("not a Sui coin type"));
+    }
+    if let Some(recovery) = sui_recovery_quote(&state, &headers, &req, &user, coin).await? {
+        return Ok(Json(recovery));
     }
     let sui = state
         .near
@@ -3392,6 +3620,47 @@ pub(super) async fn execute(
     quote_id: String,
 ) -> Result<Json<Value>, ApiError> {
     let user = app_balance::verified_wallets(&state, &headers).await?;
+    let recovery = state
+        .near
+        .recoveries
+        .lock()
+        .map_err(internal)?
+        .get(&quote_id)
+        .cloned();
+    if let Some(r) = recovery {
+        if r.intent.owner != user.user_id {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "quote belongs to another user".into(),
+            ));
+        }
+        if r.expires <= now() {
+            return Err(conflict("quote expired; request a fresh quote"));
+        }
+        let intent_id = r.intent.status.intent_id.clone();
+        let swap = r
+            .intent
+            .then_swap
+            .as_ref()
+            .ok_or_else(|| conflict("purchase cannot be resumed"))?;
+        let plan = json!({"intentId":intent_id,"kind":"buy","transactions":[],
+            "summary":[{"label":"Already paid","value":markets::say_money(r.intent.amount,&r.currency,r.rate)},
+                {"label":"New cash payment","value":markets::say_money(0,&r.currency,r.rate)},
+                {"label":"You get about","value":format!("{} {}",markets::format_units(r.expected,swap.decimals),swap.symbol)}],
+            "expiresAtUnixMs":r.expires});
+        let mut recoveries = state.near.recoveries.lock().map_err(internal)?;
+        if recoveries
+            .get(&intent_id)
+            .is_some_and(|r| r.expires > now())
+        {
+            return Err(conflict(
+                "A recovery confirmation is already open; finish it or wait for it to expire",
+            ));
+        }
+        recoveries.remove(&quote_id);
+        recoveries.insert(intent_id, r);
+        return Ok(Json(plan));
+    }
     let stored = state
         .near
         .quotes
@@ -3862,6 +4131,21 @@ pub(super) async fn signed(
             StatusCode::FORBIDDEN,
             "intent belongs to another user".into(),
         ));
+    }
+    let recovery = state
+        .near
+        .recoveries
+        .lock()
+        .map_err(internal)?
+        .get(&id)
+        .cloned();
+    if let Some(recovery) = recovery {
+        if !body.sent.is_empty() || !body.signed.is_empty() {
+            return Err(bad("recovery needs no new payment"));
+        }
+        return resume_sui_buy(&state, &headers, &id, current, recovery)
+            .await
+            .map(Json);
     }
     // After a gas top-up, the Base transfer is reported from the sign stage.
     let second_step = current.gas_topup && current.status.stage == "sign";
@@ -4392,6 +4676,32 @@ pub(super) async fn next(
 }
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn only_the_known_pre_sign_balance_failure_can_resume() {
+        let mut intent: StoredIntent = serde_json::from_value(json!({
+            "owner":"o","wallet":"w","expected_to":"t","expected_data":"0x",
+            "deposit_address":"d","deposit_memo":null,"expires":1,
+            "then_swap":{"network":"sui","coin_type":"0x2::coin::COIN","symbol":"COIN","name":"Coin",
+                "decimals":9,"icon_url":null,"sui_in":100,"expected_out":200},
+            "status":{"intentId":"near-intent-test","stage":"execute","state":"failed","txIds":["deposit"],
+                "error":"Sui RPC suix_getBalance: Method not found"}
+        })).unwrap();
+        assert!(recoverable_sui(&intent));
+        intent.status.state = "pending".into();
+        assert!(!recoverable_sui(&intent));
+        intent.status.state = "filled".into();
+        assert!(!recoverable_sui(&intent));
+        intent.status.state = "failed".into();
+        intent.status.error = Some("submit timed out".into());
+        assert!(!recoverable_sui(&intent));
+        intent.status.error = Some("Sui RPC suix_getBalance: Method not found".into());
+        intent.then_swap.as_mut().unwrap().network = "near".into();
+        assert!(!recoverable_sui(&intent));
+        intent.then_swap.as_mut().unwrap().network = "sui".into();
+        intent.sell_sui = true;
+        assert!(!recoverable_sui(&intent));
+    }
     #[test]
     fn grpc_coin_addresses_match_short_catalog_addresses() {
         assert_eq!(

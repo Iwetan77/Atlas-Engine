@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {Ed25519Keypair} from '@mysten/sui/keypairs/ed25519';
 import {blake2b} from '@noble/hashes/blake2b';
-import {intentMessage, serializedSignature, walletPublicKey, prepareSuiCashout, saleEffects, executionResult} from './sui-swap.mjs';
+import {intentMessage, serializedSignature, walletPublicKey, prepareSuiCashout, saleEffects, executionResult, checkRecoveryQuote} from './sui-swap.mjs';
 
 test('a raw ed25519 signature over blake2b(intent || tx) becomes a Sui signature that verifies', async () => {
   const keypair = new Ed25519Keypair();
@@ -75,4 +75,14 @@ test('gRPC execution counts canonical SUI credits and preserves failed outcomes'
   assert.equal(failed.effects.status.error,'out of gas');
   assert.throws(()=>executionResult({}),/outcome unavailable/);
   assert.throws(()=>executionResult({Transaction:{digest:'unknown'}}),/outcome unavailable/);
+});
+
+test('recovery requires a live quote and enforces minimum after swap slippage',()=>{
+ const good={minimumOut:'970',output:'1000',expiresAtUnixMs:Date.now()+30000};
+ assert.doesNotThrow(()=>checkRecoveryQuote(good));
+ assert.doesNotThrow(()=>checkRecoveryQuote({...good,output:'970'}));
+ assert.throws(()=>checkRecoveryQuote({...good,output:'969'}),/nothing was signed/);
+ assert.throws(()=>checkRecoveryQuote({...good,expiresAtUnixMs:Date.now()-1}));
+ assert.throws(()=>checkRecoveryQuote({...good,minimumOut:undefined}));
+ assert.throws(()=>checkRecoveryQuote({...good,minimumOut:'0'}));
 });

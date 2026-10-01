@@ -260,10 +260,15 @@ const server = createServer(async (request, response) => {
           send(response, 200, {userId, address: wallet.address, amountOut: router.amountOut.toString()});
           return;
         }
+        if (input.expectedWallet !== undefined && input.expectedWallet !== wallet.address) {
+          throw new Error('Receiving wallet changed');
+        }
         const reserve = POSITIVE_INTEGER.test(String(input.reserve ?? '')) ? input.reserve : '0';
         const result = await swapFromSui({
           wallet,
           coinType: input.coinType,
+          minimumOut: input.minimumOut,
+          expiresAtUnixMs: input.expiresAtUnixMs,
           amount: input.amount,
           reserve,
           rawSign: async (hex) => {

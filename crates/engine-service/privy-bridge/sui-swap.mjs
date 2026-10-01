@@ -142,20 +142,39 @@ export async function suiBalance(address) {
   return coinBalance(address,SUI);
 }
 
+export function checkRecoveryQuote({minimumOut,expiresAtUnixMs,output}) {
+  if(minimumOut===undefined && expiresAtUnixMs===undefined)return;
+  if(!/^[1-9][0-9]*$/.test(String(minimumOut??'')) ||
+     !Number.isSafeInteger(expiresAtUnixMs) || expiresAtUnixMs<=Date.now() ||
+     BigInt(output)<BigInt(minimumOut)) {
+    throw new Error('Recovery quote changed or expired; nothing was signed');
+  }
+}
+
 // Swaps up to `amount` MIST (never touching the last `reserve`, kept for gas) into `coinType`.
 // `rawSign(hexMessage)` signs with the user's authorization and returns the signature hex.
-export async function swapFromSui({wallet, coinType, amount, reserve, rawSign}) {
+export async function swapFromSui({wallet, coinType, amount, reserve, rawSign, minimumOut, expiresAtUnixMs}) {
   const publicKey = walletPublicKey(wallet.public_key, wallet.address);
-  const balance = await suiBalance(wallet.address);
-  const spendable = balance > BigInt(reserve) ? balance - BigInt(reserve) : 0n;
-  const input = BigInt(amount) < spendable ? BigInt(amount) : spendable;
-  if (input <= 0n) throw new Error('no SUI to swap yet');
-  const router = await quoteSwap(coinType, input, wallet.address);
-  const aggregator = new AggregatorClient({signer: wallet.address, client: client(), env: Env.Mainnet});
-  const txb = new Transaction();
-  txb.setSender(wallet.address);
-  await aggregator.fastRouterSwap({router, txb, slippage: SLIPPAGE});
-  const txBytes = await txb.build({client: client()});
+  // Everything up to the signature can fail safely: say so, so a paid buy can be finished later.
+  let txBytes;
+  let input;
+  try {
+    const balance = await suiBalance(wallet.address);
+    const spendable = balance > BigInt(reserve) ? balance - BigInt(reserve) : 0n;
+    input = BigInt(amount) < spendable ? BigInt(amount) : spendable;
+    if (input <= 0n) throw new Error('no SUI to swap yet');
+    const router = await quoteSwap(coinType, input, wallet.address);
+    checkRecoveryQuote({minimumOut,expiresAtUnixMs,output:router.amountOut.toString()});
+    const aggregator = new AggregatorClient({signer: wallet.address, client: client(), env: Env.Mainnet});
+    const txb = new Transaction();
+    txb.setSender(wallet.address);
+    await aggregator.fastRouterSwap({router, txb, slippage: SLIPPAGE});
+    txBytes = await txb.build({client: client()});
+    checkRecoveryQuote({minimumOut,expiresAtUnixMs,output:router.amountOut.toString()});
+  } catch (error) {
+    const reason = String(error?.message ?? error);
+    throw new Error(reason.includes('nothing was signed') ? reason : `${reason}; nothing was signed`);
+  }
   const signatureHex = await rawSign(`0x${toHex(intentMessage(txBytes))}`);
   const signature = serializedSignature(signatureHex, publicKey);
   if (!(await publicKey.verifyTransaction(txBytes, signature))) throw new Error('Sui signature did not verify');
