@@ -471,9 +471,10 @@ struct StoredQuote {
     currency: String,
     input_units: u128,
     output_units: u128,
-    // USDC (6 decimals) to move from Base to Solana before a Solana buy; 0 when Solana cash covers it.
+    // USDC (6 decimals) to move over before the buy: from Base for a Solana buy, from Solana for a
+    // Base buy; 0 when cash on the asset's chain covers it.
     funding_units: u128,
-    // Layerswap's fee inside funding_units, shown as the network fee.
+    // The move's fee inside funding_units, shown as the network fee.
     funding_fee: u128,
     expires: u64,
 }
@@ -518,6 +519,9 @@ struct CashMove {
     // once they confirm. None for a Layerswap move started by a transaction.
     #[serde(default)]
     authorization: Option<Authorization>,
+    // Moved by Relay from Solana with a transaction the engine landed (`swap_id` is Relay's request).
+    #[serde(default)]
+    relay: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Authorization {
@@ -1212,6 +1216,8 @@ pub(super) struct ChartQuery {
 }
 const GECKOTERMINAL: &str = "https://api.geckoterminal.com/api/v2/networks/";
 const JUPITER_CHARTS: &str = "https://datapi.jup.ag/v2/charts/";
+// A second source for Base charts: CoinGecko's price history by contract address.
+const COINGECKO_BASE_CHART: &str = "https://api.coingecko.com/api/v3/coins/base/contract/";
 
 // Jupiter chart candles: {"candles":[{"time": unix seconds, "close": usd, ...}]}, oldest first.
 const HOUR_MS: u64 = 3_600_000;
@@ -1368,11 +1374,11 @@ pub(super) async fn chart(
     }
     // (Jupiter interval, GeckoTerminal timeframe + aggregate, candles, cache). Longer ranges change
     // slowly and are cached longer.
-    let (interval, timeframe, aggregate, limit, ttl) = match range.as_str() {
-        "1D" => ("15_MINUTE", "minute", 15, 96, Duration::from_secs(60)),
-        "1W" => ("1_HOUR", "hour", 1, 168, Duration::from_secs(300)),
-        "1M" => ("4_HOUR", "hour", 4, 180, Duration::from_secs(900)),
-        "1Y" => ("1_DAY", "day", 1, 365, Duration::from_secs(3600)),
+    let (interval, timeframe, aggregate, limit, ttl, days) = match range.as_str() {
+        "1D" => ("15_MINUTE", "minute", 15, 96, Duration::from_secs(60), 1),
+        "1W" => ("1_HOUR", "hour", 1, 168, Duration::from_secs(300), 7),
+        "1M" => ("4_HOUR", "hour", 4, 180, Duration::from_secs(900), 30),
+        "1Y" => ("1_DAY", "day", 1, 365, Duration::from_secs(3600), 365),
         _ => return Err(bad("range must be 1D, 1W, 1M or 1Y")),
     };
     // 1Click assets (Sui, NEAR, Monad…) chart from GeckoTerminal by their own address; the rest are
@@ -1401,63 +1407,24 @@ pub(super) async fn chart(
         .lock()
         .map_err(internal)?
         .get(&key)
-        .filter(|(at, _)| at.elapsed() < ttl)
-        .map(|(_, points)| points.clone());
+        .map(|(at, points)| (at.elapsed() < ttl, points.clone()));
+    let source = ChartSource {
+        asset_id: &asset_id,
+        network,
+        token: &token,
+        token_path: &token_path,
+    };
+    let shape = (interval, timeframe, aggregate, limit, days);
     let points = match cached {
-        Some(points) => points,
+        Some((true, points)) => points,
+        // A stale chart beats none when the sources are busy.
+        Some((false, points)) => match chart_points(&state.markets, &source, shape).await {
+            Ok(fresh) => keep_chart(&state.markets, key, fresh)?,
+            Err(_) => points,
+        },
         None => {
-            // Solana: Jupiter's chart data (what jup.ag draws). Base: GeckoTerminal, whose free
-            // limit is per IP and often spent on shared hosts, so it may be unavailable.
-            // WETH and AAPLc track the same thing as Ether (Portal) and Apple xStock on Solana,
-            // whose charts Jupiter has.
-            let solana_twin = match asset_id.as_str() {
-                "weth-base" => Some("7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs"),
-                "aaplc-base" => Some("XsbEhLAtcf6HdfpFZ5xEMdqW8nfAvcsP5bdudRLJzJp"),
-                _ => None,
-            };
-            let points = if let Some(mint) = (network == "solana")
-                .then_some(token.as_str())
-                .or(solana_twin)
-            {
-                let url = format!(
-                    "{JUPITER_CHARTS}{mint}?interval={interval}&to={}&candles={limit}&type=price",
-                    now()
-                );
-                let body: Value = state
-                    .markets
-                    .http
-                    .get(url)
-                    .send()
-                    .await
-                    .map_err(unavailable)?
-                    .error_for_status()
-                    .map_err(|e| unavailable(format!("price history unavailable: {e}")))?
-                    .json()
-                    .await
-                    .map_err(unavailable)?;
-                jupiter_closes(&body)
-            } else {
-                let pool = deepest_pool(&state.markets, network, &token_path).await?;
-                let body: Value = gecko(
-                    &state.markets,
-                    &format!(
-                        "{network}/pools/{pool}/ohlcv/{timeframe}?aggregate={aggregate}&limit={limit}&currency=usd&token={token_path}"
-                    ),
-                )
-                .await?;
-                ohlcv_closes(&body)
-            };
-            if points.is_empty() {
-                return Err(unavailable("no price history for this asset yet"));
-            }
-            let points = Arc::new(points);
-            state
-                .markets
-                .charts
-                .lock()
-                .map_err(internal)?
-                .insert(key, (Instant::now(), points.clone()));
-            points
+            let fresh = chart_points(&state.markets, &source, shape).await?;
+            keep_chart(&state.markets, key, fresh)?
         }
     };
     let scale = rate as f64 / 1_000_000.0;
@@ -1468,6 +1435,131 @@ pub(super) async fn chart(
     Ok(Json(
         json!({"assetId":asset_id,"range":range,"currency":currency,"points":series}),
     ))
+}
+
+type ChartPoints = Arc<Vec<(u64, f64)>>;
+
+fn keep_chart(
+    state: &MarketState,
+    key: String,
+    points: Vec<(u64, f64)>,
+) -> Result<ChartPoints, ApiError> {
+    let points = Arc::new(points);
+    state
+        .charts
+        .lock()
+        .map_err(internal)?
+        .insert(key, (Instant::now(), points.clone()));
+    Ok(points)
+}
+
+struct ChartSource<'a> {
+    asset_id: &'a str,
+    network: &'a str,
+    token: &'a str,
+    token_path: &'a str,
+}
+
+// A chart's closing prices in dollars, oldest first, from the source that has them. `shape` is
+// (Jupiter interval, GeckoTerminal timeframe, aggregate, candles, CoinGecko days).
+async fn chart_points(
+    state: &MarketState,
+    source: &ChartSource<'_>,
+    shape: (&str, &str, u32, u32, u32),
+) -> Result<Vec<(u64, f64)>, ApiError> {
+    let (interval, timeframe, aggregate, limit, days) = shape;
+    let ChartSource {
+        asset_id,
+        network,
+        token,
+        token_path,
+    } = *source;
+    // Solana: Jupiter's chart data (what jup.ag draws). Elsewhere GeckoTerminal, whose free limit
+    // is per IP and often spent on shared hosts; Base then falls back to CoinGecko.
+    // WETH and AAPLc track the same thing as Ether (Portal) and Apple xStock on Solana, whose
+    // charts Jupiter has.
+    let solana_twin = match asset_id {
+        "weth-base" => Some("7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs"),
+        "aaplc-base" => Some("XsbEhLAtcf6HdfpFZ5xEMdqW8nfAvcsP5bdudRLJzJp"),
+        _ => None,
+    };
+    let points = if let Some(mint) = (network == "solana").then_some(token).or(solana_twin) {
+        let url = format!(
+            "{JUPITER_CHARTS}{mint}?interval={interval}&to={}&candles={limit}&type=price",
+            now()
+        );
+        let body: Value = state
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(unavailable)?
+            .error_for_status()
+            .map_err(|e| unavailable(format!("price history unavailable: {e}")))?
+            .json()
+            .await
+            .map_err(unavailable)?;
+        jupiter_closes(&body)
+    } else {
+        let from_gecko = async {
+            let pool = deepest_pool(state, network, token_path).await?;
+            let body: Value = gecko(
+                state,
+                &format!(
+                    "{network}/pools/{pool}/ohlcv/{timeframe}?aggregate={aggregate}&limit={limit}&currency=usd&token={token_path}"
+                ),
+            )
+            .await?;
+            Ok::<_, ApiError>(ohlcv_closes(&body))
+        };
+        match from_gecko.await {
+            Ok(points) if !points.is_empty() => points,
+            Err(_) | Ok(_) if network == "base" => {
+                coingecko_base_closes(state, token, days).await?
+            }
+            other => other?,
+        }
+    };
+    if points.is_empty() {
+        return Err(unavailable("no price history for this asset yet"));
+    }
+    Ok(points)
+}
+
+// CoinGecko's price history for a Base token: (ms, price) pairs, oldest first.
+async fn coingecko_base_closes(
+    state: &MarketState,
+    token: &str,
+    days: u32,
+) -> Result<Vec<(u64, f64)>, ApiError> {
+    let body: Value = state
+        .http
+        .get(format!(
+            "{COINGECKO_BASE_CHART}{token}/market_chart?vs_currency=usd&days={days}"
+        ))
+        .header("accept", "application/json")
+        .header("user-agent", "Atlas/1.0")
+        .send()
+        .await
+        .map_err(unavailable)?
+        .error_for_status()
+        .map_err(|e| unavailable(format!("price history unavailable: {e}")))?
+        .json()
+        .await
+        .map_err(unavailable)?;
+    Ok(coingecko_closes(&body))
+}
+
+fn coingecko_closes(body: &Value) -> Vec<(u64, f64)> {
+    body["prices"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(|p| Some((p[0].as_f64()? as u64, p[1].as_f64()?)))
+                .filter(|(_, price)| price.is_finite() && *price > 0.0)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 async fn gecko(state: &MarketState, path: &str) -> Result<Value, ApiError> {
@@ -1591,12 +1683,16 @@ pub(super) async fn quote(
     } else {
         (actual_in, actual_out)
     };
-    // Above what they have: say so now, in their currency, rather than at the confirm. A Solana buy
-    // can use Base cash too: Layerswap moves the shortfall over first.
+    // Above what they have: say so now, in their currency, rather than at the confirm. A buy can use
+    // cash on the other chain too: it moves over first.
     let mut funding_units = 0;
     let mut funding_fee = 0;
     if let Some(held) = spot_available(&state, &a, &req.side, &user).await {
-        if held < actual_in && req.side == "buy" && a.chain == "solana" {
+        if held < actual_in && req.side == "buy" && a.chain == "base" {
+            (funding_units, funding_fee) =
+                base_cash_from_solana(&state, &user, held, actual_in, &req.amount.currency, rate)
+                    .await?;
+        } else if held < actual_in && req.side == "buy" && a.chain == "solana" {
             let base_cash = match user.evm_wallet.as_deref().filter(|w| !w.is_empty()) {
                 Some(evm) => state
                     .markets
@@ -1686,7 +1782,7 @@ pub(super) async fn quote(
     );
     Ok(Json(
         json!({"quoteId":quote_id,"assetId":a.id,"side":req.side,"pay":pay,"receive":receive,"price":price,"fee":money_from_usdc(fee_usdc,&req.amount.currency,rate)?,
-            "funding":if funding_units > 0 {json!({"from":"Base","to":"Solana","amount":money_from_usdc(funding_units,&req.amount.currency,rate)?,"fee":money_from_usdc(funding_fee,&req.amount.currency,rate)?})} else {Value::Null},
+            "funding":if funding_units > 0 {json!({"from":if a.chain == "base" {"Solana"} else {"Base"},"to":if a.chain == "base" {"Base"} else {"Solana"},"amount":money_from_usdc(funding_units,&req.amount.currency,rate)?,"fee":money_from_usdc(funding_fee,&req.amount.currency,rate)?})} else {Value::Null},
             "expiresAtUnixMs":expires}),
     ))
 }
@@ -1716,6 +1812,58 @@ async fn funding_for(
     Ok((base + fee + base / 100 + 50_000, fee))
 }
 
+// ETH that rides along when cash moves to Base and the gas tank is empty: dollars (6 decimals).
+// About 0.00005 ETH, dozens of Base transactions (selling what was bought, for one).
+const BASE_GAS_BY_RELAY_USDC: u128 = 150_000;
+
+// A Solana wallet with too little SOL for its transaction fee pays a $0.50 top-up first (gas_topup).
+async fn solana_fee_reserve(state: &AppState, owner: &str) -> u128 {
+    match state.solana_mainnet.owner_sol_balance(owner).await {
+        Ok(lamports) if lamports >= GAS_FLOOR_LAMPORTS => 0,
+        _ => GAS_TOPUP_USDC,
+    }
+}
+
+// Solana USDC to send so a Base buy of `needed` has its cash on Base (which holds `held`), and the
+// fee in it. Relay lands the shortfall (plus a cent) in seconds, with a little ETH on top for an
+// empty gas tank. Short on both: the error says what they have to spend.
+async fn base_cash_from_solana(
+    state: &AppState,
+    user: &app_balance::VerifiedWallets,
+    held: u128,
+    needed: u128,
+    currency: &str,
+    rate: u128,
+) -> Result<(u128, u128), ApiError> {
+    let wallets = (
+        user.evm_wallet.as_deref().filter(|w| !w.is_empty()),
+        user.solana_wallet.as_deref().filter(|w| !w.is_empty()),
+    );
+    let (Some(evm), Some(sol)) = wallets else {
+        return Err(short_of_cash());
+    };
+    let sol_cash = solana_cash(state, sol).await;
+    let land = needed - held + 10_000;
+    let gas = if wallet_pays_gas(state, evm).await {
+        0
+    } else {
+        BASE_GAS_BY_RELAY_USDC
+    };
+    let reserve = solana_fee_reserve(state, sol).await;
+    if sol_cash < land + gas + reserve {
+        return Err(not_enough_cash(held + sol_cash, currency, rate));
+    }
+    let moved = state
+        .relay_link
+        .solana_to_base(sol, evm, land, gas)
+        .await
+        .map_err(|_| unavailable("Couldn't move your cash right now; try again shortly"))?;
+    if sol_cash < moved.amount_in_units + reserve {
+        return Err(not_enough_cash(held + sol_cash, currency, rate));
+    }
+    Ok((moved.amount_in_units, moved.amount_in_units - land))
+}
+
 // Starts moving `send` of Base cash (`fee` of it the network fee) to the user's Solana wallet: a
 // gasless Relay move when it can (the app sends nothing; the user's session signs it after the
 // confirm), else one Layerswap transfer for the app to send, returned as (to, data).
@@ -1741,6 +1889,7 @@ async fn move_to_solana(
                     typed_data: quote.typed_data,
                     api: quote.api,
                 }),
+                relay: true,
             },
             None,
         ));
@@ -1762,6 +1911,7 @@ async fn move_to_solana(
             amount_units: deposit.amount_units,
             tx_hash: None,
             authorization: None,
+            relay: false,
         },
         Some((deposit.to, deposit.data)),
     ))
@@ -2356,6 +2506,7 @@ pub(super) async fn plan_base_with_cash(
                     amount_units: deposit.amount_units,
                     tx_hash: None,
                     authorization: None,
+                    relay: false,
                 }),
                 buy_mint: None,
                 gas_request_id: gas.as_ref().map(|(id, _)| id.clone()),
@@ -2511,6 +2662,7 @@ pub(super) async fn execute_quote(
     let a = stored.asset;
     ensure_stock_units(&state.markets, &a).await?;
     let evm_wallet = user.evm_wallet.clone().filter(|w| !w.is_empty());
+    let solana_wallet = user.solana_wallet.clone().filter(|w| !w.is_empty());
     let wallet = if a.chain == "base" {
         user.evm_wallet
     } else {
@@ -2526,7 +2678,56 @@ pub(super) async fn execute_quote(
     let mut base_topup = None;
     let intent_id = id("intent");
     let output: u128;
-    if a.chain == "base" {
+    let mut network_fee = stored.funding_fee;
+    if a.chain == "base" && stored.funding_units > 0 {
+        // Cash on Solana: Relay moves it to Base (with a little ETH for an empty gas tank) in one
+        // Solana transaction the engine lands; /next makes the swap once it's there, without asking
+        // again.
+        let sol = solana_wallet.ok_or((
+            StatusCode::CONFLICT,
+            "Privy Solana wallet is not ready".into(),
+        ))?;
+        let base_cash = state
+            .markets
+            .base
+            .balance_of(BASE_USDC, &wallet)
+            .await
+            .map_err(unavailable)?;
+        let land = stored.input_units.saturating_sub(base_cash) + 10_000;
+        let gas = if wallet_pays_gas(&state, &wallet).await {
+            0
+        } else {
+            BASE_GAS_BY_RELAY_USDC
+        };
+        let moved = state
+            .relay_link
+            .solana_to_base(&sol, &wallet, land, gas)
+            .await
+            .map_err(|_| unavailable("Couldn't move your cash right now; try again shortly"))?;
+        if solana_cash(&state, &sol).await < moved.amount_in_units {
+            return Err(short_of_cash());
+        }
+        let deposit = state
+            .solana_mainnet
+            .v0_transaction(&sol, &moved.instructions, &moved.lookup_tables)
+            .await
+            .map_err(unavailable)?;
+        // A Solana wallet with no SOL pays the transaction fee from a gasless top-up first.
+        if let Some((gas_id, gas_tx)) = gas_topup(&state, &sol, moved.amount_in_units).await {
+            transactions.push(json!({"chain":"solana","transaction":gas_tx,"submit":"engine"}));
+            gas_request_id = Some(gas_id);
+        }
+        transactions.push(json!({"chain":"solana","transaction":deposit,"submit":"engine"}));
+        network_fee = moved.amount_in_units - land;
+        funding = Some(CashMove {
+            swap_id: moved.request_id,
+            amount_units: moved.amount_in_units,
+            tx_hash: None,
+            authorization: None,
+            relay: true,
+        });
+        output = stored.output_units;
+    } else if a.chain == "base" {
         let request = quote_request(&a, &stored.side, stored.input_units);
         let fresh = state
             .markets
@@ -2697,7 +2898,7 @@ pub(super) async fn execute_quote(
         json!([
             {"label":"You pay","value":say_money(stored.input_units, &stored.currency, rate)},
             {"label":"You get (about)","value":format!("{} {}", format_units(output, a.decimals), a.symbol)},
-            {"label":"Network fee","value":say_money(stored.funding_fee.max(1), &stored.currency, rate)},
+            {"label":"Network fee","value":say_money(network_fee.max(1), &stored.currency, rate)},
         ])
     } else if stored.side == "buy" {
         json!([
@@ -3078,7 +3279,7 @@ pub(super) async fn intent_status(
         let Some(cash) = &current.funding else {
             return Ok(Json(current.status));
         };
-        let moved = if cash.authorization.is_some() {
+        let moved = if cash.relay || cash.authorization.is_some() {
             state.relay_link.state(&cash.swap_id).await.ok()
         } else {
             state.layerswap.swap_state(&cash.swap_id).await.ok()
@@ -3213,6 +3414,11 @@ pub(super) async fn next_transactions(
             "nothing to sign for this intent".into(),
         ));
     }
+    // A Base buy whose cash came from Solana: a fresh swap for what landed.
+    if intent.chain == "base" && intent.trade.is_some() {
+        let transactions = base_buy_after_move(&state, &intent_id, &mut intent).await?;
+        return Ok(Json(json!({ "transactions": transactions })));
+    }
     // Cash landed on Base: the Base transactions planned at the start.
     if intent.chain == "base" {
         let txs: Vec<Value> = intent
@@ -3296,6 +3502,92 @@ pub(super) async fn next_transactions(
     }
     transactions.push(json!({"chain":"solana","transaction":transaction,"submit":"engine"}));
     Ok(Json(json!({ "transactions": transactions })))
+}
+
+// The second step of a Base buy paid with Solana cash: once the cash has landed, a fresh swap (and an
+// approval when the router needs one) for what arrived, for the app to send without asking again.
+// The plan becomes these transactions, which /signed and status check as usual.
+async fn base_buy_after_move(
+    state: &AppState,
+    intent_id: &str,
+    intent: &mut StoredIntent,
+) -> Result<Vec<Value>, ApiError> {
+    let plan = intent
+        .trade
+        .clone()
+        .ok_or_else(|| unavailable("intent has no trade"))?;
+    let asset = find_asset(&state.markets, &plan.asset_id).await?;
+    let wallet = intent.wallet.clone();
+    let cash = state
+        .markets
+        .base
+        .balance_of(BASE_USDC, &wallet)
+        .await
+        .map_err(unavailable)?;
+    let amount = plan.pay_units.min(cash);
+    if amount == 0 {
+        return Err((
+            StatusCode::CONFLICT,
+            "the cash hasn't reached Base yet".into(),
+        ));
+    }
+    let request = quote_request(&asset, "buy", amount);
+    let fresh = state
+        .markets
+        .base
+        .quote_direct(&request)
+        .await
+        .map_err(unavailable)?;
+    // Prices move while cash crosses over; more than 5% worse than the quote isn't what they agreed
+    // to. Without gas the swap can't go out (the move brings some to an empty tank).
+    let expected = mul_div_units(plan.get_units, amount, plan.pay_units);
+    let stopped = if fresh.amount_out < expected.saturating_mul(95) / 100 {
+        Some("The price moved more than 5% while your cash was moving. The cash is in your balance now; try again.")
+    } else if !wallet_pays_gas(state, &wallet).await {
+        Some("Your cash is in your balance now, but the network fee couldn't be covered yet. Try again.")
+    } else {
+        None
+    };
+    if let Some(reason) = stopped {
+        intent.status.state = "failed".into();
+        intent.status.error = Some(reason.into());
+        state.markets.save_intent(intent_id, intent).await?;
+        return Err((StatusCode::CONFLICT, reason.into()));
+    }
+    let mut txs = Vec::new();
+    let allowance = state
+        .markets
+        .base
+        .allowance(&request.source_token, &wallet)
+        .await
+        .map_err(unavailable)?;
+    if allowance < fresh.amount_in {
+        let approval = state
+            .markets
+            .base
+            .approval_transaction(&request.source_token, &wallet, fresh.amount_in)
+            .map_err(unavailable)?;
+        txs.push((approval.to, approval.data));
+    }
+    let swap = state
+        .markets
+        .base
+        .swap_transaction(&fresh, &wallet, 100)
+        .map_err(unavailable)?;
+    txs.push((swap.to, swap.data));
+    intent.expected = txs
+        .iter()
+        .map(|(to, data)| (to.to_ascii_lowercase(), data.to_ascii_lowercase()))
+        .collect();
+    if let Some(trade) = intent.trade.as_mut() {
+        trade.pay_units = fresh.amount_in;
+        trade.get_units = fresh.amount_out;
+    }
+    state.markets.save_intent(intent_id, intent).await?;
+    Ok(txs
+        .iter()
+        .map(|(to, data)| json!({"chain":"base","chainId":8453,"to":to,"data":data,"value":"0"}))
+        .collect())
 }
 
 // A filled spot trade goes into the trade book (the spot positions). Failing to keep it never
@@ -3491,6 +3783,7 @@ mod tests {
             amount_units: 5_400_000,
             tx_hash: None,
             authorization: None,
+            relay: false,
         });
         markets
             .insert_intent("intent-funded", &funded)
@@ -3531,6 +3824,7 @@ mod tests {
                 typed_data: serde_json::json!({"primaryType":"ReceiveWithAuthorization"}),
                 api: "swap".into(),
             }),
+            relay: true,
         });
         markets
             .insert_intent("intent-gasless", &gasless)
@@ -4014,6 +4308,20 @@ mod tests {
             ohlcv_closes(&body),
             vec![(1790754300000, 359.35), (1790756100000, 353.77)]
         );
+    }
+    #[test]
+    fn coingecko_history_reads_as_closes() {
+        // Shape from CoinGecko's market_chart for BRETT on Base, 2026-10-01.
+        let body = json!({"prices":[[1790743800000u64, 0.005758461401963607],
+            [1790744100000u64, 0.0], [1790830030000u64, 0.005925576268967545]]});
+        assert_eq!(
+            coingecko_closes(&body),
+            vec![
+                (1790743800000, 0.005758461401963607),
+                (1790830030000, 0.005925576268967545)
+            ]
+        );
+        assert!(coingecko_closes(&json!({"error":"rate limited"})).is_empty());
     }
     #[test]
     fn indicative_prices_keep_small_values() {
