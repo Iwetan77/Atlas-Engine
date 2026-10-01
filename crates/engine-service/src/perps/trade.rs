@@ -1348,21 +1348,6 @@ fn funding_amount(needed: u128, collateral: u128) -> Result<u128, ApiError> {
         .map(|with_room| with_room.div_ceil(1_000_000))
         .ok_or((StatusCode::BAD_REQUEST, "margin too large".into()))
 }
-// The funding transfer Atlas planned for this user's perps intent, while it hasn't been confirmed yet.
-pub(crate) async fn planned_funding(
-    state: &AppState,
-    intent_id: &str,
-    owner: &str,
-) -> Result<Option<(String, String)>, ApiError> {
-    Ok(state
-        .perps_trade
-        .get_intent(intent_id)
-        .await?
-        .filter(|i| i.quote.owner == owner && i.status.stage == "validate")
-        .and_then(|i| i.funding)
-        .filter(|f| !f.solana && !f.gasless)
-        .map(|f| (f.to, f.data)))
-}
 pub(crate) fn is_tx_hash(value: &str) -> bool {
     value.len() == 66
         && value.starts_with("0x")

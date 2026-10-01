@@ -89,7 +89,6 @@ const server = createServer(async (request, response) => {
     request.url === '/paradex/subkey-registration-signature';
   const authSubkey = request.method === 'POST' && request.url === '/paradex/subkey-auth-signature';
   const signOrder = request.method === 'POST' && request.url === '/paradex/order-signature';
-  const relayEvm = request.method === 'POST' && request.url === '/relay/evm-transaction';
   const signAuthorization = request.method === 'POST' && request.url === '/evm/sign-authorization';
   const signEscrow = request.method === 'POST' && request.url === '/escrow/sign-authorization';
   const hlRoute = request.method === 'POST' && request.url.startsWith('/hyperliquid/') ?
@@ -100,7 +99,7 @@ const server = createServer(async (request, response) => {
   const suiCashoutPrepare = request.method === 'POST' && request.url === '/sui/cashout/prepare';
   const suiCashoutCommit = request.method === 'POST' && request.url === '/sui/cashout/commit';
   if (!verifyOnly && !ensureWallet && !signOnboarding && !signAuth && !checkSigner &&
-      !registerSubkey && !authSubkey && !signOrder && !relayEvm && !signAuthorization && !signEscrow && !hyperliquid && !suiQuote &&
+      !registerSubkey && !authSubkey && !signOrder && !signAuthorization && !signEscrow && !hyperliquid && !suiQuote &&
       !suiSwap && !suiCashoutPrepare && !suiCashoutCommit) {
     response.writeHead(404).end();
     return;
@@ -269,31 +268,6 @@ const server = createServer(async (request, response) => {
     if (typeof input.walletAddress !== 'string' ||
         evmWallet?.toLowerCase() !== input.walletAddress.toLowerCase()) {
       send(response, 403, {error: 'wallet does not belong to the signed-in user'});
-      return;
-    }
-    // Sends a transaction the user already confirmed in the app. The user's own session authorizes
-    // it (no server signer involved); the engine only asks for transactions it planned. The wallet
-    // pays its own gas: Privy sponsorship is never requested.
-    if (relayEvm) {
-      const {chainId, to, data, idempotencyKey} = input;
-      if (![8453, 84532].includes(chainId) || !/^0x[0-9a-fA-F]{40}$/.test(to ?? '') ||
-          !/^0x([0-9a-fA-F]{2})*$/.test(data ?? '') || typeof idempotencyKey !== 'string' ||
-          idempotencyKey.length < 8 || idempotencyKey.length > 200) {
-        send(response, 400, {error: 'invalid relay request'});
-        return;
-      }
-      try {
-        const sent = await privy.wallets().ethereum().sendTransaction(evm.id, {
-          caip2: `eip155:${chainId}`,
-          params: {transaction: {to, data, value: '0x0', chain_id: chainId}},
-          sponsor: false,
-          idempotency_key: idempotencyKey,
-          authorization_context: {user_jwts: [userJwt]},
-        });
-        send(response, 200, {userId, walletAddress: evmWallet, hash: sent.hash});
-      } catch (error) {
-        send(response, 502, {error: String(error?.message ?? error).slice(0, 200)});
-      }
       return;
     }
     // Base without gas, for a plan the user already confirmed in the app: their own session signs a

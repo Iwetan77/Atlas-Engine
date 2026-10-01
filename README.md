@@ -61,7 +61,7 @@ network loses money.
 | **Relay** | Base → Solana cash moves (one EIP-3009 signature, the solver pays gas), and Atlas Link payouts. |
 | **Layerswap** | Solana → Base (with refuel), and perps margin to Paradex (gasless from Base). |
 | **CoW Protocol** | The Base gas tank: a USDC permit plus a USDC → ETH order, settled by a solver who pays the gas. |
-| **Hyperliquid** | Perps: 178 markets, margin moved in from the balance by Relay in the same confirm, open/close with one confirm, candles for charts. The account is the user's own wallet; trades are signed by a per-user agent the user approves once (it can trade, never withdraw). `ATLAS_PERPS_VENUE=paradex` switches back to Paradex. |
+| **Hyperliquid** | Perps: ~290 markets (its own crypto perps plus the `xyz` dex's stocks, commodities, indices and currencies), margin moved in from the balance by Relay in the same confirm, open/close with one confirm, money back to cash after a close, candles for charts. The account is the user's own wallet; trades are signed by a per-user agent the user approves once (it can trade, never withdraw). `ATLAS_PERPS_VENUE=paradex` switches back to Paradex. |
 | **Morpho, Aave, Jupiter Lend, Jito** | Earn: Morpho's three largest curated USDC vaults on Base (Gauntlet, Spark, Steakhouse), Aave USDC on Base, Jupiter Lend (USDC, USDT, JupUSD, USDS, EURC), SOL staking. Best rate first. |
 | **GeckoTerminal, CoinGecko, DexScreener** | Charts for coins beyond Jupiter; the CoinGecko listing that marks a searched coin verified (exact contract, per chain); Sui search. |
 | **Helius** | Solana RPC in production (any keyed RPC works). |
@@ -84,15 +84,17 @@ Atlas never holds user funds, and the engine can't move a user's money anywhere 
     both capped at $2 and two hours;
   - for an Atlas Link, a payout from the link's own escrow to Relay's pinned receiver, signed with the secret
     the claimer holds (the engine never stores it).
-- **Only planned transactions are relayed.** `POST /v1/relay/evm` sends a Base transaction only if it's
-  byte-for-byte one the engine planned for that user's intent, and only once (idempotency key).
 - **Venue answers are checked before anything is planned:** deposit contracts, receivers, amounts, chain IDs
   and minimum outputs. A quote that differs from what the user saw is refused.
 - **Exact approvals**, never unlimited ones.
 - **Retries never double an action.** Intents are claimed once (Postgres), stages only move forward, and a
   repeated report returns the current status.
 - **Perps orders** are signed by the user's Hyperliquid agent: derived per user, approved once by the user's
-  own wallet inside their first trade's confirm, able to trade but never withdraw or transfer.
+  own wallet inside their first trade's confirm, able to trade and move margin between the user's own
+  balances (Hyperliquid's own perps and the `xyz` stock dex), never withdraw or pay anyone else.
+- **Perps money back to cash** after a close: the bridge asks Relay for the quote itself, with the user's own
+  Solana (or Base) wallet as the recipient, checks every field of the two things the user's wallet signs (Relay's
+  nonce mapping, a USDC `sendAsset` of exactly that amount to Relay's Hyperliquid account) and recovers the signer.
 - **Unverified coins say so.** A coin found by search is verified only when CoinGecko lists that exact
   contract on its chain; look-alikes keep the warning.
 - **Errors are honest:** in the user's currency, and when nothing moved, they say nothing moved.
@@ -152,9 +154,8 @@ user's display currency.
 | POST | `/v1/intents/{id}/signed` | What the app signed or sent for a plan |
 | GET | `/v1/intents/{id}` | Where an intent stands |
 | GET | `/v1/intents/{id}/next` | The second step, once cash or gas has landed |
-| POST | `/v1/relay/evm` | Sends a Base transaction the engine planned for this user |
 | GET/POST | `/v1/perps/onboarding` | Perps access for the user's wallet |
-| GET | `/v1/perps/markets`, `/v1/perps/positions` | Paradex markets and open positions |
+| GET | `/v1/perps/markets`, `/v1/perps/positions` | Hyperliquid markets (crypto, stocks, commodities, indices, currencies) and open positions |
 | POST | `/v1/perps/quotes` → `/execute`, `/v1/perps/positions/{id}/close-quote` → `/v1/perps/close-quotes/{id}/execute` | Open and close |
 | GET | `/v1/earn/options`, `/v1/earn/positions` | Savings options and what's earning |
 | POST | `/v1/earn/quotes` → `/v1/earn/quotes/{id}/execute` | Put in / take out |

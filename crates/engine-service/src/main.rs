@@ -10,7 +10,6 @@ mod markets;
 mod near_intents;
 mod perps;
 mod positions;
-mod relay;
 mod social;
 
 use std::{
@@ -204,7 +203,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/intents/{intent_id}/next",
             get(markets::next_transactions),
         )
-        .route("/v1/relay/evm", post(relay::evm))
         .route("/v1/deposit/networks", get(near_intents::deposit_networks))
         .route("/v1/deposit/quote", post(near_intents::deposit_quote))
         .route("/v1/deposit/status", get(near_intents::deposit_status))

@@ -450,27 +450,6 @@ impl NearState {
                 _=>None
             })
     }
-    pub(super) async fn planned_base_txs(
-        &self,
-        id: &str,
-        owner: &str,
-    ) -> Result<Vec<(String, String)>, ApiError> {
-        Ok(self
-            .get_intent(id)
-            .await?
-            .filter(|i| {
-                i.owner == owner
-                    && !i.from_solana
-                    && i.expires > now()
-                    && if i.gas_topup {
-                        i.status.stage == "sign"
-                    } else {
-                        i.status.stage == "validate"
-                    }
-            })
-            .map(|i| vec![(i.expected_to.clone(), i.expected_data.clone())])
-            .unwrap_or_default())
-    }
 }
 fn venue(error: impl std::fmt::Display) -> ApiError {
     (StatusCode::BAD_GATEWAY, error.to_string())

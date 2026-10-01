@@ -721,32 +721,6 @@ impl MarketState {
 }
 
 impl MarketState {
-    // The Base transactions Atlas planned for this user's intent, while it's still awaiting them.
-    pub(super) async fn planned_base_txs(
-        &self,
-        intent_id: &str,
-        owner: &str,
-    ) -> Result<Vec<(String, String)>, ApiError> {
-        Ok(self
-            .get_intent(intent_id)
-            .await?
-            .filter(|i| {
-                i.owner == owner
-                    && match (
-                        i.chain.as_str(),
-                        i.funding.is_some() || i.base_topup.is_some(),
-                    ) {
-                        // Base actions; after cash from Solana or a gas top-up, sent once it lands.
-                        ("base", false) => i.status.stage == "validate",
-                        ("base", true) => i.status.stage == "sign",
-                        // A Solana buy's transfer from Base.
-                        (_, true) => i.status.stage == "validate",
-                        _ => false,
-                    }
-            })
-            .map(|i| i.expected)
-            .unwrap_or_default())
-    }
     // A plan of Base transactions the user sends in order; /signed and status check each against it.
     pub(super) async fn register_base_txs(
         &self,
@@ -3781,7 +3755,7 @@ mod tests {
             .unwrap());
         let stored = markets.get_intent("intent-1").await.unwrap().unwrap();
         assert_eq!(stored.status.stage, "execute");
-        // Base plans are readable by the relay only while they still await the user's transactions.
+        // A Base plan keeps the transactions the user sends (lowercased); an empty tank tops up first.
         let base_id = markets
             .register_base_txs(
                 "did:privy:a".into(),
@@ -3791,7 +3765,6 @@ mod tests {
             )
             .await
             .unwrap();
-        // An empty tank tops up first: the relay sends nothing until the top-up has filled.
         let topped = markets
             .register_base_txs(
                 "did:privy:a".into(),
@@ -3801,34 +3774,15 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(markets
-            .planned_base_txs(&topped, "did:privy:a")
-            .await
-            .unwrap()
-            .is_empty());
-        let mut filled = markets.get_intent(&topped).await.unwrap().unwrap();
+        let filled = markets.get_intent(&topped).await.unwrap().unwrap();
         assert!(filled.base_topup.as_ref().is_some_and(|t| t.uid.is_none()));
-        filled.status.stage = "sign".into();
-        markets.save_intent(&topped, &filled).await.unwrap();
+        let planned = markets.get_intent(&base_id).await.unwrap().unwrap();
         assert_eq!(
-            markets
-                .planned_base_txs(&topped, "did:privy:a")
-                .await
-                .unwrap(),
+            planned.expected,
             vec![("0xpool".to_string(), "0xdata".to_string())]
         );
-        let planned = markets
-            .planned_base_txs(&base_id, "did:privy:a")
-            .await
-            .unwrap();
-        assert_eq!(planned, vec![("0xpool".to_string(), "0xdata".to_string())]);
-        assert!(markets
-            .planned_base_txs(&base_id, "did:privy:b")
-            .await
-            .unwrap()
-            .is_empty());
-        // A Solana buy paid with Base cash: the relay sees its Base transfer while it awaits it, and
-        // the buy is claimed once, from the sign stage.
+        assert!(planned.base_topup.is_none());
+        // A Solana buy paid with Base cash is claimed once, from the sign stage.
         let mut funded = spot_intent("buy", 5_000_000, 1_000);
         funded.status.stage = "validate".into();
         funded.status.state = "pending".into();
@@ -3844,20 +3798,8 @@ mod tests {
             .insert_intent("intent-funded", &funded)
             .await
             .unwrap();
-        assert_eq!(
-            markets
-                .planned_base_txs("intent-funded", "did:privy:a")
-                .await
-                .unwrap(),
-            vec![("0xusdc".to_string(), "0xtransfer".to_string())]
-        );
         funded.status.stage = "sign".into();
         markets.save_intent("intent-funded", &funded).await.unwrap();
-        assert!(markets
-            .planned_base_txs("intent-funded", "did:privy:a")
-            .await
-            .unwrap()
-            .is_empty());
         assert!(!markets
             .claim_execution("intent-funded", &funded, "validate")
             .await
@@ -3866,8 +3808,8 @@ mod tests {
             .claim_execution("intent-funded", &funded, "sign")
             .await
             .unwrap());
-        // A gasless move (Relay): nothing for the relay endpoint to send, the authorization kept for
-        // /signed, and moves saved before gasless ones existed still load as transfers.
+        // A gasless move (Relay): the authorization kept for /signed, and moves saved before gasless
+        // ones existed still load as transfers.
         let mut gasless = spot_intent("buy", 5_000_000, 1_000);
         gasless.status.stage = "validate".into();
         gasless.status.state = "pending".into();
@@ -3885,11 +3827,6 @@ mod tests {
             .insert_intent("intent-gasless", &gasless)
             .await
             .unwrap();
-        assert!(markets
-            .planned_base_txs("intent-gasless", "did:privy:a")
-            .await
-            .unwrap()
-            .is_empty());
         let stored = markets.get_intent("intent-gasless").await.unwrap().unwrap();
         assert_eq!(stored.funding.unwrap().authorization.unwrap().api, "swap");
         let earlier: CashMove = serde_json::from_value(
@@ -3902,14 +3839,6 @@ mod tests {
             "expected":[],"request_id":null,"status":{"intentId":"i","stage":"settle","state":"filled","txIds":[],"error":null},
             "trade":null})).unwrap();
         assert!(old.funding.is_none());
-        let mut sent = markets.get_intent(&base_id).await.unwrap().unwrap();
-        sent.status.stage = "settle".into();
-        markets.save_intent(&base_id, &sent).await.unwrap();
-        assert!(markets
-            .planned_base_txs(&base_id, "did:privy:a")
-            .await
-            .unwrap()
-            .is_empty());
     }
 
     #[tokio::test]
