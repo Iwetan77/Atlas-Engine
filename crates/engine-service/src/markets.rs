@@ -2,8 +2,9 @@ use super::*;
 use axum::extract::Query;
 use engine_execution::swaps::{
     jupiter::{JupiterClient, JupiterOrderRequest},
+    kyberswap::{KyberClient, KyberRoute, KYBER_ROUTER},
     oneinch::BaseSwapRequest,
-    uniswap::{UniswapV3Client, BASE_USDC, BASE_WETH},
+    uniswap::{BaseV3Quote, UniswapV3Client, BASE_USDC, BASE_WETH, SWAP_ROUTER_02},
 };
 use serde_json::{json, Value};
 use std::{
@@ -291,6 +292,344 @@ pub(super) async fn pasted_token(
     Ok(asset)
 }
 
+// A Base token address as typed into search: 0x and 40 hex digits.
+pub(super) fn looks_like_evm_address(text: &str) -> bool {
+    text.len() == 42 && text.starts_with("0x") && text[2..].bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+// Base tokens outside the fixed list go by their address, so they never clash with catalog ids.
+fn base_token_id(address: &str) -> String {
+    format!("base:{}", address.to_ascii_lowercase())
+}
+
+const GECKO_BASE: &str = "https://api.geckoterminal.com/api/v2/networks/base/";
+const BASE_TRENDING_TTL: Duration = Duration::from_secs(10 * 60);
+const BASE_RATE_TTL: Duration = Duration::from_secs(15);
+
+fn gecko_number(value: &Value) -> f64 {
+    value
+        .as_str()
+        .and_then(|v| v.parse().ok())
+        .or_else(|| value.as_f64())
+        .filter(|v: &f64| v.is_finite())
+        .unwrap_or(0.0)
+}
+fn gecko_icon(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .filter(|url| url.starts_with("https://") && !url.contains("missing"))
+        .map(str::to_owned)
+}
+
+// What GeckoTerminal knows about a Base token: liquidity across its pools, 24h volume, its logo, and
+// whether it flags the token as a honeypot (buyable, never sellable). Its free limit is per IP and
+// often spent on Render, so callers cope without it.
+struct GeckoToken {
+    reserve_usd: f64,
+    volume_usd: f64,
+    icon: Option<String>,
+    honeypot: bool,
+}
+async fn gecko_base_token(state: &MarketState, address: &str) -> Option<GeckoToken> {
+    let get = |path: String| async move {
+        state
+            .http
+            .get(format!("{GECKO_BASE}tokens/{path}"))
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json::<Value>()
+            .await
+            .ok()
+    };
+    let (token, info) = tokio::join!(get(address.to_owned()), get(format!("{address}/info")));
+    let at = &token?["data"]["attributes"];
+    Some(GeckoToken {
+        reserve_usd: gecko_number(&at["total_reserve_in_usd"]),
+        volume_usd: gecko_number(&at["volume_usd"]["h24"]),
+        icon: gecko_icon(&at["image_url"]),
+        honeypot: info
+            .is_some_and(|i| i["data"]["attributes"]["is_honeypot"].as_bool() == Some(true)),
+    })
+}
+
+// Real liquidity without GeckoTerminal: $100 through Kyber fills within 3% of the market price
+// (about $5k of depth or more), when Kyber prices both sides.
+async fn kyber_depth_ok(state: &MarketState, address: &str) -> bool {
+    match state.kyber.route(BASE_USDC, address, 100_000_000).await {
+        Ok(route) => route.price_impact().is_some_and(|impact| impact < 0.03),
+        Err(_) => false,
+    }
+}
+
+// A Base token by its address: name, symbol and decimals from the contract, tradable only with real
+// liquidity behind it and no honeypot flag. Unverified until CoinGecko is checked (the caller does,
+// for what it shows). Kept for the catalog's lifetime once found; not-found is asked again next time.
+pub(super) async fn pasted_base_token(
+    state: &MarketState,
+    address: &str,
+) -> Result<Option<Asset>, ApiError> {
+    let address = address.to_ascii_lowercase();
+    if let Some((at, asset)) = state.pasted.lock().map_err(internal)?.get(&address) {
+        if at.elapsed() < CATALOG_TTL {
+            return Ok(asset.clone());
+        }
+    }
+    // USDC is cash and WETH is the gas tank: neither is traded here.
+    if address == BASE_USDC.to_ascii_lowercase() || address == BASE_WETH.to_ascii_lowercase() {
+        return Ok(None);
+    }
+    let Ok((name, symbol, decimals)) = state.base.token_info(&address).await else {
+        return Ok(None);
+    };
+    let gecko = gecko_base_token(state, &address).await;
+    if gecko.as_ref().is_some_and(|g| g.honeypot) {
+        return Ok(None);
+    }
+    let liquid = match &gecko {
+        Some(g) if g.reserve_usd >= MIN_PASTED_LIQUIDITY_USD => true,
+        _ => kyber_depth_ok(state, &address).await,
+    };
+    if !liquid {
+        return Ok(None);
+    }
+    let asset = Asset {
+        id: base_token_id(&address),
+        symbol,
+        name,
+        kind: "meme".into(),
+        chain: "base".into(),
+        token: address.clone(),
+        decimals,
+        icon_url: gecko.as_ref().and_then(|g| g.icon.clone()),
+        volume_24h: gecko.as_ref().map_or(0.0, |g| g.volume_usd),
+        xstock: false,
+        verified: false,
+        ref_price: 0.0,
+        change_24h: 0.0,
+        listed: true,
+    };
+    state
+        .pasted
+        .lock()
+        .map_err(internal)?
+        .insert(address, (Instant::now(), Some(asset.clone())));
+    Ok(Some(asset))
+}
+
+// GeckoTerminal's trending Base pools → coins for the Trade list: CoinGecko-listed (`listed`, the
+// exact contract), liquid like the catalog, not cash, not a bridged copy, and not a coin Atlas
+// already lists (`taken`, uppercase symbols). Kinds come later (`meme_or_crypto`).
+fn trending_base_assets(
+    body: &Value,
+    listed: impl Fn(&str) -> bool,
+    taken: &std::collections::HashSet<String>,
+) -> Vec<(Asset, Option<String>)> {
+    let tokens: HashMap<&str, &Value> = body["included"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(|t| Some((t["id"].as_str()?, &t["attributes"])))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut seen = std::collections::HashSet::new();
+    let mut found = Vec::new();
+    for pool in body["data"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
+        let at = &pool["attributes"];
+        let Some(token) = pool["relationships"]["base_token"]["data"]["id"]
+            .as_str()
+            .and_then(|id| tokens.get(id))
+        else {
+            continue;
+        };
+        let (Some(address), Some(symbol)) = (token["address"].as_str(), token["symbol"].as_str())
+        else {
+            continue;
+        };
+        let address = address.to_ascii_lowercase();
+        let upper = symbol.to_ascii_uppercase();
+        let coingecko = token["coingecko_coin_id"].as_str().map(str::to_owned);
+        if !looks_like_evm_address(&address)
+            || gecko_number(&at["reserve_in_usd"]) < MIN_LIQUIDITY_USD
+            || !listed(&address)
+            || upper.contains("USD")
+            || upper.contains("EUR")
+            || upper.contains("ETH")
+            || upper.contains("BTC")
+            || coingecko
+                .as_deref()
+                .is_some_and(|id| id.contains("bridged"))
+            || taken.contains(&upper)
+            || !seen.insert(address.clone())
+        {
+            continue;
+        }
+        let Some(decimals) = token["decimals"]
+            .as_u64()
+            .and_then(|d| u32::try_from(d).ok())
+        else {
+            continue;
+        };
+        found.push((
+            Asset {
+                id: base_token_id(&address),
+                symbol: symbol.into(),
+                name: token["name"].as_str().unwrap_or(symbol).into(),
+                kind: "crypto".into(),
+                chain: "base".into(),
+                token: address,
+                decimals,
+                icon_url: gecko_icon(&token["image_url"]),
+                volume_24h: gecko_number(&at["volume_usd"]["h24"]),
+                xstock: false,
+                verified: true,
+                ref_price: gecko_number(&at["base_token_price_usd"]),
+                change_24h: gecko_number(&at["price_change_percentage"]["h24"]),
+                listed: true,
+            },
+            coingecko,
+        ));
+    }
+    found
+}
+
+// Whether CoinGecko files a coin under memes; asked once per coin, remembered.
+async fn meme_or_crypto(state: &MarketState, coingecko_id: &str) -> Option<&'static str> {
+    if let Some(kind) = state.coin_kinds.lock().ok()?.get(coingecko_id) {
+        return Some(kind);
+    }
+    let body: Value = state
+        .http
+        .get(format!(
+            "https://api.coingecko.com/api/v3/coins/{coingecko_id}"
+        ))
+        .query(&[
+            ("localization", "false"),
+            ("tickers", "false"),
+            ("market_data", "false"),
+            ("community_data", "false"),
+            ("developer_data", "false"),
+        ])
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    let meme = body["categories"].as_array().is_some_and(|list| {
+        list.iter()
+            .filter_map(Value::as_str)
+            .any(|c| c.to_ascii_lowercase().contains("meme"))
+    });
+    let kind = if meme { "meme" } else { "crypto" };
+    state
+        .coin_kinds
+        .lock()
+        .ok()?
+        .insert(coingecko_id.to_owned(), kind);
+    Some(kind)
+}
+
+// The Base coins trending right now (see trending_base_assets), read every 10 minutes. When
+// GeckoTerminal is out of reach the last good list stays, however old.
+pub(super) async fn base_trending(state: &AppState) -> Arc<Vec<Asset>> {
+    let last = state
+        .markets
+        .base_trending
+        .lock()
+        .ok()
+        .and_then(|held| held.clone());
+    if let Some((at, list)) = &last {
+        if at.elapsed() < BASE_TRENDING_TTL {
+            return list.clone();
+        }
+    }
+    let previous = last.map(|(_, list)| list).unwrap_or_default();
+    let fetched: Option<Value> = async {
+        state
+            .markets
+            .http
+            .get(format!("{GECKO_BASE}trending_pools"))
+            .query(&[("include", "base_token"), ("page", "1")])
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()
+    }
+    .await;
+    let (Some(body), Ok(catalog)) = (fetched, catalog(&state.markets).await) else {
+        // Try again in a minute rather than waiting out the full ten.
+        if let Ok(mut held) = state.markets.base_trending.lock() {
+            *held = Some((
+                Instant::now() - BASE_TRENDING_TTL + Duration::from_secs(60),
+                previous.clone(),
+            ));
+        }
+        return previous;
+    };
+    let listed = state.near.listed().await;
+    let taken = catalog
+        .iter()
+        .filter(|a| a.listed)
+        .map(|a| a.symbol.to_ascii_uppercase())
+        .collect();
+    let mut assets = Vec::new();
+    for (mut asset, coingecko) in trending_base_assets(&body, |a| listed.has("base", a), &taken) {
+        if let Some(kind) = match coingecko {
+            Some(id) => meme_or_crypto(&state.markets, &id).await,
+            None => None,
+        } {
+            asset.kind = kind.into();
+        }
+        assets.push(asset);
+    }
+    let assets = Arc::new(assets);
+    if let Ok(mut held) = state.markets.base_trending.lock() {
+        *held = Some((Instant::now(), assets.clone()));
+    }
+    assets
+}
+
+// The trending Base list stays warm, so a Trade list never waits on GeckoTerminal and CoinGecko.
+pub(super) fn keep_base_trending_warm(state: AppState) {
+    tokio::spawn(async move {
+        loop {
+            base_trending(&state).await;
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    });
+}
+
+// How many base units of a Base token $1 buys right now (Kyber, then Uniswap), shared for 15 seconds.
+pub(super) async fn base_rate(state: &MarketState, a: &Asset) -> Option<u128> {
+    if let Some((at, rate)) = state.base_rates.lock().ok()?.get(&a.token) {
+        if at.elapsed() < BASE_RATE_TTL {
+            return Some(*rate);
+        }
+    }
+    let rate = base_quote(state, a, "buy", 1_000_000)
+        .await
+        .ok()?
+        .amount_out;
+    state
+        .base_rates
+        .lock()
+        .ok()?
+        .insert(a.token.clone(), (Instant::now(), rate));
+    (rate > 0).then_some(rate)
+}
+
 // Every asset Atlas trades: the Base list plus Jupiter's verified Solana catalog, refreshed every
 // 30 minutes. If Jupiter is down, the last good catalog keeps serving.
 pub(super) async fn catalog(state: &MarketState) -> Result<Arc<Vec<Asset>>, ApiError> {
@@ -390,8 +729,24 @@ fn curate(tokens: &[Value]) -> Vec<Asset> {
 }
 
 pub(super) async fn find_asset(state: &MarketState, id: &str) -> Result<Asset, ApiError> {
-    if let Some(asset) = catalog(state).await?.iter().find(|a| a.id == id) {
+    let catalog = catalog(state).await?;
+    if let Some(asset) = catalog.iter().find(|a| a.id == id) {
         return Ok(asset.clone());
+    }
+    if let Some(address) = id
+        .strip_prefix("base:")
+        .filter(|a| looks_like_evm_address(a))
+    {
+        // A coin on the fixed Base list keeps its own row.
+        if let Some(asset) = catalog
+            .iter()
+            .find(|a| a.chain == "base" && a.token.eq_ignore_ascii_case(address))
+        {
+            return Ok(asset.clone());
+        }
+        if let Some(asset) = pasted_base_token(state, address).await? {
+            return Ok(asset);
+        }
     }
     if looks_like_mint(id) {
         if let Some(asset) = pasted_token(state, id).await? {
@@ -448,6 +803,7 @@ pub(super) async fn usd_prices(
 #[derive(Clone)]
 pub(super) struct MarketState {
     pub(super) base: UniswapV3Client,
+    kyber: KyberClient,
     jupiter: JupiterClient,
     rpc: reqwest::Url,
     http: reqwest::Client,
@@ -456,6 +812,12 @@ pub(super) struct MarketState {
     catalog: Arc<Mutex<Option<(Instant, Arc<Vec<Asset>>)>>>,
     pasted: Arc<Mutex<HashMap<String, (Instant, Option<Asset>)>>>,
     prices: Arc<Mutex<HashMap<String, (Instant, f64, Option<f64>)>>>,
+    // Base tokens: how many base units $1 buys (Kyber), shared for a few seconds.
+    base_rates: Arc<Mutex<HashMap<String, (Instant, u128)>>>,
+    // Base coins trending on GeckoTerminal, and when they were read (the last good list stays).
+    base_trending: Arc<Mutex<Option<(Instant, Arc<Vec<Asset>>)>>>,
+    // CoinGecko's word on whether a coin (by CoinGecko id) is a meme; it doesn't change.
+    coin_kinds: Arc<Mutex<HashMap<String, &'static str>>>,
     multipliers: Arc<Mutex<HashMap<String, (Instant, bool)>>>,
     chart_pools: Arc<Mutex<HashMap<String, (Instant, String)>>>,
     charts: ChartCache,
@@ -598,6 +960,7 @@ impl MarketState {
         .parse()?;
         Ok(Self {
             base: UniswapV3Client::new(rpc.clone())?,
+            kyber: KyberClient::new()?,
             jupiter: JupiterClient::new(env::var("JUPITER_API_KEY").ok()),
             rpc,
             http: reqwest::Client::builder()
@@ -609,6 +972,9 @@ impl MarketState {
             catalog: Arc::new(Mutex::new(None)),
             pasted: Arc::new(Mutex::new(HashMap::new())),
             prices: Arc::new(Mutex::new(HashMap::new())),
+            base_rates: Arc::new(Mutex::new(HashMap::new())),
+            base_trending: Arc::new(Mutex::new(None)),
+            coin_kinds: Arc::new(Mutex::new(HashMap::new())),
             multipliers: Arc::new(Mutex::new(HashMap::new())),
             chart_pools: Arc::new(Mutex::new(HashMap::new())),
             charts: Arc::new(Mutex::new(HashMap::new())),
@@ -780,7 +1146,7 @@ fn id(prefix: &str) -> String {
 fn bad(message: &str) -> ApiError {
     (StatusCode::BAD_REQUEST, message.into())
 }
-fn unavailable(error: impl std::fmt::Display) -> ApiError {
+pub(super) fn unavailable(error: impl std::fmt::Display) -> ApiError {
     (StatusCode::BAD_GATEWAY, error.to_string())
 }
 pub(super) fn checked_currency(currency: &str) -> Result<(), ApiError> {
@@ -983,6 +1349,140 @@ fn quote_request(a: &Asset, side: &str, input: u128) -> BaseSwapRequest {
         amount_base_units: input,
     }
 }
+
+// A Base price: KyberSwap's search of every exchange, or one Uniswap pool when Kyber can't answer.
+// `fee_ppm` is in millionths of what goes in: Kyber's network fee (paid in ETH), or the pool's fee.
+pub(super) struct BaseQuote {
+    pub(super) amount_in: u128,
+    pub(super) amount_out: u128,
+    pub(super) fee_ppm: u32,
+    route: BaseRoute,
+}
+enum BaseRoute {
+    Kyber(KyberRoute),
+    Uniswap(BaseV3Quote),
+}
+pub(super) async fn base_quote(
+    state: &MarketState,
+    a: &Asset,
+    side: &str,
+    input: u128,
+) -> Result<BaseQuote, ApiError> {
+    let request = quote_request(a, side, input);
+    match state
+        .kyber
+        .route(&request.source_token, &request.destination_token, input)
+        .await
+    {
+        Ok(route) => {
+            let fee_ppm = if route.amount_in_usd > 0.0 {
+                (route.gas_usd / route.amount_in_usd * 1_000_000.0).min(1_000_000.0) as u32
+            } else {
+                0
+            };
+            return Ok(BaseQuote {
+                amount_in: route.amount_in,
+                amount_out: route.amount_out,
+                fee_ppm,
+                route: BaseRoute::Kyber(route),
+            });
+        }
+        Err(error) => eprintln!("kyberswap {}: {error}; trying Uniswap", a.symbol),
+    }
+    uniswap_quote(state, &request).await
+}
+async fn uniswap_quote(
+    state: &MarketState,
+    request: &BaseSwapRequest,
+) -> Result<BaseQuote, ApiError> {
+    let q = state
+        .base
+        .quote_direct(request)
+        .await
+        .map_err(unavailable)?;
+    Ok(BaseQuote {
+        amount_in: q.amount_in,
+        amount_out: q.amount_out,
+        fee_ppm: q.fee,
+        route: BaseRoute::Uniswap(q),
+    })
+}
+// A built swap pays out within 1% of its route, and expires after this long: long enough to cover a
+// gas top-up that runs first.
+const BASE_SLIPPAGE_BPS: u16 = 100;
+const BASE_SWAP_DEADLINE_SECS: u64 = 20 * 60;
+// A Base swap from `wallet`, ready to send: an exact approval for its router when the allowance falls
+// short, then the swap, which always pays `wallet`. If Kyber's build fails, a Uniswap pool's swap
+// takes its place; the amounts are the ones built, for the caller's price checks.
+pub(super) struct BaseSwap {
+    pub(super) amount_in: u128,
+    pub(super) amount_out: u128,
+    pub(super) txs: Vec<(String, String)>,
+}
+async fn base_swap(
+    state: &MarketState,
+    a: &Asset,
+    side: &str,
+    input: u128,
+    wallet: &str,
+) -> Result<BaseSwap, ApiError> {
+    let quote = base_quote(state, a, side, input).await?;
+    let request = quote_request(a, side, input);
+    let built = match &quote.route {
+        BaseRoute::Kyber(route) => {
+            let deadline = now() / 1000 + BASE_SWAP_DEADLINE_SECS;
+            match state
+                .kyber
+                .build(route, wallet, BASE_SLIPPAGE_BPS, deadline)
+                .await
+            {
+                Ok(swap) => Some((quote.amount_out, KYBER_ROUTER, (swap.to, swap.data))),
+                Err(error) => {
+                    eprintln!("kyberswap build {}: {error}; trying Uniswap", a.symbol);
+                    None
+                }
+            }
+        }
+        BaseRoute::Uniswap(_) => None,
+    };
+    let (amount_out, spender, swap) = match built {
+        Some(built) => built,
+        None => {
+            let fallback = match quote.route {
+                BaseRoute::Uniswap(q) => q,
+                BaseRoute::Kyber(_) => state
+                    .base
+                    .quote_direct(&request)
+                    .await
+                    .map_err(unavailable)?,
+            };
+            let swap = state
+                .base
+                .swap_transaction(&fallback, wallet, BASE_SLIPPAGE_BPS)
+                .map_err(unavailable)?;
+            (fallback.amount_out, SWAP_ROUTER_02, (swap.to, swap.data))
+        }
+    };
+    let mut txs = Vec::new();
+    let allowance = state
+        .base
+        .allowance_to(&request.source_token, wallet, spender)
+        .await
+        .map_err(unavailable)?;
+    if allowance < input {
+        let approval = state
+            .base
+            .approval_to(&request.source_token, wallet, spender, input)
+            .map_err(unavailable)?;
+        txs.push((approval.to, approval.data));
+    }
+    txs.push(swap);
+    Ok(BaseSwap {
+        amount_in: input,
+        amount_out,
+        txs,
+    })
+}
 // xStocks track shares through a multiplier that drifts above 1 as dividends accrue; prices are per
 // token, so that drift doesn't change what anyone pays or gets. A scheduled change (a split or
 // reverse split, `newMultiplier`) does jump the token's value, so quotes pause while one is pending.
@@ -1047,12 +1547,8 @@ pub(super) async fn venue_quote(
 ) -> Result<(u128, u128, u32), ApiError> {
     ensure_stock_units(state, a).await?;
     if a.chain == "base" {
-        let q = state
-            .base
-            .quote_direct(&quote_request(a, side, input))
-            .await
-            .map_err(unavailable)?;
-        Ok((q.amount_in, q.amount_out, q.fee))
+        let q = base_quote(state, a, side, input).await?;
+        Ok((q.amount_in, q.amount_out, q.fee_ppm))
     } else {
         let q = state
             .jupiter
@@ -1093,11 +1589,24 @@ pub(super) async fn assets(
     let raw = raw.trim();
     let query = raw.to_ascii_lowercase();
     let catalog = catalog(&state.markets).await?;
-    // A pasted token address finds that token, listed or not, whatever chip is selected.
-    let by_address = looks_like_mint(raw);
+    // A pasted token address finds that token, listed or not, whatever chip is selected: a Solana
+    // mint, or a 0x address on Base (verified only if CoinGecko lists that exact contract there).
+    let base_address = looks_like_evm_address(raw);
+    let by_address = looks_like_mint(raw) || base_address;
     let pasted: Vec<Asset> = if by_address {
-        match catalog.iter().find(|a| a.token == raw) {
+        match catalog.iter().find(|a| a.token.eq_ignore_ascii_case(raw)) {
             Some(listed) => vec![listed.clone()],
+            None if base_address => {
+                let listed = state.near.listed().await;
+                pasted_base_token(&state.markets, raw)
+                    .await?
+                    .map(|a| Asset {
+                        verified: listed.has("base", &a.token),
+                        ..a
+                    })
+                    .into_iter()
+                    .collect()
+            }
             None => pasted_token(&state.markets, raw)
                 .await?
                 .into_iter()
@@ -1105,6 +1614,12 @@ pub(super) async fn assets(
         }
     } else {
         Vec::new()
+    };
+    // Base coins trending on GeckoTerminal join the list (and its search).
+    let trending_base = if by_address {
+        Arc::default()
+    } else {
+        base_trending(&state).await
     };
     let rank = |a: &Asset| -> u8 {
         let (symbol, name) = (a.symbol.to_ascii_lowercase(), a.name.to_ascii_lowercase());
@@ -1123,6 +1638,7 @@ pub(super) async fn assets(
     } else {
         catalog
             .iter()
+            .chain(trending_base.iter())
             .filter(|a| a.listed)
             .filter(|a| kind.is_none_or(|k| a.kind == k))
             .filter(|a| {
@@ -1164,6 +1680,18 @@ pub(super) async fn assets(
         .map(|a| a.token.clone())
         .collect();
     let prices = usd_prices(&state.markets, &mints).await?;
+    // Base coins are priced by a live $1 quote each, all at once.
+    let mut base_rates = HashMap::new();
+    let mut quotes = tokio::task::JoinSet::new();
+    for a in picked.iter().filter(|a| a.chain == "base") {
+        let (markets, a) = (state.markets.clone(), (*a).clone());
+        quotes.spawn(async move { (a.token.clone(), base_rate(&markets, &a).await) });
+    }
+    while let Some(done) = quotes.join_next().await {
+        if let Ok((token, Some(rate))) = done {
+            base_rates.insert(token, rate);
+        }
+    }
     let mut result = Vec::with_capacity(picked.len());
     for a in picked {
         let (price, change) = if a.chain == "solana" {
@@ -1176,16 +1704,22 @@ pub(super) async fn assets(
                 change.map(|c| format!("{c:.2}")),
             )
         } else {
-            let (_, out, _) = venue_quote(&state.markets, a, "buy", 1_000_000).await?;
+            let Some(out) = base_rates.get(&a.token) else {
+                continue;
+            };
             (
-                json!(unit_price(1_000_000, out, a.decimals, &currency, rate)?),
-                None,
+                json!(unit_price(1_000_000, *out, a.decimals, &currency, rate)?),
+                (a.change_24h != 0.0).then(|| format!("{:.2}", a.change_24h)),
             )
         };
-        result.push(json!({"assetId":a.id,"symbol":a.symbol,"name":a.name,"kind":a.kind,"price":price,"change24hPct":change,"iconUrl":a.icon_url,"verified":a.verified}));
+        result.push(json!({"assetId":a.id,"symbol":a.symbol,"name":a.name,"kind":a.kind,"chain":a.chain,"price":price,"change24hPct":change,"iconUrl":a.icon_url,"verified":a.verified}));
     }
+    // Coins on other chains through 1Click; when it's down, search still answers with the rest.
     if !raw.is_empty() && kind.is_none_or(|k| k == "crypto") {
-        result.extend(near_intents::search_assets(&state, raw, &currency, rate).await?);
+        match near_intents::search_assets(&state, raw, &currency, rate).await {
+            Ok(found) => result.extend(found),
+            Err(error) => eprintln!("1Click search unavailable: {}", error.1),
+        }
     }
     Ok(Json(json!({"assets":result})))
 }
@@ -2613,12 +3147,14 @@ pub(super) async fn execute_quote(
         output = stored.output_units;
     } else if a.chain == "base" {
         let request = quote_request(&a, &stored.side, stored.input_units);
-        let fresh = state
-            .markets
-            .base
-            .quote_direct(&request)
-            .await
-            .map_err(unavailable)?;
+        let fresh = base_swap(
+            &state.markets,
+            &a,
+            &stored.side,
+            stored.input_units,
+            &wallet,
+        )
+        .await?;
         // Refuse a changed route that degrades more than 1% from the preview.
         if fresh.amount_out < stored.output_units.saturating_mul(99) / 100 {
             return Err((
@@ -2646,33 +3182,12 @@ pub(super) async fn execute_quote(
                 )
             });
         }
-        let allowance = state
-            .markets
-            .base
-            .allowance(&request.source_token, &wallet)
-            .await
-            .map_err(unavailable)?;
-        if allowance < fresh.amount_in {
-            let approval = state
-                .markets
-                .base
-                .approval_transaction(&request.source_token, &wallet, fresh.amount_in)
-                .map_err(unavailable)?;
-            expected.push((
-                approval.to.to_ascii_lowercase(),
-                approval.data.to_ascii_lowercase(),
-            ));
+        // An exact approval for the route's router when needed, then the swap.
+        for (to, data) in &fresh.txs {
+            expected.push((to.to_ascii_lowercase(), data.to_ascii_lowercase()));
             transactions
-                .push(json!({"chain":"base","chainId":8453,"to":approval.to,"data":approval.data,"value":"0"}));
+                .push(json!({"chain":"base","chainId":8453,"to":to,"data":data,"value":"0"}));
         }
-        let swap = state
-            .markets
-            .base
-            .swap_transaction(&fresh, &wallet, 100)
-            .map_err(unavailable)?;
-        expected.push((swap.to.to_ascii_lowercase(), swap.data.to_ascii_lowercase()));
-        transactions
-            .push(json!({"chain":"base","chainId":8453,"to":swap.to,"data":swap.data,"value":"0"}));
         // No ETH for gas: a gasless CoW top-up from their USDC first; the swap goes out once it lands.
         let spends = if stored.side == "buy" {
             fresh.amount_in
@@ -3444,13 +3959,7 @@ async fn base_buy_after_move(
             "the cash hasn't reached Base yet".into(),
         ));
     }
-    let request = quote_request(&asset, "buy", amount);
-    let fresh = state
-        .markets
-        .base
-        .quote_direct(&request)
-        .await
-        .map_err(unavailable)?;
+    let fresh = base_swap(&state.markets, &asset, "buy", amount, &wallet).await?;
     // Prices move while cash crosses over; more than 5% worse than the quote isn't what they agreed
     // to. Without gas the swap can't go out (the move brings some to an empty tank).
     let expected = mul_div_units(plan.get_units, amount, plan.pay_units);
@@ -3467,27 +3976,7 @@ async fn base_buy_after_move(
         state.markets.save_intent(intent_id, intent).await?;
         return Err((StatusCode::CONFLICT, reason.into()));
     }
-    let mut txs = Vec::new();
-    let allowance = state
-        .markets
-        .base
-        .allowance(&request.source_token, &wallet)
-        .await
-        .map_err(unavailable)?;
-    if allowance < fresh.amount_in {
-        let approval = state
-            .markets
-            .base
-            .approval_transaction(&request.source_token, &wallet, fresh.amount_in)
-            .map_err(unavailable)?;
-        txs.push((approval.to, approval.data));
-    }
-    let swap = state
-        .markets
-        .base
-        .swap_transaction(&fresh, &wallet, 100)
-        .map_err(unavailable)?;
-    txs.push((swap.to, swap.data));
+    let txs = fresh.txs;
     intent.expected = txs
         .iter()
         .map(|(to, data)| (to.to_ascii_lowercase(), data.to_ascii_lowercase()))
@@ -4148,6 +4637,112 @@ mod tests {
         // Base WETH stays in the catalog (the balance values it) but off the Trade list.
         assert!(catalog.iter().any(|a| a.id == "weth-base" && !a.listed));
     }
+    #[test]
+    fn base_addresses_get_their_own_ids() {
+        assert!(looks_like_evm_address(
+            "0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed"
+        ));
+        assert!(!looks_like_evm_address(
+            "0x4ed4e862860bed51a9570b96d89af5e1b0efefe"
+        ));
+        assert!(!looks_like_evm_address(
+            "0x4ed4e862860bed51a9570b96d89af5e1b0efefeg"
+        ));
+        assert!(!looks_like_evm_address(
+            "So11111111111111111111111111111111111111112"
+        ));
+        assert!(!looks_like_mint(
+            "0x4ed4e862860bed51a9570b96d89af5e1b0efefed"
+        ));
+        assert_eq!(
+            base_token_id("0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed"),
+            "base:0x4ed4e862860bed51a9570b96d89af5e1b0efefed"
+        );
+    }
+
+    #[test]
+    fn trending_base_coins_are_listed_liquid_and_new_to_atlas() {
+        // Captured from GeckoTerminal's Base trending pools on 2026-10-01 (trimmed): Doppler (xdp) in
+        // two pools, boar, Aerodrome, and Solana bridged to Base.
+        let body: Value = serde_json::from_str(r#"{"data": [{"attributes": {"name": "xdp / USDC 0.01%", "reserve_in_usd": "1738839.7394", "base_token_price_usd": "0.01987387892049", "volume_usd": {"h24": "180738711.092985"}, "price_change_percentage": {"h24": "-10.148"}}, "relationships": {"base_token": {"data": {"id": "base_0x07b3d902783c3c12b077508c3b5c00113d1291d0", "type": "token"}}}}, {"attributes": {"name": "boar / WETH", "reserve_in_usd": "307397.0505", "base_token_price_usd": "0.0000100124589837383", "volume_usd": {"h24": "542435.61549892"}, "price_change_percentage": {"h24": "22.328"}}, "relationships": {"base_token": {"data": {"id": "base_0x0cbf291ba052174879d90bf781df1a5f2bc5bb07", "type": "token"}}}}, {"attributes": {"name": "AERO / USDC", "reserve_in_usd": "41696707.6057", "base_token_price_usd": "0.809970138927019", "volume_usd": {"h24": "5346262.99400504"}, "price_change_percentage": {"h24": "0.148"}}, "relationships": {"base_token": {"data": {"id": "base_0x940181a94a35a4569e4529a3cdfb74e38fd98631", "type": "token"}}}}, {"attributes": {"name": "xdp / USDC 2%", "reserve_in_usd": "621726.7581", "base_token_price_usd": "0.0199908498069763", "volume_usd": {"h24": "21813099.1334268"}, "price_change_percentage": {"h24": "-10.013"}}, "relationships": {"base_token": {"data": {"id": "base_0x07b3d902783c3c12b077508c3b5c00113d1291d0", "type": "token"}}}}, {"attributes": {"name": "SOL / USDC 0.035%", "reserve_in_usd": "691608.3345", "base_token_price_usd": "118.4936366582", "volume_usd": {"h24": "7238471.92596665"}, "price_change_percentage": {"h24": "-0.525"}}, "relationships": {"base_token": {"data": {"id": "base_0x311935cd80b76769bf2ecc9d8ab7635b2139cf82", "type": "token"}}}}], "included": [{"id": "base_0x07b3d902783c3c12b077508c3b5c00113d1291d0", "attributes": {"address": "0x07b3d902783c3c12b077508c3b5c00113d1291d0", "name": "Doppler Finance", "symbol": "xdp", "decimals": 18, "image_url": "https://coin-images.coingecko.com/coins/images/102175227/large/03_Doppler_Symbol_Gradient_onDark_withBG.png?1785842913", "coingecko_coin_id": "doppler-finance"}}, {"id": "base_0x0cbf291ba052174879d90bf781df1a5f2bc5bb07", "attributes": {"address": "0x0cbf291ba052174879d90bf781df1a5f2bc5bb07", "name": "boar", "symbol": "boar", "decimals": 18, "image_url": "https://coin-images.coingecko.com/coins/images/102178848/large/w81p1dsba20f2viocdhmy2c5ek1n.?1790493250", "coingecko_coin_id": "boar"}}, {"id": "base_0x940181a94a35a4569e4529a3cdfb74e38fd98631", "attributes": {"address": "0x940181a94a35a4569e4529a3cdfb74e38fd98631", "name": "Aerodrome", "symbol": "AERO", "decimals": 18, "image_url": "https://coin-images.coingecko.com/coins/images/31745/large/token.png?1696530564", "coingecko_coin_id": "aerodrome-finance"}}, {"id": "base_0x311935cd80b76769bf2ecc9d8ab7635b2139cf82", "attributes": {"address": "0x311935cd80b76769bf2ecc9d8ab7635b2139cf82", "name": "Solana", "symbol": "SOL", "decimals": 9, "image_url": "https://coin-images.coingecko.com/coins/images/71099/large/solana.jpg?1765793164", "coingecko_coin_id": "base-bridged-sol-base"}}]}"#).unwrap();
+        // boar isn't on CoinGecko here, and Atlas already lists AERO.
+        let listed = |address: &str| address != "0x0cbf291ba052174879d90bf781df1a5f2bc5bb07";
+        let taken = ["AERO".to_string()].into_iter().collect();
+        let found = trending_base_assets(&body, listed, &taken);
+        let symbols: Vec<&str> = found.iter().map(|(a, _)| a.symbol.as_str()).collect();
+        // SOL is a bridged copy: never a second SOL row.
+        assert_eq!(symbols, ["xdp"]);
+        let (xdp, coingecko) = &found[0];
+        assert_eq!(xdp.id, "base:0x07b3d902783c3c12b077508c3b5c00113d1291d0");
+        assert_eq!(xdp.chain, "base");
+        assert_eq!(xdp.decimals, 18);
+        assert!(xdp.verified && xdp.listed);
+        assert!(xdp
+            .icon_url
+            .as_deref()
+            .is_some_and(|u| u.starts_with("https://")));
+        assert!(xdp.change_24h < 0.0 && xdp.volume_24h > 0.0);
+        assert_eq!(coingecko.as_deref(), Some("doppler-finance"));
+        // Thin pools stay out, whatever else is true of them.
+        let mut thin = body.clone();
+        for pool in thin["data"].as_array_mut().unwrap() {
+            pool["attributes"]["reserve_in_usd"] = json!("50000");
+        }
+        assert!(trending_base_assets(&thin, |_| true, &Default::default()).is_empty());
+    }
+
+    // Network: a Base token found by its address, priced and quoted both ways (nothing is sent).
+    // cargo test -p engine-service live_base_tokens -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn live_base_tokens() {
+        let markets = MarketState::new().unwrap();
+        let degen = pasted_base_token(&markets, "0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed")
+            .await
+            .unwrap()
+            .unwrap();
+        println!(
+            "{} ({}), {} decimals, icon {:?}",
+            degen.name, degen.symbol, degen.decimals, degen.icon_url
+        );
+        assert_eq!(degen.id, "base:0x4ed4e862860bed51a9570b96d89af5e1b0efefed");
+        assert_eq!(degen.symbol, "DEGEN");
+        assert_eq!(
+            find_asset(&markets, &degen.id).await.unwrap().token,
+            degen.token
+        );
+        let rate = base_rate(&markets, &degen).await.unwrap();
+        println!("$1 buys {:.2} DEGEN", rate as f64 / 1e18);
+        let back = base_quote(&markets, &degen, "sell", rate / 2)
+            .await
+            .unwrap();
+        println!(
+            "half of that sells for ${:.4} (fee {} ppm)",
+            back.amount_out as f64 / 1e6,
+            back.fee_ppm
+        );
+        assert!(back.amount_out > 400_000 && back.amount_out < 520_000);
+        // A coin on the fixed list keeps its row; cash, gas and a wallet aren't tokens to trade.
+        let brett = find_asset(&markets, "base:0x532f27101965dd16442e59d40670faf5ebb142e4")
+            .await
+            .unwrap();
+        assert_eq!(brett.id, "brett-base");
+        assert!(pasted_base_token(&markets, BASE_USDC)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(pasted_base_token(&markets, BASE_WETH)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            pasted_base_token(&markets, "0x4838b106fce9647bdf1e7877bf73ce8b0bad5f97")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[test]
     fn jupiter_chart_candles_become_points() {
         let body = json!({"candles":[

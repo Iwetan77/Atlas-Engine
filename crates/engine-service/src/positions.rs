@@ -299,14 +299,9 @@ async fn valued(
                 (held as f64 / 10f64.powi(asset.decimals as i32) * usd * 1_000_000.0) as u128,
             )
         } else {
-            let Ok((_, per_dollar, _)) =
-                markets::venue_quote(markets, asset, "buy", 1_000_000).await
-            else {
+            let Some(per_dollar) = markets::base_rate(markets, asset).await else {
                 continue;
             };
-            if per_dollar == 0 {
-                continue;
-            }
             (
                 json!(markets::unit_price(
                     1_000_000,

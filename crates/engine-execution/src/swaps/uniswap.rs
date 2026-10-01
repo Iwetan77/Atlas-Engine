@@ -172,16 +172,51 @@ impl UniswapV3Client {
         source_token: &str,
         sender: &str,
     ) -> Result<u128, UniswapV3Error> {
+        self.allowance_to(source_token, sender, SWAP_ROUTER_02)
+            .await
+    }
+
+    /// Read the sender's ERC-20 allowance to `spender` (a swap router).
+    pub async fn allowance_to(
+        &self,
+        source_token: &str,
+        sender: &str,
+        spender: &str,
+    ) -> Result<u128, UniswapV3Error> {
         let token = address_bytes(source_token)?;
         let owner = address_bytes(sender)?;
         self.check_chain().await?;
         let mut data = selector("allowance(address,address)").to_vec();
         data.extend_from_slice(&address_word(owner));
-        data.extend_from_slice(&address_word(address_bytes(SWAP_ROUTER_02)?));
+        data.extend_from_slice(&address_word(address_bytes(spender)?));
         let result = self
             .eth_call(&hex_prefixed(&token), &hex_prefixed(&data))
             .await?;
         decode_first_u128(&result)
+    }
+
+    /// An ERC-20's name, symbol and decimals, read from the contract. Strings may come back as
+    /// ABI strings or as bytes32 (older tokens).
+    pub async fn token_info(&self, token: &str) -> Result<(String, String, u32), UniswapV3Error> {
+        let token = hex_prefixed(&address_bytes(token)?);
+        self.check_chain().await?;
+        let [name, symbol, decimals] = ["name()", "symbol()", "decimals()"]
+            .map(|signature| hex_prefixed(&selector(signature)));
+        let (name, symbol, decimals) = tokio::join!(
+            self.eth_call(&token, &name),
+            self.eth_call(&token, &symbol),
+            self.eth_call(&token, &decimals),
+        );
+        let decimals = u32::try_from(decode_first_u128(&decimals?)?)
+            .ok()
+            .filter(|d| *d <= 36)
+            .ok_or(UniswapV3Error::InvalidRpcResponse)?;
+        let symbol = decode_text(&symbol?).ok_or(UniswapV3Error::InvalidRpcResponse)?;
+        let name = name
+            .ok()
+            .and_then(|n| decode_text(&n))
+            .unwrap_or_else(|| symbol.clone());
+        Ok((name, symbol, decimals))
     }
 
     /// Build a direct ERC-20 transfer; the user wallet signs and sends it.
@@ -219,13 +254,24 @@ impl UniswapV3Client {
         sender: &str,
         amount: u128,
     ) -> Result<EvmUnsignedTransaction, UniswapV3Error> {
+        self.approval_to(source_token, sender, SWAP_ROUTER_02, amount)
+    }
+
+    /// An exact-amount approval for `spender` (a swap router), never an unlimited one.
+    pub fn approval_to(
+        &self,
+        source_token: &str,
+        sender: &str,
+        spender: &str,
+        amount: u128,
+    ) -> Result<EvmUnsignedTransaction, UniswapV3Error> {
         if amount == 0 {
             return Err(UniswapV3Error::InvalidRequest);
         }
         let token = address_bytes(source_token)?;
         let owner = address_bytes(sender)?;
         let mut data = selector("approve(address,uint256)").to_vec();
-        data.extend_from_slice(&address_word(address_bytes(SWAP_ROUTER_02)?));
+        data.extend_from_slice(&address_word(address_bytes(spender)?));
         data.extend_from_slice(&uint_word(amount));
         Ok(EvmUnsignedTransaction {
             from: hex_prefixed(&owner),
@@ -316,6 +362,28 @@ fn decode_quote(result: &str) -> Result<(u128, u128), UniswapV3Error> {
     Ok((decode_word(&bytes[0..32])?, decode_word(&bytes[96..128])?))
 }
 
+// An ABI string (offset, length, bytes) or a bytes32, as printable text without padding.
+fn decode_text(result: &str) -> Option<String> {
+    let bytes = from_hex(result).ok()?;
+    let raw: Vec<u8> = if bytes.len() == 32 {
+        bytes.into_iter().take_while(|b| *b != 0).collect()
+    } else {
+        let word = |at: usize| -> Option<usize> {
+            let w = bytes.get(at..at + 32)?;
+            w[..24]
+                .iter()
+                .all(|b| *b == 0)
+                .then(|| usize::try_from(u64::from_be_bytes(w[24..].try_into().ok()?)).ok())?
+        };
+        let start = word(0)?;
+        let length = word(start)?;
+        bytes.get(start + 32..start + 32 + length)?.to_vec()
+    };
+    let text = String::from_utf8(raw).ok()?;
+    let text = text.trim();
+    (!text.is_empty() && text.len() <= 64 && !text.chars().any(char::is_control))
+        .then(|| text.to_string())
+}
 fn decode_first_u128(result: &str) -> Result<u128, UniswapV3Error> {
     let bytes = from_hex(result)?;
     if bytes.len() != 32 {
@@ -394,6 +462,23 @@ fn hex_prefixed(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_names_decode_from_abi_strings_and_bytes32() {
+        // symbol() of BRETT on Base: an ABI string "BRETT".
+        let abi = "0x0000000000000000000000000000000000000000000000000000000000000020\
+                   0000000000000000000000000000000000000000000000000000000000000005\
+                   4252455454000000000000000000000000000000000000000000000000000000";
+        assert_eq!(decode_text(abi).as_deref(), Some("BRETT"));
+        // An older token's bytes32 symbol ("MKR").
+        let short = "0x4d4b520000000000000000000000000000000000000000000000000000000000";
+        assert_eq!(decode_text(short).as_deref(), Some("MKR"));
+        assert_eq!(decode_text("0x"), None);
+        assert_eq!(
+            decode_text("0x0000000000000000000000000000000000000000000000000000000000000000"),
+            None
+        );
+    }
 
     #[test]
     fn abi_selectors_match_known_contract_methods() {

@@ -246,9 +246,28 @@ pub(super) async fn balance(
             .ok_or((StatusCode::BAD_GATEWAY, "balance overflow".into()))?;
     }
     let catalog = markets::catalog(&state.markets).await?;
-    // Base assets: read each, valued through the same live venue route as the trade preview.
-    // Valuation is indicative; a missing route fails explicitly instead of an incomplete total.
-    for asset in catalog.iter().filter(|a| a.chain == "base") {
+    // Base assets: the fixed list, plus every other Base token they bought through Atlas (found by
+    // its address). Each is read and valued through the same live route as the trade preview.
+    // Valuation is indicative; a missing route on the fixed list fails explicitly instead of an
+    // incomplete total, while a pasted token nobody can price any more is left out.
+    let mut base_assets: Vec<(markets::Asset, bool)> = catalog
+        .iter()
+        .filter(|a| a.chain == "base")
+        .map(|a| (a.clone(), true))
+        .collect();
+    if let Ok(trades) = state.trades.for_user(&user.user_id).await {
+        for id in base_tokens_bought(&trades) {
+            if let Ok(asset) = markets::find_asset(&state.markets, id).await {
+                if !base_assets
+                    .iter()
+                    .any(|(a, _)| a.token.eq_ignore_ascii_case(&asset.token))
+                {
+                    base_assets.push((asset, false));
+                }
+            }
+        }
+    }
+    for (asset, fixed) in &base_assets {
         let units = state
             .markets
             .base
@@ -258,8 +277,15 @@ pub(super) async fn balance(
         if units == 0 {
             continue;
         }
-        let (_, one_dollar_units, _) =
-            markets::venue_quote(&state.markets, asset, "buy", 1_000_000).await?;
+        let Some(one_dollar_units) = markets::base_rate(&state.markets, asset).await else {
+            if *fixed {
+                return Err(markets::unavailable(format!(
+                    "Couldn't price {} right now",
+                    asset.symbol
+                )));
+            }
+            continue;
+        };
         let value_usdc = indicative_usdc_value(units, one_dollar_units)?;
         total = total
             .checked_add(value_usdc)
@@ -592,6 +618,18 @@ pub(super) async fn verified_wallets(
     Ok(user)
 }
 
+// The Base tokens outside the fixed list someone has traded through Atlas, once each.
+fn base_tokens_bought(trades: &[positions::Trade]) -> Vec<&str> {
+    let mut ids: Vec<&str> = trades
+        .iter()
+        .map(|t| t.asset_id.as_str())
+        .filter(|id| id.starts_with("base:"))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 fn catalog_holding(
     asset: &markets::Asset,
     units: u128,
@@ -719,6 +757,26 @@ mod tests {
             1_000_000_000
         );
         assert!(indicative_usdc_value(1, 0).is_err());
+        let trade = |asset_id: &str| positions::Trade {
+            intent_id: "i".into(),
+            user_id: "u".into(),
+            asset_id: asset_id.into(),
+            side: "buy".into(),
+            token_units: 1,
+            usdc_units: 1,
+            tx_id: None,
+            filled_at_ms: 0,
+        };
+        let trades = [
+            trade("base:0x4ed4e862860bed51a9570b96d89af5e1b0efefed"),
+            trade("brett-base"),
+            trade("So11111111111111111111111111111111111111112"),
+            trade("base:0x4ed4e862860bed51a9570b96d89af5e1b0efefed"),
+        ];
+        assert_eq!(
+            base_tokens_bought(&trades),
+            vec!["base:0x4ed4e862860bed51a9570b96d89af5e1b0efefed"]
+        );
     }
     #[test]
     fn rates_and_money_use_integer_arithmetic() {

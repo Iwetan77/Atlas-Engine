@@ -121,6 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // Perps run on Hyperliquid.
     hl::keep_warm(state.clone());
+    markets::keep_base_trending_warm(state.clone());
     let perps_routes = Router::new()
         .route(
             "/v1/perps/onboarding",

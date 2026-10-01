@@ -170,7 +170,7 @@ impl NearState {
             monad_rpc: env_url("ATLAS_MONAD_MAINNET_RPC_URL", "https://rpc.monad.xyz").parse()?,
         })
     }
-    async fn listed(&self) -> Arc<Listed> {
+    pub(super) async fn listed(&self) -> Arc<Listed> {
         let last = self.listed.lock().ok().and_then(|held| held.clone());
         if let Some((until, listed)) = &last {
             if Instant::now() < *until {

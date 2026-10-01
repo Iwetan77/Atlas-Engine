@@ -55,7 +55,8 @@ network loses money.
 |---|---|
 | **Privy** | Sign-in, the user's embedded wallets, and signing under the user's own login (JWT) for the few things only a server can do: relaying a Base transaction they confirmed, a gasless USDC authorization, a CoW top-up, a Sui swap. |
 | **Jupiter** | Solana spot: ~350 verified assets (memes, xStocks, crypto), gasless orders, price charts, Jupiter Lend savings. |
-| **Uniswap v3** | A few Base assets. |
+| **KyberSwap** | Base swaps: searches every exchange for the best route (router pinned, every built swap decoded and checked: amount in, no fees, pays the user). Any Base token by pasting its address; trending Base coins (GeckoTerminal, CoinGecko-listed only) in Trade. |
+| **Uniswap v3** | Base swaps when Kyber can't answer (one direct pool). |
 | **NEAR Intents 1Click** | Buys on other chains (Sui, NEAR, Monad…), paid from Base cash or, when Base can't cover it, Solana cash; deposits from 23 networks and coins; SUI cashouts. |
 | **Cetus** | Sui coins 1Click doesn't list (DEEP…): 1Click delivers SUI, then Cetus swaps it in the user's own Sui wallet. |
 | **Relay** | Base → Solana cash moves (one EIP-3009 signature, the solver pays gas), and Atlas Link payouts. |
@@ -109,7 +110,7 @@ flowchart LR
   APP -->|signs plans| PRIVYW[(User's Privy wallets)]
   API -->|user's JWT only| BRIDGE[privy-bridge<br/>Node, loopback]
   BRIDGE --> PRIVY[Privy]
-  API --> JUP[Jupiter] & UNI[Uniswap v3] & ONECLICK[NEAR Intents 1Click]
+  API --> JUP[Jupiter] & KYBER[KyberSwap] & UNI[Uniswap v3] & ONECLICK[NEAR Intents 1Click]
   API --> RELAY[Relay] & LS[Layerswap] & COW[CoW Protocol]
   API --> HL[Hyperliquid] & EARN[Morpho · Aave · Jupiter Lend · Jito]
   BRIDGE --> CETUS[Cetus / Sui]
@@ -232,6 +233,7 @@ Every ✅ has a live call or a reproducible check behind it.
 | Check | Status |
 |---|---|
 | Jupiter catalog, quotes, gasless orders, charts; trending per kind | ✅ live |
+| KyberSwap on Base: route and build decoded (router, amount, receiver, minimum); pasted Base tokens (DEGEN) priced both ways | ✅ live; ⏳ funded |
 | Relay Base → Solana: exact-output quote, one EIP-3009 signature, fee ~$0.035 | ✅ live quotes; ⏳ funded move |
 | CoW gas top-up: permit pre-hook and order signature accepted by CoW's orderbook | ✅ (a throwaway key fails only on balance) |
 | Layerswap Solana → Base with refuel | ✅ live swaps created; ⏳ funded |
