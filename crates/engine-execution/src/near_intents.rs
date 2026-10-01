@@ -123,6 +123,10 @@ pub struct Status {
 #[serde(rename_all = "camelCase")]
 pub struct SwapDetails {
     #[serde(default)]
+    pub origin_chain_tx_hashes: Vec<ChainTx>,
+    #[serde(default)]
+    pub near_tx_hashes: Vec<String>,
+    #[serde(default)]
     pub destination_chain_tx_hashes: Vec<ChainTx>,
 }
 #[derive(Clone, Debug, Deserialize)]
@@ -226,6 +230,19 @@ mod tests {
             result.swap_details.unwrap().destination_chain_tx_hashes[0].hash,
             "0xabc"
         );
+    }
+    #[test]
+    fn status_carries_every_hop() {
+        // Shape from 1Click's OpenAPI (GET /v0/status swapDetails).
+        let result: Status = serde_json::from_value(serde_json::json!({
+            "status":"SUCCESS","swapDetails":{
+                "originChainTxHashes":[{"hash":"0xsui","explorerUrl":"https://suiscan.xyz/mainnet/tx/0xsui"}],
+                "nearTxHashes":["Near1"],
+                "destinationChainTxHashes":[{"hash":"5sol","explorerUrl":"https://solscan.io/tx/5sol"}]}}))
+        .unwrap();
+        let details = result.swap_details.unwrap();
+        assert_eq!(details.origin_chain_tx_hashes[0].hash, "0xsui");
+        assert_eq!(details.near_tx_hashes, vec!["Near1"]);
     }
     #[test]
     fn quote_request_is_exact_input_and_origin_chain() {

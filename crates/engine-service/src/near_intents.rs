@@ -1,6 +1,6 @@
 use super::*;
 use base64::Engine;
-use engine_execution::near_intents::{Client, QuoteRequest, Token};
+use engine_execution::near_intents::{ChainTx, Client, QuoteRequest, Token};
 use engine_execution::swaps::uniswap::BASE_USDC;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1278,7 +1278,40 @@ pub(super) async fn deposit_status(
         "REFUNDED" => "refunded",
         _ => "failed",
     };
-    Ok(Json(json!({"state": state_name})))
+    // Each hop's transactions with links to see them: the deposit on its own chain, the swap on
+    // NEAR, the payout on Solana. Only https links pass.
+    let details = status.swap_details.as_ref();
+    let hop = |txs: &[ChainTx]| -> Vec<Value> {
+        txs.iter()
+            .filter(|t| t.hash.len() <= 128)
+            .map(|t| {
+                let url = t
+                    .explorer_url
+                    .as_deref()
+                    .filter(|u| u.starts_with("https://") && u.len() <= 300);
+                json!({"hash": t.hash, "url": url})
+            })
+            .collect()
+    };
+    let near_hop: Vec<Value> = details
+        .map(|d| {
+            d.near_tx_hashes
+                .iter()
+                .filter(|h| {
+                    !h.is_empty() && h.len() <= 64 && h.bytes().all(|b| b.is_ascii_alphanumeric())
+                })
+                .map(|h| json!({"hash": h, "url": format!("https://nearblocks.io/txns/{h}")}))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Json(json!({
+        "state": state_name,
+        "journey": {
+            "deposit": details.map(|d| hop(&d.origin_chain_tx_hashes)).unwrap_or_default(),
+            "swap": near_hop,
+            "payout": details.map(|d| hop(&d.destination_chain_tx_hashes)).unwrap_or_default(),
+        }
+    })))
 }
 
 fn sui_coin_type(value: &str) -> bool {

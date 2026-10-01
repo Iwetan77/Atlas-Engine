@@ -538,6 +538,10 @@ struct PlannedTrade {
     get_units: u128,
     // Base: the token the wallet receives (lowercase), read from the swap receipt.
     receive_token: String,
+    // A Base buy whose swap /next handed out: the wallet's next nonce then. Once the wallet has moved
+    // past it, those transactions went out, and no fresh swap is handed out again.
+    #[serde(default)]
+    handed_nonce: Option<u64>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2584,6 +2588,7 @@ pub(super) async fn plan_solana_swap_with_base_cash(
                     pay_units: amount,
                     get_units: 0,
                     receive_token: String::new(),
+                    handed_nonce: None,
                 }),
                 funding: Some(cash),
                 buy_mint: Some(buy_mint.into()),
@@ -2952,6 +2957,7 @@ pub(super) async fn execute_quote(
                     } else {
                         BASE_USDC.to_ascii_lowercase()
                     },
+                    handed_nonce: None,
                 }),
                 funding,
                 buy_mint: None,
@@ -3517,6 +3523,20 @@ pub(super) async fn next_transactions(
     Ok(Json(json!({ "transactions": transactions })))
 }
 
+// The wallet's next nonce on Base, counting transactions still waiting to be mined.
+async fn wallet_nonce(state: &AppState, wallet: &str) -> Result<u64, ApiError> {
+    let count = base_rpc(
+        &state.markets,
+        "eth_getTransactionCount",
+        json!([wallet, "pending"]),
+    )
+    .await?;
+    count
+        .as_str()
+        .and_then(|hex| u64::from_str_radix(hex.trim_start_matches("0x"), 16).ok())
+        .ok_or_else(|| unavailable("Base nonce unavailable"))
+}
+
 // The second step of a Base buy paid with Solana cash: once the cash has landed, a fresh swap (and an
 // approval when the router needs one) for what arrived, for the app to send without asking again.
 // The plan becomes these transactions, which /signed and status check as usual.
@@ -3531,6 +3551,15 @@ async fn base_buy_after_move(
         .ok_or_else(|| unavailable("intent has no trade"))?;
     let asset = find_asset(&state.markets, &plan.asset_id).await?;
     let wallet = intent.wallet.clone();
+    // Handed out before and the wallet has sent since: those went out (the app's report of them
+    // was lost). A fresh swap now would buy twice; the app reports what it sent instead.
+    let nonce = wallet_nonce(state, &wallet).await?;
+    if plan.handed_nonce.is_some_and(|handed| nonce > handed) {
+        return Err((
+            StatusCode::CONFLICT,
+            "This buy was already sent; it's settling.".into(),
+        ));
+    }
     // Relay reports the move done as it fills; Base nodes can be a block behind, so give the cash
     // (and any gas with it) a few seconds to show.
     let mut cash = 0;
@@ -3606,6 +3635,7 @@ async fn base_buy_after_move(
     if let Some(trade) = intent.trade.as_mut() {
         trade.pay_units = fresh.amount_in;
         trade.get_units = fresh.amount_out;
+        trade.handed_nonce = Some(nonce);
     }
     state.markets.save_intent(intent_id, intent).await?;
     Ok(txs
@@ -3704,6 +3734,7 @@ mod tests {
                 pay_units: pay,
                 get_units: get,
                 receive_token: String::new(),
+                handed_nonce: None,
             }),
             funding: None,
             buy_mint: None,
