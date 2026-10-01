@@ -836,6 +836,7 @@ async fn bridge(
         .ok_or("Privy access token required")?;
     let mut request = body;
     request["accessToken"] = json!(token);
+    request["identityToken"] = json!(app_balance::identity_token(headers));
     request["walletAddress"] = json!(wallet);
     let response = http
         .post(format!("{bridge_url}/hyperliquid/{route}"))

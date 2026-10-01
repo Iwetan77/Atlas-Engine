@@ -84,7 +84,8 @@ pub(super) async fn evm(
     let response = http
         .post(format!("{bridge_url}/relay/evm-transaction"))
         .json(
-            &json!({"accessToken":token,"walletAddress":wallet,"chainId":req.chain_id,
+            &json!({"accessToken":token,"identityToken":app_balance::identity_token(&headers),
+            "walletAddress":wallet,"chainId":req.chain_id,
             "to":to,"data":data,"idempotencyKey":idempotency_key}),
         )
         .send()

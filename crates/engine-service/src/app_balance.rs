@@ -47,7 +47,55 @@ pub(super) struct AppBalanceResponse {
     total_usd: String,
     pending: Option<Money>,
     holdings: Vec<Holding>,
+    // The gas tanks: what pays network fees on each chain. Not counted in `total`; Profile shows it.
+    gas: Vec<GasTank>,
     as_of_unix_ms: u128,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct GasTank {
+    chain: &'static str,
+    symbol: &'static str,
+    amount: String,
+    value: Money,
+}
+
+// The user's Privy identity token, when the app sent one: Privy's server-side signing as the user
+// takes it (the bridge checks it's the same user as the access token).
+pub(super) fn identity_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("privy-id-token")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty() && v.len() < 8192)
+        .map(str::to_string)
+}
+
+// Ether's price, read through its Solana twin (Portal ETH) the way SOL's is read.
+const PORTAL_ETH_MINT: &str = "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs";
+
+// SOL the user bought through Atlas and still holds on net: the rest of the native SOL is the gas
+// tank Atlas fills for Solana fees.
+async fn sol_bought(state: &AppState, user_id: &str, catalog: &[markets::Asset]) -> u128 {
+    let Some(sol) = catalog
+        .iter()
+        .find(|a| a.chain == "solana" && a.token == markets::SOL_MINT)
+    else {
+        return 0;
+    };
+    let Ok(trades) = state.trades.for_user(user_id).await else {
+        return 0;
+    };
+    trades
+        .iter()
+        .filter(|t| t.asset_id == sol.id)
+        .fold(0u128, |net, t| {
+            if t.side == "buy" {
+                net.saturating_add(t.token_units)
+            } else {
+                net.saturating_sub(t.token_units)
+            }
+        })
 }
 
 const ARC_USDC: &str = "0x3600000000000000000000000000000000000000";
@@ -232,6 +280,9 @@ pub(super) async fn balance(
     );
     let mut held = held.map_err(internal)?;
     let native_sol = native_sol.map_err(internal)?;
+    // Native SOL beyond what they bought is gas: off the asset list and out of the total.
+    let gas_sol = native_sol.saturating_sub(sol_bought(&state, &user.user_id, &catalog).await);
+    let native_sol = native_sol - gas_sol;
     if native_sol > 0 {
         match held
             .iter_mut()
@@ -411,6 +462,7 @@ pub(super) async fn balance(
             icon_url: state.near.icon_for(&asset),
         });
     }
+    let gas = gas_tanks(&state, gas_sol, &evm, &currency, rate).await?;
     let as_of_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(internal)?
@@ -420,8 +472,45 @@ pub(super) async fn balance(
         total_usd: usd(total),
         pending: None,
         holdings,
+        gas,
         as_of_unix_ms,
     }))
+}
+
+// Solana's tank (`sol` lamports) and Base's (the wallet's ETH), valued at live prices. A tank that
+// can't be priced right now is still listed, at zero.
+async fn gas_tanks(
+    state: &AppState,
+    sol: u128,
+    evm: &str,
+    currency: &str,
+    rate: u128,
+) -> Result<Vec<GasTank>, ApiError> {
+    let eth = markets::base_eth(state, evm).await.unwrap_or(0);
+    let mints = [markets::SOL_MINT.to_string(), PORTAL_ETH_MINT.to_string()];
+    let prices = markets::usd_prices(&state.markets, &mints)
+        .await
+        .unwrap_or_default();
+    let worth = |units: u128, decimals: i32, mint: &str| {
+        prices
+            .get(mint)
+            .map(|(usd, _)| (units as f64 / 10f64.powi(decimals) * usd * 1_000_000.0) as u128)
+            .unwrap_or(0)
+    };
+    Ok(vec![
+        GasTank {
+            chain: "solana",
+            symbol: "SOL",
+            amount: markets::format_units(sol, 9),
+            value: money(worth(sol, 9, markets::SOL_MINT), currency, rate)?,
+        },
+        GasTank {
+            chain: "base",
+            symbol: "ETH",
+            amount: markets::format_units(eth, 18),
+            value: money(worth(eth, 18, PORTAL_ETH_MINT), currency, rate)?,
+        },
+    ])
 }
 
 fn indicative_usdc_value(units: u128, one_dollar_units: u128) -> Result<u128, ApiError> {

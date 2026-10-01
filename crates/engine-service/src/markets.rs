@@ -2168,7 +2168,7 @@ pub(super) const GAS_NOT_READY: &str =
 // What Layerswap's refuel turns into ETH on an empty tank's first hop from Solana.
 const BASE_REFUEL_USDC: u128 = 500_000;
 
-async fn base_eth(state: &AppState, wallet: &str) -> Option<u128> {
+pub(super) async fn base_eth(state: &AppState, wallet: &str) -> Option<u128> {
     let result = base_rpc(&state.markets, "eth_getBalance", json!([wallet, "latest"]))
         .await
         .ok()?;

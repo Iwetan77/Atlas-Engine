@@ -1311,6 +1311,7 @@ async fn bridge(
             "Privy access token required".into(),
         ))?;
     body["accessToken"] = json!(access_token);
+    body["identityToken"] = json!(app_balance::identity_token(headers));
     let response = http
         .post(format!("{bridge_url}{path}"))
         .timeout(Duration::from_secs(90))

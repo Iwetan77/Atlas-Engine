@@ -26,7 +26,10 @@ pub(super) async fn sign(
         .ok_or("Privy access token required")?;
     let response = http
         .post(format!("{bridge_url}/evm/sign-authorization"))
-        .json(&json!({"accessToken":token,"walletAddress":wallet,"typedData":typed_data}))
+        .json(
+            &json!({"accessToken":token,"identityToken":app_balance::identity_token(headers),
+            "walletAddress":wallet,"typedData":typed_data}),
+        )
         .send()
         .await
         .map_err(|_| "Privy signing unavailable".to_string())?;

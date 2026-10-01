@@ -124,6 +124,17 @@ const server = createServer(async (request, response) => {
     if (typeof userId !== 'string' || !userId.startsWith('did:privy:')) {
       throw new Error('invalid identity');
     }
+    // Signing as the user: Privy exchanges the user's identity token (not the access token) for a
+    // key to their wallets. Only the same user's identity token is used; else the access token.
+    let userJwt = accessToken;
+    if (typeof input.identityToken === 'string' && input.identityToken) {
+      try {
+        const identity = await privy.utils().auth().verifyIdentityToken(input.identityToken);
+        if (identity?.id === userId) userJwt = input.identityToken;
+      } catch {
+        // An expired or foreign identity token: fall back to the access token.
+      }
+    }
     let user;
     try {
       user = await privy.users()._get(userId);
@@ -191,7 +202,7 @@ const server = createServer(async (request, response) => {
           rawSign: async (hex) => {
             const signed = await privy.wallets().rawSign(wallet.id, {
               params: {bytes: hex, encoding: 'hex', hash_function: 'blake2b256'},
-              authorization_context: {user_jwts: [accessToken]},
+              authorization_context: {user_jwts: [userJwt]},
             });
             return signed.signature;
           },
@@ -230,7 +241,7 @@ const server = createServer(async (request, response) => {
           rawSign: async (hex) => {
             const signed = await privy.wallets().rawSign(wallet.id, {
               params: {bytes: hex, encoding: 'hex', hash_function: 'blake2b256'},
-              authorization_context: {user_jwts: [accessToken]},
+              authorization_context: {user_jwts: [userJwt]},
             });
             return signed.signature;
           },
@@ -276,7 +287,7 @@ const server = createServer(async (request, response) => {
           params: {transaction: {to, data, value: '0x0', chain_id: chainId}},
           sponsor: false,
           idempotency_key: idempotencyKey,
-          authorization_context: {user_jwts: [accessToken]},
+          authorization_context: {user_jwts: [userJwt]},
         });
         send(response, 200, {userId, walletAddress: evmWallet, hash: sent.hash});
       } catch (error) {
@@ -297,7 +308,7 @@ const server = createServer(async (request, response) => {
       try {
         const signed = await privy.wallets().ethereum().signTypedData(evm.id, {
           params: {typed_data: typedData},
-          authorization_context: {user_jwts: [accessToken]},
+          authorization_context: {user_jwts: [userJwt]},
         });
         checkSignature(typedData, signed.signature, evmWallet);
         send(response, 200, {userId, walletAddress: evmWallet, signature: signed.signature});
@@ -317,7 +328,7 @@ const server = createServer(async (request, response) => {
         if (hlRoute === 'approve') {
           const signed = await privy.wallets().ethereum().signTypedData(evm.id, {
             params: {typed_data: approveTypedData(agent.address, nonce)},
-            authorization_context: {user_jwts: [accessToken]},
+            authorization_context: {user_jwts: [userJwt]},
           });
           const signature = checkApproval(agent.address, nonce, signed.signature, evmWallet);
           return answer(await hlPost({action: approveAction(agent.address, nonce), nonce, signature}));

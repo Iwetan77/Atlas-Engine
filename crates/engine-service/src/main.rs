@@ -308,7 +308,11 @@ fn configured_cors() -> Result<Option<CorsLayer>, Box<dyn std::error::Error>> {
         CorsLayer::new()
             .allow_origin(AllowOrigin::list(origins))
             .allow_methods([Method::GET, Method::POST])
-            .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]),
+            .allow_headers([
+                header::AUTHORIZATION,
+                header::CONTENT_TYPE,
+                header::HeaderName::from_static("privy-id-token"),
+            ]),
     ))
 }
 

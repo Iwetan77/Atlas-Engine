@@ -958,7 +958,8 @@ async fn signed_bridge(
     let AuthMode::Privy { bridge_url, http } = &state.auth else {
         return Err(unavailable("Privy signer unavailable"));
     };
-    let mut input = json!({"accessToken":access_token(headers)?,"walletAddress":wallet});
+    let mut input = json!({"accessToken":access_token(headers)?,
+        "identityToken":app_balance::identity_token(headers),"walletAddress":wallet});
     if let (Some(to), Some(from)) = (input.as_object_mut(), details.as_object()) {
         for (k, v) in from {
             to.insert(k.clone(), v.clone());
