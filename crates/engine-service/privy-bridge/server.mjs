@@ -7,6 +7,7 @@ import {quoteSwap, swapFromSui, prepareSuiCashout, transferSui} from './sui-swap
 import {checkSignature, signable, signForEscrow} from './base-authorization.mjs';
 import {agentFor, approveAction, approveTypedData, checkApproval, leverageAction, orderAction, post as hlPost,
   signAsAgent} from './hyperliquid.mjs';
+import {cashOut} from './hyperliquid-cashout.mjs';
 
 const SUI_COIN_TYPE = /^0x[0-9a-fA-F]{1,64}::[A-Za-z_][A-Za-z0-9_]*::[A-Za-z_][A-Za-z0-9_]*$/;
 const POSITIVE_INTEGER = /^[1-9][0-9]{0,30}$/;
@@ -93,7 +94,7 @@ const server = createServer(async (request, response) => {
   const signEscrow = request.method === 'POST' && request.url === '/escrow/sign-authorization';
   const hlRoute = request.method === 'POST' && request.url.startsWith('/hyperliquid/') ?
     request.url.slice('/hyperliquid/'.length) : null;
-  const hyperliquid = ['agent', 'approve', 'leverage', 'order'].includes(hlRoute);
+  const hyperliquid = ['agent', 'approve', 'leverage', 'order', 'cashout'].includes(hlRoute);
   const suiQuote = request.method === 'POST' && request.url === '/sui/quote';
   const suiSwap = request.method === 'POST' && request.url === '/sui/swap';
   const suiCashoutPrepare = request.method === 'POST' && request.url === '/sui/cashout/prepare';
@@ -318,12 +319,30 @@ const server = createServer(async (request, response) => {
       return;
     }
     // Hyperliquid, for the user's own account (their EVM wallet): their Atlas agent signs trades; their
-    // own session signs only the one-time approval of that agent (hyperliquid.mjs).
+    // own session signs only the one-time approval of that agent (hyperliquid.mjs) and a cash-out to
+    // their own Solana or Base wallet (hyperliquid-cashout.mjs).
     if (hyperliquid) {
       const agent = agentFor(appSecret, userId, evmWallet);
       const answer = (result) => send(response, 200, {userId, walletAddress: evmWallet, agentAddress: agent.address, result});
       try {
         if (hlRoute === 'agent') return answer(null);
+        if (hlRoute === 'cashout') {
+          // Paid out only to this user's own wallet, never to an address the engine passes.
+          const recipient = {solana: solanaWallet, base: evmWallet}[input.to];
+          if (!recipient) {
+            send(response, 400, {error: 'no wallet to pay out to'});
+            return;
+          }
+          return answer(await cashOut({
+            wallet: evmWallet, recipient, to: input.to, amount: String(input.amount ?? ''),
+            relayKey: process.env.RELAY_API_KEY,
+            signTyped: async (typed) => (await privy.wallets().ethereum().signTypedData(evm.id, {
+              params: {typed_data: typed},
+              authorization_context: {user_jwts: [userJwt]},
+            })).signature,
+            post: hlPost,
+          }));
+        }
         const nonce = nextNonce();
         if (hlRoute === 'approve') {
           const signed = await privy.wallets().ethereum().signTypedData(evm.id, {

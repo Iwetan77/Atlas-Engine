@@ -2,7 +2,8 @@
 //! wallet. Margin moves in from the balance in the same confirmation (Relay: gasless from Base, or a
 //! Solana transaction the user signs); then the user's Atlas agent (approved once, by their own
 //! wallet, inside that confirmation) sets leverage and places an immediate-or-cancel order. The
-//! agent can trade, never withdraw.
+//! agent can trade, never withdraw. A close sends the money it freed back to the user's cash in the
+//! same confirmation (Relay, signed by the user's own session through the bridge).
 use super::*;
 use axum::extract::Query;
 use engine_execution::hyperliquid::{order_price, order_size, Market};
@@ -19,6 +20,9 @@ const SLIPPAGE: f64 = 0.03;
 const MIN_NOTIONAL: f64 = 10.0;
 // How long margin may take to arrive (Relay usually takes seconds).
 const FUNDING_LIMIT: Duration = Duration::from_secs(300);
+// Less than $1 stays in perps for the next trade; a cash-out is watched for up to 2 minutes.
+const CASHOUT_MIN_UNITS: u128 = 1_000_000;
+const CASHOUT_LIMIT: Duration = Duration::from_secs(120);
 // Coins Hyperliquid lists as memes (the rest are crypto).
 const MEMES: [&str; 22] = [
     "kPEPE", "kBONK", "kSHIB", "kFLOKI", "kNEIRO", "DOGE", "WIF", "POPCAT", "FARTCOIN", "PENGU",
@@ -51,6 +55,9 @@ struct HlQuote {
     funding_units: u128,
     #[serde(default)]
     funding_from_solana: bool,
+    // A close: what it frees (margin ± PnL − fee), in dollars.
+    #[serde(default)]
+    receive_usd: f64,
     expires: u64,
 }
 
@@ -206,6 +213,11 @@ fn usd(value: f64) -> Value {
 fn trim(value: f64) -> String {
     let text = format!("{value:.6}");
     text.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+// Relay's fee for moving money out of Hyperliquid to cash: about 2.4¢ plus 0.04% (live quotes,
+// 2026-10-01: $0.50 → 2.5¢, $5 → 2.6¢, $50 → 4.5¢).
+fn cashout_fee(usd: f64) -> f64 {
+    0.025 + usd * 0.0004
 }
 fn category(coin: &str) -> &'static str {
     if MEMES.contains(&coin) {
@@ -473,6 +485,7 @@ pub(super) async fn quote(
             close: false,
             funding_units,
             funding_from_solana,
+            receive_usd: 0.0,
             expires,
         },
     );
@@ -512,8 +525,15 @@ pub(super) async fn close_quote(
         .cloned()
         .ok_or((StatusCode::NOT_FOUND, "no such position".into()))?;
     let m = market(&state, &market_id(&position.coin)).await?;
-    let fee = position.size.abs() * m.mark * TAKER_FEE;
-    let pnl = position.unrealized_pnl - fee;
+    let trade_fee = position.size.abs() * m.mark * TAKER_FEE;
+    let pnl = position.unrealized_pnl - trade_fee;
+    let freed = (position.margin + pnl).max(0.0);
+    // What it frees comes back to cash (less Relay's cents); under $1 it stays in perps.
+    let cashout = if freed * 1_000_000.0 >= CASHOUT_MIN_UNITS as f64 {
+        cashout_fee(freed)
+    } else {
+        0.0
+    };
     let quote_id = format!("hlc-{:x}-{:x}", now(), rand_suffix());
     let expires = now() + QUOTE_MS;
     state.hl.quotes.lock().map_err(internal)?.insert(
@@ -531,6 +551,7 @@ pub(super) async fn close_quote(
             close: true,
             funding_units: 0,
             funding_from_solana: false,
+            receive_usd: freed,
             expires,
         },
     );
@@ -539,9 +560,9 @@ pub(super) async fn close_quote(
         json!({"amount":format!("{display:.2}"),"currency":currency})
     };
     Ok(Json(json!({"quoteId":quote_id,"positionId":position_id,
-        "receive":money((position.margin + pnl).max(0.0),&currency,rate),
+        "receive":money((freed - cashout).max(0.0),&currency,rate),
         "realizedPnl":signed(pnl),"exitPrice":money(m.mark,&currency,rate),
-        "fee":money(fee,&currency,rate),"expiresAtUnixMs":expires})))
+        "fee":money(trade_fee + cashout,&currency,rate),"expiresAtUnixMs":expires})))
 }
 
 // Execute (open or close): the plan. Margin from Solana is a transaction the app signs (after a gas
@@ -812,7 +833,83 @@ async fn run(
             "size":quote.size,"reduceOnly":quote.close}),
     )
     .await?;
-    filled(&placed)
+    filled(&placed)?;
+    if quote.close {
+        cash_out(state, headers, intent).await;
+    }
+    Ok(())
+}
+
+// After a close: the money it freed goes back to cash. A cash-out that doesn't happen leaves the
+// money in perps, where it still counts in the balance and pays for the next trade: the close stands.
+async fn cash_out(state: &AppState, headers: &HeaderMap, intent: &mut HlIntent) {
+    intent.status.stage = "settle".into();
+    let id = intent.status.intent_id.clone();
+    if let Err(error) = state.hl.intents.put(&id, intent).await {
+        eprintln!("hyperliquid intent {id} not saved: {}", error.1);
+    }
+    if let Err(reason) = move_to_cash(state, headers, &intent.quote).await {
+        eprintln!("hyperliquid cash-out for {id} not done: {reason}");
+    }
+}
+
+// Relay pays it out to the user's own Solana wallet (Base without one); the bridge pins that.
+// With nothing left open, everything in the account comes back, else only what this close freed.
+async fn move_to_cash(
+    state: &AppState,
+    headers: &HeaderMap,
+    quote: &HlQuote,
+) -> Result<(), String> {
+    let account = state
+        .hl
+        .client
+        .account(&quote.wallet)
+        .await
+        .map_err(|e| e.to_string())?;
+    let units = cashout_units(&account, quote.receive_usd);
+    if units < CASHOUT_MIN_UNITS {
+        return Ok(());
+    }
+    let user = app_balance::verified_wallets(state, headers)
+        .await
+        .map_err(|e| e.1)?;
+    let to = if user.solana_wallet.is_some_and(|w| !w.is_empty()) {
+        "solana"
+    } else {
+        "base"
+    };
+    let answer = bridge(
+        state,
+        headers,
+        "cashout",
+        json!({"amount":units.to_string(),"to":to}),
+    )
+    .await?;
+    let request_id = answer["result"]["requestId"]
+        .as_str()
+        .ok_or("Relay gave no request id")?;
+    let deadline = tokio::time::Instant::now() + CASHOUT_LIMIT;
+    loop {
+        match state.relay_link.state(request_id).await {
+            Ok(engine_execution::layerswap::SwapState::Completed) => return Ok(()),
+            Ok(engine_execution::layerswap::SwapState::Failed(why)) => {
+                return Err(format!("Relay says {why}"));
+            }
+            _ if tokio::time::Instant::now() > deadline => {
+                return Err(format!("Relay request {request_id} still moving"));
+            }
+            _ => tokio::time::sleep(Duration::from_secs(2)).await,
+        }
+    }
+}
+
+fn cashout_units(account: &engine_execution::hyperliquid::Account, freed_usd: f64) -> u128 {
+    let usd = if account.positions.is_empty() {
+        account.withdrawable
+    } else {
+        account.withdrawable.min(freed_usd)
+    };
+    (usd.max(0.0) * 1_000_000.0).floor() as u128
 }
 
 async fn bridge(
@@ -962,6 +1059,38 @@ mod tests {
             "approve"
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_close_sends_back_what_it_freed_or_everything_once_nothing_is_open() {
+        use engine_execution::hyperliquid::{Account, Position};
+        let mut account = Account {
+            value: 12.5,
+            withdrawable: 12.5,
+            positions: Vec::new(),
+        };
+        // Nothing left open: the whole account, leftovers included.
+        assert_eq!(cashout_units(&account, 10.0), 12_500_000);
+        // Another position still open: only what this close freed, never past what can leave.
+        account.positions.push(Position {
+            coin: "BTC".into(),
+            size: 0.001,
+            entry: 100_000.0,
+            value: 100.0,
+            unrealized_pnl: 0.0,
+            return_on_equity: 0.0,
+            liquidation: None,
+            margin: 20.0,
+            leverage: 5,
+        });
+        assert_eq!(cashout_units(&account, 10.0), 10_000_000);
+        account.withdrawable = 4.2;
+        assert_eq!(cashout_units(&account, 10.0), 4_200_000);
+        account.withdrawable = -1.0;
+        assert_eq!(cashout_units(&account, 10.0), 0);
+        // Relay's cents, as measured.
+        assert!((cashout_fee(5.0) - 0.027).abs() < 0.002);
+        assert!((cashout_fee(50.0) - 0.045).abs() < 0.002);
     }
 
     #[test]
