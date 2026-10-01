@@ -238,30 +238,105 @@ export async function searchRef(query){
   return found;
 }
 
+// Where a sale's cash lands: the user's own Solana USDC, or Base USDC without a Solana wallet. The
+// engine's `cash_target` picks the same way. (Naira payouts can chain on after this.)
+export const SOLANA_USDC='nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near';
+export const BASE_USDC='nep141:base-0x833589fcd6edb6e08f4c7c32d4f71b54bda02913.omft.near';
+export function cashDestination(solanaWallet,evmWallet){
+  if(solanaWallet)return {asset:SOLANA_USDC,recipient:solanaWallet};
+  if(/^0x[0-9a-fA-F]{40}$/.test(evmWallet??''))return {asset:BASE_USDC,recipient:evmWallet};
+  throw new Error('cash wallet unavailable');
+}
+
+// A token's transfer from `from` to `to` in a transaction's receipts, by the token's own event.
+export function sentToken(result,token,from,to){
+  let amount=0n;
+  for(const receipt of result.receipts_outcome??[]){
+    if(receipt.outcome?.executor_id!==token||receipt.outcome.status?.Failure)continue;
+    for(const log of receipt.outcome.logs??[]){
+      if(!log.startsWith('EVENT_JSON:'))continue;
+      let event;try{event=JSON.parse(log.slice(11));}catch{continue;}
+      if(event.standard!=='nep141'||event.event!=='ft_transfer')continue;
+      for(const item of event.data??[])if(item.old_owner_id===from&&item.new_owner_id===to)amount+=BigInt(item.amount);
+    }
+  }
+  return amount;
+}
+
+// The deposit to 1Click for a NEAR token: a storage registration for 1Click's address on that token
+// when it has none, then the transfer, in one transaction to the token contract (ORIGIN_CHAIN, per
+// 1Click's docs: transfer the tokens to the quote's deposit address).
+export async function depositActions(token,depositAddress,amount){
+  const actions=[];
+  if(!(await view(token,'storage_balance_of',{account_id:depositAddress}))){
+    const bounds=await view(token,'storage_balance_bounds');
+    const minimum=BigInt(bounds.min);
+    if(minimum>10000000000000000000000n)throw new Error('token storage cost is too high');
+    actions.push(call('storage_deposit',{account_id:depositAddress,registration_only:true},30000000000000n,minimum));
+  }
+  actions.push(call('ft_transfer',{receiver_id:depositAddress,amount:String(amount)},30000000000000n,1n));
+  return actions;
+}
+
 const cashouts=new PreparedSales();
-export async function prepareCashout({wallet,userId,userJwt,evmWallet,solanaWallet,amount,minimumOut}){
-  if(!solanaWallet&&!/^0x[0-9a-fA-F]{40}$/.test(evmWallet))throw new Error('cash wallet unavailable');
+// A sale of `amount` of `token` to cash: 1Click's quote (ORIGIN_CHAIN, refunds to the NEAR wallet)
+// for the user's own cash wallet, held once for the commit. `scope` comes from a confirmed intent
+// (direct sales); otherwise one is made for these exact values (a Ref sale's wNEAR).
+export async function prepareCashout({wallet,userId,userJwt,evmWallet,solanaWallet,token=WRAP,amount,minimumOut,scope}){
+  account(token);
+  const cash=cashDestination(solanaWallet,evmWallet);
   if(BigInt(amount)<=0n||BigInt(minimumOut)<=0n)throw new Error('invalid cashout');
-  if(BigInt(await view(WRAP,'ft_balance_of',{account_id:wallet.address}))<BigInt(amount))throw new Error('holding changed');
-  const request={dry:false,swapType:'EXACT_INPUT',slippageTolerance:100,originAsset:'nep141:wrap.near',depositType:'INTENTS',
-    destinationAsset:solanaWallet?'nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near':'nep141:base-0x833589fcd6edb6e08f4c7c32d4f71b54bda02913.omft.near',
-    amount:String(amount),recipient:solanaWallet??evmWallet,recipientType:'DESTINATION_CHAIN',refundTo:wallet.address,refundType:'ORIGIN_CHAIN',deadline:new Date(Date.now()+240000).toISOString()};
+  const native=BigInt((await rpc('query',{request_type:'view_account',finality:'final',account_id:wallet.address})).amount);
+  if(native<GAS_RESERVE)throw new Error('not enough NEAR for the network fee');
+  if(available(token,BigInt(await view(token,'ft_balance_of',{account_id:wallet.address})),native)<BigInt(amount))throw new Error('holding changed');
+  const request={dry:false,swapType:'EXACT_INPUT',slippageTolerance:100,originAsset:`nep141:${token}`,depositType:'ORIGIN_CHAIN',
+    destinationAsset:cash.asset,amount:String(amount),recipient:cash.recipient,recipientType:'DESTINATION_CHAIN',
+    refundTo:wallet.address,refundType:'ORIGIN_CHAIN',deadline:new Date(Date.now()+240000).toISOString()};
   const response=await fetch('https://1click.chaindefuser.com/v0/quote',{method:'POST',headers:{'content-type':'application/json',...(process.env.NEAR_INTENTS_API_KEY?{'X-API-Key':process.env.NEAR_INTENTS_API_KEY}:{})},body:JSON.stringify(request),signal:AbortSignal.timeout(20000)});
   if(!response.ok)throw new Error('cashout route unavailable');
   const q=(await response.json()).quote;
-  if(q.amountIn!==String(amount)||BigInt(q.minAmountOut??q.amountOut??0)<BigInt(minimumOut)||
-    !/^[a-zA-Z0-9._-]{2,128}$/.test(q.depositAddress??'')||q.depositMemo!=null)throw new Error('cashout route changed');
-  const scope={userId,walletId:wallet.id,address:wallet.address,quoteId:randomUUID(),coinType:WRAP,amount:String(amount),minimumOut:String(minimumOut),expiresAtUnixMs:Date.now()+180000};
-  const cashoutId=cashouts.put(scope,userJwt,{depositAddress:q.depositAddress});
-  return {cashoutId,scope,depositAddress:q.depositAddress,amountOut:q.amountOut};
+  checkCashoutQuote(q,amount,minimumOut);
+  const bound=scope??{userId,walletId:wallet.id,address:wallet.address,quoteId:randomUUID(),coinType:token,
+    amount:String(amount),minimumOut:String(minimumOut),expiresAtUnixMs:Date.now()+180000};
+  if(bound.coinType!==token||bound.amount!==String(amount)||bound.minimumOut!==String(minimumOut))throw new Error('sale changed');
+  const cashoutId=cashouts.put(bound,userJwt,{depositAddress:q.depositAddress});
+  return {cashoutId,scope:bound,depositAddress:q.depositAddress,amountOut:q.amountOut};
+}
+// 1Click's quote must take exactly the amount, pay at least the minimum, and name a plain NEAR
+// account to deposit to (no memo).
+export function checkCashoutQuote(q,amount,minimumOut){
+  if(q?.amountIn!==String(amount)||BigInt(q.minAmountOut??q.amountOut??0)<BigInt(minimumOut)||
+    !/^([0-9a-f]{64}|[a-z0-9]+([._-][a-z0-9]+)*\.near)$/.test(q.depositAddress??'')||q.depositMemo!=null)throw new Error('cashout route changed');
+}
+// A direct sale of a NEAR token the user confirmed: its coin, amount and minimum come only from that
+// intent (consumed once by the engine).
+export async function prepareSale({intentId,wallet,userId,userJwt,accessToken,identityToken,evmWallet,solanaWallet}){
+  const scope=await salePermission({intentId,wallet,userId,accessToken,identityToken});
+  if(scope.network!=='nearintents'||scope.side!=='sell')throw new Error('invalid sale permission');
+  const {walletId,...rest}=scope;
+  const bound={userId:rest.userId,walletId,address:rest.address,quoteId:rest.quoteId,coinType:rest.coinType,
+    amount:rest.amount,minimumOut:rest.minimumOut,expiresAtUnixMs:rest.expiresAtUnixMs};
+  return prepareCashout({wallet,userId,userJwt,evmWallet,solanaWallet,token:bound.coinType,amount:bound.amount,
+    minimumOut:bound.minimumOut,scope:bound});
+}
+// What a wallet can sell of `token`: its balance, and for NEAR also native NEAR beyond the gas reserve
+// (1Click pays NEAR out unwrapped, so that's where most of it sits).
+export function available(token,held,native){
+  return token===WRAP?held+(native>GAS_RESERVE?native-GAS_RESERVE:0n):held;
+}
+// NEAR sold from native NEAR is wrapped first, in the same transaction to wrap.near.
+export function wrapFirst(token,held,amount){
+  if(token!==WRAP||held>=BigInt(amount))return [];
+  return [call('near_deposit',{},10000000000000n,BigInt(amount)-held)];
 }
 export async function commitCashout({cashoutId,scope,wallet,userId,userJwt,rawSign}){
   if(scope.userId!==userId||scope.walletId!==wallet.id||scope.address!==wallet.address)throw new Error('wallet changed');
   const item=cashouts.take(cashoutId,scope,userJwt);
-  const held=BigInt(await view(WRAP,'ft_balance_of',{account_id:wallet.address}));
+  const token=item.scope.coinType,amount=item.scope.amount,to=item.data.depositAddress;
+  const held=BigInt(await view(token,'ft_balance_of',{account_id:wallet.address}));
   const native=BigInt((await rpc('query',{request_type:'view_account',finality:'final',account_id:wallet.address})).amount);
-  if(held<BigInt(item.scope.amount)||native<GAS_RESERVE)throw new Error('holding changed');
-  const result=await sendCall(wallet,WRAP,[call('ft_transfer_call',{receiver_id:'intents.near',amount:item.scope.amount,msg:item.data.depositAddress},100000000000000n,1n)],rawSign,item.scope.expiresAtUnixMs);
-  let used;try{used=JSON.parse(Buffer.from(result.status.SuccessValue,'base64').toString());}catch{}
-  return {ok:used===item.scope.amount,digest:result.transaction.hash};
+  if(available(token,held,native)<BigInt(amount)||native<GAS_RESERVE)throw new Error('holding changed');
+  const actions=[...wrapFirst(token,held,amount),...await depositActions(token,to,amount)];
+  const result=await sendCall(wallet,token,actions,rawSign,item.scope.expiresAtUnixMs);
+  return {ok:sentToken(result,token,wallet.address,to)===BigInt(amount),digest:result.transaction.hash};
 }

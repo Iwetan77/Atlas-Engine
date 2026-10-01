@@ -920,7 +920,7 @@ pub(super) struct AssetsQuery {
     category: Option<String>,
     q: Option<String>,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct QuoteRequest {
     pub(super) asset_id: String,

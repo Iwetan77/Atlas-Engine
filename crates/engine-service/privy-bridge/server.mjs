@@ -1,4 +1,4 @@
-import {prepareRef,commitRef,quoteRef,searchRef,tokenInfo,prepareCashout as prepareNearCashout,commitCashout as commitNearCashout,view as nearView} from './ref-swap.mjs';
+import {prepareRef,commitRef,quoteRef,searchRef,tokenInfo,prepareCashout as prepareNearCashout,commitCashout as commitNearCashout,prepareSale as prepareNearSale,view as nearView} from './ref-swap.mjs';
 import {createServer} from 'node:http';
 import {createHash, randomUUID} from 'node:crypto';
 import {PrivyClient} from '@privy-io/node';
@@ -56,7 +56,7 @@ const server = createServer(async (request, response) => {
   const hlRoute = request.method === 'POST' && request.url.startsWith('/hyperliquid/') ?
     request.url.slice('/hyperliquid/'.length) : null;
   const hyperliquid = ['agent', 'approve', 'leverage', 'order', 'move', 'cashout'].includes(hlRoute);
-  const refRoute = request.method === 'POST' && ['/near/ref/search','/near/ref/quote','/near/ref/prepare','/near/ref/commit','/near/ref/balance','/near/cashout/prepare','/near/cashout/commit'].includes(request.url);
+  const refRoute = request.method === 'POST' && ['/near/ref/search','/near/ref/quote','/near/ref/prepare','/near/ref/commit','/near/ref/balance','/near/cashout/prepare','/near/cashout/commit','/near/sell/prepare','/near/sell/commit'].includes(request.url);
   const suiSale = request.method === 'POST' && ['/sui/sale/quote','/sui/sale/prepare','/sui/sale/commit'].includes(request.url);
   const suiQuote = request.method === 'POST' && request.url === '/sui/quote';
   const suiSwap = request.method === 'POST' && request.url === '/sui/swap';
@@ -138,7 +138,10 @@ const server = createServer(async (request, response) => {
         const wallet=await ensureReceivingWallet(userId,'near');
         if(request.url==='/near/cashout/prepare'){
           send(response,200,{userId,address:wallet.address,...await prepareNearCashout({wallet,userId,userJwt,evmWallet,solanaWallet,amount:input.amount,minimumOut:input.minimumOut})});
-        }else if(request.url==='/near/cashout/commit'){
+        }else if(request.url==='/near/sell/prepare'){
+          // A direct sale: everything it may do comes from the intent the user confirmed.
+          send(response,200,{userId,address:wallet.address,...await prepareNearSale({intentId:input.intentId,wallet,userId,userJwt,accessToken,identityToken:input.identityToken,evmWallet,solanaWallet})});
+        }else if(request.url==='/near/cashout/commit'||request.url==='/near/sell/commit'){
           const result=await commitNearCashout({cashoutId:input.cashoutId,scope:input.scope,wallet,userId,userJwt,
             rawSign:async bytes=>(await privy.wallets().rawSign(wallet.id,{params:{bytes,encoding:'hex',hash_function:'sha256'},authorization_context:{user_jwts:[userJwt]}})).signature});
           send(response,200,{userId,address:wallet.address,...result});

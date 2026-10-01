@@ -204,7 +204,7 @@ pub(super) async fn spot(
         solana: user.solana_wallet.as_deref().filter(|w| !w.is_empty()),
         evm: user.evm_wallet.as_deref().filter(|w| !w.is_empty()),
     };
-    let positions = valued(
+    let mut positions = valued(
         &state.markets,
         &state.solana_mainnet,
         wallets,
@@ -213,6 +213,16 @@ pub(super) async fn spot(
         rate,
     )
     .await?;
+    positions.extend(near_valued(&state, &headers, &user, &trades, &currency, rate).await?);
+    positions.sort_by(|a, b| {
+        let v = |x: &Value| {
+            x["value"]["amount"]
+                .as_str()
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0)
+        };
+        v(b).total_cmp(&v(a))
+    });
     let as_of = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(internal)?
@@ -358,6 +368,57 @@ async fn valued(
         };
         v(b).total_cmp(&v(a))
     });
+    Ok(result)
+}
+
+// Positions in NEAR Intents coins (NEAR and Monad coins, Ref coins): priced from 1Click's list or
+// Ref, capped by what the wallet holds now, in the same shape as the rest.
+async fn near_valued(
+    state: &AppState,
+    headers: &HeaderMap,
+    user: &app_balance::VerifiedWallets,
+    trades: &[Trade],
+    currency: &str,
+    rate: u128,
+) -> Result<Vec<Value>, ApiError> {
+    let mut result = Vec::new();
+    for (asset_id, p) in fold(trades) {
+        if p.units == 0 || !asset_id.starts_with("near:") {
+            continue;
+        }
+        let Some(coin) = near_intents::position_coin(state, headers, user, &asset_id).await else {
+            continue;
+        };
+        let held = coin.held.min(p.units);
+        if held == 0 || coin.price <= 0.0 {
+            continue;
+        }
+        let invested = mul_div(p.cost, held, p.units);
+        let value = (held as f64 / 10f64.powi(coin.decimals as i32) * coin.price * 1e6) as u128;
+        let pnl = value as i128 - invested as i128;
+        let pnl_pct =
+            (invested > 0).then(|| format!("{:.2}", pnl as f64 / invested as f64 * 100.0));
+        let entry = (invested > 0)
+            .then(|| markets::unit_price(invested, held, coin.decimals, currency, rate))
+            .transpose()?;
+        result.push(json!({
+            "assetId": asset_id,
+            "symbol": coin.symbol,
+            "name": coin.name,
+            "kind": "crypto",
+            "chain": coin.chain,
+            "iconUrl": coin.icon,
+            "amount": markets::format_units(held, coin.decimals),
+            "invested": signed_money(invested as i128, currency, rate),
+            "value": signed_money(value as i128, currency, rate),
+            "pnl": signed_money(pnl, currency, rate),
+            "pnlPct": pnl_pct,
+            "entryPrice": entry,
+            "price": markets::money_from_usd(coin.price, currency, rate)?,
+            "realizedPnl": signed_money(p.realized, currency, rate),
+            "openedAtUnixMs": p.opened_at_ms,
+        }));
+    }
     Ok(result)
 }
 

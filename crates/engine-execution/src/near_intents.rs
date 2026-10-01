@@ -128,6 +128,9 @@ pub struct SwapDetails {
     pub near_tx_hashes: Vec<String>,
     #[serde(default)]
     pub destination_chain_tx_hashes: Vec<ChainTx>,
+    // What actually reached the recipient (base units), once settled.
+    #[serde(default)]
+    pub amount_out: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

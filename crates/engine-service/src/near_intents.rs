@@ -44,6 +44,9 @@ struct StoredQuote {
     from_solana: bool,
     network_fee: u128,
     sale: Option<SuiSale>,
+    // The Atlas asset id traded (for the trade book), and a Monad sale (the phone sends the coin).
+    asset_id: String,
+    monad_sale: bool,
 }
 // The second leg of an unlisted Sui buy.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -115,6 +118,17 @@ struct StoredIntent {
     sale_permission_used: bool,
     #[serde(default)]
     ref_wallet: Option<String>,
+    // The Atlas asset id traded, so a fill goes into the trade book.
+    #[serde(default)]
+    asset_id: String,
+    // Monad: the deposit goes out from the phone on Monad (`expected_value` wei with it), and the
+    // wallet's nonce when the plan was handed out: once it moves on, the plan may have gone out.
+    #[serde(default)]
+    origin_chain: String,
+    #[serde(default)]
+    expected_value: String,
+    #[serde(default)]
+    handed_nonce: Option<u64>,
 }
 // CoinGecko's chain names for the chains Atlas supports, keyed by Atlas's.
 const LISTED_CHAINS: [(&str, &str); 8] = [
@@ -391,27 +405,39 @@ impl NearState {
         }
         let mut result = Vec::new();
         for asset in assets.into_values() {
-            let value = if let Some(contract) = asset.contract_address.as_deref() {
-                if !is_evm(contract) {
-                    return Err(venue("invalid Monad token contract"));
-                }
-                let data = format!("0x70a08231{:0>64}", &wallet[2..].to_ascii_lowercase());
-                self.monad_call("eth_call", json!([{"to":contract,"data":data},"latest"]))
-                    .await?
-            } else {
-                self.monad_call("eth_getBalance", json!([wallet, "latest"]))
-                    .await?
-            };
-            let hex = value
-                .as_str()
-                .and_then(|v| v.strip_prefix("0x"))
-                .ok_or_else(|| venue("Monad RPC returned no balance"))?;
-            let units = u128::from_str_radix(hex, 16).map_err(internal)?;
+            let units = self.monad_balance(&asset, wallet).await?;
             if units > 0 {
                 result.push((asset, units));
             }
         }
         Ok(result)
+    }
+    // What `wallet` holds of a Monad coin (native MON, or an ERC-20), in base units.
+    async fn monad_balance(&self, asset: &Token, wallet: &str) -> Result<u128, ApiError> {
+        if !is_evm(wallet) {
+            return Err(venue("invalid Monad wallet"));
+        }
+        let value = if let Some(contract) = asset.contract_address.as_deref() {
+            if !is_evm(contract) {
+                return Err(venue("invalid Monad token contract"));
+            }
+            let data = format!("0x70a08231{:0>64}", &wallet[2..].to_ascii_lowercase());
+            self.monad_call("eth_call", json!([{"to":contract,"data":data},"latest"]))
+                .await?
+        } else {
+            self.monad_call("eth_getBalance", json!([wallet, "latest"]))
+                .await?
+        };
+        hex_units(&value).ok_or_else(|| venue("Monad RPC returned no balance"))
+    }
+    // The wallet's next Monad nonce, counting what's still pending.
+    async fn monad_nonce(&self, wallet: &str) -> Result<u64, ApiError> {
+        let value = self
+            .monad_call("eth_getTransactionCount", json!([wallet, "pending"]))
+            .await?;
+        hex_units(&value)
+            .and_then(|n| u64::try_from(n).ok())
+            .ok_or_else(|| venue("Monad RPC returned no nonce"))
     }
     async fn monad_call(&self, method: &str, params: Value) -> Result<Value, ApiError> {
         let response = self
@@ -522,6 +548,9 @@ fn is_evm(address: &str) -> bool {
         && address.starts_with("0x")
         && address[2..].bytes().all(|b| b.is_ascii_hexdigit())
 }
+fn hex_units(value: &Value) -> Option<u128> {
+    u128::from_str_radix(value.as_str()?.strip_prefix("0x")?, 16).ok()
+}
 fn valid_hash(hash: &str) -> bool {
     hash.len() == 66 && hash.starts_with("0x") && hash[2..].bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -585,8 +614,17 @@ fn unit_price(
     json!({"amount":markets::format_units(value,12),"currency":currency})
 }
 fn supported(token: &Token) -> bool {
-    matches!(token.blockchain.as_str(), "monad" | "sui" | "near")
+    sell_route(&token.blockchain).is_some()
         && !matches!(token.symbol.as_str(), "USDC" | "USDT" | "USDT0")
+}
+// How a coin on each chain goes back to cash. A chain without one isn't bought at all.
+fn sell_route(blockchain: &str) -> Option<&'static str> {
+    match blockchain {
+        "near" => Some("1Click from the NEAR wallet, or Ref then 1Click"),
+        "monad" => Some("1Click from the Monad wallet, sent by the phone"),
+        "sui" => Some("1Click from the Sui wallet, after Cetus for other coins"),
+        _ => None,
+    }
 }
 fn recipient<'a>(
     token: &Token,
@@ -761,7 +799,6 @@ pub(super) async fn near_holdings(
         return Ok(Vec::new());
     }
     let wallet = destination(state, headers, tracked.values().next().unwrap(), user).await?;
-    let rpc = env_url("ATLAS_NEAR_MAINNET_RPC_URL", "https://rpc.mainnet.near.org");
     let mut held = Vec::new();
     for asset in tracked.into_values() {
         let contract = asset
@@ -776,39 +813,81 @@ pub(super) async fn near_holdings(
         {
             return Err(venue("An asset balance is temporarily unavailable"));
         }
-        let args = base64::engine::general_purpose::STANDARD
-            .encode(serde_json::to_vec(&json!({"account_id":wallet})).map_err(internal)?);
-        let body: Value = state
-            .near
-            .icon_http
-            .post(&rpc)
-            .json(&json!({"jsonrpc":"2.0","id":1,"method":"query","params":{
-                "request_type":"call_function","finality":"final","account_id":contract,
-                "method_name":"ft_balance_of","args_base64":args}}))
-            .send()
-            .await
-            .map_err(venue)?
-            .error_for_status()
-            .map_err(venue)?
-            .json()
-            .await
-            .map_err(venue)?;
-        let raw = body["result"]["result"]
-            .as_array()
-            .ok_or_else(|| venue("An asset balance is temporarily unavailable"))?;
-        let bytes = raw
-            .iter()
-            .map(|v| v.as_u64().and_then(|n| u8::try_from(n).ok()))
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| venue("An asset balance is temporarily unavailable"))?;
-        let units: String = serde_json::from_slice(&bytes).map_err(venue)?;
-        let units = units.parse::<u128>().map_err(venue)?;
+        let units = near_coin_held(state, contract, &wallet).await?;
         if units > 0 {
             held.push((asset, units));
         }
     }
     Ok(held)
 }
+
+// NEAR RPC: one `query`, answered as the RPC sends it (errors included, for the caller to read).
+async fn near_query(state: &AppState, params: Value) -> Result<Value, ApiError> {
+    let rpc = env_url("ATLAS_NEAR_MAINNET_RPC_URL", "https://rpc.mainnet.near.org");
+    state
+        .near
+        .icon_http
+        .post(&rpc)
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"query","params":params}))
+        .send()
+        .await
+        .map_err(venue)?
+        .error_for_status()
+        .map_err(venue)?
+        .json()
+        .await
+        .map_err(venue)
+}
+// A NEP-141 token balance of `account`, in base units.
+async fn ft_balance(state: &AppState, contract: &str, account: &str) -> Result<u128, ApiError> {
+    let args = base64::engine::general_purpose::STANDARD
+        .encode(serde_json::to_vec(&json!({"account_id":account})).map_err(internal)?);
+    let body = near_query(
+        state,
+        json!({"request_type":"call_function","finality":"final","account_id":contract,
+            "method_name":"ft_balance_of","args_base64":args}),
+    )
+    .await?;
+    let bytes = body["result"]["result"]
+        .as_array()
+        .and_then(|raw| {
+            raw.iter()
+                .map(|v| v.as_u64().and_then(|n| u8::try_from(n).ok()))
+                .collect::<Option<Vec<_>>>()
+        })
+        .ok_or_else(|| venue("An asset balance is temporarily unavailable"))?;
+    let units: String = serde_json::from_slice(&bytes).map_err(venue)?;
+    units.parse::<u128>().map_err(venue)
+}
+// Native NEAR (yocto) in `account`; one that doesn't exist yet holds none.
+async fn near_native(state: &AppState, account: &str) -> Result<u128, ApiError> {
+    let body = near_query(
+        state,
+        json!({"request_type":"view_account","finality":"final","account_id":account}),
+    )
+    .await?;
+    if body["error"].to_string().contains("UNKNOWN_ACCOUNT")
+        || body["result"]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("does not exist"))
+    {
+        return Ok(0);
+    }
+    body["result"]["amount"]
+        .as_str()
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| venue("Your NEAR balance is temporarily unavailable"))
+}
+// What the user holds of a NEAR coin. 1Click pays NEAR out as native NEAR (it unwraps wNEAR on the
+// way), so for NEAR itself the native balance counts with any wNEAR.
+async fn near_coin_held(state: &AppState, contract: &str, account: &str) -> Result<u128, ApiError> {
+    let tokens = ft_balance(state, contract, account).await?;
+    if contract == WRAP_NEAR {
+        return Ok(tokens.saturating_add(near_native(state, account).await?));
+    }
+    Ok(tokens)
+}
+const WRAP_NEAR: &str = "wrap.near";
 // What the user holds on Sui from Atlas buys (SUI left for gas included), valued in USD:
 // (asset id, symbol, name, decimals, units, USDC units, icon). Nothing to read, nothing asked.
 pub(super) async fn sui_holdings(
@@ -1558,6 +1637,8 @@ async fn sui_quote(
                 sui_in,
                 expected_out,
             }),
+            asset_id: req.asset_id.clone(),
+            monad_sale: false,
         },
     );
     Ok(Json(
@@ -1677,6 +1758,8 @@ async fn ref_buy_quote(
                 sui_in,
                 expected_out,
             }),
+            asset_id: req.asset_id.clone(),
+            monad_sale: false,
         },
     );
     Ok(Json(
@@ -1929,7 +2012,7 @@ pub(super) async fn search_assets(
         let icon = state.near.icon_for(t);
         out.push(
             json!({"assetId":format!("near:{}", t.asset_id),"symbol":t.symbol,
-            "name":format!("{} on {}",t.symbol,t.blockchain),"kind":"crypto",
+            "name":format!("{} on {}",t.symbol,t.blockchain),"kind":"crypto","chain":t.blockchain,
             "price":{"amount":format!("{display:.12}").trim_end_matches('0').trim_end_matches('.'),
                 "currency":currency},"change24hPct":null,"iconUrl":icon,"verified":true}),
         );
@@ -1941,6 +2024,87 @@ pub(super) async fn search_assets(
     out.extend(search_ref_unlisted(state, &query, currency, rate).await);
     Ok(out)
 }
+// A NEAR Intents coin's live price and what the user holds of it, for its position card: NEAR and
+// Monad coins from 1Click's list, and NEAR coins found on Ref.
+pub(super) struct NearCoin {
+    pub(super) symbol: String,
+    pub(super) name: String,
+    pub(super) chain: String,
+    pub(super) icon: Option<String>,
+    pub(super) decimals: u32,
+    pub(super) price: f64,
+    pub(super) held: u128,
+}
+pub(super) async fn position_coin(
+    state: &AppState,
+    headers: &HeaderMap,
+    user: &app_balance::VerifiedWallets,
+    asset_id: &str,
+) -> Option<NearCoin> {
+    let id = asset_id.strip_prefix("near:")?;
+    let near_wallet = |contract: &str| Token {
+        asset_id: format!("nep141:{contract}"),
+        blockchain: "near".into(),
+        symbol: String::new(),
+        decimals: 0,
+        contract_address: Some(contract.into()),
+        price: None,
+        coingecko_id: None,
+    };
+    if let Some(contract) = id.strip_prefix("ref:") {
+        let found = ref_assets(state, contract)
+            .await
+            .ok()?
+            .into_iter()
+            .find(|a| a["token"] == contract)?;
+        let wallet = destination(state, headers, &near_wallet(contract), user)
+            .await
+            .ok()?;
+        let symbol = found["symbol"].as_str()?.to_owned();
+        return Some(NearCoin {
+            name: found["name"].as_str().unwrap_or(&symbol).to_owned(),
+            symbol,
+            chain: "near".into(),
+            icon: found["icon"]
+                .as_str()
+                .filter(|v| v.starts_with("https://"))
+                .map(str::to_owned),
+            decimals: u32::try_from(found["decimals"].as_u64()?).ok()?,
+            price: found["price"].as_str()?.parse().ok()?,
+            held: ft_balance(state, contract, &wallet).await.ok()?,
+        });
+    }
+    let token = state
+        .near
+        .tokens()
+        .await
+        .ok()?
+        .into_iter()
+        .find(|t| t.asset_id == id && supported(t))?;
+    let held = match token.blockchain.as_str() {
+        "near" => {
+            let contract = token.contract_address.clone()?;
+            let wallet = destination(state, headers, &token, user).await.ok()?;
+            near_coin_held(state, &contract, &wallet).await.ok()?
+        }
+        "monad" => {
+            let wallet = user.evm_wallet.as_deref()?;
+            state.near.monad_balance(&token, wallet).await.ok()?
+        }
+        _ => return None,
+    };
+    Some(NearCoin {
+        name: format!("{} on {}", token.symbol, token.blockchain),
+        icon: state.near.icon_for(&token),
+        chain: token.blockchain.clone(),
+        decimals: token.decimals,
+        price: token_usd(&token),
+        symbol: token.symbol,
+        held,
+    })
+}
+// Where every sale's cash lands: USDC in the user's own Solana wallet, or Base without one. Kept in
+// this one place (and its twin `cashDestination` in the bridge) so naira payouts can follow on later.
 fn cash_target(user: &app_balance::VerifiedWallets) -> Result<(&'static str, &str), ApiError> {
     if let Some(wallet) = user.solana_wallet.as_deref() {
         return Ok((SOLANA_USDC_1CLICK, wallet));
@@ -1975,6 +2139,351 @@ fn sell_units(
     }
     Ok(units)
 }
+// MON kept back for the network fee when selling it: a plain transfer costs about 0.002 MON.
+const MONAD_GAS_RESERVE: u128 = 20_000_000_000_000_000;
+const NEAR_GAS_SHORT: &str = "Selling needs about 0.05 NEAR in your NEAR wallet for network fees. Buy a little NEAR first, then sell.";
+
+// A 1Click coin's USD price, as the token list gives it (memecoins sit far below a micro-dollar).
+fn token_usd(token: &Token) -> f64 {
+    token
+        .price
+        .as_ref()
+        .and_then(|p| p.as_f64().or_else(|| p.as_str()?.parse().ok()))
+        .filter(|p| p.is_finite() && *p > 0.0)
+        .unwrap_or(0.0)
+}
+// Base units of a coin worth `usd_micros`, and what base units are worth (USD micros).
+fn units_worth(usd_micros: u128, price: f64, decimals: u32) -> u128 {
+    if price <= 0.0 {
+        return 0;
+    }
+    (usd_micros as f64 / 1e6 / price * 10f64.powi(decimals as i32)) as u128
+}
+fn worth_of(units: u128, price: f64, decimals: u32) -> u128 {
+    (units as f64 / 10f64.powi(decimals as i32) * price * 1e6) as u128
+}
+// How much to sell: the whole holding for Max, else what the asked value buys at the coin's price.
+fn sale_units(
+    held: u128,
+    value: u128,
+    price: f64,
+    decimals: u32,
+    all: bool,
+) -> Result<u128, ApiError> {
+    if all {
+        return (held > 0)
+            .then_some(held)
+            .ok_or_else(|| bad("No holding to sell"));
+    }
+    if price <= 0.0 {
+        return Err(venue("Price is unavailable"));
+    }
+    let units = units_worth(value, price, decimals);
+    if units == 0 || units > held {
+        return Err(bad("The sell amount exceeds your holding"));
+    }
+    Ok(units)
+}
+// 1Click's quote for exactly `amount` of `origin` to the user's cash, refunded to `refund_to` on the
+// coin's own chain if it can't go through.
+async fn cash_quote(
+    state: &AppState,
+    user: &app_balance::VerifiedWallets,
+    origin: &Token,
+    amount: u128,
+    refund_to: &str,
+    dry: bool,
+) -> Result<engine_execution::near_intents::Quote, ApiError> {
+    let (cash_asset, cash_wallet) = cash_target(user)?;
+    let deadline = deadline_utc(if dry { 180 } else { 240 });
+    let units = amount.to_string();
+    let request = QuoteRequest::exact_input(
+        &origin.asset_id,
+        cash_asset,
+        &units,
+        cash_wallet,
+        refund_to,
+        &deadline,
+        dry,
+    );
+    let q = state.near.client.quote(&request).await.map_err(venue)?;
+    if q.amount_in.parse::<u128>().ok() != Some(amount) {
+        return Err(venue("1Click changed the exact input amount"));
+    }
+    Ok(q)
+}
+fn min_out(q: &engine_execution::near_intents::Quote) -> Result<u128, ApiError> {
+    q.min_amount_out
+        .as_deref()
+        .unwrap_or(&q.amount_out)
+        .parse()
+        .map_err(internal)
+}
+// Whether Atlas can sell `token` back to cash right now (about `usd_micros` of it): Atlas won't buy
+// a coin it can't sell.
+async fn sellable(
+    state: &AppState,
+    headers: &HeaderMap,
+    user: &app_balance::VerifiedWallets,
+    token: &Token,
+    usd_micros: u128,
+) -> bool {
+    if token.blockchain == "sui" {
+        return true;
+    }
+    let units = units_worth(usd_micros, token_usd(token), token.decimals);
+    if units == 0 {
+        return false;
+    }
+    let Ok(refund) = destination(state, headers, token, user).await else {
+        return false;
+    };
+    if cash_quote(state, user, token, units, &refund, true)
+        .await
+        .is_ok()
+    {
+        return true;
+    }
+    // A NEAR coin 1Click won't take directly can still go out through Ref.
+    match token.contract_address.as_deref() {
+        Some(contract) if token.blockchain == "near" && near_account(contract) => {
+            ref_assets(state, contract).await.is_ok_and(|found| {
+                found
+                    .iter()
+                    .any(|a| a["token"] == contract && a["tradeable"] == true)
+            })
+        }
+        _ => false,
+    }
+}
+#[allow(clippy::too_many_arguments)]
+fn sale_json(
+    quote_id: &str,
+    asset_id: &str,
+    paid: (u128, u32, &str),
+    value: u128,
+    receive: u128,
+    currency: &str,
+    rate: u128,
+    expires: u64,
+) -> Value {
+    let (amount, decimals, symbol) = paid;
+    json!({"quoteId":quote_id,"assetId":asset_id,"side":"sell",
+        "pay":{"amount":markets::format_units(amount,decimals),"symbol":symbol,"value":money(value,currency,rate)},
+        "receive":{"amount":markets::format_units(receive,6),"symbol":"USDC","value":money(receive,currency,rate)},
+        "price":unit_price(receive,amount,decimals,currency,rate),
+        "fee":money(value.saturating_sub(receive),currency,rate),"expiresAtUnixMs":expires})
+}
+
+// Selling a NEAR coin Atlas bought through 1Click: straight to 1Click from the user's NEAR wallet,
+// or through Ref to wNEAR first when 1Click can't take it or Ref leaves more cash. Either way the
+// bridge signs once for exactly what's confirmed here (prepare → commit), and the cash lands as USDC.
+async fn near_coin_sell_quote(
+    state: AppState,
+    headers: HeaderMap,
+    req: markets::QuoteRequest,
+    user: app_balance::VerifiedWallets,
+    token: Token,
+) -> Result<Json<Value>, ApiError> {
+    let contract = token
+        .contract_address
+        .clone()
+        .filter(|c| near_account(c))
+        .ok_or_else(|| bad("Atlas can't sell this coin"))?;
+    let wallet = destination(&state, &headers, &token, &user).await?;
+    if near_native(&state, &wallet).await? < NEAR_GAS_RESERVE {
+        return Err(conflict(NEAR_GAS_SHORT));
+    }
+    let mut held = near_coin_held(&state, &contract, &wallet).await?;
+    if contract == WRAP_NEAR {
+        // NEAR keeps its own fee money.
+        held = held.saturating_sub(NEAR_GAS_RESERVE);
+    }
+    let price = token_usd(&token);
+    let rate = app_balance::fx_rate(&req.amount.currency).await?;
+    let desired = markets::parse_micros(&req.amount.amount)?
+        .checked_mul(1_000_000)
+        .ok_or_else(|| bad("Amount too large"))?
+        / rate;
+    let amount = sale_units(held, desired, price, token.decimals, req.all)?;
+    let value = worth_of(amount, price, token.decimals);
+    markets::check_limits(value, &req.amount.currency, rate)?;
+    let direct = cash_quote(&state, &user, &token, amount, &wallet, true).await;
+    let via_ref = if contract == WRAP_NEAR {
+        None
+    } else {
+        let quoted = ref_sell_quote(
+            state.clone(),
+            headers.clone(),
+            req.clone(),
+            user.clone(),
+            &contract,
+        )
+        .await
+        .ok();
+        quoted.and_then(|json| {
+            let id = json["quoteId"].as_str()?.to_owned();
+            let minimum = state.near.quotes.lock().ok()?.get(&id)?.minimum_out;
+            Some((json, id, minimum))
+        })
+    };
+    let direct_minimum = match &direct {
+        Ok(q) => Some(min_out(q)?),
+        Err(_) => None,
+    };
+    // Ref leaves more (or 1Click can't take it): Ref's quote stands as it is.
+    if let Some((json, id, ref_minimum)) = via_ref {
+        if direct_minimum.is_none_or(|d| ref_minimum > d) {
+            return Ok(json);
+        }
+        state.near.quotes.lock().map_err(internal)?.remove(&id);
+    }
+    let (Ok(q), Some(minimum)) = (direct, direct_minimum) else {
+        return Err(conflict(&format!(
+            "Atlas can't sell {} to cash right now. Try again later.",
+            token.symbol
+        )));
+    };
+    let receive: u128 = q.amount_out.parse().map_err(internal)?;
+    let (from_solana, paying) = match user.evm_wallet.clone() {
+        Some(evm) => (false, evm),
+        None => (
+            true,
+            user.solana_wallet
+                .clone()
+                .ok_or_else(|| conflict("Your cash wallet is not ready"))?,
+        ),
+    };
+    let quote_id = id("q");
+    let expires = now() + 30_000;
+    state.near.quotes.lock().map_err(internal)?.insert(
+        quote_id.clone(),
+        StoredQuote {
+            owner: user.user_id.clone(),
+            wallet: paying,
+            recipient: wallet,
+            asset: token.clone(),
+            amount,
+            minimum_out: minimum,
+            currency: req.amount.currency.clone(),
+            expires,
+            then_swap: None,
+            sell_sui: true,
+            from_solana,
+            network_fee: value.saturating_sub(receive),
+            sale: Some(SuiSale {
+                network: "nearintents".into(),
+                coin_type: contract,
+                symbol: token.symbol.clone(),
+                name: token.symbol.clone(),
+                decimals: token.decimals,
+                icon_url: None,
+                amount,
+                minimum_sui: minimum,
+            }),
+            asset_id: req.asset_id.clone(),
+            monad_sale: false,
+        },
+    );
+    Ok(Json(sale_json(
+        &quote_id,
+        &req.asset_id,
+        (amount, token.decimals, &token.symbol),
+        value,
+        receive,
+        &req.amount.currency,
+        rate,
+        expires,
+    )))
+}
+
+// Selling a Monad coin: the phone sends it to 1Click's deposit address (one plain transfer, MON
+// itself or an ERC-20 `transfer`), and the cash lands as USDC.
+async fn monad_sell_quote(
+    state: AppState,
+    req: markets::QuoteRequest,
+    user: app_balance::VerifiedWallets,
+    token: Token,
+) -> Result<Json<Value>, ApiError> {
+    let wallet = user
+        .evm_wallet
+        .clone()
+        .filter(|w| is_evm(w))
+        .ok_or_else(|| conflict("Your wallet is still being set up. Try again in a moment."))?;
+    let held = state.near.monad_balance(&token, &wallet).await?;
+    let native = token.contract_address.is_none();
+    let gas = if native {
+        held
+    } else {
+        let mon = Token {
+            contract_address: None,
+            ..token.clone()
+        };
+        state.near.monad_balance(&mon, &wallet).await?
+    };
+    if gas < MONAD_GAS_RESERVE {
+        return Err(conflict(
+            "Selling needs a little MON in your wallet for the network fee (about 0.02 MON).",
+        ));
+    }
+    let available = if native {
+        held - MONAD_GAS_RESERVE
+    } else {
+        held
+    };
+    let price = token_usd(&token);
+    let rate = app_balance::fx_rate(&req.amount.currency).await?;
+    let desired = markets::parse_micros(&req.amount.amount)?
+        .checked_mul(1_000_000)
+        .ok_or_else(|| bad("Amount too large"))?
+        / rate;
+    let amount = sale_units(available, desired, price, token.decimals, req.all)?;
+    let value = worth_of(amount, price, token.decimals);
+    markets::check_limits(value, &req.amount.currency, rate)?;
+    let q = cash_quote(&state, &user, &token, amount, &wallet, true)
+        .await
+        .map_err(|_| {
+            conflict(&format!(
+                "{} can't be sold to cash right now: NEAR Intents isn't taking it. Try again later.",
+                token.symbol
+            ))
+        })?;
+    let receive: u128 = q.amount_out.parse().map_err(internal)?;
+    let minimum = min_out(&q)?;
+    let quote_id = id("q");
+    let expires = now() + 30_000;
+    state.near.quotes.lock().map_err(internal)?.insert(
+        quote_id.clone(),
+        StoredQuote {
+            owner: user.user_id.clone(),
+            wallet: wallet.clone(),
+            recipient: wallet,
+            asset: token.clone(),
+            amount,
+            minimum_out: minimum,
+            currency: req.amount.currency.clone(),
+            expires,
+            then_swap: None,
+            sell_sui: false,
+            from_solana: false,
+            network_fee: value.saturating_sub(receive),
+            sale: None,
+            asset_id: req.asset_id.clone(),
+            monad_sale: true,
+        },
+    );
+    Ok(Json(sale_json(
+        &quote_id,
+        &req.asset_id,
+        (amount, token.decimals, &token.symbol),
+        value,
+        receive,
+        &req.amount.currency,
+        rate,
+        expires,
+    )))
+}
+
 async fn sui_coin_sell_quote(
     state: AppState,
     headers: HeaderMap,
@@ -2120,6 +2629,8 @@ async fn sui_coin_sell_quote(
                 amount,
                 minimum_sui: min_sui,
             }),
+            asset_id: req.asset_id.clone(),
+            monad_sale: false,
         },
     );
     Ok(Json(
@@ -2213,7 +2724,7 @@ async fn ref_sell_quote(
     let (cash_asset, cash_wallet) = cash_target(&user)?;
     let deadline = deadline_utc(180);
     let units = cashout.to_string();
-    let mut request = QuoteRequest::exact_input(
+    let request = QuoteRequest::exact_input(
         &token.asset_id,
         cash_asset,
         &units,
@@ -2222,7 +2733,6 @@ async fn ref_sell_quote(
         &deadline,
         true,
     );
-    request.deposit_type = "INTENTS";
     let q = state.near.client.quote(&request).await.map_err(|_| {
         bad("The cashout is below the available route minimum or unavailable. Try a larger amount.")
     })?;
@@ -2267,6 +2777,8 @@ async fn ref_sell_quote(
                 amount,
                 minimum_sui: min_sui,
             }),
+            asset_id: req.asset_id.clone(),
+            monad_sale: false,
         },
     );
     Ok(Json(
@@ -2465,6 +2977,8 @@ async fn sui_sell_quote(
             sale: None,
             from_solana: false,
             network_fee: 0,
+            asset_id: req.asset_id.clone(),
+            monad_sale: false,
         },
     );
     Ok(Json(json!({
@@ -2554,8 +3068,21 @@ pub(super) async fn quote(
                 let coin = coin.to_owned();
                 return sui_coin_sell_quote(state, headers, req, user, &coin).await;
             }
+            return sui_sell_quote(state, headers, req, user).await;
         }
-        return sui_sell_quote(state, headers, req, user).await;
+        let token = state
+            .near
+            .tokens()
+            .await?
+            .into_iter()
+            .find(|t| format!("near:{}", t.asset_id) == req.asset_id && supported(t))
+            .ok_or((StatusCode::NOT_FOUND, "1Click asset not found".into()))?;
+        return match (token.blockchain.as_str(), sell_route(&token.blockchain)) {
+            ("near", Some(_)) => near_coin_sell_quote(state, headers, req, user, token).await,
+            ("monad", Some(_)) => monad_sell_quote(state, req, user, token).await,
+            ("sui", Some(_)) => sui_sell_quote(state, headers, req, user).await,
+            _ => Err(bad("Atlas can't sell this coin")),
+        };
     }
     if req.side != "buy" {
         return Err(bad("unsupported trade side"));
@@ -2578,6 +3105,31 @@ pub(super) async fn quote(
         .ok_or_else(|| bad("amount too large"))?
         / rate;
     markets::check_limits(amount, &req.amount.currency, rate)?;
+    // A NEAR coin's sale is paid for in NEAR. With none in the wallet, the coin is bought through
+    // NEAR and Ref, which keeps 0.05 NEAR back for those fees.
+    if let Some(contract) = token
+        .contract_address
+        .clone()
+        .filter(|c| token.blockchain == "near" && c != WRAP_NEAR && near_account(c))
+    {
+        if near_native(&state, &destination).await? < NEAR_GAS_RESERVE {
+            let symbol = token.symbol.clone();
+            return ref_buy_quote(state, headers, req, user, &contract)
+                .await
+                .map_err(|_| {
+                    conflict(&format!(
+                        "Buying {symbol} needs a little NEAR in your NEAR wallet for the fees of selling it later. Buy a little NEAR first."
+                    ))
+                });
+        }
+    }
+    // Atlas won't buy a coin it can't sell back to cash.
+    if !sellable(&state, &headers, &user, &token, amount).await {
+        return Err(conflict(&format!(
+            "Atlas can't sell {} back to cash right now, so it won't buy it. Try again later.",
+            token.symbol
+        )));
+    }
     let (wallet, from_solana, network_fee, origin) =
         pay_from(&state, &user, amount, &req.amount.currency, rate).await?;
     let deadline = deadline_utc(180);
@@ -2622,6 +3174,8 @@ pub(super) async fn quote(
             sale: None,
             from_solana,
             network_fee,
+            asset_id: req.asset_id.clone(),
+            monad_sale: false,
         },
     );
     Ok(Json(
@@ -2632,6 +3186,142 @@ pub(super) async fn quote(
         "price":unit_price(input,output,token.decimals,&req.amount.currency,rate),
         "fee":money(network_fee,&req.amount.currency,rate),"expiresAtUnixMs":expires}),
     ))
+}
+// A Monad sale's plan: one transfer to 1Click's deposit address, for the phone to send (MON itself,
+// or an ERC-20 `transfer`). The wallet's nonce is noted: once it moves on, the plan may have gone out.
+async fn execute_monad_sale(
+    state: &AppState,
+    user: &app_balance::VerifiedWallets,
+    stored: StoredQuote,
+) -> Result<Json<Value>, ApiError> {
+    let token = stored.asset.clone();
+    let held = state.near.monad_balance(&token, &stored.wallet).await?;
+    let gas = if token.contract_address.is_none() {
+        MONAD_GAS_RESERVE
+    } else {
+        0
+    };
+    if held < stored.amount.saturating_add(gas) {
+        return Err(conflict(&format!(
+            "You no longer hold that much {}.",
+            token.symbol
+        )));
+    }
+    let q = cash_quote(state, user, &token, stored.amount, &stored.wallet, false).await?;
+    if min_out(&q)? < stored.minimum_out.saturating_mul(99) / 100 {
+        return Err(conflict("route price changed; request a fresh quote"));
+    }
+    let deposit = q
+        .deposit_address
+        .clone()
+        .filter(|d| is_evm(d) && q.deposit_memo.is_none())
+        .ok_or_else(|| venue("1Click returned an unsupported deposit destination"))?;
+    let (to, data, value) = monad_transfer(&token, &deposit, stored.amount)?;
+    let nonce = state.near.monad_nonce(&stored.wallet).await?;
+    let intent_id = id("intent");
+    let expires = now() + 120_000;
+    state
+        .near
+        .insert_intent(
+            &intent_id,
+            StoredIntent {
+                owner: user.user_id.clone(),
+                wallet: stored.wallet.clone(),
+                expected_to: to.clone(),
+                expected_data: data.clone(),
+                deposit_address: deposit,
+                deposit_memo: None,
+                asset: Some(token.clone()),
+                expires,
+                status: markets::IntentStatus {
+                    intent_id: intent_id.clone(),
+                    stage: "validate".into(),
+                    state: "pending".into(),
+                    tx_ids: Vec::new(),
+                    error: None,
+                },
+                then_swap: None,
+                sell_sui: false,
+                amount: stored.amount,
+                minimum_out: stored.minimum_out,
+                sui_wallet: None,
+                from_solana: false,
+                gas_request_id: None,
+                gas_topup: false,
+                gas_order: None,
+                sale: None,
+                sale_permission_used: false,
+                ref_wallet: None,
+                asset_id: stored.asset_id.clone(),
+                origin_chain: "monad".into(),
+                expected_value: format!("0x{value:x}"),
+                handed_nonce: Some(nonce),
+            },
+        )
+        .await?;
+    let rate = app_balance::fx_rate(&stored.currency).await?;
+    let mut summary = vec![
+        json!({"label":"You sell","value":format!("{} {}",markets::format_units(stored.amount,token.decimals),token.symbol)}),
+        json!({"label":"You receive (at least)","value":markets::say_money(stored.minimum_out,&stored.currency,rate)}),
+    ];
+    if stored.network_fee > 0 {
+        summary.push(json!({"label":"Fees","value":markets::say_money(stored.network_fee,&stored.currency,rate)}));
+    }
+    Ok(Json(
+        json!({"intentId":intent_id,"kind":"sell","summary":summary,
+        "transactions":[{"chain":"monad","chainId":MONAD_CHAIN_ID,"to":to,"data":data,"value":value.to_string()}],
+        "expiresAtUnixMs":expires}),
+    ))
+}
+const MONAD_CHAIN_ID: u64 = 143;
+// The transfer that pays 1Click on Monad: (to, calldata, wei). MON goes as value; an ERC-20 goes as
+// a `transfer(deposit, amount)` call to its contract.
+fn monad_transfer(
+    token: &Token,
+    deposit: &str,
+    amount: u128,
+) -> Result<(String, String, u128), ApiError> {
+    if !is_evm(deposit) || amount == 0 {
+        return Err(bad("invalid transfer"));
+    }
+    let deposit = deposit.to_ascii_lowercase();
+    match token.contract_address.as_deref() {
+        None => Ok((deposit, "0x".into(), amount)),
+        Some(contract) if is_evm(contract) => Ok((
+            contract.to_ascii_lowercase(),
+            format!("0xa9059cbb{:0>64}{:064x}", &deposit[2..], amount),
+            0,
+        )),
+        Some(_) => Err(venue("invalid Monad token contract")),
+    }
+}
+// A filled trade goes into the trade book, so positions and P&L follow it. Keeping it never fails
+// the trade the user already made.
+async fn record_fill(
+    state: &AppState,
+    intent_id: &str,
+    intent: &StoredIntent,
+    side: &str,
+    token_units: u128,
+    usdc_units: u128,
+    tx_id: Option<String>,
+) {
+    if intent.asset_id.is_empty() || token_units == 0 {
+        return;
+    }
+    let trade = positions::Trade {
+        intent_id: intent_id.into(),
+        user_id: intent.owner.clone(),
+        asset_id: intent.asset_id.clone(),
+        side: side.into(),
+        token_units,
+        usdc_units,
+        tx_id,
+        filled_at_ms: now(),
+    };
+    if let Err(error) = state.trades.record(&trade).await {
+        eprintln!("trade {intent_id} not kept: {}", error.1);
+    }
 }
 async fn execute_sui_sell(
     state: &AppState,
@@ -2685,6 +3375,10 @@ async fn execute_sui_sell(
                 gas_order: None,
                 sale_permission_used: false,
                 ref_wallet: None,
+                asset_id: quote.asset_id.clone(),
+                origin_chain: String::new(),
+                expected_value: String::new(),
+                handed_nonce: None,
             },
         )
         .await?;
@@ -2744,6 +3438,9 @@ pub(super) async fn execute(
     }
     if stored.sell_sui {
         return execute_sui_sell(&state, &user, stored).await;
+    }
+    if stored.monad_sale {
+        return execute_monad_sale(&state, &user, stored).await;
     }
     let balance = if stored.from_solana {
         markets::solana_cash(&state, &stored.wallet).await
@@ -2868,6 +3565,10 @@ pub(super) async fn execute(
                 gas_order: None,
                 sale_permission_used: false,
                 ref_wallet: Some(stored.recipient.clone()),
+                asset_id: stored.asset_id.clone(),
+                origin_chain: String::new(),
+                expected_value: String::new(),
+                handed_nonce: None,
             },
         )
         .await?;
@@ -2969,8 +3670,14 @@ async fn run_sui_sell(
     let is_near = current
         .sale
         .as_ref()
-        .is_some_and(|sale| sale.network == "near");
-    if let Some(sale) = current.sale.clone() {
+        .is_some_and(|sale| matches!(sale.network.as_str(), "near" | "nearintents"));
+    // A NEAR coin sold straight to 1Click: no swap first, the coin itself is the deposit.
+    let direct = current
+        .sale
+        .as_ref()
+        .filter(|sale| sale.network == "nearintents")
+        .map(|sale| sale.symbol.clone());
+    if let Some(sale) = current.sale.clone().filter(|_| direct.is_none()) {
         let prepared = bridge(
             state,
             headers,
@@ -3046,30 +3753,35 @@ async fn run_sui_sell(
             }
         }
     }
-    let prepared = bridge(
-        state,
-        headers,
-        if is_near {
-            "/near/cashout/prepare"
-        } else {
-            "/sui/cashout/prepare"
-        },
-        json!({"amount":current.amount.to_string(),
-            "minimumOut":current.minimum_out.to_string()}),
-    )
-    .await;
+    // A direct sale's bounds come only from this intent (the bridge asks for its permission).
+    let prepared = if direct.is_some() {
+        bridge(state, headers, "/near/sell/prepare", json!({"intentId":id})).await
+    } else {
+        bridge(
+            state,
+            headers,
+            if is_near {
+                "/near/cashout/prepare"
+            } else {
+                "/sui/cashout/prepare"
+            },
+            json!({"amount":current.amount.to_string(),
+                "minimumOut":current.minimum_out.to_string()}),
+        )
+        .await
+    };
+    current.sale_permission_used |= direct.is_some();
     let prepared = match prepared {
         Ok(value) => value,
         Err(_) => {
             current.status.state = "failed".into();
-            current.status.error = Some(
-                if current.sale.is_some() {
-                    "Your sale settled, but cashout is unavailable. The proceeds are still in your wallet."
-                } else {
-                    "Cashout route is unavailable; nothing was sent"
-                }
-                .into(),
-            );
+            current.status.error = Some(if let Some(symbol) = &direct {
+                format!("The sale didn't start. Your {symbol} is still in your NEAR wallet.")
+            } else if current.sale.is_some() {
+                "Your sale settled, but cashout is unavailable. The proceeds are still in your wallet.".into()
+            } else {
+                "Cashout route is unavailable; nothing was sent".into()
+            });
             state.near.save_intent(id, current.clone()).await?;
             return Ok(Json(current.status));
         }
@@ -3104,7 +3816,9 @@ async fn run_sui_sell(
     let result = bridge(
         state,
         headers,
-        if is_near {
+        if direct.is_some() {
+            "/near/sell/commit"
+        } else if is_near {
             "/near/cashout/commit"
         } else {
             "/sui/cashout/commit"
@@ -3190,6 +3904,21 @@ pub(super) async fn signed(
         state.near.save_intent(&id, current).await?;
         return Ok(Json(result));
     }
+    // A Monad sale: the phone sent the coin to 1Click; status follows it on Monad, then 1Click.
+    if current.origin_chain == "monad" {
+        if !body.signed.is_empty()
+            || body.sent.len() != 1
+            || body.sent[0].chain != "monad"
+            || !valid_hash(&body.sent[0].id)
+        {
+            return Err(bad("signed report does not match the sale plan"));
+        }
+        current.status.stage = "settle".into();
+        current.status.tx_ids = vec![body.sent[0].id.clone()];
+        let result = current.status.clone();
+        state.near.save_intent(&id, current).await?;
+        return Ok(Json(result));
+    }
     if current.gas_topup && !second_step {
         if !body.sent.is_empty() || !body.signed.is_empty() {
             return Err(bad("signed report does not match 1Click deposit plan"));
@@ -3258,6 +3987,7 @@ pub(super) async fn status(
             .map_err(venue)?;
         match venue_status.status.as_str() {
             "SUCCESS" => {
+                let cash = delivered(&venue_status).unwrap_or(current.minimum_out);
                 let hashes = venue_status
                     .swap_details
                     .map(|details| {
@@ -3275,6 +4005,9 @@ pub(super) async fn status(
                 result.stage = "settle".into();
                 result.state = "filled".into();
                 result.error = None;
+                let sold = current.sale.as_ref().map_or(current.amount, |s| s.amount);
+                let tx = result.tx_ids.first().cloned();
+                record_fill(&state, &id, &current, "sell", sold, cash, tx).await;
             }
             "REFUNDED" | "FAILED" | "EXPIRED" => {
                 result.stage = "settle".into();
@@ -3309,6 +4042,56 @@ pub(super) async fn status(
         state.near.save_intent(&id, current).await?;
         return Ok(Json(result));
     }
+    // A Monad sale nobody reported: past its window, and the wallet's nonce still where it was when
+    // the plan was handed out, nothing went out. If the nonce moved, it may have: follow 1Click.
+    if current.origin_chain == "monad"
+        && result.stage == "validate"
+        && result.state == "pending"
+        && now() > current.expires
+    {
+        let moved = match current.handed_nonce {
+            Some(handed) => state.near.monad_nonce(&current.wallet).await? > handed,
+            None => true,
+        };
+        if !moved {
+            result.state = "failed".into();
+            result.error = Some(format!(
+                "Nothing was sent, so your {} is still in your wallet.",
+                current.asset.as_ref().map_or("coin", |a| a.symbol.as_str())
+            ));
+            current.status = result.clone();
+            state.near.save_intent(&id, current).await?;
+            return Ok(Json(result));
+        }
+        let venue_status = state
+            .near
+            .client
+            .status(&current.deposit_address, None)
+            .await
+            .map_err(venue)?;
+        match venue_status.status.as_str() {
+            "SUCCESS" => {
+                result.stage = "settle".into();
+                result.state = "filled".into();
+                let cash = delivered(&venue_status).unwrap_or(current.minimum_out);
+                record_fill(&state, &id, &current, "sell", current.amount, cash, None).await;
+            }
+            "FAILED" | "REFUNDED" => {
+                result.state = "failed".into();
+                result.error = Some(format!("1Click {}", venue_status.status));
+            }
+            _ => {
+                result.error = Some(
+                    "It may have gone through. Checking with NEAR Intents before saying more."
+                        .into(),
+                );
+                return Ok(Json(result));
+            }
+        }
+        current.status = result.clone();
+        state.near.save_intent(&id, current).await?;
+        return Ok(Json(result));
+    }
     if result.stage != "settle" || result.state != "pending" {
         return Ok(Json(result));
     }
@@ -3328,6 +4111,7 @@ pub(super) async fn status(
                 .map_err(venue)?;
             match venue_status.status.as_str() {
                 "SUCCESS" => {
+                    let got = delivered(&venue_status).unwrap_or(current.minimum_out);
                     let hashes = venue_status
                         .swap_details
                         .map(|s| {
@@ -3412,6 +4196,21 @@ pub(super) async fn status(
                                 }
                                 result.stage = "settle".into();
                                 result.state = "filled".into();
+                                let bought = body["amountOut"]
+                                    .as_str()
+                                    .and_then(|v| v.parse().ok())
+                                    .unwrap_or(swap.expected_out);
+                                let tx = result.tx_ids.last().cloned();
+                                record_fill(
+                                    &state,
+                                    &id,
+                                    &current,
+                                    "buy",
+                                    bought,
+                                    current.amount,
+                                    tx,
+                                )
+                                .await;
                             }
                             Ok(body) => {
                                 result.state = "failed".into();
@@ -3431,6 +4230,14 @@ pub(super) async fn status(
                         }
                     } else {
                         result.state = "filled".into();
+                        let tx = result.tx_ids.first().cloned();
+                        if current.origin_chain == "monad" {
+                            record_fill(&state, &id, &current, "sell", current.amount, got, tx)
+                                .await;
+                        } else {
+                            record_fill(&state, &id, &current, "buy", got, current.amount, tx)
+                                .await;
+                        }
                     }
                 }
                 "FAILED" | "REFUNDED" => {
@@ -3452,6 +4259,16 @@ pub(super) async fn status(
     Ok(Json(result))
 }
 
+// What 1Click says reached the recipient, once settled.
+fn delivered(status: &engine_execution::near_intents::Status) -> Option<u128> {
+    status
+        .swap_details
+        .as_ref()?
+        .amount_out
+        .as_deref()?
+        .parse()
+        .ok()
+}
 // Whether the user's deposit to 1Click has landed: Ok(true) once it has, as planned; Ok(false)
 // until then; Err with what the user reads when it failed.
 async fn deposit_landed(
@@ -3472,6 +4289,9 @@ async fn deposit_landed(
                 Some(Err(_)) => Err(NOT_SENT.into()),
             },
         );
+    }
+    if current.origin_chain == "monad" {
+        return monad_deposit_landed(state, current, hash).await;
     }
     let tx = markets::base_rpc(&state.markets, "eth_getTransactionByHash", json!([hash])).await?;
     if tx.is_null() {
@@ -3501,6 +4321,55 @@ async fn deposit_landed(
     Ok(Ok(true))
 }
 
+// A Monad sale's transfer: exactly the planned one (from the wallet, to, data and value, on chain
+// 143), and it succeeded.
+async fn monad_deposit_landed(
+    state: &AppState,
+    current: &StoredIntent,
+    hash: &str,
+) -> Result<Result<bool, String>, ApiError> {
+    let tx = state
+        .near
+        .monad_call("eth_getTransactionByHash", json!([hash]))
+        .await?;
+    if tx.is_null() {
+        return Ok(Ok(false));
+    }
+    if !monad_tx_matches(&tx, current) {
+        return Ok(Err(
+            "reported transaction does not match the sale plan".into()
+        ));
+    }
+    let receipt = state
+        .near
+        .monad_call("eth_getTransactionReceipt", json!([hash]))
+        .await?;
+    if receipt.is_null() {
+        return Ok(Ok(false));
+    }
+    if receipt["status"].as_str() != Some("0x1") {
+        return Ok(Err(format!(
+            "The transfer didn't go through, so your {} is still in your wallet.",
+            current.asset.as_ref().map_or("coin", |a| a.symbol.as_str())
+        )));
+    }
+    Ok(Ok(true))
+}
+fn monad_tx_matches(tx: &Value, current: &StoredIntent) -> bool {
+    let field = |name: &str, want: &str| {
+        tx[name]
+            .as_str()
+            .is_some_and(|v| v.eq_ignore_ascii_case(want))
+    };
+    let value = hex_units(&tx["value"]);
+    field("from", &current.wallet)
+        && field("to", &current.expected_to)
+        && (field("input", &current.expected_data)
+            || (current.expected_data == "0x" && tx["input"].as_str() == Some("0x")))
+        && value.is_some()
+        && value == hex_units(&json!(current.expected_value))
+        && tx["chainId"].as_str() == Some("0x8f")
+}
 // The Base transfer to 1Click once an empty gas tank has been topped up (GET /v1/intents/{id}/next).
 pub(super) async fn next(
     state: AppState,
@@ -3541,6 +4410,187 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+    fn token(
+        chain: &str,
+        symbol: &str,
+        contract: Option<&str>,
+        decimals: u32,
+        price: f64,
+    ) -> Token {
+        Token {
+            asset_id: format!("nep141:{symbol}"),
+            blockchain: chain.into(),
+            symbol: symbol.into(),
+            decimals,
+            contract_address: contract.map(str::to_owned),
+            price: Some(json!(price)),
+            coingecko_id: None,
+        }
+    }
+    #[test]
+    fn nothing_is_bought_on_a_chain_atlas_cant_sell_from() {
+        for chain in ["near", "monad", "sui"] {
+            assert!(supported(&token(chain, "COIN", None, 18, 1.0)), "{chain}");
+            assert!(sell_route(chain).is_some());
+        }
+        for chain in ["eth", "base", "sol", "arb", "btc", "aptos"] {
+            assert!(!supported(&token(chain, "COIN", None, 18, 1.0)), "{chain}");
+        }
+        // Cash itself isn't traded.
+        assert!(!supported(&token(
+            "monad",
+            "USDC",
+            Some("0x754704bc059f8c67012fed69bc8a327a5aafb603"),
+            6,
+            1.0
+        )));
+    }
+    #[test]
+    fn memecoins_far_below_a_microdollar_still_price() {
+        // BLACKDRAGON: about $0.00000002 a coin, 24 decimals.
+        let price = 2.0065261919009766e-8;
+        let units = units_worth(1_500_000, price, 24);
+        assert!((units as f64 / 1e24 - 74_756_000.0).abs() < 100_000.0);
+        let back = worth_of(units, price, 24);
+        assert!((back as i128 - 1_500_000).abs() < 10);
+        assert_eq!(
+            sale_units(units, 1_500_000, price, 24, false).unwrap(),
+            units
+        );
+        assert!(sale_units(units / 2, 1_500_000, price, 24, false).is_err());
+        assert_eq!(sale_units(123, 0, 0.0, 24, true).unwrap(), 123);
+        assert!(sale_units(0, 0, price, 24, true).is_err());
+        assert_eq!(token_usd(&token("near", "X", None, 24, price)), price);
+        let mut quoted = token("near", "X", None, 24, 0.0);
+        quoted.price = Some(json!("0.25"));
+        assert_eq!(token_usd(&quoted), 0.25);
+    }
+    #[test]
+    fn a_monad_sale_is_one_plain_transfer_to_the_deposit() {
+        let deposit = "0x1111111111111111111111111111111111111111";
+        let mon = token("monad", "MON", None, 18, 0.03);
+        assert_eq!(
+            monad_transfer(&mon, deposit, 5).unwrap(),
+            (deposit.into(), "0x".into(), 5)
+        );
+        let usd = token(
+            "monad",
+            "COIN",
+            Some("0x754704BC059F8C67012FED69BC8A327A5AAFB603"),
+            6,
+            1.0,
+        );
+        let (to, data, value) = monad_transfer(&usd, deposit, 255).unwrap();
+        assert_eq!(to, "0x754704bc059f8c67012fed69bc8a327a5aafb603");
+        assert_eq!(value, 0);
+        assert_eq!(
+            data,
+            format!(
+                "0xa9059cbb{:0>64}{:064x}",
+                "1111111111111111111111111111111111111111", 255
+            )
+        );
+        assert!(monad_transfer(&mon, "not-an-address", 5).is_err());
+        assert!(monad_transfer(&mon, deposit, 0).is_err());
+    }
+    #[test]
+    fn a_reported_monad_transfer_must_be_exactly_the_plan() {
+        let mut intent: StoredIntent = serde_json::from_value(json!({
+            "owner":"o","wallet":"0x4838b106fce9647bdf1e7877bf73ce8b0bad5f97","expected_to":"0x1111111111111111111111111111111111111111",
+            "expected_data":"0x","deposit_address":"0x1111111111111111111111111111111111111111","deposit_memo":null,
+            "expires":0,"status":{"intentId":"i","stage":"settle","state":"pending","txIds":[],"error":null},
+            "origin_chain":"monad","expected_value":"0x2386f26fc10000"}))
+        .unwrap();
+        let tx = json!({"from":"0x4838B106FCe9647Bdf1E7877BF73cE8B0BAD5f97","to":"0x1111111111111111111111111111111111111111",
+            "input":"0x","value":"0x2386f26fc10000","chainId":"0x8f"});
+        assert!(monad_tx_matches(&tx, &intent));
+        for (field, value) in [
+            ("to", "0x2222222222222222222222222222222222222222"),
+            ("value", "0x2386f26fc10001"),
+            ("chainId", "0x2105"),
+            ("from", "0x0000000000000000000000000000000000000001"),
+            ("input", "0xa9059cbb"),
+        ] {
+            let mut changed = tx.clone();
+            changed[field] = json!(value);
+            assert!(!monad_tx_matches(&changed, &intent), "{field}");
+        }
+        intent.expected_value = "0x0".into();
+        assert!(!monad_tx_matches(&tx, &intent));
+    }
+    #[test]
+    fn a_captured_near_coin_sale_quote_reads_its_minimum_and_deposit() {
+        // From 1Click on 2026-10-01: 2,000 SHITZU to Solana USDC (ORIGIN_CHAIN, not funded).
+        let body = json!({"quote":{"amountIn":"2000000000000000000000","amountOut":"7792945",
+            "amountOutUsd":"7.79","minAmountOut":"7715015",
+            "depositAddress":"7478b3f96ffcaffb848a85a269195600a6201f30658fbf671029a5480da89c7d",
+            "depositMemo":null,"timeEstimate":20,"deadline":"2026-10-04T17:06:27.000Z"}});
+        let quote: engine_execution::near_intents::QuoteResponse =
+            serde_json::from_value(body).unwrap();
+        assert_eq!(min_out(&quote.quote).unwrap(), 7_715_015);
+        assert_eq!(
+            quote.quote.deposit_address.as_deref().map(str::len),
+            Some(64)
+        );
+        // What settled: 1Click's own amount, for the trade book.
+        let status: engine_execution::near_intents::Status = serde_json::from_value(json!({
+            "status":"SUCCESS","swapDetails":{"amountOut":"7790001","destinationChainTxHashes":[]}}))
+        .unwrap();
+        assert_eq!(delivered(&status), Some(7_790_001));
+    }
+    // Network: dry quotes only, nothing is sent.
+    // cargo test -p engine-service live_near_and_monad_sales -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn live_near_and_monad_sales() {
+        let client = Client::new(std::env::var("NEAR_INTENTS_API_KEY").ok()).unwrap();
+        let deadline = deadline_utc(180);
+        let solana = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM";
+        for (origin, amount, refund, label) in [
+            (
+                "nep141:token.0xshitzu.near",
+                "2000000000000000000000",
+                "atlas.near",
+                "2,000 SHITZU",
+            ),
+            (
+                "nep141:blackdragon.tkn.near",
+                "100000000000000000000000000000000",
+                "atlas.near",
+                "100M BLACKDRAGON",
+            ),
+            (
+                "nep141:wrap.near",
+                "1000000000000000000000000",
+                "atlas.near",
+                "1 NEAR",
+            ),
+            (
+                "nep245:v2_1.omni.hot.tg:143_11111111111111111111",
+                "100000000000000000000",
+                "0x4838B106FCe9647Bdf1E7877BF73cE8B0BAD5f97",
+                "100 MON",
+            ),
+        ] {
+            let request = QuoteRequest::exact_input(
+                origin,
+                SOLANA_USDC_1CLICK,
+                amount,
+                solana,
+                refund,
+                &deadline,
+                true,
+            );
+            match client.quote(&request).await {
+                Ok(q) => println!(
+                    "LIVE DRY: {label} -> {} USDC units on Solana (at least {})",
+                    q.amount_out,
+                    q.min_amount_out.unwrap_or_default()
+                ),
+                Err(error) => println!("LIVE DRY: {label} -> not quoted ({error})"),
+            }
+        }
     }
     #[test]
     fn max_sale_uses_the_exact_onchain_holding() {

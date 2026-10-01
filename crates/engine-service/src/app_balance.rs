@@ -10,7 +10,7 @@ pub(super) struct BalanceQuery {
     currency: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct VerifiedWallets {
     pub(super) user_id: String,
