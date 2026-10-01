@@ -446,17 +446,25 @@ pub(super) async fn verified_wallets(
             StatusCode::UNAUTHORIZED,
             "Privy access token required".into(),
         ))?;
-    let response = http
-        .post(format!("{bridge_url}/verify"))
-        .json(&serde_json::json!({"accessToken":token}))
-        .send()
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Privy verification unavailable".into(),
-            )
-        })?;
+    // A bridge that's restarting gets one more try before sign-in checks fail.
+    let verify = || {
+        http.post(format!("{bridge_url}/verify"))
+            .json(&serde_json::json!({"accessToken":token}))
+            .send()
+    };
+    let response = match verify().await {
+        Ok(response) => Ok(response),
+        Err(_) => {
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            verify().await
+        }
+    }
+    .map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Privy verification unavailable".into(),
+        )
+    })?;
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
         return Err((
             StatusCode::UNAUTHORIZED,
