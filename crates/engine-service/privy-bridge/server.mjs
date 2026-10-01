@@ -100,12 +100,14 @@ const server = createServer(async (request, response) => {
     // Which token signs as the user, logged by kind only (never the token), so a Privy refusal
     // can be traced to a missing or rejected identity token.
     let userJwtKind = 'access token (no identity token sent)';
+    let identityVerified = false;
     if (typeof input.identityToken === 'string' && input.identityToken) {
       try {
         const identity = await privy.utils().auth().verifyIdentityToken(input.identityToken);
         if (identity?.id === userId) {
           userJwt = input.identityToken;
           userJwtKind = 'identity token';
+          identityVerified = true;
         } else {
           userJwtKind = 'access token (identity token is another user)';
         }
@@ -280,12 +282,26 @@ const server = createServer(async (request, response) => {
           expiresAtUnixMs: input.expiresAtUnixMs,
           amount: input.amount,
           reserve,
+          // Signs as the user with their identity token, then their access token if Privy refuses
+          // the first; the error names what Privy said to each (by kind, never the token).
           rawSign: async (hex) => {
-            const signed = await privy.wallets().rawSign(wallet.id, {
-              params: {bytes: hex, encoding: 'hex', hash_function: 'blake2b256'},
-              authorization_context: {user_jwts: [userJwt]},
-            });
-            return signed.signature;
+            const tries = [...(identityVerified ? [['identity token', input.identityToken]] : []), ['access token', accessToken]];
+            const refusals = [];
+            for (const [kind, jwt] of tries) {
+              try {
+                const signed = await privy.wallets().rawSign(wallet.id, {
+                  params: {bytes: hex, encoding: 'hex', hash_function: 'blake2b256'},
+                  authorization_context: {user_jwts: [jwt]},
+                });
+                if (refusals.length) console.error(`[bridge] /sui/swap signed with ${kind} after: ${refusals.join(' | ')}`);
+                return signed.signature;
+              } catch (error) {
+                const reason = String(error?.message ?? error);
+                if (!/invalid jwt|invalid_data|unauthori[sz]ed|\b401\b/i.test(reason)) throw error;
+                refusals.push(`${kind}: ${reason.replace(/^[0-9]{3} /, '').slice(0, 70)}`);
+              }
+            }
+            throw new Error(`Privy refused to sign (${userJwtKind}; ${refusals.join(' | ')})`);
           },
         });
         send(response, 200, {userId, address: wallet.address, ...result});

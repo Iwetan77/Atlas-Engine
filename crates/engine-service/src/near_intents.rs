@@ -73,7 +73,7 @@ fn short_reason(reason: &str) -> String {
     reason
         .trim_start_matches("Sui swap unavailable: ")
         .chars()
-        .take(140)
+        .take(260)
         .collect()
 }
 // The second leg of an unlisted Sui buy.
