@@ -283,3 +283,25 @@ cannot build a transaction until it holds its input and gas; report those checks
 `GET /v1/assets?currency=NGN&category=crypto&q=deep` keeps the existing `{assets:[...]}` shape and adds `searchComplete: boolean`. Sui, Ref and 1Click lookups run independently; one provider's timeout never discards another provider's rows. Prices and on-chain metadata remain required. Verification badges refresh in the background and stay unverified until the exact contract is known.
 
 When `searchComplete` is false, the app keeps any returned rows and offers a retry. An empty incomplete search is retried once, then shown as a failed lookup, never as a confirmed no-match. A completed empty search may show no matches.
+
+
+### Transaction history
+
+Authenticated with the same Privy Bearer token as balance:
+
+- `GET /v1/transactions?currency=NGN&limit=6` returns `{ transactions: TransactionReceipt[], nextCursor: string | null }`.
+  Limits are 1–50 (default 20). Pass the opaque `cursor` back to read older actions.
+- `GET /v1/transactions/{id}?currency=NGN` returns one owned receipt; unknown or another user's ID returns 404.
+
+A receipt is `{ id, intentId: string | null, kind, title, symbol, assetId: string | null, iconUrl: string | null,
+createdAtUnixMs, state: "pending" | "filled" | "failed", stage, amount: Money | null, txIds: string[],
+error: string | null, summary: [{ label, value }] }`. Money uses decimal strings. Pending amounts are previews;
+filled spot trades and tracked deposits use recorded proceeds. Confirmation summaries retain the currency originally confirmed.
+Kinds include buy/sell, earn_deposit/earn_withdraw, perp_open/perp_close, send/cashlink and deposit.
+Onramp/offramp receipt kinds are supported when those integrations create real actions; unavailable routes create no fictional payments.
+
+History reads saved spot, cross-chain and perps intents, with older fills backfilled from the trade book.
+New execution plans save their receipt metadata in `atlas_receipts` using `DATABASE_URL`; without it local runs use memory.
+New deposits quoted through `/v1/deposit/quote` are tracked, including pending status and payout IDs. Old direct wallet deposits
+made outside this lifecycle are not backfilled. No signing request, wallet approval, login token or owner ID is returned.
+Pending transfer observations run in the background; listing history never submits a new buy or asks for a signature.

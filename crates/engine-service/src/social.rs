@@ -635,7 +635,7 @@ pub(super) async fn send_quote(
         json!({"quoteId":quote_id,"destinationLabel":label,"send":send,"receive":receive,"fee":fee,"eta":"After confirmation","expiresAtUnixMs":expires}),
     ))
 }
-pub(super) async fn execute_send(
+async fn execute_send_inner(
     State(state): State<AppState>,
     Path(quote_id): Path<String>,
     headers: HeaderMap,
@@ -825,4 +825,37 @@ mod tests {
         assert_eq!(parse_micros("0.123456").unwrap(), 123456);
         assert!(parse_micros("0.1234567").is_err());
     }
+}
+
+// Save the confirmation's receipt before the phone signs; this does not submit an action.
+pub(super) async fn execute_send(
+    State(state): State<AppState>,
+    Path(quote_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let owner = app_balance::verified_wallets(&state, &headers)
+        .await?
+        .user_id;
+
+    let quote = state
+        .social
+        .quotes
+        .lock()
+        .map_err(internal)?
+        .get(&quote_id)
+        .cloned();
+    let plan =
+        execute_send_inner(State(state.clone()), Path(quote_id), headers, Json(body)).await?;
+    let mut receipt = transactions::Receipt::plan(&owner, &plan.0);
+
+    if let Some(q) = quote {
+        receipt.usdc_units = Some(q.usdc_units.to_string());
+        if q.link.is_some() {
+            receipt.kind = "cashlink".into();
+        }
+    }
+    receipt.title = transactions::title(&receipt.kind, &receipt.symbol);
+    state.history.put(&receipt).await?;
+    Ok(plan)
 }

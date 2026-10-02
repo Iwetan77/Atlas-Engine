@@ -818,7 +818,7 @@ pub(super) async fn close_quote(
 // Execute (open or close): the plan. Margin from Solana is a transaction the app signs (after a gas
 // top-up if needed); from Base the phone signs the gasless authorization. A newly funded account
 // approves its agent in the next phone step, covered by the same confirmation.
-pub(super) async fn execute(
+async fn execute_inner(
     State(state): State<AppState>,
     Path(quote_id): Path<String>,
     headers: HeaderMap,
@@ -1743,4 +1743,61 @@ mod tests {
         );
         assert_eq!(usd(5.30), json!({"amount":"5.3","currency":"USD"}));
     }
+}
+
+impl HlState {
+    pub(super) async fn history_rows(&self, owner: &str) -> Result<Vec<Value>, ApiError> {
+        if let Some(pg) = &self.intents.postgres {
+            return pg
+                .query(
+                    "SELECT payload FROM atlas_hl_intents WHERE owner=$1",
+                    &[&owner],
+                )
+                .await
+                .map_err(internal)?
+                .into_iter()
+                .map(|r| history_value(r.get::<_, &str>(0)))
+                .collect();
+        }
+        self.intents
+            .memory
+            .lock()
+            .map_err(internal)?
+            .values()
+            .filter(|i| i.quote.owner == owner)
+            .map(|i| {
+                serde_json::to_string(i)
+                    .map_err(internal)
+                    .and_then(|s| serde_json::from_str(&s).map_err(internal))
+            })
+            .collect()
+    }
+}
+
+// Save the confirmation's receipt before the phone signs; this does not submit an action.
+pub(super) async fn execute(
+    State(state): State<AppState>,
+    Path(quote_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let owner = app_balance::verified_wallets(&state, &headers)
+        .await?
+        .user_id;
+
+    let plan = execute_inner(State(state.clone()), Path(quote_id), headers).await?;
+    let mut receipt = transactions::Receipt::plan(&owner, &plan.0);
+
+    receipt.title = transactions::title(&receipt.kind, &receipt.symbol);
+    state.history.put(&receipt).await?;
+    Ok(plan)
+}
+
+fn history_value(payload: &str) -> Result<Value, ApiError> {
+    let i: HlIntent = serde_json::from_str(payload).map_err(internal)?;
+    let mut v = serde_json::to_value(&i).map_err(internal)?;
+    v["historyIcon"] = json!(icon_url(
+        split_coin(&i.quote.coin).1,
+        category(&i.quote.coin)
+    ));
+    Ok(v)
 }

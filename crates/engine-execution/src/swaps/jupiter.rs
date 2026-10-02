@@ -1,7 +1,7 @@
 //! Jupiter Swap API V2 client for one Solana token path.
 //! Spot, memes and tokenized equities differ only by their mint addresses.
 
-use std::str::FromStr;
+use std::{str::FromStr, time::Duration};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use reqwest::{Client, Url};
@@ -50,6 +50,7 @@ pub struct JupiterOrder {
     #[serde(default)]
     pub error_message: Option<String>,
     #[serde(default)]
+    #[serde(deserialize_with = "optional_height")]
     pub last_valid_block_height: Option<u64>,
     /// True when Jupiter pays the network fee and account rent (low-SOL takers on eligible routes).
     #[serde(default)]
@@ -60,6 +61,7 @@ pub struct JupiterOrder {
 #[serde(rename_all = "camelCase")]
 pub struct JupiterExecution {
     pub status: String,
+    #[serde(default)]
     pub signature: String,
     pub code: i64,
     #[serde(default)]
@@ -80,10 +82,14 @@ pub enum JupiterError {
     NotExecutable(String),
     #[error("Jupiter request failed: {0}")]
     Transport(#[from] reqwest::Error),
-    #[error("Jupiter returned HTTP {0}")]
-    Rejected(reqwest::StatusCode),
-    #[error("Jupiter reported a failed on-chain swap: code {0}")]
-    ExecutionFailed(i64),
+    #[error("Jupiter {operation} returned HTTP {status}: {reason}")]
+    Rejected {
+        operation: &'static str,
+        status: reqwest::StatusCode,
+        reason: String,
+    },
+    #[error("Jupiter could not complete this swap (code {code}): {reason}")]
+    ExecutionFailed { code: i64, reason: String },
     #[error("Jupiter URL could not be parsed")]
     Url(#[from] url::ParseError),
 }
@@ -97,23 +103,17 @@ impl JupiterClient {
     }
 
     /// Without a taker this returns a real quote but no signable transaction.
-    /// A fresh order with the Privy wallet address must be fetched at confirm. A swap too small for
-    /// Jupiter to pay its fee is asked for again with the taker paying from their own SOL.
+    /// A fresh order with the Privy wallet address must be fetched at confirm.
     pub async fn order(&self, request: &JupiterOrderRequest) -> Result<JupiterOrder, JupiterError> {
         validate_order(request)?;
         let order = self.fetch_order(request, None).await?;
-        let order = match (&request.taker, own_gas_needed(&order)) {
-            (Some(taker), true) => self.fetch_order(request, Some(taker)).await?,
-            _ => order,
-        };
         if request.taker.is_some() && order.transaction.as_deref().unwrap_or("").is_empty() {
             return Err(JupiterError::NotExecutable(not_executable_reason(&order)));
         }
         Ok(order)
     }
 
-    // One /order call; `payer` names who pays the network fee (the taker, to keep Jupiter from
-    // offering to pay it on a swap below its minimum).
+    // `payer` only sponsors gas when it differs from the taker; naming the taker has no effect.
     async fn fetch_order(
         &self,
         request: &JupiterOrderRequest,
@@ -132,13 +132,13 @@ impl JupiterClient {
                 query.append_pair("payer", payer);
             }
         }
-        let mut call = self.http.get(url);
+        let mut call = self.http.get(url).timeout(Duration::from_secs(20));
         if let Some(key) = &self.api_key {
             call = call.header("x-api-key", key);
         }
         let response = call.send().await?;
         if !response.status().is_success() {
-            return Err(JupiterError::Rejected(response.status()));
+            return Err(rejected("quote", response).await);
         }
         Ok(response.json().await?)
     }
@@ -164,11 +164,19 @@ impl JupiterClient {
         }
         let response = call.send().await?;
         if !response.status().is_success() {
-            return Err(JupiterError::Rejected(response.status()));
+            return Err(rejected("submission", response).await);
         }
         let result: JupiterExecution = response.json().await?;
         if result.status != "Success" || result.code != 0 {
-            return Err(JupiterError::ExecutionFailed(result.code));
+            return Err(JupiterError::ExecutionFailed {
+                code: result.code,
+                reason: safe_reason(
+                    result
+                        .error
+                        .as_deref()
+                        .unwrap_or("Check your transaction status before trying again."),
+                ),
+            });
         }
         Ok(result)
     }
@@ -176,12 +184,18 @@ impl JupiterClient {
 
 // Jupiter offered to pay the fee but the swap is below its minimum for that.
 fn own_gas_needed(order: &JupiterOrder) -> bool {
-    order.error_code == Some(BELOW_GASLESS_MINIMUM)
+    order.router != "jupiterz"
+        && order.error_code == Some(BELOW_GASLESS_MINIMUM)
         && order.transaction.as_deref().unwrap_or("").is_empty()
 }
 
 // What the user reads when Jupiter can't make the swap.
 fn not_executable_reason(order: &JupiterOrder) -> String {
+    if own_gas_needed(order) {
+        return order.error_message.clone().unwrap_or_else(|| {
+            "This amount is below the route's minimum for a fee-paid swap.".into()
+        });
+    }
     match order.error_code {
         Some(INSUFFICIENT_FUNDS) => {
             "There isn't enough in this wallet for the swap and its network fee (paid in SOL)"
@@ -191,6 +205,64 @@ fn not_executable_reason(order: &JupiterOrder) -> String {
             .error_message
             .clone()
             .unwrap_or_else(|| format!("code {:?}", order.error_code)),
+    }
+}
+
+// Some routers send the block height as a JSON string, others as a number or null.
+fn optional_height<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    let v = Option::<serde_json::Value>::deserialize(d)?;
+    v.map(|v| {
+        v.as_u64()
+            .or_else(|| v.as_str()?.parse().ok())
+            .ok_or_else(|| serde::de::Error::custom("invalid block height"))
+    })
+    .transpose()
+}
+fn safe_reason(reason: &str) -> String {
+    reason
+        .split_whitespace()
+        .map(|w| if w.len() > 100 { "[omitted]" } else { w })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(240)
+        .collect()
+}
+async fn rejected(operation: &'static str, response: reqwest::Response) -> JupiterError {
+    let status = response.status();
+    let mut response = response;
+    // Read only a small error body; never expose the request, signed bytes or partner key.
+    let mut bytes = Vec::new();
+    while let Ok(Some(chunk)) = response.chunk().await {
+        if bytes.len() + chunk.len() > 4096 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let body = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default();
+    let reason = body["errorMessage"]
+        .as_str()
+        .or_else(|| body["error"].as_str())
+        .or_else(|| body["message"].as_str())
+        .filter(|s| {
+            !s.to_ascii_lowercase().contains("signedtransaction")
+                && !s.to_ascii_lowercase().contains("api-key")
+        })
+        .map(safe_reason)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            "The venue rejected this request. Check the transaction status before retrying.".into()
+        });
+    let reason = if let Some(code) = body["code"].as_i64() {
+        format!("{reason} (code {code})")
+    } else {
+        reason
+    };
+    JupiterError::Rejected {
+        operation,
+        status,
+        reason,
     }
 }
 
@@ -225,6 +297,13 @@ mod tests {
         assert!(!older.gasless);
     }
 
+    #[test]
+    fn reads_string_block_heights_and_does_not_misclassify_jupiterz() {
+        let order: JupiterOrder=serde_json::from_value(serde_json::json!({"inputMint":"a","outputMint":"b","inAmount":"1","outAmount":"1","requestId":"r","router":"jupiterz","transaction":null,"errorCode":3,"lastValidBlockHeight":"350001234"})).unwrap();
+        assert_eq!(order.last_valid_block_height, Some(350001234));
+        assert!(!own_gas_needed(&order));
+        assert_eq!(safe_reason(&"a".repeat(200)), "[omitted]");
+    }
     use super::*;
 
     #[test]
@@ -245,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn a_swap_below_the_gasless_minimum_is_asked_for_again_with_the_taker_paying() {
+    fn gasless_minimum_is_reported_only_for_aggregator_routes() {
         // Shape from Jupiter's /order for a ₦500 (about $0.34) buy by a low-SOL taker, 2026-10-02.
         let refused: JupiterOrder = serde_json::from_value(serde_json::json!({
             "inputMint":"a","outputMint":"b","inAmount":"340000","outAmount":"1","requestId":"r",
@@ -254,7 +333,7 @@ mod tests {
         }))
         .unwrap();
         assert!(own_gas_needed(&refused));
-        // With the taker as payer Jupiter routes normally and the taker's SOL pays.
+        // A normally funded aggregator route comes back with a signable transaction.
         let own: JupiterOrder = serde_json::from_value(serde_json::json!({
             "inputMint":"a","outputMint":"b","inAmount":"340000","outAmount":"1","requestId":"r",
             "router":"okx","transaction":"tx","gasless":false

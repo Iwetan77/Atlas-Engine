@@ -3125,7 +3125,7 @@ fn mul_div_units(a: u128, b: u128, c: u128) -> u128 {
         .unwrap_or_else(|| (a as f64 * b as f64 / c as f64) as u128)
 }
 
-pub(super) async fn execute_quote(
+async fn execute_quote_inner(
     State(state): State<AppState>,
     Path(quote_id): Path<String>,
     headers: HeaderMap,
@@ -4912,5 +4912,82 @@ mod tests {
         assert_eq!(format_units(283, 4), "0.0283");
         let price = unit_price(1_000_000, 1_000_000_000, 5, "NGN", 1_000_000_000).unwrap();
         assert_eq!(price.amount, "0.1");
+    }
+}
+
+impl MarketState {
+    pub(super) async fn history_rows(&self, owner: &str) -> Result<Vec<Value>, ApiError> {
+        if let Some(pg) = &self.postgres {
+            return pg
+                .query(
+                    "SELECT payload FROM atlas_intents WHERE owner=$1",
+                    &[&owner],
+                )
+                .await
+                .map_err(internal)?
+                .into_iter()
+                .map(|r| serde_json::from_str(r.get::<_, &str>(0)).map_err(internal))
+                .collect();
+        }
+        self.intents
+            .lock()
+            .map_err(internal)?
+            .values()
+            .filter(|i| i.owner == owner)
+            .map(|i| {
+                serde_json::to_string(i)
+                    .map_err(internal)
+                    .and_then(|s| serde_json::from_str(&s).map_err(internal))
+            })
+            .collect()
+    }
+}
+
+// Save the confirmation's receipt before the phone signs; this does not submit an action.
+pub(super) async fn execute_quote(
+    State(state): State<AppState>,
+    Path(quote_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let owner = app_balance::verified_wallets(&state, &headers)
+        .await?
+        .user_id;
+
+    let quote = state
+        .markets
+        .quotes
+        .lock()
+        .map_err(internal)?
+        .get(&quote_id)
+        .cloned();
+    let plan =
+        execute_quote_inner(State(state.clone()), Path(quote_id), headers, Json(body)).await?;
+    let mut receipt = transactions::Receipt::plan(&owner, &plan.0);
+    if let Some(q) = quote {
+        receipt.symbol = q.asset.symbol;
+        receipt.icon_url = q.asset.icon_url;
+    }
+    receipt.title = transactions::title(&receipt.kind, &receipt.symbol);
+    state.history.put(&receipt).await?;
+    Ok(plan)
+}
+
+impl MarketState {
+    pub(super) fn history_asset(&self, id: &str) -> Option<Asset> {
+        self.catalog
+            .lock()
+            .ok()
+            .and_then(|c| {
+                c.as_ref()
+                    .and_then(|(_, assets)| assets.iter().find(|a| a.id == id).cloned())
+            })
+            .or_else(|| {
+                self.pasted
+                    .lock()
+                    .ok()
+                    .and_then(|c| c.get(id).and_then(|(_, a)| a.clone()))
+            })
+            .or_else(|| base_assets().into_iter().find(|a| a.id == id))
     }
 }

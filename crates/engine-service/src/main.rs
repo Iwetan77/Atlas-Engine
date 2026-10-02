@@ -11,6 +11,7 @@ mod near_intents;
 mod pending;
 mod positions;
 mod social;
+mod transactions;
 
 use std::{
     collections::HashMap,
@@ -49,6 +50,7 @@ struct AppState {
     earn: earn::EarnState,
     social: social::SocialState,
     trades: positions::TradeBook,
+    history: transactions::HistoryStore,
 }
 
 #[derive(Clone)]
@@ -113,6 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         earn: earn::EarnState::default(),
         social: social::SocialState::new().await?,
         trades: positions::TradeBook::new().await?,
+        history: transactions::HistoryStore::new().await?,
     };
     let bind: SocketAddr = env::var("ATLAS_BALANCE_BIND")
         .unwrap_or_else(|_| "127.0.0.1:3000".into())
@@ -144,6 +147,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .merge(perps_routes)
         .route("/health", get(health))
         .route("/v1/balance", get(app_balance::balance))
+        .route("/v1/transactions", get(transactions::list))
+        .route("/v1/transactions/{id}", get(transactions::detail))
         .route("/v1/assets", get(markets::assets))
         .route("/v1/assets/{asset_id}/chart", get(markets::chart))
         .route("/v1/positions/spot", get(positions::spot))

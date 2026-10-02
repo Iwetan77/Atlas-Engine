@@ -1477,6 +1477,16 @@ pub(super) async fn deposit_quote(
         .as_deref()
         .and_then(|v| v.parse().ok())
         .unwrap_or(units.saturating_mul(99) / 100);
+    state
+        .history
+        .put(&transactions::Receipt::deposit(
+            &user.user_id,
+            &address,
+            q.deposit_memo.clone(),
+            asset,
+            receive,
+        ))
+        .await?;
     Ok(Json(json!({
         "address": address,
         "memo": q.deposit_memo,
@@ -1503,7 +1513,7 @@ pub(super) async fn deposit_status(
     headers: HeaderMap,
     axum::extract::Query(q): axum::extract::Query<DepositStatusQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    app_balance::verified_wallets(&state, &headers).await?;
+    let user = app_balance::verified_wallets(&state, &headers).await?;
     if q.address.is_empty() || q.address.len() > 128 {
         return Err(bad("invalid deposit address"));
     }
@@ -1513,6 +1523,10 @@ pub(super) async fn deposit_status(
         .status(&q.address, q.memo.as_deref())
         .await
         .map_err(venue)?;
+    state
+        .history
+        .observe_deposit(&user.user_id, &q.address, &status)
+        .await?;
     let state_name = match status.status.as_str() {
         "PENDING_DEPOSIT" => "waiting",
         "KNOWN_DEPOSIT_TX" | "PROCESSING" => "processing",
@@ -5885,5 +5899,31 @@ mod tests {
             solana_wallet: None,
         };
         assert!(recipient(&sui, &user).is_err());
+    }
+}
+
+pub(super) async fn history_rows(state: &AppState, owner: &str) -> Result<Vec<Value>, ApiError> {
+    owned_intents(state, owner)
+        .await?
+        .iter()
+        .map(|i| {
+            let mut value: Value = serde_json::to_string(i)
+                .map_err(internal)
+                .and_then(|s| serde_json::from_str(&s).map_err(internal))?;
+            if let Some(asset) = &i.asset {
+                value["historyIcon"] = json!(state.near.icon_for(asset));
+            }
+            Ok(value)
+        })
+        .collect()
+}
+
+impl NearState {
+    pub(super) async fn history_deposit_status(
+        &self,
+        address: &str,
+        memo: Option<&str>,
+    ) -> Result<engine_execution::near_intents::Status, ApiError> {
+        self.client.status(address, memo).await.map_err(venue)
     }
 }

@@ -860,7 +860,7 @@ pub(super) async fn quote(
     })))
 }
 
-pub(super) async fn execute(
+async fn execute_inner(
     State(state): State<AppState>,
     Path(quote_id): Path<String>,
     headers: HeaderMap,
@@ -1223,4 +1223,44 @@ mod tests {
         assert!(word_units(20_000_000).ends_with("1312d00"));
         assert_eq!(usdc(20_500_001), "20.500001");
     }
+}
+
+// Save the confirmation's receipt before the phone signs; this does not submit an action.
+pub(super) async fn execute(
+    State(state): State<AppState>,
+    Path(quote_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let owner = app_balance::verified_wallets(&state, &headers)
+        .await?
+        .user_id;
+
+    let quote = state
+        .earn
+        .quotes
+        .lock()
+        .map_err(internal)?
+        .get(&quote_id)
+        .cloned();
+
+    let plan = execute_inner(State(state.clone()), Path(quote_id), headers, Json(body)).await?;
+    let mut receipt = transactions::Receipt::plan(&owner, &plan.0);
+
+    if let Some(q) = quote {
+        let (symbol, icon) = if q.share_mint.is_some() {
+            ("Jupiter Lend", JUPITER_ICON)
+        } else if q.vault.is_some() {
+            ("Morpho", MORPHO_ICON)
+        } else {
+            ("Aave", AAVE_ICON)
+        };
+        receipt.symbol = symbol.into();
+        receipt.icon_url = Some(icon.into());
+        receipt.usdc_units = Some(q.units.to_string());
+    }
+
+    receipt.title = transactions::title(&receipt.kind, &receipt.symbol);
+    state.history.put(&receipt).await?;
+    Ok(plan)
 }
