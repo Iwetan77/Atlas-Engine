@@ -1431,7 +1431,7 @@ fn parse_time(text: &str) -> Option<u64> {
     let secs = days_from_civil(y, m, d) * 86_400 + h * 3600 + mi * 60 + s - offset_min * 60;
     u64::try_from(secs * 1000 + ms).ok()
 }
-fn format_time(ms: u64) -> String {
+pub(super) fn format_time(ms: u64) -> String {
     let secs = (ms / 1000) as i64;
     let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
     let t = secs.rem_euclid(86_400);

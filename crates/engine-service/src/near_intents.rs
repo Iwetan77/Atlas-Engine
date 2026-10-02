@@ -295,7 +295,7 @@ impl NearState {
             monad_rpc: env_url("ATLAS_MONAD_MAINNET_RPC_URL", "https://rpc.monad.xyz").parse()?,
         })
     }
-    fn listed_for_search(&self) -> Arc<Listed> {
+    pub(super) fn listed_for_search(&self) -> Arc<Listed> {
         let cached = self.listed.lock().ok().and_then(|held| held.clone());
         let fresh = cached
             .as_ref()
@@ -1109,7 +1109,8 @@ async fn sui_holdings_now(
     if let (true, Some(price)) = (sui_units > 0, price_of(&sui.price)) {
         let value = (sui_units as f64 / 1e9 * price * 1e6) as u128;
         out.push((
-            "near:sui:0x2::sui::SUI".into(),
+            // The same id search and buys use, so SUI's position card lines up with the holding.
+            format!("near:{}", sui.asset_id),
             "SUI".into(),
             "Sui".into(),
             9,
@@ -2236,6 +2237,40 @@ async fn search_ref_unlisted(
     })
 }
 
+// DexScreener's search for a query, shared for a minute by everything that reads it (Sui coins and
+// Base coins found by name), so one search is one call.
+pub(super) async fn dex_search(
+    http: &reqwest::Client,
+    query: &str,
+) -> Result<Arc<Value>, ApiError> {
+    static HELD: std::sync::LazyLock<Mutex<HashMap<String, (Instant, Arc<Value>)>>> =
+        std::sync::LazyLock::new(Default::default);
+    let key = query.trim().to_ascii_lowercase();
+    if let Some((at, body)) = HELD.lock().ok().and_then(|held| held.get(&key).cloned()) {
+        if at.elapsed() < Duration::from_secs(60) {
+            return Ok(body);
+        }
+    }
+    let body: Value = http
+        .get("https://api.dexscreener.com/latest/dex/search")
+        .query(&[("q", query)])
+        .timeout(Duration::from_secs(4))
+        .send()
+        .await
+        .map_err(venue)?
+        .error_for_status()
+        .map_err(venue)?
+        .json()
+        .await
+        .map_err(venue)?;
+    let body = Arc::new(body);
+    if let Ok(mut held) = HELD.lock() {
+        held.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(60));
+        held.insert(key, (Instant::now(), body.clone()));
+    }
+    Ok(body)
+}
+
 async fn search_sui_unlisted(
     state: &NearState,
     query: &str,
@@ -2245,19 +2280,7 @@ async fn search_sui_unlisted(
     if query.len() < 2 || query.len() > 160 {
         return Ok(SearchAssets::empty());
     }
-    let body: Value = state
-        .icon_http
-        .get("https://api.dexscreener.com/latest/dex/search")
-        .query(&[("q", query)])
-        .timeout(Duration::from_secs(2))
-        .send()
-        .await
-        .map_err(venue)?
-        .error_for_status()
-        .map_err(venue)?
-        .json()
-        .await
-        .map_err(venue)?;
+    let body = dex_search(&state.icon_http, query).await?;
     let pairs = body["pairs"]
         .as_array()
         .ok_or_else(|| venue("Token search returned an invalid answer"))?;
@@ -2367,6 +2390,24 @@ async fn sui_search_row(
         "change24hPct":null,"iconUrl":icon,"verified":verified,"tradeable":true}))
 }
 
+// A 1Click or Sui coin's symbol and live dollar price, for finding its chart on an exchange.
+pub(super) async fn chart_quote(state: &AppState, asset_id: &str) -> Option<(String, f64)> {
+    if let Some(coin) = asset_id.strip_prefix("near:sui:") {
+        let (symbol, _, _, _) = sui_meta(state, coin).await?;
+        let price = sui_coin_price(state.near.icon_http.clone(), coin.to_owned()).await?;
+        return Some((symbol, price));
+    }
+    let id = asset_id.strip_prefix("near:")?;
+    let token = state
+        .near
+        .tokens()
+        .await
+        .ok()?
+        .into_iter()
+        .find(|t| t.asset_id == id)?;
+    let price = token_usd(&token);
+    (price > 0.0).then_some((token.symbol, price))
+}
 // Where a 1Click asset's price history lives on GeckoTerminal: (network, token address). None
 // when the chain or the token (a native coin without a wrapped twin there) has no pools to read.
 pub(super) async fn chart_token(
@@ -2458,13 +2499,55 @@ pub(super) async fn search_assets(
     currency: &str,
     rate: u128,
 ) -> SearchAssets {
+    let key = |source: &str| format!("{source}|{currency}|{}", query.trim().to_ascii_lowercase());
     collect_search_sources(
         Duration::from_secs(5),
-        search_listed(state, query, currency, rate),
-        search_sui_unlisted(&state.near, query, currency, rate),
-        search_ref_unlisted(state, query, currency, rate),
+        remembered(key("listed"), search_listed(state, query, currency, rate)),
+        remembered(
+            key("sui"),
+            search_sui_unlisted(&state.near, query, currency, rate),
+        ),
+        remembered(
+            key("ref"),
+            search_ref_unlisted(state, query, currency, rate),
+        ),
     )
     .await
+}
+
+// One search source's answer for a query, reused for a minute; when the source fails or is slow,
+// its answer from the past ten minutes stands, so a busy DexScreener or Ref doesn't turn a search
+// into "some results couldn't load".
+async fn remembered(
+    key: String,
+    source: impl std::future::Future<Output = Result<SearchAssets, ApiError>>,
+) -> Result<SearchAssets, ApiError> {
+    static HELD: std::sync::LazyLock<Mutex<HashMap<String, (Instant, Vec<Value>)>>> =
+        std::sync::LazyLock::new(Default::default);
+    let last = HELD.lock().ok().and_then(|held| held.get(&key).cloned());
+    let reuse = |max: Duration| {
+        last.clone()
+            .filter(|(at, _)| at.elapsed() < max)
+            .map(|(_, assets)| SearchAssets {
+                assets,
+                complete: true,
+            })
+    };
+    if let Some(fresh) = reuse(Duration::from_secs(60)) {
+        return Ok(fresh);
+    }
+    match tokio::time::timeout(Duration::from_millis(4500), source).await {
+        Ok(Ok(found)) if found.complete => {
+            if let Ok(mut held) = HELD.lock() {
+                held.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(600));
+                held.insert(key, (Instant::now(), found.assets.clone()));
+            }
+            Ok(found)
+        }
+        Ok(Ok(found)) => Ok(reuse(Duration::from_secs(600)).unwrap_or(found)),
+        Ok(Err(error)) => reuse(Duration::from_secs(600)).ok_or(error),
+        Err(_) => reuse(Duration::from_secs(600)).ok_or_else(|| venue("Token search is slow")),
+    }
 }
 
 async fn search_listed(
@@ -2568,6 +2651,23 @@ pub(super) async fn position_coin(
             held: ft_balance(state, contract, &wallet).await.ok()?,
         });
     }
+    // A Sui coin bought on Sui (DEEP and the like): its details, held amount and DexScreener price.
+    if let Some(coin) = id.strip_prefix("sui:") {
+        let (symbol, name, decimals, icon) = sui_meta(state, coin).await?;
+        let (held, price) = tokio::join!(
+            sui_held(state, headers, user, coin),
+            sui_coin_price(state.near.icon_http.clone(), coin.to_owned()),
+        );
+        return Some(NearCoin {
+            symbol,
+            name,
+            chain: "sui".into(),
+            icon,
+            decimals,
+            price: price?,
+            held: held?,
+        });
+    }
     let token = state
         .near
         .tokens()
@@ -2576,6 +2676,8 @@ pub(super) async fn position_coin(
         .into_iter()
         .find(|t| t.asset_id == id && supported(t))?;
     let held = match token.blockchain.as_str() {
+        // SUI itself, bought through 1Click.
+        "sui" => sui_held(state, headers, user, "0x2::sui::SUI").await?,
         "near" => {
             let contract = token.contract_address.clone()?;
             let wallet = destination(state, headers, &token, user).await.ok()?;
@@ -2596,6 +2698,26 @@ pub(super) async fn position_coin(
         symbol: token.symbol,
         held,
     })
+}
+// How much of a Sui coin the user's own Sui wallet holds, checked against that wallet's address.
+async fn sui_held(
+    state: &AppState,
+    headers: &HeaderMap,
+    user: &app_balance::VerifiedWallets,
+    coin: &str,
+) -> Option<u128> {
+    let tokens = state.near.tokens().await.ok()?;
+    let sui = tokens
+        .iter()
+        .find(|t| t.blockchain == "sui" && t.symbol == "SUI")?;
+    let owner = destination(state, headers, sui, user).await.ok()?;
+    let body = bridge(state, headers, "/sui/balance", json!({"coinType": coin}))
+        .await
+        .ok()?;
+    if body["address"].as_str() != Some(owner.as_str()) {
+        return None;
+    }
+    body["result"]["totalBalance"].as_str()?.parse().ok()
 }
 // Where every sale's cash lands: USDC in the user's own Solana wallet, or Base without one. Kept in
 // this one place (and its twin `cashDestination` in the bridge) so naira payouts can follow on later.

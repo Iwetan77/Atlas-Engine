@@ -272,16 +272,25 @@ pub(super) async fn balance(
         if units == 0 {
             continue;
         }
-        let Some(one_dollar_units) = markets::base_rate(&state.markets, asset).await else {
-            if *fixed {
-                return Err(markets::unavailable(format!(
-                    "Couldn't price {} right now",
-                    asset.symbol
-                )));
+        let value_usdc = match markets::base_rate(&state.markets, asset).await {
+            Some(one_dollar_units) => {
+                remember_price(
+                    &asset.id,
+                    10f64.powi(asset.decimals as i32) / one_dollar_units as f64,
+                );
+                indicative_usdc_value(units, one_dollar_units)?
             }
-            continue;
+            None => match recent_price(&asset.id) {
+                Some(usd) => worth(units, asset.decimals, usd),
+                None if *fixed => {
+                    return Err(markets::unavailable(format!(
+                        "Couldn't price {} right now",
+                        asset.symbol
+                    )));
+                }
+                None => continue,
+            },
         };
-        let value_usdc = indicative_usdc_value(units, one_dollar_units)?;
         total = total
             .checked_add(value_usdc)
             .ok_or((StatusCode::BAD_GATEWAY, "portfolio value overflow".into()))?;
@@ -370,17 +379,23 @@ pub(super) async fn balance(
     let prices = markets::usd_prices(&state.markets, &mints).await?;
     for (asset, units) in &listed {
         let (asset, units) = (asset, *units);
-        let Some((usd, _)) = prices.get(&asset.token) else {
-            if unpriced_ok(asset) {
-                continue;
+        let usd = match prices.get(&asset.token) {
+            Some((usd, _)) => {
+                remember_price(&asset.id, *usd);
+                *usd
             }
-            return Err((
-                StatusCode::BAD_GATEWAY,
-                format!("no live price for {}", asset.symbol),
-            ));
+            None => match recent_price(&asset.id) {
+                Some(usd) => usd,
+                None if unpriced_ok(asset) => continue,
+                None => {
+                    return Err((
+                        StatusCode::BAD_GATEWAY,
+                        format!("no live price for {}", asset.symbol),
+                    ));
+                }
+            },
         };
-        let value_usdc =
-            (units as f64 / 10f64.powi(asset.decimals as i32) * usd * 1_000_000.0) as u128;
+        let value_usdc = worth(units, asset.decimals, usd);
         total = total
             .checked_add(value_usdc)
             .ok_or((StatusCode::BAD_GATEWAY, "portfolio value overflow".into()))?;
@@ -408,11 +423,7 @@ pub(super) async fn balance(
     }
     // A NEAR buy is held in the user's own Privy wallet; the current on-chain amount is authoritative.
     for (asset, units) in near_intents::near_holdings(&state, &headers, &user).await? {
-        let price = asset
-            .price
-            .as_ref()
-            .and_then(|value| value.as_f64().or_else(|| value.as_str()?.parse().ok()))
-            .filter(|price: &f64| price.is_finite() && *price > 0.0)
+        let price = live_or_recent(&format!("near:{}", asset.asset_id), asset.price.as_ref())
             .ok_or((
                 StatusCode::BAD_GATEWAY,
                 "An asset price is temporarily unavailable".into(),
@@ -441,14 +452,7 @@ pub(super) async fn balance(
     // Once a 1Click buy settles, read the destination wallet on Monad itself.
     // The spent Base USDC and received asset must both be reflected in Home.
     for (asset, units) in state.near.monad_holdings(&user.user_id, &evm).await? {
-        let price = asset
-            .price
-            .as_ref()
-            .and_then(|v| {
-                v.as_f64()
-                    .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
-            })
-            .filter(|p| p.is_finite() && *p > 0.0)
+        let price = live_or_recent(&format!("near:{}", asset.asset_id), asset.price.as_ref())
             .ok_or((
                 StatusCode::BAD_GATEWAY,
                 format!("no live price for {}", asset.symbol),
@@ -641,6 +645,44 @@ pub(super) async fn signed_in(state: &AppState, headers: &HeaderMap) -> Result<(
         seen.insert(token.to_owned(), Instant::now());
     }
     Ok(())
+}
+
+// Each asset's last good dollar price per whole token. When a live price is missing, a holding is
+// valued at its price from the past 30 minutes instead of dropping out of the balance (and the
+// total) for one failed lookup.
+static LAST_PRICES: std::sync::LazyLock<Mutex<HashMap<String, (Instant, f64)>>> =
+    std::sync::LazyLock::new(Default::default);
+fn remember_price(asset_id: &str, usd: f64) {
+    if usd.is_finite() && usd > 0.0 {
+        if let Ok(mut last) = LAST_PRICES.lock() {
+            last.insert(asset_id.to_owned(), (Instant::now(), usd));
+        }
+    }
+}
+fn recent_price(asset_id: &str) -> Option<f64> {
+    LAST_PRICES
+        .lock()
+        .ok()?
+        .get(asset_id)
+        .filter(|(at, _)| at.elapsed() < Duration::from_secs(30 * 60))
+        .map(|(_, usd)| *usd)
+}
+// A price as 1Click lists it (number or text), remembered; or the recent one when it's missing.
+fn live_or_recent(asset_id: &str, live: Option<&Value>) -> Option<f64> {
+    match live
+        .and_then(|v| v.as_f64().or_else(|| v.as_str()?.parse().ok()))
+        .filter(|p: &f64| p.is_finite() && *p > 0.0)
+    {
+        Some(usd) => {
+            remember_price(asset_id, usd);
+            Some(usd)
+        }
+        None => recent_price(asset_id),
+    }
+}
+// USDC micros for `units` of a token at `usd` per whole token.
+fn worth(units: u128, decimals: u32, usd: f64) -> u128 {
+    (units as f64 / 10f64.powi(decimals as i32) * usd * 1_000_000.0) as u128
 }
 
 // The Base tokens outside the fixed list someone has traded through Atlas, once each.

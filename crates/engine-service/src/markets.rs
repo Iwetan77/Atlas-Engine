@@ -263,23 +263,32 @@ pub(super) async fn pasted_token(
     state: &MarketState,
     mint: &str,
 ) -> Result<Option<Asset>, ApiError> {
-    if let Some((at, asset)) = state.pasted.lock().map_err(internal)?.get(mint) {
+    let held = state.pasted.lock().map_err(internal)?.get(mint).cloned();
+    if let Some((at, asset)) = &held {
         if at.elapsed() < CATALOG_TTL {
             return Ok(asset.clone());
         }
     }
-    let tokens: Vec<Value> = state
-        .http
-        .get(JUPITER_SEARCH)
-        .query(&[("query", mint)])
-        .send()
-        .await
-        .map_err(unavailable)?
-        .error_for_status()
-        .map_err(unavailable)?
-        .json()
-        .await
-        .map_err(unavailable)?;
+    let fetched: Result<Vec<Value>, ApiError> = async {
+        state
+            .http
+            .get(JUPITER_SEARCH)
+            .query(&[("query", mint)])
+            .send()
+            .await
+            .map_err(unavailable)?
+            .error_for_status()
+            .map_err(unavailable)?
+            .json()
+            .await
+            .map_err(unavailable)
+    }
+    .await;
+    // Jupiter busy: the token as last seen, so a held coin doesn't drop out of the balance.
+    let tokens = match fetched {
+        Ok(tokens) => tokens,
+        Err(error) => return held.map(|(_, asset)| asset).ok_or(error),
+    };
     let asset = tokens
         .iter()
         .find(|t| t["id"].as_str() == Some(mint))
@@ -1679,11 +1688,28 @@ pub(super) async fn assets(
             None
         }
     };
-    let (listed, found) = tokio::join!(
+    let base_by_name = async {
+        if raw.len() >= 2
+            && !looks_like_evm_address(raw)
+            && !looks_like_mint(raw)
+            && kind.is_none_or(|k| k == "crypto")
+        {
+            base_search(&state, &catalog, raw, &currency, rate).await
+        } else {
+            Vec::new()
+        }
+    };
+    let (listed, found, base_found) = tokio::join!(
         listed_assets(&state, &catalog, raw, kind, &currency, rate),
-        other_chains
+        other_chains,
+        base_by_name
     );
     let (mut result, mut search_complete) = listed?;
+    for row in base_found {
+        if !result.iter().any(|r| r["assetId"] == row["assetId"]) {
+            result.push(row);
+        }
+    }
     if let Some(found) = found {
         search_complete &= found.complete;
         result.extend(found.assets);
@@ -1693,6 +1719,78 @@ pub(super) async fn assets(
         state.markets.keep_search(key, &answer);
     }
     Ok(Json(answer))
+}
+
+// Base coins found by name on DexScreener, beyond Atlas's own list: the few most liquid (at least
+// $100k), verified only when CoinGecko lists that contract on Base. They go by their address, like
+// a pasted one, so they can be bought from here. A busy DexScreener just adds nothing.
+async fn base_search(
+    state: &AppState,
+    catalog: &[Asset],
+    query: &str,
+    currency: &str,
+    rate: u128,
+) -> Vec<Value> {
+    let Ok(body) = near_intents::dex_search(&state.markets.http, query).await else {
+        return Vec::new();
+    };
+    let needle = query.to_ascii_lowercase();
+    let mut best: HashMap<String, (f64, &Value)> = HashMap::new();
+    for pair in body["pairs"].as_array().into_iter().flatten() {
+        let token = &pair["baseToken"];
+        let (Some(address), Some(symbol), Some(name)) = (
+            token["address"].as_str(),
+            token["symbol"].as_str(),
+            token["name"].as_str(),
+        ) else {
+            continue;
+        };
+        let liquidity = pair["liquidity"]["usd"].as_f64().unwrap_or(0.0);
+        if pair["chainId"] != "base"
+            || !looks_like_evm_address(address)
+            || liquidity < 100_000.0
+            || !(symbol.to_ascii_lowercase().contains(&needle)
+                || name.to_ascii_lowercase().contains(&needle))
+            || catalog
+                .iter()
+                .any(|a| a.chain == "base" && a.token.eq_ignore_ascii_case(address))
+        {
+            continue;
+        }
+        let entry = best
+            .entry(address.to_ascii_lowercase())
+            .or_insert((0.0, pair));
+        if liquidity > entry.0 {
+            *entry = (liquidity, pair);
+        }
+    }
+    let mut found: Vec<_> = best.into_values().collect();
+    found.sort_by(|a, b| b.0.total_cmp(&a.0));
+    // Never waits for CoinGecko's list: unverified until it's warm.
+    let listed = state.near.listed_for_search();
+    found
+        .into_iter()
+        .take(5)
+        .filter_map(|(_, pair)| {
+            let token = &pair["baseToken"];
+            let address = token["address"].as_str()?;
+            let usd: f64 = pair["priceUsd"].as_str()?.parse().ok()?;
+            if !usd.is_finite() || usd <= 0.0 {
+                return None;
+            }
+            Some(json!({
+                "assetId": base_token_id(address),
+                "symbol": token["symbol"],
+                "name": token["name"],
+                "kind": "crypto",
+                "chain": "base",
+                "price": money_from_usd(usd, currency, rate).ok()?,
+                "change24hPct": pair["priceChange"]["h24"].as_f64().map(|c| format!("{c:.2}")),
+                "iconUrl": pair["info"]["imageUrl"].as_str().filter(|u| u.starts_with("https://")),
+                "verified": listed.has("base", address),
+            }))
+        })
+        .collect()
 }
 
 // Atlas's own coins (Solana and Base, plus a pasted address) matching a search, priced live, and
@@ -1942,19 +2040,28 @@ pub(super) async fn chart(
     };
     // 1Click assets (Sui, NEAR, Monad…) chart from GeckoTerminal by their own address; the rest are
     // catalog assets on Solana or Base.
-    let (asset_id, network, token) = if asset_id.starts_with("near:") {
-        let (network, token) = near_intents::chart_token(&state, &asset_id)
-            .await?
-            .ok_or_else(|| unavailable("no price history for this asset yet"))?;
-        (asset_id, network, token)
+    // The coin's symbol and live price too, for an exchange's chart (not on Solana: Jupiter has it).
+    let (asset_id, network, token, quote) = if asset_id.starts_with("near:") {
+        let (found, quote) = tokio::join!(
+            near_intents::chart_token(&state, &asset_id),
+            near_intents::chart_quote(&state, &asset_id)
+        );
+        let (network, token) =
+            found?.ok_or_else(|| unavailable("no price history for this asset yet"))?;
+        (asset_id, network, token, quote)
     } else {
         let asset = find_asset(&state.markets, &asset_id).await?;
-        let network = if asset.chain == "base" {
-            "base"
+        if asset.chain == "base" {
+            let quote = base_rate(&state.markets, &asset).await.map(|units| {
+                (
+                    asset.symbol.clone(),
+                    10f64.powi(asset.decimals as i32) / units as f64,
+                )
+            });
+            (asset.id, "base", asset.token, quote)
         } else {
-            "solana"
-        };
-        (asset.id, network, asset.token)
+            (asset.id, "solana", asset.token, None)
+        }
     };
     // Sui coin types ("0x…::deep::DEEP") go into GeckoTerminal paths with their colons escaped.
     let token_path = token.replace(':', "%3A");
@@ -1977,12 +2084,12 @@ pub(super) async fn chart(
     let points = match cached {
         Some((true, points)) => points,
         // A stale chart beats none when the sources are busy.
-        Some((false, points)) => match chart_points(&state.markets, &source, shape).await {
+        Some((false, points)) => match chart_any(&state, &source, shape, &range, quote).await {
             Ok(fresh) => keep_chart(&state.markets, key, fresh)?,
             Err(_) => points,
         },
         None => {
-            let fresh = chart_points(&state.markets, &source, shape).await?;
+            let fresh = chart_any(&state, &source, shape, &range, quote).await?;
             keep_chart(&state.markets, key, fresh)?
         }
     };
@@ -2017,6 +2124,148 @@ struct ChartSource<'a> {
     network: &'a str,
     token: &'a str,
     token_path: &'a str,
+}
+
+// A chart outside Solana: first an exchange that trades the coin by its symbol (Coinbase,
+// Hyperliquid, Gate.io: free, and far more generous with requests than GeckoTerminal), used only
+// when its latest price is within 3% of the coin's live price so a look-alike symbol never draws
+// another coin's chart; then GeckoTerminal and CoinGecko.
+async fn chart_any(
+    state: &AppState,
+    source: &ChartSource<'_>,
+    shape: (&str, &str, u32, u32, u32),
+    range: &str,
+    quote: Option<(String, f64)>,
+) -> Result<Vec<(u64, f64)>, ApiError> {
+    if let Some((symbol, live)) = quote.filter(|_| source.network != "solana") {
+        if let Some(points) = exchange_closes(state, &symbol, live, range).await {
+            return Ok(points);
+        }
+    }
+    chart_points(&state.markets, source, shape).await
+}
+
+async fn exchange_closes(
+    state: &AppState,
+    symbol: &str,
+    live: f64,
+    range: &str,
+) -> Option<Vec<(u64, f64)>> {
+    // wNEAR trades as NEAR.
+    let symbol = symbol
+        .strip_prefix('w')
+        .filter(|rest| rest.starts_with(|c: char| c.is_ascii_uppercase()))
+        .unwrap_or(symbol)
+        .to_ascii_uppercase();
+    if symbol.is_empty() || !symbol.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let matches = |points: &[(u64, f64)]| {
+        points.len() >= 10
+            && live.is_finite()
+            && live > 0.0
+            && points
+                .last()
+                .is_some_and(|(_, close)| (close / live - 1.0).abs() <= 0.03)
+    };
+    let limit = Duration::from_secs(3);
+    let http = &state.markets.http;
+    if let Ok(Some(points)) =
+        tokio::time::timeout(limit, coinbase_closes(http, &symbol, range)).await
+    {
+        if matches(&points) {
+            return Some(points);
+        }
+    }
+    if let Ok(Ok(points)) =
+        tokio::time::timeout(limit, hl::closes(state, &format!("{symbol}-PERP"), range)).await
+    {
+        if matches(&points) {
+            return Some(points);
+        }
+    }
+    if let Ok(Some(points)) = tokio::time::timeout(limit, gate_closes(http, &symbol, range)).await {
+        if matches(&points) {
+            return Some(points);
+        }
+    }
+    None
+}
+
+// Coinbase Exchange candles for SYMBOL-USD: [time s, low, high, open, close, volume], newest first.
+async fn coinbase_closes(
+    http: &reqwest::Client,
+    symbol: &str,
+    range: &str,
+) -> Option<Vec<(u64, f64)>> {
+    let (granularity, span_ms): (u64, u64) = match range {
+        "1D" => (900, 86_400_000),
+        "1W" => (3600, 7 * 86_400_000),
+        "1M" => (21_600, 30 * 86_400_000),
+        // At most 300 candles per request.
+        _ => (86_400, 300 * 86_400_000),
+    };
+    let end = now();
+    let body: Value = http
+        .get(format!(
+            "https://api.exchange.coinbase.com/products/{symbol}-USD/candles"
+        ))
+        .query(&[
+            ("granularity", granularity.to_string()),
+            ("start", daya::format_time(end.saturating_sub(span_ms))),
+            ("end", daya::format_time(end)),
+        ])
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    let mut points: Vec<(u64, f64)> = body
+        .as_array()?
+        .iter()
+        .filter_map(|c| Some((c[0].as_u64()? * 1000, c[4].as_f64()?)))
+        .filter(|(_, close)| close.is_finite() && *close > 0.0)
+        .collect();
+    points.sort_by_key(|(ms, _)| *ms);
+    Some(points)
+}
+
+// Gate.io candles for SYMBOL_USDT: [time s, quote volume, close, high, low, open, …], oldest first.
+async fn gate_closes(http: &reqwest::Client, symbol: &str, range: &str) -> Option<Vec<(u64, f64)>> {
+    let (interval, limit) = match range {
+        "1D" => ("15m", 96),
+        "1W" => ("1h", 168),
+        "1M" => ("4h", 180),
+        _ => ("1d", 365),
+    };
+    let body: Value = http
+        .get("https://api.gateio.ws/api/v4/spot/candlesticks")
+        .query(&[
+            ("currency_pair", format!("{symbol}_USDT")),
+            ("interval", interval.to_owned()),
+            ("limit", limit.to_string()),
+        ])
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    Some(
+        body.as_array()?
+            .iter()
+            .filter_map(|c| {
+                let seconds: u64 = c[0].as_str()?.parse().ok()?;
+                let close: f64 = c[2].as_str()?.parse().ok()?;
+                (close.is_finite() && close > 0.0).then_some((seconds * 1000, close))
+            })
+            .collect(),
+    )
 }
 
 // A chart's closing prices in dollars, oldest first, from the source that has them. `shape` is
