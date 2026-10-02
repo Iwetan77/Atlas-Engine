@@ -89,10 +89,26 @@ impl Receipt {
     fn public(&self, currency: &str, rate: u128) -> Value {
         let amount = self.usdc_units.as_deref().and_then(|u| u.parse::<u128>().ok())
             .and_then(|u| u.checked_mul(rate)).map(|u| json!({"amount": markets::format_units(u / 1_000_000, 6), "currency": currency}));
+        // Older perps plans wrote their moved margin in dollars; receipts use the chosen currency.
+        let summary: Vec<_> = self
+            .summary
+            .iter()
+            .map(|line| {
+                let mut line = line.clone();
+                if let Some(usd) = line["value"]
+                    .as_str()
+                    .and_then(|v| v.strip_prefix('$'))
+                    .and_then(|v| markets::parse_micros(v).ok())
+                {
+                    line["value"] = json!(markets::say_money(usd, currency, rate));
+                }
+                line
+            })
+            .collect();
         json!({"id":self.id,"intentId":self.intent_id,"kind":self.kind,"title":self.title,
             "symbol":self.symbol,"assetId":self.asset_id,"iconUrl":self.icon_url,
             "createdAtUnixMs":self.created_at_unix_ms,"state":self.state,"stage":self.stage,
-            "amount":amount,"txIds":self.tx_ids,"error":self.error,"summary":self.summary})
+            "amount":amount,"txIds":self.tx_ids,"error":self.error,"summary":summary})
     }
 }
 fn text(v: &Value, k: &str) -> String {
@@ -583,6 +599,19 @@ mod tests {
         let r = snapshot("alice", &v, "near");
         assert_eq!(r.kind, "sell");
         assert_eq!(r.usdc_units.as_deref(), Some("2000000"));
+    }
+    #[test]
+    fn legacy_perps_margin_uses_the_users_currency() {
+        let r = Receipt::plan(
+            "alice",
+            &json!({"intentId":"hl-19a112abcde-1","kind":"perp_open","summary":[{"label":"Margin moved","value":"$2.00"}]}),
+        );
+        let public = r.public("NGN", 1_500_000_000);
+        assert_eq!(
+            public["summary"][0]["value"],
+            markets::say_money(2_000_000, "NGN", 1_500_000_000)
+        );
+        assert!(!public.to_string().contains("$2.00"));
     }
     #[tokio::test]
     async fn deposits_use_the_actual_payout_and_cannot_update_another_user() {
