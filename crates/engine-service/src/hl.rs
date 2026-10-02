@@ -1470,6 +1470,28 @@ pub(super) async fn next(
         json!({"kind":if intent.quote.close{"perp_close"}else{"perp_open"},"transactions":intent.approvals.iter().map(|a|gasless::step(&a.typed,"hyperliquid")).collect::<Vec<_>>()}),
     ))
 }
+// Home's Finish only returns a closed position's cash; an opening that stopped is never finished
+// later, at a price nobody agreed to.
+pub(super) async fn resume_close(
+    state: AppState,
+    id: String,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let (user, _) = wallet_of(&state, &headers).await?;
+    let close = state
+        .hl
+        .intents
+        .get(&id)
+        .await?
+        .filter(|i| i.quote.owner == user.user_id)
+        .is_some_and(|i| i.quote.close);
+    if !close {
+        return Err(conflict(
+            "This trade stopped earlier and won't be finished now. Nothing more was spent.",
+        ));
+    }
+    next(state, id, headers).await
+}
 async fn signed_cashout(
     state: AppState,
     id: String,
@@ -1614,7 +1636,7 @@ pub(super) async fn pending_rows(state: &AppState, owner: &str) -> Result<Vec<Va
             .cloned()
             .collect()
     };
-    Ok(intents.into_iter().filter(|i|i.status.state=="pending"&&i.status.stage=="sign").map(|i|
+    Ok(intents.into_iter().filter(|i|i.quote.close&&i.status.state=="pending"&&i.status.stage=="sign").map(|i|
         json!({"intentId":i.status.intent_id,"symbol":split_coin(&i.quote.coin).1,"kind":if i.quote.close{"perp_close"}else{"perp_open"},"stage":"sign","error":i.status.error})).collect())
 }
 #[cfg(test)]

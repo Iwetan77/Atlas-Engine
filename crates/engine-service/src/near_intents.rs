@@ -5340,7 +5340,8 @@ pub(super) async fn pending_rows(
             .as_ref()
             .map(|s| s.symbol.as_str())
             .or_else(|| intent.sale.as_ref().map(|s| s.symbol.as_str()))
-            .unwrap_or("purchase");
+            .or_else(|| intent.asset.as_ref().map(|a| a.symbol.as_str()))
+            .unwrap_or("Coin");
         rows.push(json!({"intentId":intent.status.intent_id,"assetId":intent.asset_id,"symbol":symbol,
             "kind":if intent.sell_sui{"sell"}else{"buy"},"stage":intent.status.stage,"error":intent.status.error}));
     }

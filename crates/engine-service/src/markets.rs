@@ -4172,32 +4172,6 @@ fn received_units(receipt: &Value, token: &str, wallet: &str) -> Option<u128> {
     total
 }
 
-pub(super) async fn pending_rows(state: &AppState, owner: &str) -> Result<Vec<Value>, ApiError> {
-    let intents: Vec<StoredIntent> = if let Some(pg) = &state.markets.postgres {
-        pg.query(
-            "SELECT payload FROM atlas_intents WHERE owner=$1 AND stage='sign'",
-            &[&owner],
-        )
-        .await
-        .map_err(internal)?
-        .into_iter()
-        .map(|row| serde_json::from_str(row.get::<_, &str>(0)).map_err(internal))
-        .collect::<Result<_, _>>()?
-    } else {
-        state
-            .markets
-            .intents
-            .lock()
-            .map_err(internal)?
-            .values()
-            .filter(|i| i.owner == owner)
-            .cloned()
-            .collect()
-    };
-    Ok(intents.into_iter().filter(|i|i.status.state=="pending"&&i.status.stage=="sign").map(|i|
-        json!({"intentId":i.status.intent_id,"assetId":i.trade.as_ref().map(|t|&t.asset_id),
-            "symbol":"purchase","kind":i.trade.as_ref().map_or("buy",|t|t.side.as_str()),"stage":"sign","error":i.status.error})).collect())
-}
 #[cfg(test)]
 mod tests {
     use super::*;
