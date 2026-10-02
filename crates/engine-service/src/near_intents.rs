@@ -47,6 +47,7 @@ pub(super) struct NearState {
     // refreshed daily: a token found by search counts as verified only when it's among them, so a
     // look-alike with the same name never does. Held with the time it's good until.
     listed: Arc<Mutex<Option<(Instant, Arc<Listed>)>>>,
+    listed_refresh: Arc<std::sync::atomic::AtomicBool>,
     monad_rpc: reqwest::Url,
     postgres: Option<Arc<tokio_postgres::Client>>,
 }
@@ -289,9 +290,25 @@ impl NearState {
                 .timeout(Duration::from_secs(6))
                 .build()?,
             listed: Arc::new(Mutex::new(None)),
+            listed_refresh: Arc::default(),
             postgres,
             monad_rpc: env_url("ATLAS_MONAD_MAINNET_RPC_URL", "https://rpc.monad.xyz").parse()?,
         })
+    }
+    fn listed_for_search(&self) -> Arc<Listed> {
+        let cached = self.listed.lock().ok().and_then(|held| held.clone());
+        let fresh = cached
+            .as_ref()
+            .is_some_and(|(until, _)| Instant::now() < *until);
+        if !fresh && !self.listed_refresh.swap(true, Ordering::Relaxed) {
+            let state = self.clone();
+            tokio::spawn(async move {
+                state.listed().await;
+                state.listed_refresh.store(false, Ordering::Relaxed);
+            });
+        }
+        // A cold verification list means an honest unverified badge, not a missing coin.
+        cached.map(|(_, listed)| listed).unwrap_or_default()
     }
     pub(super) async fn listed(&self) -> Arc<Listed> {
         let last = self.listed.lock().ok().and_then(|held| held.clone());
@@ -339,33 +356,39 @@ impl NearState {
             }
         }
         let list = self.client.tokens().await.map_err(venue)?;
-        // CoinGecko IDs are supplied by 1Click. Fetch images in one bounded request.
-        let ids: Vec<&str> = list
-            .iter()
-            .filter(|t| supported(t))
-            .filter_map(|t| t.coingecko_id.as_deref())
-            .collect();
-        if !ids.is_empty() {
-            if let Ok(response) = self
-                .icon_http
-                .get("https://api.coingecko.com/api/v3/coins/markets")
-                .query(&[("vs_currency", "usd"), ("ids", &ids.join(","))])
-                .send()
-                .await
-            {
-                if let Ok(rows) = response.json::<Vec<Value>>().await {
-                    let mut icons = self.icons.lock().map_err(internal)?;
-                    for row in rows {
-                        if let (Some(id), Some(url)) = (row["id"].as_str(), row["image"].as_str()) {
-                            if url.starts_with("https://coin-images.coingecko.com/") {
-                                icons.insert(id.into(), url.into());
+        *self.tokens.lock().map_err(internal)? = Some((Instant::now(), list.clone()));
+        let state = self.clone();
+        let image_tokens = list.clone();
+        tokio::spawn(async move {
+            // CoinGecko IDs are supplied by 1Click. Fetch images in one bounded request.
+            let ids: Vec<String> = image_tokens
+                .iter()
+                .filter(|t| supported(t))
+                .filter_map(|t| t.coingecko_id.clone())
+                .collect();
+            if !ids.is_empty() {
+                if let Ok(response) = state
+                    .icon_http
+                    .get("https://api.coingecko.com/api/v3/coins/markets")
+                    .query(&[("vs_currency", "usd"), ("ids", &ids.join(","))])
+                    .send()
+                    .await
+                {
+                    if let Ok(rows) = response.json::<Vec<Value>>().await {
+                        let mut icons = state.icons.lock().unwrap_or_else(|e| e.into_inner());
+                        for row in rows {
+                            if let (Some(id), Some(url)) =
+                                (row["id"].as_str(), row["image"].as_str())
+                            {
+                                if url.starts_with("https://coin-images.coingecko.com/") {
+                                    icons.insert(id.into(), url.into());
+                                }
                             }
                         }
                     }
                 }
             }
-        }
-        *self.tokens.lock().map_err(internal)? = Some((Instant::now(), list.clone()));
+        });
         Ok(list)
     }
     async fn insert_intent(&self, id: &str, intent: StoredIntent) -> Result<(), ApiError> {
@@ -2098,20 +2121,21 @@ async fn ref_assets(state: &AppState, query: &str) -> Result<Vec<Value>, ApiErro
         .json()
         .await
         .map_err(venue)?;
-    Ok(response["assets"].as_array().cloned().unwrap_or_default())
+    response["assets"]
+        .as_array()
+        .cloned()
+        .ok_or_else(|| venue("Token search returned an invalid answer"))
 }
 async fn search_ref_unlisted(
     state: &AppState,
     query: &str,
     currency: &str,
     rate: u128,
-) -> Vec<Value> {
-    let Ok(found) = ref_assets(state, query).await else {
-        return vec![];
-    };
+) -> Result<SearchAssets, ApiError> {
+    let found = ref_assets(state, query).await?;
     // Verified only when CoinGecko lists that exact contract on NEAR, like pasted coins elsewhere.
-    let listed = state.near.listed().await;
-    found.into_iter().filter_map(|a|{
+    let listed = state.near.listed_for_search();
+    let assets = found.into_iter().filter_map(|a|{
         let token=a["token"].as_str()?;
         let price=a["price"].as_str()?.parse::<f64>().ok()?;
         if !price.is_finite() || price<=0.0 {return None}
@@ -2119,38 +2143,39 @@ async fn search_ref_unlisted(
         Some(json!({"assetId":format!("near:ref:{token}"),"symbol":a["symbol"],"name":a["name"],"kind":"crypto",
             "price":{"amount":format!("{display:.12}").trim_end_matches('0').trim_end_matches('.'),"currency":currency},
             "iconUrl":a["icon"].as_str().filter(|v|v.starts_with("https://")),"verified":listed.has("near",token),"tradeable":a["tradeable"],"change24hPct":null}))
-    }).collect()
+    }).collect();
+    Ok(SearchAssets {
+        assets,
+        complete: true,
+    })
 }
 
 async fn search_sui_unlisted(
-    state: &AppState,
+    state: &NearState,
     query: &str,
     currency: &str,
     rate: u128,
-) -> Vec<Value> {
+) -> Result<SearchAssets, ApiError> {
     if query.len() < 2 || query.len() > 160 {
-        return Vec::new();
+        return Ok(SearchAssets::empty());
     }
-    let Ok(response) = state
-        .near
+    let body: Value = state
         .icon_http
         .get("https://api.dexscreener.com/latest/dex/search")
         .query(&[("q", query)])
+        .timeout(Duration::from_secs(2))
         .send()
         .await
-    else {
-        return Vec::new();
-    };
-    let Ok(body) = response.error_for_status() else {
-        return Vec::new();
-    };
-    let Ok(body) = body.json::<Value>().await else {
-        return Vec::new();
-    };
-    let Some(pairs) = body["pairs"].as_array() else {
-        return Vec::new();
-    };
-    let listed = state.near.listed().await;
+        .map_err(venue)?
+        .error_for_status()
+        .map_err(venue)?
+        .json()
+        .await
+        .map_err(venue)?;
+    let pairs = body["pairs"]
+        .as_array()
+        .ok_or_else(|| venue("Token search returned an invalid answer"))?;
+    let listed = state.listed_for_search();
     let mut candidates = HashMap::<String, (f64, f64)>::new();
     for pair in pairs {
         if pair["chainId"].as_str() != Some("sui") {
@@ -2188,51 +2213,72 @@ async fn search_sui_unlisted(
     }
     let mut candidates: Vec<_> = candidates.into_iter().collect();
     candidates.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0));
-    let mut result = Vec::new();
-    for (coin, (_, price)) in candidates.into_iter().take(5) {
-        let graphql = json!({
+    let mut lookups = tokio::task::JoinSet::new();
+    for (rank, (coin, (_, price))) in candidates.into_iter().take(5).enumerate() {
+        let (state, currency) = (state.clone(), currency.to_owned());
+        let verified = listed.has("sui", &coin);
+        lookups.spawn(async move {
+            (
+                rank,
+                sui_search_row(&state, &coin, price, &currency, rate, verified).await,
+            )
+        });
+    }
+    let mut rows = Vec::new();
+    let mut complete = true;
+    let finished = tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(found) = lookups.join_next().await {
+            match found {
+                Ok((rank, Ok(row))) => rows.push((rank, row)),
+                _ => complete = false,
+            }
+        }
+    })
+    .await;
+    complete &= finished.is_ok();
+    rows.sort_by_key(|(rank, _)| *rank);
+    Ok(SearchAssets {
+        assets: rows.into_iter().map(|(_, row)| row).collect(),
+        complete,
+    })
+}
+
+async fn sui_search_row(
+    state: &NearState,
+    coin: &str,
+    price: f64,
+    currency: &str,
+    rate: u128,
+    verified: bool,
+) -> Result<Value, ApiError> {
+    let body: Value = state.icon_http
+        .post("https://graphql.mainnet.sui.io/graphql")
+        .json(&json!({
             "query":"query($coinType:String!){coinMetadata(coinType:$coinType){symbol name decimals iconUrl}}",
             "variables":{"coinType":coin}
-        });
-        let Ok(response) = state
-            .near
-            .icon_http
-            .post("https://graphql.mainnet.sui.io/graphql")
-            .json(&graphql)
-            .send()
-            .await
-        else {
-            continue;
-        };
-        let Ok(body) = response.error_for_status() else {
-            continue;
-        };
-        let Ok(body) = body.json::<Value>().await else {
-            continue;
-        };
-        let meta = &body["data"]["coinMetadata"];
-        let (Some(symbol), Some(name), Some(decimals)) = (
-            meta["symbol"].as_str(),
-            meta["name"].as_str(),
-            meta["decimals"].as_u64(),
-        ) else {
-            continue;
-        };
-        if symbol.is_empty() || name.is_empty() || decimals > 18 {
-            continue;
-        }
-        let display = price * (rate as f64 / 1_000_000.0);
-        let icon = meta["iconUrl"]
-            .as_str()
-            .filter(|url| url.starts_with("https://"));
-        let verified = listed.has("sui", &coin);
-        result.push(json!({"assetId":format!("near:sui:{coin}"),"symbol":symbol,
-            "name":format!("{name} on sui"),"kind":"crypto","chain":"sui",
-            "price":{"amount":format!("{display:.12}").trim_end_matches('0').trim_end_matches('.'),
-                "currency":currency},"change24hPct":null,"iconUrl":icon,"verified":verified,
-            "tradeable":true}));
+        }))
+        .send().await.map_err(venue)?
+        .error_for_status().map_err(venue)?
+        .json().await.map_err(venue)?;
+    let meta = &body["data"]["coinMetadata"];
+    let (Some(symbol), Some(name), Some(decimals)) = (
+        meta["symbol"].as_str(),
+        meta["name"].as_str(),
+        meta["decimals"].as_u64(),
+    ) else {
+        return Err(venue("Token details couldn't load"));
+    };
+    if symbol.is_empty() || name.is_empty() || decimals > 18 {
+        return Err(venue("Token details couldn't load"));
     }
-    result
+    let display = price * (rate as f64 / 1_000_000.0);
+    let icon = meta["iconUrl"]
+        .as_str()
+        .filter(|url| url.starts_with("https://"));
+    Ok(json!({"assetId":format!("near:sui:{coin}"),"symbol":symbol,
+        "name":format!("{name} on sui"),"kind":"crypto","chain":"sui",
+        "price":{"amount":format!("{display:.12}").trim_end_matches('0').trim_end_matches('.'),"currency":currency},
+        "change24hPct":null,"iconUrl":icon,"verified":verified,"tradeable":true}))
 }
 
 // Where a 1Click asset's price history lives on GeckoTerminal: (network, token address). None
@@ -2276,13 +2322,70 @@ pub(super) async fn chart_token(
     Ok(Some((network, address)))
 }
 
+pub(super) struct SearchAssets {
+    pub(super) assets: Vec<Value>,
+    pub(super) complete: bool,
+}
+impl SearchAssets {
+    fn empty() -> Self {
+        Self {
+            assets: vec![],
+            complete: true,
+        }
+    }
+}
+
+async fn collect_search_sources<A, B, C>(
+    limit: Duration,
+    listed: A,
+    sui: B,
+    near: C,
+) -> SearchAssets
+where
+    A: std::future::Future<Output = Result<SearchAssets, ApiError>>,
+    B: std::future::Future<Output = Result<SearchAssets, ApiError>>,
+    C: std::future::Future<Output = Result<SearchAssets, ApiError>>,
+{
+    let found = tokio::join!(
+        tokio::time::timeout(limit, listed),
+        tokio::time::timeout(limit, sui),
+        tokio::time::timeout(limit, near),
+    );
+    let mut result = SearchAssets::empty();
+    for source in [found.0, found.1, found.2] {
+        match source {
+            Ok(Ok(found)) => {
+                result.complete &= found.complete;
+                result.assets.extend(found.assets);
+            }
+            Ok(Err(_)) | Err(_) => result.complete = false,
+        }
+    }
+    result
+}
+
 pub(super) async fn search_assets(
     state: &AppState,
     query: &str,
     currency: &str,
     rate: u128,
-) -> Result<Vec<Value>, ApiError> {
-    let list = state.near.tokens().await.unwrap_or_default();
+) -> SearchAssets {
+    collect_search_sources(
+        Duration::from_secs(5),
+        search_listed(state, query, currency, rate),
+        search_sui_unlisted(&state.near, query, currency, rate),
+        search_ref_unlisted(state, query, currency, rate),
+    )
+    .await
+}
+
+async fn search_listed(
+    state: &AppState,
+    query: &str,
+    currency: &str,
+    rate: u128,
+) -> Result<SearchAssets, ApiError> {
+    let list = state.near.tokens().await?;
     let query = query.to_ascii_lowercase();
     let mut out = Vec::new();
     for t in list.iter().filter(|t| supported(t)) {
@@ -2322,9 +2425,10 @@ pub(super) async fn search_assets(
             break;
         }
     }
-    out.extend(search_sui_unlisted(state, &query, currency, rate).await);
-    out.extend(search_ref_unlisted(state, &query, currency, rate).await);
-    Ok(out)
+    Ok(SearchAssets {
+        assets: out,
+        complete: true,
+    })
 }
 // A NEAR Intents coin's live price and what the user holds of it, for its position card: NEAR and
 // Monad coins from 1Click's list, and NEAR coins found on Ref.
@@ -5355,6 +5459,67 @@ pub(super) async fn resume(
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn a_slow_provider_keeps_the_deep_result_from_another_provider() {
+        let found = super::collect_search_sources(
+            std::time::Duration::from_millis(20),
+            async { Ok(super::SearchAssets::empty()) },
+            async {
+                Ok(super::SearchAssets {
+                    assets: vec![serde_json::json!({"symbol":"DEEP"})],
+                    complete: true,
+                })
+            },
+            std::future::pending(),
+        )
+        .await;
+        assert_eq!(found.assets[0]["symbol"], "DEEP");
+        assert!(!found.complete);
+    }
+
+    #[tokio::test]
+    async fn failed_sources_are_distinct_from_a_real_empty_search() {
+        let failed = super::collect_search_sources(
+            std::time::Duration::from_millis(20),
+            async { Err(super::venue("provider unavailable")) },
+            async { Ok(super::SearchAssets::empty()) },
+            async { Ok(super::SearchAssets::empty()) },
+        )
+        .await;
+        assert!(failed.assets.is_empty());
+        assert!(!failed.complete);
+        let empty = super::collect_search_sources(
+            std::time::Duration::from_millis(20),
+            async { Ok(super::SearchAssets::empty()) },
+            async { Ok(super::SearchAssets::empty()) },
+            async { Ok(super::SearchAssets::empty()) },
+        )
+        .await;
+        assert!(empty.assets.is_empty());
+        assert!(empty.complete);
+    }
+
+    #[tokio::test]
+    #[ignore = "reads live DexScreener and Sui metadata; no signatures or transactions"]
+    async fn live_deep_search() {
+        let state = super::NearState::new().await.unwrap();
+        for query in ["deep", "DEEP", "DeepBook"] {
+            let at = std::time::Instant::now();
+            let found = super::search_sui_unlisted(&state, query, "USD", 1_000_000)
+                .await
+                .unwrap();
+            assert!(
+                found.assets.iter().any(|row| row["symbol"] == "DEEP"),
+                "{query}: no DEEP result"
+            );
+            println!(
+                "{query}: DEEP found in {}ms, complete={}",
+                at.elapsed().as_millis(),
+                found.complete
+            );
+        }
+    }
 
     #[tokio::test]
     async fn preparing_and_reporting_the_same_intent_are_serialised() {

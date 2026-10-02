@@ -1707,7 +1707,8 @@ pub(super) async fn assets(
         }
     })
     .await;
-    let mut result = Vec::with_capacity(picked.len());
+    let picked_count = picked.len();
+    let mut result = Vec::with_capacity(picked_count);
     for a in picked {
         let (price, change) = if a.chain == "solana" {
             // No live price, no row: never show a stale or guessed one.
@@ -1729,20 +1730,16 @@ pub(super) async fn assets(
         };
         result.push(json!({"assetId":a.id,"symbol":a.symbol,"name":a.name,"kind":a.kind,"chain":a.chain,"price":price,"change24hPct":change,"iconUrl":a.icon_url,"verified":a.verified}));
     }
-    // Coins on other chains through 1Click; when it's down, search still answers with the rest.
+    // Each source owns its deadline; a slow source must not erase another source's matches.
+    let mut search_complete = query.is_empty() || result.len() == picked_count;
     if !raw.is_empty() && kind.is_none_or(|k| k == "crypto") {
-        let found = tokio::time::timeout(
-            SEARCH_SOURCE_LIMIT * 2,
-            near_intents::search_assets(&state, raw, &currency, rate),
-        )
-        .await;
-        match found {
-            Ok(Ok(found)) => result.extend(found),
-            Ok(Err(error)) => eprintln!("1Click search unavailable: {}", error.1),
-            Err(_) => eprintln!("1Click search too slow; answered without it"),
-        }
+        let found = near_intents::search_assets(&state, raw, &currency, rate).await;
+        search_complete &= found.complete;
+        result.extend(found.assets);
     }
-    Ok(Json(json!({"assets":result})))
+    Ok(Json(
+        json!({"assets":result,"searchComplete":search_complete}),
+    ))
 }
 
 // How long one optional source (trending lists, prices for a few Base coins, other chains' search)

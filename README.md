@@ -277,3 +277,9 @@ steps if a later send cannot be verified. Unknown outcomes are not retried as fr
 Read-only mainnet checks: run `device-approval.live.mjs` from `privy-bridge` with `ATLAS_DRY_USER_ID` and the ignored
 Privy environment file. The script refuses signing, broadcasting and exchange writes. An unfunded receiving wallet
 cannot build a transaction until it holds its input and gas; report those checks as unverified, not passed.
+
+### Asset search completeness
+
+`GET /v1/assets?currency=NGN&category=crypto&q=deep` keeps the existing `{assets:[...]}` shape and adds `searchComplete: boolean`. Sui, Ref and 1Click lookups run independently; one provider's timeout never discards another provider's rows. Prices and on-chain metadata remain required. Verification badges refresh in the background and stay unverified until the exact contract is known.
+
+When `searchComplete` is false, the app keeps any returned rows and offers a retry. An empty incomplete search is retried once, then shown as a failed lookup, never as a confirmed no-match. A completed empty search may show no matches.
