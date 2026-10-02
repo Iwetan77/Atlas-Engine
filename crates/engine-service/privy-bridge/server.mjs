@@ -120,7 +120,12 @@ const server = createServer(async (request, response) => {
     const evmWallet = evm?.address ?? null;
     const solanaWallet = wallets.find((account) => account.chain_type === 'solana')?.address ?? null;
     if (verifyOnly) {
-      send(response, 200, {userId, evmWallet, solanaWallet});
+      // Bank transfers register the user with Daya by their sign-in email (and Google name).
+      const emailAccount = user.linked_accounts.find((account) => account.type === 'email');
+      const google = user.linked_accounts.find((account) => account.type === 'google_oauth');
+      const email = emailAccount?.address ?? google?.email ?? null;
+      const name = google?.name ?? null;
+      send(response, 200, {userId, evmWallet, solanaWallet, email, name});
       return;
     }
     // Claiming an Atlas Link: the claimer is signed in, and the link's secret pays out its escrow,

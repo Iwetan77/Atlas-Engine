@@ -16,6 +16,11 @@ pub(super) struct VerifiedWallets {
     pub(super) user_id: String,
     pub(super) evm_wallet: Option<String>,
     pub(super) solana_wallet: Option<String>,
+    // The sign-in email and Google name: bank transfers register the user with Daya by these.
+    #[serde(default)]
+    pub(super) email: Option<String>,
+    #[serde(default)]
+    pub(super) name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -547,6 +552,8 @@ pub(super) async fn verified_wallets(
             user_id: state.user_id.clone(),
             evm_wallet: Some(state.base_wallet.clone()),
             solana_wallet: Some(state.solana_owner.clone()),
+            email: None,
+            name: None,
         });
     };
     let token = headers

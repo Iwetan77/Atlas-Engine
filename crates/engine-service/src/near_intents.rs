@@ -5897,6 +5897,8 @@ mod tests {
             user_id: "u".into(),
             evm_wallet: Some("0x845c22a46398E0a702733e556bEB6aFcB2E92132".into()),
             solana_wallet: None,
+            email: None,
+            name: None,
         };
         assert!(recipient(&sui, &user).is_err());
     }

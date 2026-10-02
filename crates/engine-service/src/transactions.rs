@@ -86,6 +86,45 @@ impl Receipt {
         r.title = title(&r.kind, &r.symbol);
         r
     }
+    // A bank transfer through Daya: no intent of its own, updated by Daya's webhook and polling.
+    pub(super) fn ramp(
+        owner: &str,
+        id: &str,
+        kind: &str,
+        summary: Vec<Value>,
+        usdc_units: u128,
+    ) -> Self {
+        let mut r = Self::plan(owner, &json!({"intentId":id,"kind":kind,"summary":summary}));
+        r.intent_id = None;
+        r.created_at_unix_ms = now();
+        r.stage = "waiting".into();
+        r.usdc_units = Some(usdc_units.to_string());
+        r
+    }
+    pub(super) fn set_state(&mut self, state: &str, stage: &str, error: Option<String>) {
+        self.state = state.into();
+        self.stage = stage.into();
+        self.error = error;
+    }
+    pub(super) fn set_error(&mut self, error: Option<String>) {
+        self.error = error;
+    }
+    pub(super) fn set_usdc(&mut self, units: u128) {
+        self.usdc_units = Some(units.to_string());
+    }
+    // Replaces the summary line with this label, or adds it.
+    pub(super) fn set_line(&mut self, label: &str, value: String) {
+        let line = json!({"label":label,"value":value});
+        match self.summary.iter_mut().find(|l| l["label"] == label) {
+            Some(existing) => *existing = line,
+            None => self.summary.push(line),
+        }
+    }
+    pub(super) fn add_tx(&mut self, tx: String) {
+        if !self.tx_ids.contains(&tx) {
+            self.tx_ids.push(tx);
+        }
+    }
     fn public(&self, currency: &str, rate: u128) -> Value {
         let amount = self.usdc_units.as_deref().and_then(|u| u.parse::<u128>().ok())
             .and_then(|u| u.checked_mul(rate)).map(|u| json!({"amount": markets::format_units(u / 1_000_000, 6), "currency": currency}));
@@ -120,6 +159,7 @@ fn now() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
+const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 fn created_ms(id: &str) -> u64 {
     // Market ids use hex milliseconds, cross-chain ids use decimal milliseconds.
     id.split('-')
@@ -256,6 +296,26 @@ impl HistoryStore {
             }
         }
         self.put(&r).await
+    }
+    pub(super) async fn find(&self, owner: &str, id: &str) -> Result<Option<Receipt>, ApiError> {
+        if let Some(pg) = &self.postgres {
+            return pg
+                .query_opt(
+                    "SELECT payload FROM atlas_receipts WHERE id=$1 AND owner=$2",
+                    &[&id, &owner],
+                )
+                .await
+                .map_err(internal)?
+                .map(|r| serde_json::from_str(r.get::<_, &str>(0)).map_err(internal))
+                .transpose();
+        }
+        Ok(self
+            .memory
+            .lock()
+            .map_err(internal)?
+            .get(id)
+            .filter(|r| r.owner == owner)
+            .cloned())
     }
     async fn owned(&self, owner: &str) -> Result<Vec<Receipt>, ApiError> {
         if let Some(pg) = &self.postgres {
@@ -458,6 +518,23 @@ fn refresh(state: &AppState, headers: &HeaderMap, owner: &str, rows: &[Receipt])
     }
     held.insert(owner.into(), Instant::now());
     drop(held);
+    // Bank transfers through Daya: a naira deposit still on its way, or a cash-out in its first days
+    // (its USDC send may be done while the bank payout isn't).
+    for r in rows
+        .iter()
+        .filter(|r| {
+            (r.kind == "onramp" && r.state == "pending")
+                || (r.kind == "offramp" && now().saturating_sub(r.created_at_unix_ms) < 3 * DAY_MS)
+        })
+        .take(4)
+    {
+        let (state, owner, id) = (state.clone(), owner.to_owned(), r.id.clone());
+        tokio::spawn(async move {
+            let _ =
+                tokio::time::timeout(Duration::from_secs(8), daya::observe(&state, &owner, &id))
+                    .await;
+        });
+    }
     // Reading history stays fast. Observe pending transfers without starting new buys or signing.
     for r in rows
         .iter()

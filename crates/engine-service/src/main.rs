@@ -3,6 +3,7 @@
 
 mod app_balance;
 mod cashlinks;
+mod daya;
 mod earn;
 mod gasless;
 mod hl;
@@ -51,6 +52,7 @@ struct AppState {
     social: social::SocialState,
     trades: positions::TradeBook,
     history: transactions::HistoryStore,
+    daya: daya::DayaState,
 }
 
 #[derive(Clone)]
@@ -116,6 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         social: social::SocialState::new().await?,
         trades: positions::TradeBook::new().await?,
         history: transactions::HistoryStore::new().await?,
+        daya: daya::DayaState::new().await?,
     };
     let bind: SocketAddr = env::var("ATLAS_BALANCE_BIND")
         .unwrap_or_else(|_| "127.0.0.1:3000".into())
@@ -126,6 +129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Perps run on Hyperliquid.
     hl::keep_warm(state.clone());
     markets::keep_base_trending_warm(state.clone());
+    daya::keep_checked(state.clone());
     let perps_routes = Router::new()
         .route(
             "/v1/perps/onboarding",
@@ -158,6 +162,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/users/resolve", get(social::resolve_user))
         .route("/v1/offramp/banks", get(social::banks))
         .route("/v1/offramp/resolve", post(social::resolve_bank))
+        .route("/v1/onramp/bank/quote", post(daya::onramp_quote))
+        .route("/v1/onramp/bank", post(daya::onramp_open))
+        .route("/v1/onramp/bank/{id}", get(daya::onramp_status))
+        .route("/v1/daya/webhook", post(daya::webhook))
         .route("/v1/sends/quote", post(social::send_quote))
         .route(
             "/v1/sends/quote/{quote_id}/execute",
@@ -219,6 +227,8 @@ async fn health() -> Json<serde_json::Value> {
             "nearIntents": env::var("NEAR_INTENTS_API_KEY").is_ok_and(|k| !k.trim().is_empty()),
             "relay": env::var("RELAY_API_KEY").is_ok_and(|k| !k.trim().is_empty()),
         },
+        // Bank transfers: whether Daya's key and webhook secret are set, and its last no-money check.
+        "daya": daya::health(),
     }))
 }
 

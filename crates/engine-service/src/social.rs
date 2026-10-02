@@ -52,6 +52,8 @@ struct SendQuote {
     plan: Option<Value>,
     // An Atlas Link: its escrow, the note, and what the claimer gets (`usdc_units` adds the claim fee).
     link: Option<(String, Option<String>, u128)>,
+    // A bank withdrawal through Daya, and the naira its quote showed the bank getting.
+    bank: Option<(daya::Payout, u128)>,
 }
 #[derive(Deserialize)]
 pub(super) struct HandleBody {
@@ -498,7 +500,7 @@ pub(super) async fn banks(
     if q.country.as_deref() != Some("NG") {
         return Err(bad("only NG banks are supported"));
     }
-    Err(unavailable("Daya bank directory is not configured"))
+    Ok(Json(json!({"banks": *state.daya.banks().await?})))
 }
 pub(super) async fn resolve_bank(
     State(state): State<AppState>,
@@ -506,13 +508,14 @@ pub(super) async fn resolve_bank(
     Json(body): Json<BankResolve>,
 ) -> Result<Json<Value>, ApiError> {
     app_balance::verified_wallets(&state, &headers).await?;
-    if body.bank_code.is_empty()
-        || body.account_number.len() != 10
-        || !body.account_number.bytes().all(|b| b.is_ascii_digit())
+    match state
+        .daya
+        .account_name(&body.bank_code, &body.account_number)
+        .await?
     {
-        return Err(bad("invalid Nigerian bank details"));
+        Some(name) => Ok(Json(json!({"accountName": name}))),
+        None => Err((StatusCode::NOT_FOUND, "no such bank account".into())),
     }
-    Err(unavailable("Daya account resolution is not configured"))
 }
 pub(super) async fn send_quote(
     State(state): State<AppState>,
@@ -527,6 +530,7 @@ pub(super) async fn send_quote(
         "Privy Ethereum wallet is not ready".into(),
     ))?;
     let mut link: Option<(String, Option<String>)> = None;
+    let mut bank: Option<daya::Payout> = None;
     let (recipient, recipient_solana, label) = match req.destination {
         Destination::Atlas { handle } => {
             let record = state
@@ -544,12 +548,15 @@ pub(super) async fn send_quote(
                 format!("@{}", record.handle),
             )
         }
+        // Paid to Daya's one-time address, opened when the user confirms.
         Destination::Bank {
             bank_code,
             account_number,
         } => {
-            let _ = (bank_code, account_number);
-            return Err(unavailable("Daya off-ramp is not configured"));
+            let payout = state.daya.payout_to(&bank_code, &account_number).await?;
+            let label = payout.label.clone();
+            bank = Some(payout);
+            (String::new(), None, label)
         }
         Destination::Cashlink { message, escrow } => {
             let escrow = escrow
@@ -593,6 +600,10 @@ pub(super) async fn send_quote(
         .unwrap_or(0);
     let solana_covers = match (&solana, &recipient_solana) {
         (Some(from), Some(_)) => markets::solana_cash(&state, from).await >= usdc_units,
+        // Daya takes USDC on Solana as well as Base.
+        (Some(from), None) if bank.is_some() => {
+            markets::solana_cash(&state, from).await >= usdc_units
+        }
         _ => false,
     };
     if base_cash < usdc_units && !solana_covers {
@@ -606,6 +617,13 @@ pub(super) async fn send_quote(
         )
         .await?;
     }
+    let bank = match bank {
+        Some(mut payout) => {
+            let (get, fee) = state.daya.payout_amounts(&mut payout, usdc_units).await?;
+            Some((payout, get, fee))
+        }
+        None => None,
+    };
     let quote_id = format!(
         "send-{:x}-{:x}",
         now(),
@@ -626,9 +644,16 @@ pub(super) async fn send_quote(
             expires,
             plan: None,
             link: link.map(|(escrow, note)| (escrow, note, gift_units)),
+            bank: bank.as_ref().map(|(payout, get, _)| (payout.clone(), *get)),
         },
     );
     let send = money_usdc(usdc_units, &req.amount.currency, rate)?;
+    // The bank gets naira at Daya's rate, after Daya's payout fee.
+    if let Some((_, get, fee)) = bank {
+        return Ok(Json(
+            json!({"quoteId":quote_id,"destinationLabel":label,"send":send,"receive":money_usdc(get,"NGN",1_000_000)?,"fee":money_usdc(fee,"NGN",1_000_000)?,"eta":"Usually within minutes","expiresAtUnixMs":expires}),
+        ));
+    }
     let receive = money_usdc(gift_units, &req.amount.currency, rate)?;
     let fee = money_usdc(fee_units, &req.amount.currency, rate)?;
     Ok(Json(
@@ -664,6 +689,37 @@ async fn execute_send_inner(
     }
     if user.evm_wallet.as_deref() != Some(quote.sender_wallet.as_str()) {
         return Err((StatusCode::CONFLICT, "Privy wallet changed".into()));
+    }
+    if let Some((payout, get)) = &quote.bank {
+        let (plan, funding_account, expires) =
+            bank_plan(&state, &user, &quote_id, &quote, payout, *get).await?;
+        {
+            let mut quotes = state.social.quotes.lock().map_err(internal)?;
+            let stored = quotes
+                .get_mut(&quote_id)
+                .ok_or((StatusCode::NOT_FOUND, "send quote not found".into()))?;
+            // Two executes racing: the first plan stands (both opened the same Daya address).
+            if let Some(plan) = &stored.plan {
+                return Ok(Json(plan.clone()));
+            }
+            stored.plan = Some(plan.clone());
+        }
+        // Only the plan that stands is tied to the payout, so Daya's updates reach its receipt.
+        let intent_id = plan["intentId"].as_str().unwrap_or("");
+        if let Err((_, error)) = state
+            .daya
+            .record_payout(
+                &user.user_id,
+                &funding_account,
+                intent_id,
+                quote.usdc_units,
+                expires,
+            )
+            .await
+        {
+            eprintln!("bank withdrawal {intent_id}: payout not recorded: {error}");
+        }
+        return Ok(Json(plan));
     }
     let tx = state
         .markets
@@ -794,6 +850,81 @@ async fn execute_send_inner(
     stored.plan = Some(plan.clone());
     Ok(Json(plan))
 }
+// A bank withdrawal: Daya opens a one-time USDC address on the chain the cash is on (Base, or
+// Solana when only Solana holds it), and the phone sends the USDC there. Daya's idempotency key is
+// the quote, so a retried execute gets the same address.
+async fn bank_plan(
+    state: &AppState,
+    user: &app_balance::VerifiedWallets,
+    quote_id: &str,
+    quote: &SendQuote,
+    payout: &daya::Payout,
+    get: u128,
+) -> Result<(Value, String, u64), ApiError> {
+    let rate = app_balance::fx_rate(&quote.currency).await?;
+    let base_cash = state
+        .markets
+        .base
+        .balance_of(BASE_USDC, &quote.sender_wallet)
+        .await
+        .unwrap_or(0);
+    let on_solana = match &quote.sender_solana {
+        Some(from) if base_cash < quote.usdc_units => {
+            markets::solana_cash(state, from).await >= quote.usdc_units
+        }
+        _ => false,
+    };
+    let chain = if on_solana { "SOLANA" } else { "BASE" };
+    let (funding_account, address, expires) = state
+        .daya
+        .open_payout(user, payout, chain, &format!("atlas-{quote_id}"))
+        .await?;
+    let (intent_id, transactions, fee) = match (&quote.sender_solana, on_solana) {
+        (Some(from), true) => {
+            let (intent_id, transactions) = markets::plan_solana_transfer(
+                state,
+                user.user_id.clone(),
+                from.clone(),
+                &address,
+                quote.usdc_units,
+            )
+            .await?;
+            (intent_id, transactions, None)
+        }
+        _ => {
+            let tx = state
+                .markets
+                .base
+                .transfer_transaction(BASE_USDC, &quote.sender_wallet, &address, quote.usdc_units)
+                .map_err(internal)?;
+            markets::plan_base_with_cash(
+                state,
+                user.user_id.clone(),
+                quote.sender_wallet.clone(),
+                user.solana_wallet.clone().filter(|w| !w.is_empty()),
+                vec![(tx.to.clone(), tx.data.clone())],
+                quote.usdc_units,
+                &quote.currency,
+                rate,
+            )
+            .await?
+        }
+    };
+    let mut summary = vec![
+        json!({"label":"Send to","value":quote.label}),
+        json!({"label":"Amount","value":markets::say_money(quote.usdc_units,&quote.currency,rate)}),
+        json!({"label":"Bank gets","value":format!("about {}", markets::say_micros(get, "NGN"))}),
+        json!({"label":"Rate","value":payout.rate_line()}),
+        json!({"label":"Bank payout","value":"Waiting for your USDC"}),
+    ];
+    if let Some(fee) = fee {
+        summary.push(
+            json!({"label":"Network fee","value":markets::say_money(fee,&quote.currency,rate)}),
+        );
+    }
+    let plan = json!({"intentId":intent_id,"kind":"send","summary":summary,"transactions":transactions,"expiresAtUnixMs":now()+120_000});
+    Ok((plan, funding_account, expires))
+}
 #[cfg(test)]
 mod tests {
     #[test]
@@ -853,6 +984,9 @@ pub(super) async fn execute_send(
         receipt.usdc_units = Some(q.usdc_units.to_string());
         if q.link.is_some() {
             receipt.kind = "cashlink".into();
+        }
+        if q.bank.is_some() {
+            receipt.kind = "offramp".into();
         }
     }
     receipt.title = transactions::title(&receipt.kind, &receipt.symbol);
