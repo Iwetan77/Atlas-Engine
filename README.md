@@ -252,3 +252,28 @@ Every ✅ has a live call or a reproducible check behind it.
 
 **Tests:** 82 Rust unit tests (engine-execution and engine-service) and 16 bridge tests, plus the live
 checks above.
+
+
+### Phone approvals and waiting purchases
+
+The engine prepares signing requests; access tokens authenticate their owner and never authorize a wallet signature.
+Plans may include `{ "chain": "privy", "request": { "version": 1, "method": "POST", "url": "...", "body": { "params": {} }, "headers": {} } }` for Sui/NEAR.
+The phone approves the exact request with Privy's authorization-signature hook. EVM plans may include
+`{ "chain": "base", "typedData": { "domain": {}, "types": {}, "primaryType": "...", "message": {} } }`
+or `chain: "hyperliquid"`. The embedded wallet signs EIP-712 locally. Both types are returned as
+`{ "index": 0, "transaction": "signature" }` in `/v1/intents/{id}/signed`, never sent as an EVM transaction.
+
+After a deposit arrives, `stage: "sign"` means the phone must approve the next step from
+`GET /v1/intents/{id}/next`. The current action keeps its single confirmation. Prepared requests expire within three
+minutes and are consumed once; expired preparations must be fetched again, not replayed.
+
+`GET /v1/intents/pending` (Bearer auth) returns `{ "intents": [{ "intentId", "symbol", "kind", "stage", "error" }] }`.
+It only returns the caller's waiting steps, including received funds from a safely failed purchase.
+`POST /v1/intents/{id}/resume {}` returns a fresh ExecutionPlan for those funds, with optional `stage: "sign"`.
+Home shows a Finish card and reviews this plan without collecting a new purchase payment.
+NEAR batches approve each transaction, use consecutive nonces, submit in order and report hashes for any completed
+steps if a later send cannot be verified. Unknown outcomes are not retried as fresh payments.
+
+Read-only mainnet checks: run `device-approval.live.mjs` from `privy-bridge` with `ATLAS_DRY_USER_ID` and the ignored
+Privy environment file. The script refuses signing, broadcasting and exchange writes. An unfunded receiving wallet
+cannot build a transaction until it holds its input and gas; report those checks as unverified, not passed.

@@ -61,16 +61,6 @@ pub(super) struct GasTank {
     value: Money,
 }
 
-// The user's Privy identity token, when the app sent one: Privy's server-side signing as the user
-// takes it (the bridge checks it's the same user as the access token).
-pub(super) fn identity_token(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("privy-id-token")
-        .and_then(|v| v.to_str().ok())
-        .filter(|v| !v.is_empty() && v.len() < 8192)
-        .map(str::to_string)
-}
-
 // Ether's price, read through its Solana twin (Portal ETH) the way SOL's is read.
 const PORTAL_ETH_MINT: &str = "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs";
 

@@ -217,6 +217,8 @@ struct Funding {
     base_api: Option<String>,
     #[serde(default)]
     gas_request_id: Option<String>,
+    #[serde(default)]
+    main_index: usize,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -225,6 +227,18 @@ struct HlIntent {
     status: markets::IntentStatus,
     funding: Option<Funding>,
     expires: u64,
+    #[serde(default)]
+    approvals: Vec<HlApproval>,
+    #[serde(default)]
+    cash_request: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct HlApproval {
+    index: usize,
+    kind: String,
+    prepare_id: String,
+    typed: Value,
 }
 
 #[derive(Clone)]
@@ -268,13 +282,13 @@ impl IntentStore {
         Ok(())
     }
     // Moves an intent out of `validate` once: a repeated /signed can't start it twice.
-    async fn claim(&self, id: &str, intent: &HlIntent) -> Result<bool, ApiError> {
+    async fn claim(&self, id: &str, intent: &HlIntent, stage: &str) -> Result<bool, ApiError> {
         let payload = serde_json::to_string(intent).map_err(internal)?;
         if let Some(pg) = &self.postgres {
             let changed = pg
                 .execute(
-                    "UPDATE atlas_hl_intents SET stage=$2, payload=$3 WHERE intent_id=$1 AND stage='validate'",
-                    &[&id, &intent.status.stage, &payload],
+                    "UPDATE atlas_hl_intents SET stage=$2, payload=$3 WHERE intent_id=$1 AND stage=$4",
+                    &[&id, &intent.status.stage, &payload, &stage],
                 )
                 .await
                 .map_err(internal)?;
@@ -282,7 +296,7 @@ impl IntentStore {
         }
         let mut memory = self.memory.lock().map_err(internal)?;
         match memory.get(id) {
-            Some(current) if current.status.stage == "validate" => {
+            Some(current) if current.status.stage == stage => {
                 memory.insert(id.into(), intent.clone());
                 Ok(true)
             }
@@ -612,15 +626,6 @@ pub(super) async fn quote(
     Json(req): Json<OpenRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let (user, wallet) = wallet_of(&state, &headers).await?;
-    // The first trade approves the user's agent by signing as them from the server, which Privy
-    // refuses for now; margin moved in before that would be stuck. Opening waits until it's fixed.
-    if !near_intents::SERVER_SIGNS_AS_USER {
-        return Err((
-            StatusCode::CONFLICT,
-            "Opening a position is paused for a short while, so nothing was charged. Your money is safe."
-                .into(),
-        ));
-    }
     if !matches!(req.side.as_str(), "long" | "short") {
         return Err(bad("side must be long or short"));
     }
@@ -811,8 +816,8 @@ pub(super) async fn close_quote(
 }
 
 // Execute (open or close): the plan. Margin from Solana is a transaction the app signs (after a gas
-// top-up if the wallet needs one); from Base nothing is signed in the app (the user's session signs
-// the gasless authorization at /signed); the rest happens after the confirm.
+// top-up if needed); from Base the phone signs the gasless authorization. A newly funded account
+// approves its agent in the next phone step, covered by the same confirmation.
 pub(super) async fn execute(
     State(state): State<AppState>,
     Path(quote_id): Path<String>,
@@ -840,6 +845,39 @@ pub(super) async fn execute(
     }
     let intent_id = format!("hl-{:x}-{:x}", now(), rand_suffix());
     let mut transactions = Vec::new();
+    let mut approvals = Vec::new();
+    let agent = bridge(&state, &headers, "agent", json!({}))
+        .await
+        .map_err(venue)?;
+    let address = agent["agentAddress"]
+        .as_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if quote.funding_units == 0
+        && !state
+            .hl
+            .client
+            .agents(&wallet)
+            .await
+            .map_err(venue)?
+            .contains(&address)
+    {
+        let prepared = bridge(&state, &headers, "approve_prepare", json!({}))
+            .await
+            .map_err(venue)?;
+        let result = &prepared["result"];
+        let typed = result["typedData"][0].clone();
+        approvals.push(HlApproval {
+            index: 0,
+            kind: "agent".into(),
+            prepare_id: result["prepareId"]
+                .as_str()
+                .ok_or_else(|| venue("Agent approval unavailable"))?
+                .into(),
+            typed: typed.clone(),
+        });
+        transactions.push(gasless::step(&typed, "hyperliquid"));
+    }
     let funding = if quote.funding_units == 0 {
         None
     } else if quote.funding_from_solana {
@@ -864,12 +902,14 @@ pub(super) async fn execute(
         if let Some((_, gas_tx)) = &gas {
             transactions.push(json!({"chain":"solana","transaction":gas_tx,"submit":"engine"}));
         }
+        let main_index = transactions.len();
         transactions.push(json!({"chain":"solana","transaction":tx,"submit":"engine"}));
         Some(Funding {
             request_id: deposit.request_id,
             base_typed_data: None,
             base_api: None,
             gas_request_id: gas.map(|(id, _)| id),
+            main_index,
         })
     } else {
         let deposit = state
@@ -877,11 +917,20 @@ pub(super) async fn execute(
             .base_to_hyperliquid(&wallet, quote.funding_units)
             .await
             .map_err(|_| conflict("Couldn't move your margin right now. Try again shortly."))?;
+        let index = transactions.len();
+        transactions.push(gasless::step(&deposit.typed_data, "base"));
+        approvals.push(HlApproval {
+            index,
+            kind: "funding".into(),
+            prepare_id: String::new(),
+            typed: deposit.typed_data.clone(),
+        });
         Some(Funding {
             request_id: deposit.request_id,
             base_typed_data: Some(deposit.typed_data),
             base_api: Some(deposit.api),
             gas_request_id: None,
+            main_index: 0,
         })
     };
     let currency_rate = |q: &HlQuote| (q.size.clone(), q.leverage);
@@ -907,6 +956,8 @@ pub(super) async fn execute(
         },
         funding,
         expires: now() + 120_000,
+        approvals,
+        cash_request: None,
         quote,
     };
     state.hl.intents.put(&intent_id, &intent).await?;
@@ -935,23 +986,39 @@ pub(super) async fn signed(
             "intent belongs to another user".into(),
         ));
     }
+    if current.status.stage == "sign" {
+        return signed_cashout(state, intent_id, headers, current, body)
+            .await
+            .map(Json);
+    }
     if current.status.stage != "validate" {
         return Ok(Json(current.status));
     }
+    if current.expires <= now() {
+        return Err(conflict("Confirmation expired; request a fresh quote"));
+    }
     let from_solana = current.funding.is_some() && current.quote.funding_from_solana;
-    let main = usize::from(
-        current
-            .funding
-            .as_ref()
-            .is_some_and(|f| f.gas_request_id.is_some()),
-    );
-    if from_solana {
-        if !body.sent.is_empty() || body.signed.len() != main + 1 || body.signed[main].index != main
-        {
-            return Err(bad("signed report does not match the plan"));
-        }
-    } else if !body.sent.is_empty() || !body.signed.is_empty() {
-        return Err(bad("signed report does not match the plan"));
+    let main = current.funding.as_ref().map_or(0, |f| f.main_index);
+    let sol_count = if from_solana {
+        1 + usize::from(
+            current
+                .funding
+                .as_ref()
+                .is_some_and(|f| f.gas_request_id.is_some()),
+        )
+    } else {
+        0
+    };
+    if !body.sent.is_empty()
+        || body.signed.iter().enumerate().any(|(n, s)| s.index != n)
+        || body.signed.len() != sol_count + current.approvals.len()
+        || current
+            .approvals
+            .iter()
+            .any(|a| !body.signed.iter().any(|s| s.index == a.index))
+        || (from_solana && !body.signed.iter().any(|s| s.index == main))
+    {
+        return Err(bad("Approvals do not match the plan"));
     }
     let mut claimed = current.clone();
     claimed.status.stage = if current.funding.is_some() {
@@ -960,7 +1027,12 @@ pub(super) async fn signed(
         "execute"
     }
     .into();
-    if !state.hl.intents.claim(&intent_id, &claimed).await? {
+    if !state
+        .hl
+        .intents
+        .claim(&intent_id, &claimed, "validate")
+        .await?
+    {
         let latest = state.hl.intents.get(&intent_id).await?;
         return Ok(Json(latest.map_or(current.status, |i| i.status)));
     }
@@ -969,9 +1041,12 @@ pub(super) async fn signed(
     tokio::spawn(async move {
         let mut intent = claimed;
         let result = run(&state, &headers, &mut intent, &signed, main).await;
-        intent.status.stage = "settle".into();
         match result {
-            Ok(()) => intent.status.state = "filled".into(),
+            Ok(()) if intent.status.stage == "sign" => {}
+            Ok(()) => {
+                intent.status.stage = "settle".into();
+                intent.status.state = "filled".into();
+            }
             Err(message) => {
                 intent.status.state = "failed".into();
                 intent.status.error = Some(message);
@@ -994,27 +1069,70 @@ async fn run(
     main: usize,
 ) -> Result<(), String> {
     let quote = intent.quote.clone();
+    if let Some(approval) = intent.approvals.iter().find(|a| a.kind == "agent") {
+        let signature = signed
+            .iter()
+            .find(|s| s.index == approval.index)
+            .ok_or("Agent approval missing")?;
+        expect_ok(
+            bridge(
+                state,
+                headers,
+                "approve",
+                json!({"prepareId":approval.prepare_id,"signatures":[signature.transaction]}),
+            )
+            .await?,
+            "approve",
+        )?;
+    }
     if let Some(funding) = intent.funding.clone() {
         let not_moved = |reason: String| {
             eprintln!("hyperliquid margin not moved: {reason}");
             "Moving your margin didn't go through, so nothing left your balance and nothing was ordered".to_string()
         };
         if let (Some(typed), Some(api)) = (&funding.base_typed_data, &funding.base_api) {
-            let signature = gasless::sign(state, headers, &quote.wallet, typed)
-                .await
-                .map_err(not_moved)?;
+            let signature = gasless::verify(
+                state,
+                headers,
+                &quote.wallet,
+                typed,
+                &signed
+                    .iter()
+                    .find(|s| {
+                        s.index
+                            == intent
+                                .approvals
+                                .iter()
+                                .find(|a| a.kind == "funding")
+                                .map_or(usize::MAX, |a| a.index)
+                    })
+                    .ok_or("Funding approval missing")?
+                    .transaction,
+            )
+            .await
+            .map_err(not_moved)?;
             state
                 .relay_link
                 .submit(&funding.request_id, api, &signature)
                 .await
                 .map_err(|e| not_moved(e.to_string()))?;
         } else {
-            if let (Some(gas_id), true) = (&funding.gas_request_id, main == 1) {
-                markets::land_gas_topup(state, gas_id, &signed[0].transaction).await;
+            if let Some(gas_id) = &funding.gas_request_id {
+                let gas = signed
+                    .iter()
+                    .find(|s| s.index + 1 == main)
+                    .ok_or("Gas transaction missing")?;
+                markets::land_gas_topup(state, gas_id, &gas.transaction).await;
             }
             let signature = state
                 .solana_mainnet
-                .send_signed(&signed[main].transaction)
+                .send_signed(
+                    &signed
+                        .iter()
+                        .find(|s| s.index == main)
+                        .ok_or("Funding transaction missing")?
+                        .transaction,
+                )
                 .await
                 .map_err(|e| not_moved(e.to_string()))?;
             intent.status.tx_ids.push(signature);
@@ -1032,6 +1150,8 @@ async fn run(
                 _ => tokio::time::sleep(Duration::from_secs(2)).await,
             }
         }
+        intent.funding = None;
+        intent.approvals.clear();
         intent.status.stage = "execute".into();
     }
     let agent = bridge(state, headers, "agent", json!({})).await?;
@@ -1047,10 +1167,14 @@ async fn run(
         .map_err(|e| e.to_string())?
         .contains(&agent);
     if !approved {
-        expect_ok(
-            bridge(state, headers, "approve", json!({})).await?,
-            "approve",
-        )?;
+        prepare_agent_step(state, headers, intent).await?;
+        state
+            .hl
+            .intents
+            .put(&intent.status.intent_id, intent)
+            .await
+            .map_err(|e| e.1)?;
+        return Ok(());
     }
     if !quote.close {
         if quote.dex_units > 0 {
@@ -1106,8 +1230,9 @@ async fn cash_out(state: &AppState, headers: &HeaderMap, intent: &mut HlIntent) 
     if let Err(error) = state.hl.intents.put(&id, intent).await {
         eprintln!("hyperliquid intent {id} not saved: {}", error.1);
     }
-    if let Err(reason) = move_to_cash(state, headers, &intent.quote).await {
-        eprintln!("hyperliquid cash-out for {id} not done: {reason}");
+    if let Err(reason) = move_to_cash(state, headers, intent).await {
+        intent.status.stage = "sign".into();
+        intent.status.error=Some(format!("The position closed. Cash is still in your perps account; cash return needs attention ({reason})."));
     }
 }
 
@@ -1116,8 +1241,9 @@ async fn cash_out(state: &AppState, headers: &HeaderMap, intent: &mut HlIntent) 
 async fn move_to_cash(
     state: &AppState,
     headers: &HeaderMap,
-    quote: &HlQuote,
+    intent: &mut HlIntent,
 ) -> Result<(), String> {
+    let quote = intent.quote.clone();
     // A dex's margin comes back to the main balance first (the agent, to the same account only).
     if !quote.dex.is_empty() {
         let on_dex = state
@@ -1161,26 +1287,32 @@ async fn move_to_cash(
     let answer = bridge(
         state,
         headers,
-        "cashout",
+        "cashout_prepare",
         json!({"amount":units.to_string(),"to":to}),
     )
     .await?;
-    let request_id = answer["result"]["requestId"]
+    let prepared = &answer["result"];
+    let prepare_id = prepared["prepareId"]
         .as_str()
-        .ok_or("Relay gave no request id")?;
-    let deadline = tokio::time::Instant::now() + CASHOUT_LIMIT;
-    loop {
-        match state.relay_link.state(request_id).await {
-            Ok(engine_execution::layerswap::SwapState::Completed) => return Ok(()),
-            Ok(engine_execution::layerswap::SwapState::Failed(why)) => {
-                return Err(format!("Relay says {why}"));
-            }
-            _ if tokio::time::Instant::now() > deadline => {
-                return Err(format!("Relay request {request_id} still moving"));
-            }
-            _ => tokio::time::sleep(Duration::from_secs(2)).await,
-        }
-    }
+        .ok_or("Cash return approval unavailable")?;
+    intent.approvals = prepared["typedData"]
+        .as_array()
+        .ok_or("Cash return requests unavailable")?
+        .iter()
+        .enumerate()
+        .map(|(index, typed)| HlApproval {
+            index,
+            kind: "cashout".into(),
+            prepare_id: prepare_id.into(),
+            typed: typed.clone(),
+        })
+        .collect();
+    intent.expires = prepared["expiresAtUnixMs"]
+        .as_u64()
+        .unwrap_or(now() + 180_000);
+    intent.status.stage = "sign".into();
+    intent.status.error = None;
+    Ok(())
 }
 
 fn cashout_units(account: &engine_execution::hyperliquid::Account, freed_usd: f64) -> u128 {
@@ -1213,7 +1345,6 @@ async fn bridge(
         .ok_or("Privy access token required")?;
     let mut request = body;
     request["accessToken"] = json!(token);
-    request["identityToken"] = json!(app_balance::identity_token(headers));
     request["walletAddress"] = json!(wallet);
     let response = http
         .post(format!("{bridge_url}/hyperliquid/{route}"))
@@ -1283,6 +1414,160 @@ pub(super) async fn status(
     Ok(Json(current.status))
 }
 
+async fn prepare_agent_step(
+    state: &AppState,
+    headers: &HeaderMap,
+    intent: &mut HlIntent,
+) -> Result<(), String> {
+    let prepared = bridge(state, headers, "approve_prepare", json!({})).await?;
+    let data = &prepared["result"];
+    intent.approvals = vec![HlApproval {
+        index: 0,
+        kind: "agent".into(),
+        prepare_id: data["prepareId"]
+            .as_str()
+            .ok_or("Agent approval unavailable")?
+            .into(),
+        typed: data["typedData"][0].clone(),
+    }];
+    intent.expires = data["expiresAtUnixMs"]
+        .as_u64()
+        .ok_or("Agent approval expiry unavailable")?;
+    intent.status.stage = "sign".into();
+    intent.status.state = "pending".into();
+    Ok(())
+}
+
+pub(super) async fn next(
+    state: AppState,
+    id: String,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let (user, _) = wallet_of(&state, &headers).await?;
+    let mut intent = state
+        .hl
+        .intents
+        .get(&id)
+        .await?
+        .filter(|i| i.quote.owner == user.user_id)
+        .ok_or((StatusCode::NOT_FOUND, "Intent not found".into()))?;
+    if intent.status.stage != "sign" || intent.status.state != "pending" {
+        return Err(conflict("Nothing waiting to sign"));
+    }
+    if intent.expires <= now() || intent.approvals.is_empty() {
+        if intent.approvals.first().is_some_and(|a| a.kind == "agent") || !intent.quote.close {
+            prepare_agent_step(&state, &headers, &mut intent)
+                .await
+                .map_err(venue)?;
+        } else {
+            move_to_cash(&state, &headers, &mut intent)
+                .await
+                .map_err(venue)?;
+        }
+        state.hl.intents.put(&id, &intent).await?;
+    }
+    Ok(Json(
+        json!({"kind":if intent.quote.close{"perp_close"}else{"perp_open"},"transactions":intent.approvals.iter().map(|a|gasless::step(&a.typed,"hyperliquid")).collect::<Vec<_>>()}),
+    ))
+}
+async fn signed_cashout(
+    state: AppState,
+    id: String,
+    headers: HeaderMap,
+    mut intent: HlIntent,
+    body: markets::Submission,
+) -> Result<markets::IntentStatus, ApiError> {
+    if intent.expires <= now() {
+        return Err(conflict("Cash return approval expired; request it again"));
+    }
+    if !body.sent.is_empty()
+        || body.signed.len() != intent.approvals.len()
+        || body.signed.iter().enumerate().any(|(n, s)| s.index != n)
+    {
+        return Err(bad("Cash return approvals do not match"));
+    }
+    let prepare_id = intent
+        .approvals
+        .first()
+        .ok_or_else(|| conflict("Cash return needs preparation"))?
+        .prepare_id
+        .clone();
+    intent.status.stage = "execute".into();
+    if !state.hl.intents.claim(&id, &intent, "sign").await? {
+        return Ok(state
+            .hl
+            .intents
+            .get(&id)
+            .await?
+            .ok_or_else(|| conflict("Intent changed"))?
+            .status);
+    }
+    let answer = intent.status.clone();
+    if intent.approvals.first().is_some_and(|a| a.kind == "agent") {
+        tokio::spawn(async move {
+            match run(&state, &headers, &mut intent, &body.signed, 0).await {
+                Ok(()) if intent.status.stage == "sign" => {}
+                Ok(()) => {
+                    intent.status.stage = "settle".into();
+                    intent.status.state = "filled".into();
+                }
+                Err(reason) => {
+                    intent.status.state = "failed".into();
+                    intent.status.error = Some(reason);
+                }
+            }
+            let _ = state.hl.intents.put(&id, &intent).await;
+        });
+        return Ok(answer);
+    }
+    tokio::spawn(async move {
+        let result = async {
+            let signatures: Vec<_> = body.signed.iter().map(|s| s.transaction.clone()).collect();
+            let sent = bridge(
+                &state,
+                &headers,
+                "cashout",
+                json!({"prepareId":prepare_id,"signatures":signatures}),
+            )
+            .await?;
+            let request = sent["result"]["requestId"]
+                .as_str()
+                .ok_or("Cash return request unavailable")?
+                .to_string();
+            intent.cash_request = Some(request.clone());
+            state.hl.intents.put(&id, &intent).await.map_err(|e| e.1)?;
+            let deadline = tokio::time::Instant::now() + CASHOUT_LIMIT;
+            loop {
+                match state.relay_link.state(&request).await {
+                    Ok(engine_execution::layerswap::SwapState::Completed) => break,
+                    Ok(engine_execution::layerswap::SwapState::Failed(reason)) => {
+                        return Err(reason)
+                    }
+                    _ if tokio::time::Instant::now() > deadline => {
+                        return Err("Cash is still moving; check your balance shortly".into())
+                    }
+                    _ => tokio::time::sleep(Duration::from_secs(2)).await,
+                }
+            }
+            Ok::<(), String>(())
+        }
+        .await;
+        intent.status.stage = "settle".into();
+        match result {
+            Ok(()) => {
+                intent.status.state = "filled".into();
+                intent.status.error = None;
+            }
+            Err(reason) => {
+                intent.status.state = "failed".into();
+                intent.status.error=Some(format!("The position closed, but cash return could not be verified ({reason}). Check cash and perps balances."));
+            }
+        }
+        let _ = state.hl.intents.put(&id, &intent).await;
+    });
+    Ok(answer)
+}
+
 // Price history for a Hyperliquid market: (ms, USD close), oldest first.
 pub(super) async fn closes(
     state: &AppState,
@@ -1306,6 +1591,32 @@ pub(super) async fn closes(
         .map_err(venue)
 }
 
+pub(super) async fn pending_rows(state: &AppState, owner: &str) -> Result<Vec<Value>, ApiError> {
+    let intents: Vec<HlIntent> = if let Some(pg) = &state.hl.intents.postgres {
+        pg.query(
+            "SELECT payload FROM atlas_hl_intents WHERE owner=$1 AND stage='sign'",
+            &[&owner],
+        )
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .map(|row| serde_json::from_str(row.get::<_, &str>(0)).map_err(internal))
+        .collect::<Result<_, _>>()?
+    } else {
+        state
+            .hl
+            .intents
+            .memory
+            .lock()
+            .map_err(internal)?
+            .values()
+            .filter(|i| i.quote.owner == owner)
+            .cloned()
+            .collect()
+    };
+    Ok(intents.into_iter().filter(|i|i.status.state=="pending"&&i.status.stage=="sign").map(|i|
+        json!({"intentId":i.status.intent_id,"symbol":split_coin(&i.quote.coin).1,"kind":if i.quote.close{"perp_close"}else{"perp_open"},"stage":"sign","error":i.status.error})).collect())
+}
 #[cfg(test)]
 mod tests {
     use super::*;

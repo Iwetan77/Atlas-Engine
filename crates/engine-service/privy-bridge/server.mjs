@@ -1,17 +1,20 @@
+function approvalFailure(error,fallback){const reason=error.message??fallback;return error.maybeSent||error.sent?.length?reason:reason+'; nothing was sent';}
+import {DeviceApprovals,deviceSign} from './device-approval.mjs';
 import {coinBalance,walletBalances} from './sui-swap.mjs';
-import {prepareRef,commitRef,quoteRef,searchRef,tokenInfo,prepareCashout as prepareNearCashout,commitCashout as commitNearCashout,prepareSale as prepareNearSale,view as nearView} from './ref-swap.mjs';
+import {buildRef,buildNearCashout,finishNearCalls,prepareRef,quoteRef,searchRef,tokenInfo,prepareCashout as prepareNearCashout,prepareSale as prepareNearSale,view as nearView} from './ref-swap.mjs';
 import {createServer} from 'node:http';
 import {createHash, randomUUID} from 'node:crypto';
 import {PrivyClient} from '@privy-io/node';
-import {quoteSwap, swapFromSui, buildSuiSwap, finishSuiSwap, rawSignRequest, prepareSuiCashout, transferSui, quoteSale, prepareSale, commitSale} from './sui-swap.mjs';
+import {buildSale,finishSale,buildSuiTransfer,finishSuiTransfer,quoteSwap, buildSuiSwap, finishSuiSwap, rawSignRequest, prepareSuiCashout, quoteSale, prepareSale} from './sui-swap.mjs';
 import {checkSignature, signable, signForEscrow} from './base-authorization.mjs';
 import {agentFor, approveAction, approveTypedData, checkApproval, leverageAction, moveAction, orderAction,
   post as hlPost, signAsAgent} from './hyperliquid.mjs';
-import {cashOut} from './hyperliquid-cashout.mjs';
+import {prepareCashOut,finishCashOut} from './hyperliquid-cashout.mjs';
 
 const SUI_COIN_TYPE = /^0x[0-9a-fA-F]{1,64}::[A-Za-z_][A-Za-z0-9_]*::[A-Za-z_][A-Za-z0-9_]*$/;
 const POSITIVE_INTEGER = /^[1-9][0-9]{0,30}$/;
-const preparedCashouts = new Map();
+const deviceApprovals=new DeviceApprovals();
+const preparedTyped=new Map();
 // Sui swaps built and waiting for the user's device to approve their exact Privy request. One use each.
 const preparedSwaps = new Map();
 
@@ -58,12 +61,11 @@ const server = createServer(async (request, response) => {
   const signEscrow = request.method === 'POST' && request.url === '/escrow/sign-authorization';
   const hlRoute = request.method === 'POST' && request.url.startsWith('/hyperliquid/') ?
     request.url.slice('/hyperliquid/'.length) : null;
-  const hyperliquid = ['agent', 'approve', 'leverage', 'order', 'move', 'cashout'].includes(hlRoute);
+  const hyperliquid = ['agent', 'approve_prepare', 'approve', 'leverage', 'order', 'move', 'cashout_prepare', 'cashout'].includes(hlRoute);
   const refRoute = request.method === 'POST' && ['/near/ref/search','/near/ref/quote','/near/ref/prepare','/near/ref/commit','/near/ref/balance','/near/cashout/prepare','/near/cashout/commit','/near/sell/prepare','/near/sell/commit'].includes(request.url);
   const suiSale = request.method === 'POST' && ['/sui/sale/quote','/sui/sale/prepare','/sui/sale/commit'].includes(request.url);
   const suiBalanceRead=request.method==='POST' && ['/sui/balance','/sui/balances'].includes(request.url);
   const suiQuote = request.method === 'POST' && request.url === '/sui/quote';
-  const suiSwap = request.method === 'POST' && request.url === '/sui/swap';
   // The user's device approves the swap: prepare builds it and the exact request to sign; commit
   // passes the device's authorization signature to Privy (no login token is exchanged).
   const suiSwapPrepare = request.method === 'POST' && request.url === '/sui/swap/prepare';
@@ -71,7 +73,7 @@ const server = createServer(async (request, response) => {
   const suiCashoutPrepare = request.method === 'POST' && request.url === '/sui/cashout/prepare';
   const suiCashoutCommit = request.method === 'POST' && request.url === '/sui/cashout/commit';
   if (!verifyOnly && !ensureWallet && !signAuthorization && !signEscrow && !hyperliquid && !suiQuote &&
-      !suiBalanceRead && !suiSwap && !suiSale && !refRoute && !suiCashoutPrepare && !suiCashoutCommit &&
+      !suiBalanceRead && !suiSale && !refRoute && !suiCashoutPrepare && !suiCashoutCommit &&
       !suiSwapPrepare && !suiSwapCommit) {
     response.writeHead(404).end();
     return;
@@ -101,28 +103,7 @@ const server = createServer(async (request, response) => {
     if (typeof userId !== 'string' || !userId.startsWith('did:privy:')) {
       throw new Error('invalid identity');
     }
-    // Signing as the user: Privy exchanges the user's identity token (not the access token) for a
-    // key to their wallets. Only the same user's identity token is used; else the access token.
-    let userJwt = accessToken;
-    // Which token signs as the user, logged by kind only (never the token), so a Privy refusal
-    // can be traced to a missing or rejected identity token.
-    let userJwtKind = 'access token (no identity token sent)';
-    let identityVerified = false;
-    if (typeof input.identityToken === 'string' && input.identityToken) {
-      try {
-        const identity = await privy.utils().auth().verifyIdentityToken(input.identityToken);
-        if (identity?.id === userId) {
-          userJwt = input.identityToken;
-          userJwtKind = 'identity token';
-          identityVerified = true;
-        } else {
-          userJwtKind = 'access token (identity token is another user)';
-        }
-      } catch (error) {
-        // An expired or foreign identity token: fall back to the access token.
-        userJwtKind = `access token (identity token rejected: ${String(error?.message ?? error).slice(0, 80)})`;
-      }
-    }
+    const userJwt = accessToken; // Scope binding only; never passed to a wallet signing call.
     let user;
     try {
       user = await privy.users()._get(userId);
@@ -156,28 +137,31 @@ const server = createServer(async (request, response) => {
     if(refRoute){
       try{
         const wallet=await ensureReceivingWallet(userId,'near');
+        let prepared,built;
         if(request.url==='/near/cashout/prepare'){
-          send(response,200,{userId,address:wallet.address,...await prepareNearCashout({wallet,userId,userJwt,evmWallet,solanaWallet,amount:input.amount,minimumOut:input.minimumOut})});
+          prepared=await prepareNearCashout({wallet,userId,userJwt,evmWallet,solanaWallet,amount:input.amount,minimumOut:input.minimumOut});
+          built=await buildNearCashout({...prepared,wallet,userId,userJwt});
         }else if(request.url==='/near/sell/prepare'){
-          // A direct sale: everything it may do comes from the intent the user confirmed.
-          send(response,200,{userId,address:wallet.address,...await prepareNearSale({intentId:input.intentId,wallet,userId,userJwt,accessToken,identityToken:input.identityToken,evmWallet,solanaWallet})});
-        }else if(request.url==='/near/cashout/commit'||request.url==='/near/sell/commit'){
-          const result=await commitNearCashout({cashoutId:input.cashoutId,scope:input.scope,wallet,userId,userJwt,
-            rawSign:async bytes=>(await privy.wallets().rawSign(wallet.id,{params:{bytes,encoding:'hex',hash_function:'sha256'},authorization_context:{user_jwts:[userJwt]}})).signature});
-          send(response,200,{userId,address:wallet.address,...result});
+          prepared=await prepareNearSale({intentId:input.intentId,wallet,userId,userJwt,accessToken,evmWallet,solanaWallet});
+          built=await buildNearCashout({...prepared,wallet,userId,userJwt});
         }else if(request.url==='/near/ref/prepare'){
-          send(response,200,{userId,address:wallet.address,...await prepareRef({intentId:input.intentId,wallet,userId,userJwt,accessToken,identityToken:input.identityToken})});
-        }else if(request.url==='/near/ref/commit'){
-          const result=await commitRef({saleId:input.saleId,scope:input.scope,wallet,userId,userJwt,
-            rawSign:async bytes=>(await privy.wallets().rawSign(wallet.id,{params:{bytes,encoding:'hex',hash_function:'sha256'},authorization_context:{user_jwts:[userJwt]}})).signature});
-          send(response,200,{userId,address:wallet.address,...result});
+          prepared=await prepareRef({intentId:input.intentId,wallet,userId,userJwt,accessToken});
+          built=await buildRef({...prepared,wallet,userId,userJwt});
+        }else if(request.url.endsWith('/commit')){
+          const item=deviceApprovals.take({prepareId:input.prepareId,userId,wallet,signatures:input.signatures,operation:request.url});
+          const signatures=await deviceSign(privy,item);
+          const result=await finishNearCalls({wallet,built:item.data,signatures});
+          send(response,200,{userId,address:wallet.address,...result});return;
         }else if(request.url==='/near/ref/balance'){
-          send(response,200,{userId,address:wallet.address,amount:await nearView(input.token,'ft_balance_of',{account_id:wallet.address})});
+          send(response,200,{userId,address:wallet.address,amount:await nearView(input.token,'ft_balance_of',{account_id:wallet.address})});return;
         }else{
           const q=await quoteRef(input.token,input.amount,input.sell===true);
-          send(response,200,{userId,address:wallet.address,...q,metadata:await tokenInfo(input.token)});
+          send(response,200,{userId,address:wallet.address,...q,metadata:await tokenInfo(input.token)});return;
         }
-      }catch{send(response,409,{error:'Swap changed or could not complete; check your asset balance'});}
+        const approval=deviceApprovals.put({userId,wallet,appId,messages:built.calls.map(c=>c.message),hashFunction:'sha256',data:built,operation:request.url.replace('/prepare','/commit'),
+          expires:Math.min(prepared.scope.expiresAtUnixMs,Date.now()+180000)});
+        send(response,200,{userId,address:wallet.address,...prepared,...approval});
+      }catch(error){send(response,409,{error:approvalFailure(error,'Swap could not complete'),txIds:error.sent??[],maybeSent:error.maybeSent===true});}
       return;
     }
     if(suiBalanceRead){
@@ -188,75 +172,41 @@ const server = createServer(async (request, response) => {
       }catch{send(response,503,{error:'Your asset balance is temporarily unavailable'});}
       return;
     }
-    if (suiSale) {
-      try {
-        const wallet = await ensureReceivingWallet(userId,'sui');
-        if (request.url === '/sui/sale/quote') {
-          if (!SUI_COIN_TYPE.test(input.coinType ?? '') || !POSITIVE_INTEGER.test(String(input.amount ?? ''))) {
-            throw new Error('invalid sale');
-          }
-          const route = await quoteSale(input.coinType,input.amount,wallet.address);
+    if(suiSale){
+      try{
+        const wallet=await ensureReceivingWallet(userId,'sui');
+        if(request.url==='/sui/sale/quote'){
+          if(!SUI_COIN_TYPE.test(input.coinType??'')||!POSITIVE_INTEGER.test(String(input.amount??'')))throw new Error('invalid sale');
+          const route=await quoteSale(input.coinType,input.amount,wallet.address);
           send(response,200,{userId,address:wallet.address,amountOut:route.amountOut.toString()});
-        } else if (request.url === '/sui/sale/prepare') {
-          const prepared = await prepareSale({intentId:input.intentId,wallet,userId,userJwt,accessToken,identityToken:input.identityToken});
-          send(response,200,{userId,address:wallet.address,...prepared});
-        } else {
-          const result = await commitSale({saleId:input.saleId,scope:input.scope,wallet,userId,userJwt,
-            rawSign:async bytes => (await privy.wallets().rawSign(wallet.id,{
-              params:{bytes,encoding:'hex',hash_function:'blake2b256'},
-              authorization_context:{user_jwts:[userJwt]},
-            })).signature});
-          send(response,200,{userId,address:wallet.address,...result});
+        }else if(request.url==='/sui/sale/prepare'){
+          const prepared=await prepareSale({intentId:input.intentId,wallet,userId,userJwt,accessToken});
+          const built=await buildSale({...prepared,wallet,userId,userJwt});
+          const approval=deviceApprovals.put({userId,wallet,appId,messages:[built.message],hashFunction:'blake2b256',data:built,operation:request.url.replace('/prepare','/commit'),
+            expires:Math.min(prepared.scope.expiresAtUnixMs,Date.now()+180000)});
+          send(response,200,{userId,address:wallet.address,...prepared,...approval});
+        }else{
+          const item=deviceApprovals.take({prepareId:input.prepareId,userId,wallet,signatures:input.signatures,operation:request.url});
+          const [signatureHex]=await deviceSign(privy,item);
+          send(response,200,{userId,address:wallet.address,...await finishSale({wallet,built:item.data,signatureHex})});
         }
-      } catch { send(response,409,{error:'Sale changed or could not complete; check your asset balance'}); }
+      }catch(error){send(response,409,{error:approvalFailure(error,'Sale could not complete'),maybeSent:error.maybeSent===true});}
       return;
     }
-    // A cashout can only land in the verified user's own Base wallet. Prepare stores the
-    // venue-issued deposit address so the engine can persist it before commit moves SUI.
-    if (suiCashoutPrepare || suiCashoutCommit) {
-      try {
-        const wallet = await ensureReceivingWallet(userId, 'sui');
-        if (suiCashoutPrepare) {
-          if ((!evmWallet && !solanaWallet) || !POSITIVE_INTEGER.test(String(input.amount ?? '')) ||
-              !POSITIVE_INTEGER.test(String(input.minimumOut ?? ''))) {
-            send(response, 400, {error: 'invalid cashout request'});
-            return;
-          }
-          const quote = await prepareSuiCashout({
-            wallet, evmWallet, solanaWallet, amount: input.amount, minimumOut: input.minimumOut,
-          });
-          for (const [id, prepared] of preparedCashouts) {
-            if (prepared.expires <= Date.now()) preparedCashouts.delete(id);
-          }
-          if (preparedCashouts.size >= 1000) throw new Error('cashout queue is full');
-          const cashoutId = randomUUID();
-          preparedCashouts.set(cashoutId, {userId, walletId: wallet.id, address: wallet.address,
-            amount: input.amount, depositAddress: quote.depositAddress,
-            expires: Date.now() + 180_000});
-          send(response, 200, {userId, address: wallet.address, cashoutId, ...quote});
-          return;
+    if(suiCashoutPrepare||suiCashoutCommit){
+      try{
+        const wallet=await ensureReceivingWallet(userId,'sui');
+        if(suiCashoutPrepare){
+          const quote=await prepareSuiCashout({wallet,evmWallet,solanaWallet,amount:input.amount,minimumOut:input.minimumOut});
+          const built=await buildSuiTransfer({wallet,recipient:quote.depositAddress,amount:input.amount,reserve:'20000000'});
+          const approval=deviceApprovals.put({userId,wallet,appId,messages:[built.message],hashFunction:'blake2b256',data:built,operation:'/sui/cashout/commit'});
+          send(response,200,{userId,address:wallet.address,...quote,...approval,cashoutId:approval.prepareId});
+        }else{
+          const item=deviceApprovals.take({prepareId:input.prepareId,userId,wallet,signatures:input.signatures,operation:request.url});
+          const [signatureHex]=await deviceSign(privy,item);
+          send(response,200,{userId,address:wallet.address,...await finishSuiTransfer({wallet,built:item.data,signatureHex})});
         }
-        const prepared = preparedCashouts.get(input.cashoutId);
-        if (!prepared || prepared.userId !== userId || prepared.walletId !== wallet.id ||
-            prepared.address !== wallet.address || prepared.expires <= Date.now()) {
-          send(response, 409, {error: 'cashout preparation expired'});
-          return;
-        }
-        preparedCashouts.delete(input.cashoutId); // one use, even if the network response is lost
-        const result = await transferSui({
-          wallet, recipient: prepared.depositAddress, amount: prepared.amount, reserve: '20000000',
-          rawSign: async (hex) => {
-            const signed = await privy.wallets().rawSign(wallet.id, {
-              params: {bytes: hex, encoding: 'hex', hash_function: 'blake2b256'},
-              authorization_context: {user_jwts: [userJwt]},
-            });
-            return signed.signature;
-          },
-        });
-        send(response, 200, {userId, address: wallet.address, ...result});
-      } catch (error) {
-        send(response, 502, {error: `Cashout unavailable: ${error.message}`});
-      }
+      }catch(error){send(response,502,{error:approvalFailure(error,'Cashout unavailable'),maybeSent:error.maybeSent===true});}
       return;
     }
     if (suiSwapPrepare || suiSwapCommit) {
@@ -326,68 +276,13 @@ const server = createServer(async (request, response) => {
       }
       return;
     }
-    // Sui coins: price SUI → coin, and swap SUI in the user's own Sui wallet with their authorization.
-    if (suiQuote || suiSwap) {
-      if (!SUI_COIN_TYPE.test(input.coinType ?? '') || !POSITIVE_INTEGER.test(String(input.amount ?? ''))) {
-        send(response, 400, {error: 'invalid Sui swap request'});
-        return;
-      }
-      let wallet;
-      try {
-        wallet = await ensureReceivingWallet(userId, 'sui');
-      } catch {
-        send(response, 503, {error: 'Privy Sui wallet unavailable'});
-        return;
-      }
-      try {
-        if (suiQuote) {
-          const router = await quoteSwap(input.coinType, input.amount, wallet.address);
-          send(response, 200, {userId, address: wallet.address, amountOut: router.amountOut.toString()});
-          return;
-        }
-        if (input.expectedWallet !== undefined && input.expectedWallet !== wallet.address) {
-          throw new Error('Receiving wallet changed');
-        }
-        const reserve = POSITIVE_INTEGER.test(String(input.reserve ?? '')) ? input.reserve : '0';
-        const result = await swapFromSui({
-          wallet,
-          coinType: input.coinType,
-          minimumOut: input.minimumOut,
-          expiresAtUnixMs: input.expiresAtUnixMs,
-          amount: input.amount,
-          reserve,
-          // Signs as the user with their identity token, then their access token if Privy refuses
-          // the first; the error names what Privy said to each (by kind, never the token).
-          rawSign: async (hex) => {
-            const tries = [...(identityVerified ? [['identity token', input.identityToken]] : []), ['access token', accessToken]];
-            const refusals = [];
-            for (const [kind, jwt] of tries) {
-              try {
-                const signed = await privy.wallets().rawSign(wallet.id, {
-                  params: {bytes: hex, encoding: 'hex', hash_function: 'blake2b256'},
-                  authorization_context: {user_jwts: [jwt]},
-                });
-                if (refusals.length) console.error(`[bridge] /sui/swap signed with ${kind} after: ${refusals.join(' | ')}`);
-                return signed.signature;
-              } catch (error) {
-                const reason = String(error?.message ?? error);
-                if (!/invalid jwt|invalid_data|unauthori[sz]ed|\b401\b/i.test(reason)) throw error;
-                refusals.push(`${kind}: ${reason.replace(/^[0-9]{3} /, '').slice(0, 70)}`);
-              }
-            }
-            throw new Error(`Privy refused to sign (${userJwtKind}; ${refusals.join(' | ')})`);
-          },
-        });
-        send(response, 200, {userId, address: wallet.address, ...result});
-      } catch (error) {
-        // Only a failure while submitting may have reached the network; anything earlier (a quote,
-        // the wallet check, Privy refusing to sign) sent nothing.
-        const reason = String(error?.message ?? error).slice(0, 300);
-        console.error(`[bridge] /sui/swap failed (signing with ${userJwtKind}): ${reason}`);
-        send(response, 502, {error: error?.maybeSent
-          ? `Sui swap unavailable: ${reason} (may have been sent)`
-          : `Sui swap unavailable: ${reason}; nothing was sent`});
-      }
+    if(suiQuote){
+      try{
+        if(!SUI_COIN_TYPE.test(input.coinType??'')||!POSITIVE_INTEGER.test(String(input.amount??'')))throw new Error('invalid quote');
+        const wallet=await ensureReceivingWallet(userId,'sui');
+        const router=await quoteSwap(input.coinType,input.amount,wallet.address);
+        send(response,200,{userId,address:wallet.address,amountOut:router.amountOut.toString()});
+      }catch{send(response,503,{error:'Swap price unavailable'});}
       return;
     }
     if (ensureWallet) {
@@ -408,7 +303,7 @@ const server = createServer(async (request, response) => {
       send(response, 403, {error: 'wallet does not belong to the signed-in user'});
       return;
     }
-    // Base without gas, for a plan the user already confirmed in the app: their own session signs a
+    // Base without gas, for a plan the user already confirmed in the app: their phone signs a
     // venue's deposit authorization or a CoW gas top-up, and nothing wider (base-authorization.mjs).
     if (signAuthorization) {
       let typedData;
@@ -419,51 +314,51 @@ const server = createServer(async (request, response) => {
         return;
       }
       try {
-        const signed = await privy.wallets().ethereum().signTypedData(evm.id, {
-          params: {typed_data: typedData},
-          authorization_context: {user_jwts: [userJwt]},
-        });
-        checkSignature(typedData, signed.signature, evmWallet);
-        send(response, 200, {userId, walletAddress: evmWallet, signature: signed.signature});
-      } catch (error) {
-        send(response, 502, {error: String(error?.message ?? error).slice(0, 200)});
-      }
+        checkSignature(typedData,input.signature,evmWallet);
+        send(response,200,{userId,walletAddress:evmWallet,signature:input.signature});
+      }catch(error){send(response,400,{error:error.message});}
       return;
     }
     // Hyperliquid, for the user's own account (their EVM wallet): their Atlas agent signs trades; their
-    // own session signs only the one-time approval of that agent (hyperliquid.mjs) and a cash-out to
+    // own phone signs only the one-time approval of that agent (hyperliquid.mjs) and a cash-out to
     // their own Solana or Base wallet (hyperliquid-cashout.mjs).
     if (hyperliquid) {
       const agent = agentFor(appSecret, userId, evmWallet);
       const answer = (result) => send(response, 200, {userId, walletAddress: evmWallet, agentAddress: agent.address, result});
       try {
         if (hlRoute === 'agent') return answer(null);
-        if (hlRoute === 'cashout') {
-          // Paid out only to this user's own wallet, never to an address the engine passes.
-          const recipient = {solana: solanaWallet, base: evmWallet}[input.to];
-          if (!recipient) {
-            send(response, 400, {error: 'no wallet to pay out to'});
-            return;
+        if(hlRoute==='approve_prepare'||hlRoute==='cashout_prepare'){
+          for(const [id,item] of preparedTyped)if(item.expires<=Date.now())preparedTyped.delete(id);
+          if(preparedTyped.size>=1000)throw new Error('approval queue full');
+          const prepareId=randomUUID(),expires=Date.now()+180000;
+          let data,typed;
+          if(hlRoute==='approve_prepare'){
+            const nonce=nextNonce();data={nonce,agentAddress:agent.address};
+            typed=[approveTypedData(agent.address,nonce)];
+          }else{
+            const recipient={solana:solanaWallet,base:evmWallet}[input.to];
+            if(!recipient)throw new Error('cash wallet unavailable');
+            data=await prepareCashOut({wallet:evmWallet,recipient,to:input.to,amount:String(input.amount??''),relayKey:process.env.RELAY_API_KEY});
+            typed=[data.mapping,data.send];
           }
-          return answer(await cashOut({
-            wallet: evmWallet, recipient, to: input.to, amount: String(input.amount ?? ''),
-            relayKey: process.env.RELAY_API_KEY,
-            signTyped: async (typed) => (await privy.wallets().ethereum().signTypedData(evm.id, {
-              params: {typed_data: typed},
-              authorization_context: {user_jwts: [userJwt]},
-            })).signature,
-            post: hlPost,
-          }));
+          preparedTyped.set(prepareId,{userId,wallet:evmWallet,kind:hlRoute,data,expires});
+          return answer({prepareId,expiresAtUnixMs:expires,typedData:typed.map(t=>({
+            domain:t.domain,types:t.types,primaryType:t.primary_type,message:t.message}))});
         }
-        const nonce = nextNonce();
-        if (hlRoute === 'approve') {
-          const signed = await privy.wallets().ethereum().signTypedData(evm.id, {
-            params: {typed_data: approveTypedData(agent.address, nonce)},
-            authorization_context: {user_jwts: [userJwt]},
-          });
-          const signature = checkApproval(agent.address, nonce, signed.signature, evmWallet);
-          return answer(await hlPost({action: approveAction(agent.address, nonce), nonce, signature}));
+        if(hlRoute==='approve'||hlRoute==='cashout'){
+          const prepared=preparedTyped.get(input.prepareId);
+          if(!prepared||prepared.userId!==userId||prepared.wallet!==evmWallet||prepared.expires<=Date.now()||
+             prepared.kind!==hlRoute+'_prepare')throw new Error('approval expired or used');
+          if(!Array.isArray(input.signatures)||input.signatures.length!==(hlRoute==='approve'?1:2))throw new Error('wrong approval count');
+          preparedTyped.delete(input.prepareId);
+          if(hlRoute==='approve'){
+            const signature=checkApproval(prepared.data.agentAddress,prepared.data.nonce,input.signatures[0],evmWallet);
+            return answer(await hlPost({action:approveAction(prepared.data.agentAddress,prepared.data.nonce),nonce:prepared.data.nonce,signature}));
+          }
+          return answer(await finishCashOut({checked:prepared.data,wallet:evmWallet,signatures:input.signatures,
+            relayKey:process.env.RELAY_API_KEY,post:hlPost}));
         }
+        const nonce=nextNonce();
         const action = hlRoute === 'order' ? orderAction(input) :
           hlRoute === 'move' ? moveAction({wallet: evmWallet, from: input.from, to: input.to, amount: input.amount}, nonce) :
           leverageAction(input);

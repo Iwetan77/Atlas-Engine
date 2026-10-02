@@ -26,12 +26,11 @@ export class PreparedSales {
 
 // The signer fetches the confirmed intent itself. The public bridge request cannot supply a coin,
 // amount, output floor or recipient. The engine consumes this permission atomically in Postgres.
-export async function salePermission({intentId,userId,wallet,accessToken,identityToken}) {
+export async function salePermission({intentId,userId,wallet,accessToken}) {
   if (!/^near-intent-[0-9]+-[0-9]+$/.test(intentId ?? '')) throw new Error('invalid sale intent');
   const port = Number((process.env.ATLAS_BALANCE_BIND ?? '127.0.0.1:3000').split(':').at(-1));
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('invalid engine port');
   const headers = {authorization:`Bearer ${accessToken}`};
-  if (identityToken) headers['privy-id-token'] = identityToken;
   const res = await fetch(`http://127.0.0.1:${port}/v1/intents/${intentId}/sale-permission`, {
     method:'POST',headers,signal:AbortSignal.timeout(20_000)});
   if (!res.ok) throw new Error('sale permission unavailable or used');

@@ -1,5 +1,5 @@
 // Swaps SUI in a user's own Privy Sui wallet into another Sui coin (Cetus aggregator), signed with
-// Privy rawSign under the user's own login token: no server key can move the wallet on its own.
+// device-approved Privy rawSign: no login token or server key can sign for this wallet.
 import {PreparedSales, salePermission} from './prepared-sale.mjs';
 import {AggregatorClient, Env} from '@cetusprotocol/aggregator-sdk';
 import {toSerializedSignature} from '@mysten/sui/cryptography';
@@ -43,7 +43,8 @@ export function executionResult(result){
     balanceChanges:(tx.balanceChanges??[]).map(c=>({coinType:c.coinType,owner:{AddressOwner:c.address},amount:c.amount}))};
 }
 async function submit(txBytes,signature){
-  return executionResult(await client().executeTransaction({transaction:txBytes,signatures:[signature],include:{balanceChanges:true,effects:true}}));
+  try { return executionResult(await client().executeTransaction({transaction:txBytes,signatures:[signature],include:{balanceChanges:true,effects:true}})); }
+  catch(error){error.maybeSent=true;throw error;}
 }
 
 // Sui signs blake2b256(intent || transaction bytes); the intent for a transaction is [0, 0, 0].
@@ -97,13 +98,12 @@ export async function quoteSale(coinType, amount, sender) {
   return route;
 }
 
-export async function prepareSale({intentId,wallet,userId,userJwt,accessToken,identityToken}) {
-  const scope = await salePermission({intentId,wallet,userId,accessToken,identityToken});
+export async function prepareSale({intentId,wallet,userId,userJwt,accessToken}) {
+  const scope = await salePermission({intentId,wallet,userId,accessToken});
   const held = await coinBalance(wallet.address,scope.coinType);
   if (BigInt(scope.amount) <= 0n || BigInt(scope.amount) > held) {
     throw new Error('the sell amount exceeds your holding');
   }
-  if (await suiBalance(wallet.address) < 20000000n) throw new Error('not enough for the network fee');
   const router = await quoteSale(scope.coinType,scope.amount,wallet.address);
   if (BigInt(router.amountOut)*99n/100n < BigInt(scope.minimumOut)) throw new Error('sale price changed');
   return {saleId:sales.put(scope,userJwt,router),scope};
@@ -130,6 +130,42 @@ export async function commitSale({saleId,scope,wallet,userId,userJwt,rawSign}) {
   return saleEffects(result,wallet.address);
 }
 
+// Build the exact sell before device approval; consume its confirmed scope once.
+export async function buildSale({saleId,scope,wallet,userId,userJwt}) {
+  if(scope.userId!==userId || scope.walletId!==wallet.id || scope.address!==wallet.address)throw new Error('sale wallet changed');
+  const {scope:approved,data:router}=sales.take(saleId,scope,userJwt);
+  return buildSaleTransaction({wallet,approved,router});
+}
+export async function buildSaleTransaction({wallet,approved,router}) {
+  if(approved.address!==wallet.address || BigInt(router.amountOut)*99n/100n<BigInt(approved.minimumOut))throw new Error('sale changed');
+  if(await coinBalance(wallet.address,approved.coinType)<BigInt(approved.amount))throw new Error('holding changed');
+  const aggregator=new AggregatorClient({signer:wallet.address,client:client(),env:Env.Mainnet});
+  const txb=new Transaction();txb.setSender(wallet.address);
+  await aggregator.fastRouterSwap({router,txb,slippage:SLIPPAGE});
+  const txBytes=await txb.build({client:client()});
+  checkSaleGas(txb.getData().gasData.budget,await suiBalance(wallet.address));
+  return {txBytes,message:`0x${toHex(intentMessage(txBytes))}`,scope:approved};
+}
+export async function finishSale({wallet,built,signatureHex}) {
+  const result=await finishSuiSwap({wallet,coinType:SUI,txBytes:built.txBytes,input:BigInt(built.scope.amount),signatureHex});
+  return result;
+}
+export async function buildSuiTransfer({wallet,recipient,amount,reserve}) {
+  const input=BigInt(amount);
+  if(input<=0n || await suiBalance(wallet.address)<input+BigInt(reserve))throw new Error('not enough SUI to send and pay gas');
+  const txb=new Transaction();txb.setSender(wallet.address);
+  const [coin]=txb.splitCoins(txb.gas,[input]);txb.transferObjects([coin],recipient);
+  const txBytes=await txb.build({client:client()});
+  return {txBytes,input,message:`0x${toHex(intentMessage(txBytes))}`,recipient};
+}
+export async function finishSuiTransfer({wallet,built,signatureHex}) {
+  const key=walletPublicKey(wallet.public_key,wallet.address);
+  const signature=serializedSignature(signatureHex,key);
+  if(!await key.verifyTransaction(built.txBytes,signature))throw new Error('signature did not verify');
+  const result=await submit(built.txBytes,signature);
+  return {ok:result.effects.status.status==='success',digest:result.digest,amountIn:built.input.toString()};
+}
+
 // The wallet's net SUI credit includes gas. Never send an estimated output to 1Click.
 export function saleEffects(result, owner) {
   const ok = result?.effects?.status?.status === 'success';
@@ -146,7 +182,7 @@ export function checkRecoveryQuote({minimumOut,expiresAtUnixMs,output}) {
   if(minimumOut===undefined && expiresAtUnixMs===undefined)return;
   if(!/^[1-9][0-9]*$/.test(String(minimumOut??'')) ||
      !Number.isSafeInteger(expiresAtUnixMs) || expiresAtUnixMs<=Date.now() ||
-     BigInt(output)<BigInt(minimumOut)) {
+     BigInt(output)*99n/100n<BigInt(minimumOut)) {
     throw new Error('Recovery quote changed or expired; nothing was signed');
   }
 }
@@ -271,4 +307,8 @@ export async function prepareSuiCashout({wallet, evmWallet, solanaWallet, amount
       !/^0x[0-9a-fA-F]{64}$/.test(quote.depositAddress ?? '') ||
       quote.depositMemo != null) throw new Error('invalid cashout deposit route');
   return {depositAddress: quote.depositAddress, amountOut: quote.amountOut};
+}
+// The sale produces SUI; its cash-out keeps 0.02 SUI. Before approving the swap, existing SUI must cover its real budget.
+export function checkSaleGas(budget,held) {
+  if(!/^[1-9][0-9]*$/.test(String(budget??'')) || BigInt(held)<BigInt(budget))throw new Error('not enough for the transaction gas budget');
 }

@@ -169,3 +169,16 @@ test('a cash-out posts the mapping to Relay before the send to Hyperliquid, and 
     globalThis.fetch = realFetch;
   }
 });
+
+
+test('phone cash return verifies both signatures before its first network write',async()=>{
+ const {finishCashOut}=await import('./hyperliquid-cashout.mjs');
+ let writes=0;
+ const original=globalThis.fetch;
+ globalThis.fetch=async()=>{writes++;throw new Error('unexpected write');};
+ try{
+  await assert.rejects(()=>finishCashOut({checked:{mapping:{},send:{}},wallet:'0x'+'1'.repeat(40),
+   signatures:['not-a-signature','not-a-signature'],post:async()=>{writes++;}}));
+  assert.equal(writes,0);
+ }finally{globalThis.fetch=original;}
+});

@@ -43,7 +43,7 @@ pub struct CowClient {
 }
 
 /// A USDC → ETH order for `owner`'s own wallet, ready to sign (`typed_data`) and place.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GasOrder {
     pub owner: String,
     pub sell_units: u128,

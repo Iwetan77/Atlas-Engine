@@ -868,10 +868,14 @@ struct StoredIntent {
     base_topup: Option<BaseTopup>,
 }
 #[derive(Clone, Serialize, Deserialize)]
-struct BaseTopup {
-    // CoW's order, once placed.
-    uid: Option<String>,
+pub(super) struct BaseTopup {
+    pub(super) uid: Option<String>,
+    #[serde(default)]
+    pub(super) permit: Option<Value>,
+    #[serde(default)]
+    pub(super) order: Option<engine_execution::cow::GasOrder>,
 }
+
 #[derive(Clone, Serialize, Deserialize)]
 struct CashMove {
     swap_id: String,
@@ -1120,7 +1124,11 @@ impl MarketState {
                 buy_mint: None,
                 gas_request_id: None,
                 solana_transfer: false,
-                base_topup: topup.then_some(BaseTopup { uid: None }),
+                base_topup: topup.then_some(BaseTopup {
+                    uid: None,
+                    permit: None,
+                    order: None,
+                }),
             },
         )
         .await?;
@@ -2697,39 +2705,83 @@ pub(super) async fn base_topup_fits(state: &AppState, wallet: &str, spends: u128
 // Fills an empty tank without gas once the user has confirmed: their session signs a USDC permit
 // for CoW and a $0.50 USDC → ETH order to themselves; a solver settles it and pays the gas. Returns
 // CoW's order id.
-pub(super) async fn run_base_topup(
-    state: &AppState,
-    headers: &HeaderMap,
-    evm: &str,
-) -> Result<String, String> {
-    use engine_execution::cow;
+pub(super) async fn prepare_base_topup(state: &AppState, evm: &str) -> Result<BaseTopup, ApiError> {
     let owner = evm.trim_start_matches("0x").to_ascii_lowercase();
-    // USDC.nonces(owner): the permit's nonce.
     let nonce = base_rpc(
         &state.markets,
         "eth_call",
-        json!([{"to":BASE_USDC,"data":format!("0x7ecebe00{owner:0>64}")}, "latest"]),
+        json!([{"to":BASE_USDC,"data":format!("0x7ecebe00{owner:0>64}")},"latest"]),
     )
-    .await
-    .ok()
-    .and_then(|v| u128::from_str_radix(v.as_str()?.trim_start_matches("0x"), 16).ok())
-    .ok_or("USDC nonce unavailable")?;
-    let deadline = now() / 1000 + 3600;
-    let permit = cow::permit_typed_data(evm, BASE_GAS_REFILL_USDC, nonce, deadline);
-    let permit_signature = gasless::sign(state, headers, evm, &permit).await?;
-    let app_data = cow::permit_app_data(evm, BASE_GAS_REFILL_USDC, deadline, &permit_signature)
-        .map_err(|e| e.to_string())?;
-    let order = state
-        .cow
-        .gas_order(evm, BASE_GAS_REFILL_USDC, &app_data)
-        .await
-        .map_err(|e| e.to_string())?;
-    let order_signature = gasless::sign(state, headers, evm, &order.typed_data()).await?;
-    state
-        .cow
-        .place(&order, &order_signature)
-        .await
-        .map_err(|e| e.to_string())
+    .await?
+    .as_str()
+    .and_then(|s| u128::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+    .ok_or_else(|| unavailable("USDC nonce unavailable"))?;
+    Ok(BaseTopup {
+        uid: None,
+        permit: Some(engine_execution::cow::permit_typed_data(
+            evm,
+            BASE_GAS_REFILL_USDC,
+            nonce,
+            now() / 1000 + 180,
+        )),
+        order: None,
+    })
+}
+pub(super) fn topup_expired(topup: &BaseTopup) -> bool {
+    let expires = topup.order.as_ref().map(|o| o.valid_to as u64).or_else(|| {
+        topup
+            .permit
+            .as_ref()?
+            .get("message")?
+            .get("deadline")?
+            .as_str()?
+            .parse::<u64>()
+            .ok()
+    });
+    expires.is_none_or(|at| at <= now() / 1000)
+}
+pub(super) fn topup_steps(topup: &BaseTopup) -> Vec<Value> {
+    match (&topup.order, &topup.permit) {
+        (Some(order), _) => vec![gasless::step(&order.typed_data(), "base")],
+        (_, Some(permit)) => vec![gasless::step(permit, "base")],
+        _ => Vec::new(),
+    }
+}
+pub(super) async fn advance_base_topup(
+    state: &AppState,
+    headers: &HeaderMap,
+    evm: &str,
+    mut topup: BaseTopup,
+    signature: &str,
+) -> Result<BaseTopup, String> {
+    if let Some(order) = &topup.order {
+        let signed = gasless::verify(state, headers, evm, &order.typed_data(), signature).await?;
+        topup.uid = Some(
+            state
+                .cow
+                .place(order, &signed)
+                .await
+                .map_err(|e| e.to_string())?,
+        );
+        return Ok(topup);
+    }
+    let permit = topup.permit.as_ref().ok_or("Top-up preparation expired")?;
+    let signed = gasless::verify(state, headers, evm, permit, signature).await?;
+    let deadline = permit["message"]["deadline"]
+        .as_str()
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or("Permit deadline unavailable")?;
+    let app_data =
+        engine_execution::cow::permit_app_data(evm, BASE_GAS_REFILL_USDC, deadline, &signed)
+            .map_err(|e| e.to_string())?;
+    topup.order = Some(
+        state
+            .cow
+            .gas_order(evm, BASE_GAS_REFILL_USDC, &app_data)
+            .await
+            .map_err(|e| e.to_string())?,
+    );
+    Ok(topup)
 }
 
 // USDC in a Solana wallet (0 if it can't be read).
@@ -2865,7 +2917,16 @@ pub(super) async fn plan_base_with_cash(
             .markets
             .register_base_txs(owner, evm, txs, true)
             .await?;
-        return Ok((intent_id, Vec::new(), None));
+        let mut intent = state
+            .markets
+            .get_intent(&intent_id)
+            .await?
+            .ok_or_else(|| unavailable("Intent unavailable"))?;
+        let topup = prepare_base_topup(state, &intent.wallet).await?;
+        let steps = topup_steps(&topup);
+        intent.base_topup = Some(topup);
+        state.markets.save_intent(&intent_id, &intent).await?;
+        return Ok((intent_id, steps, None));
     }
     // Otherwise an empty tank gets ETH on a hop from Solana (Layerswap refuel). Atlas never pays gas:
     // with neither, the user is asked for a little more.
@@ -2974,10 +3035,13 @@ pub(super) async fn plan_solana_swap_with_base_cash(
 ) -> Result<(String, Vec<Value>), ApiError> {
     let intent_id = id("intent");
     let (cash, transfer) = move_to_solana(state, evm, &solana, send, fee, &intent_id).await?;
-    let transactions = transfer
+    let mut transactions: Vec<Value> = transfer
         .iter()
         .map(|(to, data)| json!({"chain":"base","chainId":8453,"to":to,"data":data,"value":"0"}))
         .collect();
+    if let Some(auth) = &cash.authorization {
+        transactions.push(gasless::step(&auth.typed_data, "base"));
+    }
     state
         .markets
         .insert_intent(
@@ -3212,8 +3276,8 @@ pub(super) async fn execute_quote(
             0
         };
         if base_topup_fits(&state, &wallet, spends).await {
-            base_topup = Some(BaseTopup { uid: None });
-            transactions.clear();
+            base_topup = Some(prepare_base_topup(&state, &wallet).await?);
+            transactions = topup_steps(base_topup.as_ref().expect("prepared"));
         } else if !wallet_pays_gas(&state, &wallet).await {
             let rate = app_balance::fx_rate(&stored.currency).await?;
             return Err(short_of_gas(&stored.currency, rate));
@@ -3248,6 +3312,9 @@ pub(super) async fn execute_quote(
             expected.push((to.to_ascii_lowercase(), data.to_ascii_lowercase()));
             transactions
                 .push(json!({"chain":"base","chainId":8453,"to":to,"data":data,"value":"0"}));
+        }
+        if let Some(auth) = &cash.authorization {
+            transactions.push(gasless::step(&auth.typed_data, "base"));
         }
         funding = Some(cash);
         output = stored.output_units;
@@ -3432,13 +3499,13 @@ pub(super) async fn signed(
     }
     // An empty Base gas tank: the app sent nothing; now that the user has confirmed, their session
     // signs the CoW top-up, and the Base transactions follow once it fills.
-    if current.base_topup.is_some() && !second_step {
-        if !body.sent.is_empty() || !body.signed.is_empty() {
+    if current.base_topup.as_ref().is_some_and(|t| t.uid.is_none()) {
+        if !body.sent.is_empty() || body.signed.len() != 1 || body.signed[0].index != 0 {
             return Err(bad("signed report does not match the plan"));
         }
         if !state
             .markets
-            .claim_execution(&intent_id, &current, "validate")
+            .claim_execution(&intent_id, &current, &current.status.stage)
             .await?
         {
             let latest = state.markets.get_intent(&intent_id).await?;
@@ -3446,8 +3513,19 @@ pub(super) async fn signed(
         }
         let mut updated = current;
         updated.status.stage = "fund".into();
-        match run_base_topup(&state, &headers, &updated.wallet).await {
-            Ok(uid) => updated.base_topup = Some(BaseTopup { uid: Some(uid) }),
+        match advance_base_topup(
+            &state,
+            &headers,
+            &updated.wallet,
+            updated.base_topup.clone().expect("topup"),
+            &body.signed[0].transaction,
+        )
+        .await
+        {
+            Ok(topup) => {
+                updated.status.stage = if topup.uid.is_some() { "fund" } else { "sign" }.into();
+                updated.base_topup = Some(topup);
+            }
             Err(reason) => {
                 eprintln!("intent {intent_id}: gas top-up not started: {reason}");
                 updated.status.state = "failed".into();
@@ -3464,7 +3542,7 @@ pub(super) async fn signed(
         .as_ref()
         .and_then(|c| c.authorization.clone());
     if let (Some(auth), false) = (authorization, second_step) {
-        if !body.sent.is_empty() || !body.signed.is_empty() {
+        if !body.sent.is_empty() || body.signed.len() != 1 || body.signed[0].index != 0 {
             return Err(bad("signed report does not match the move"));
         }
         let evm = user.evm_wallet.clone().filter(|w| !w.is_empty()).ok_or((
@@ -3485,7 +3563,15 @@ pub(super) async fn signed(
             .as_ref()
             .map(|c| c.swap_id.clone())
             .unwrap_or_default();
-        let moved = match gasless::sign(&state, &headers, &evm, &auth.typed_data).await {
+        let moved = match gasless::verify(
+            &state,
+            &headers,
+            &evm,
+            &auth.typed_data,
+            &body.signed[0].transaction,
+        )
+        .await
+        {
             Ok(signature) => state
                 .relay_link
                 .submit(&request_id, &auth.api, &signature)
@@ -3807,6 +3893,9 @@ pub(super) async fn next_transactions(
     if intent_id.starts_with("near-intent-") {
         return near_intents::next(state, headers, intent_id).await;
     }
+    if intent_id.starts_with("hl-") {
+        return hl::next(state, intent_id, headers).await;
+    }
     let user = app_balance::verified_wallets(&state, &headers).await?;
     let mut intent = state
         .markets
@@ -3823,6 +3912,15 @@ pub(super) async fn next_transactions(
         return Err((
             StatusCode::CONFLICT,
             "nothing to sign for this intent".into(),
+        ));
+    }
+    if let Some(topup) = intent.base_topup.as_ref().filter(|t| t.uid.is_none()) {
+        if topup_expired(topup) {
+            intent.base_topup = Some(prepare_base_topup(&state, &intent.wallet).await?);
+            state.markets.save_intent(&intent_id, &intent).await?;
+        }
+        return Ok(Json(
+            json!({"transactions":topup_steps(intent.base_topup.as_ref().expect("topup"))}),
         ));
     }
     // A Base buy whose cash came from Solana: a fresh swap for what landed.
@@ -4077,6 +4175,32 @@ fn received_units(receipt: &Value, token: &str, wallet: &str) -> Option<u128> {
     total
 }
 
+pub(super) async fn pending_rows(state: &AppState, owner: &str) -> Result<Vec<Value>, ApiError> {
+    let intents: Vec<StoredIntent> = if let Some(pg) = &state.markets.postgres {
+        pg.query(
+            "SELECT payload FROM atlas_intents WHERE owner=$1 AND stage='sign'",
+            &[&owner],
+        )
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .map(|row| serde_json::from_str(row.get::<_, &str>(0)).map_err(internal))
+        .collect::<Result<_, _>>()?
+    } else {
+        state
+            .markets
+            .intents
+            .lock()
+            .map_err(internal)?
+            .values()
+            .filter(|i| i.owner == owner)
+            .cloned()
+            .collect()
+    };
+    Ok(intents.into_iter().filter(|i|i.status.state=="pending"&&i.status.stage=="sign").map(|i|
+        json!({"intentId":i.status.intent_id,"assetId":i.trade.as_ref().map(|t|&t.asset_id),
+            "symbol":"purchase","kind":i.trade.as_ref().map_or("buy",|t|t.side.as_str()),"stage":"sign","error":i.status.error})).collect())
+}
 #[cfg(test)]
 mod tests {
     use super::*;

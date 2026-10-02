@@ -20,7 +20,7 @@ export async function rpc(method, params) {
         body:JSON.stringify({jsonrpc:'2.0',id:'atlas',method,params}),signal:AbortSignal.timeout(12000)});
       if(!response.ok)continue;
       const body=await response.json();
-      if(body.error)continue;
+      if(body.error || body.result?.error)continue;
       return body.result;
     } catch {}
   }
@@ -169,8 +169,8 @@ export function receivedToken(result,token,owner){
   }
   return amount;
 }
-export async function prepareRef({intentId,wallet,userId,userJwt,accessToken,identityToken}){
-  const scope=await salePermission({intentId,wallet,userId,userJwt,accessToken,identityToken});
+export async function prepareRef({intentId,wallet,userId,userJwt,accessToken}){
+  const scope=await salePermission({intentId,wallet,userId,userJwt,accessToken});
   if(scope.network!=='near'||!['buy','sell'].includes(scope.side))throw new Error('invalid swap permission');
   const sell=scope.side==='sell';account(scope.coinType);
   const balance=BigInt((await rpc('query',{request_type:'view_account',finality:'final',account_id:wallet.address})).amount);
@@ -310,8 +310,8 @@ export function checkCashoutQuote(q,amount,minimumOut){
 }
 // A direct sale of a NEAR token the user confirmed: its coin, amount and minimum come only from that
 // intent (consumed once by the engine).
-export async function prepareSale({intentId,wallet,userId,userJwt,accessToken,identityToken,evmWallet,solanaWallet}){
-  const scope=await salePermission({intentId,wallet,userId,accessToken,identityToken});
+export async function prepareSale({intentId,wallet,userId,userJwt,accessToken,evmWallet,solanaWallet}){
+  const scope=await salePermission({intentId,wallet,userId,accessToken});
   if(scope.network!=='nearintents'||scope.side!=='sell')throw new Error('invalid sale permission');
   const {walletId,...rest}=scope;
   const bound={userId:rest.userId,walletId,address:rest.address,quoteId:rest.quoteId,coinType:rest.coinType,
@@ -339,4 +339,73 @@ export async function commitCashout({cashoutId,scope,wallet,userId,userJwt,rawSi
   const actions=[...wrapFirst(token,held,amount),...await depositActions(token,to,amount)];
   const result=await sendCall(wallet,token,actions,rawSign,item.scope.expiresAtUnixMs);
   return {ok:sentToken(result,token,wallet.address,to)===BigInt(amount),digest:result.transaction.hash};
+}
+
+// Prepare all NEAR transactions with one access-key snapshot and consecutive nonces.
+export async function buildNearCalls(wallet,calls) {
+  const key=publicKey(wallet),publicKeyString='ed25519:'+toBase58(key);
+  const access=await rpc('query',{request_type:'view_access_key',finality:'optimistic',account_id:wallet.address,public_key:publicKeyString});
+  if(!Number.isSafeInteger(access.nonce))throw new Error('nonce unavailable');
+  return calls.map((c,index)=>{
+    const bytes=transaction({signer:wallet.address,publicKey:publicKeyString,nonce:BigInt(access.nonce)+1n+BigInt(index),
+      receiver:c.receiver,blockHash:access.block_hash,actions:c.actions});
+    return {bytes,receiver:c.receiver,message:'0x'+bytes.toString('hex')};
+  });
+}
+async function storageCall(wallet,token) {
+  if(await view(token,'storage_balance_of',{account_id:wallet.address}))return [];
+  const minimum=BigInt((await view(token,'storage_balance_bounds')).min);
+  if(minimum>10000000000000000000000n)throw new Error('token storage cost is too high');
+  return [{receiver:token,actions:[call('storage_deposit',{account_id:wallet.address,registration_only:true},30000000000000n,minimum)]}];
+}
+export async function buildRef({saleId,scope,wallet,userId,userJwt}) {
+  if(scope.userId!==userId||scope.walletId!==wallet.id||scope.address!==wallet.address)throw new Error('wallet changed');
+  const item=prepared.take(saleId,scope,userJwt);
+  return buildRefTransactions({wallet,...item.data});
+}
+export async function buildRefTransactions({wallet,q,sell}) {
+  const calls=await storageCall(wallet,q.tokenOut);
+  if(!sell){
+    calls.push(...await storageCall(wallet,WRAP));
+    const held=BigInt(await view(WRAP,'ft_balance_of',{account_id:wallet.address}));
+    const wrap=BigInt(q.amountIn)>held?BigInt(q.amountIn)-held:0n;
+    if(wrap>0n)calls.push({receiver:WRAP,actions:[call('near_deposit',{},30000000000000n,wrap)]});
+  }
+  calls.push({receiver:q.tokenIn,actions:[swapCall(q)]});
+  return {calls:await buildNearCalls(wallet,calls),tokenOut:q.tokenOut,minimumOut:q.minimumOut};
+}
+export async function buildNearCashout({cashoutId,scope,wallet,userId,userJwt}) {
+  if(scope.userId!==userId||scope.walletId!==wallet.id||scope.address!==wallet.address)throw new Error('wallet changed');
+  const item=cashouts.take(cashoutId,scope,userJwt);
+  const token=item.scope.coinType,amount=item.scope.amount,to=item.data.depositAddress;
+  const held=BigInt(await view(token,'ft_balance_of',{account_id:wallet.address}));
+  const native=BigInt((await rpc('query',{request_type:'view_account',finality:'final',account_id:wallet.address})).amount);
+  if(available(token,held,native)<BigInt(amount)||native<GAS_RESERVE)throw new Error('holding changed');
+  const actions=[...wrapFirst(token,held,amount),...await depositActions(token,to,amount)];
+  return {calls:await buildNearCalls(wallet,[{receiver:token,actions}]),token,amount,to};
+}
+export async function finishNearCalls({wallet,built,signatures}) {
+  if(signatures.length!==built.calls.length)throw new Error('wrong approval count');
+  const key=publicKey(wallet),results=[],sent=[];
+  // Verify the whole batch before its first submission.
+  const signed=built.calls.map((c,index)=>{
+    const signature=Buffer.from(signatures[index].replace(/^0x/,''),'hex');
+    if(signature.length!==64||!ed25519.verify(signature,sha256(c.bytes),key))throw new Error('signature did not verify');
+    return Buffer.concat([c.bytes,Buffer.from([0]),signature]).toString('base64');
+  });
+  for(let index=0;index<signed.length;index++){
+    try {
+      const response=await fetch(RPC,{method:'POST',headers:{'content-type':'application/json'},
+        body:JSON.stringify({jsonrpc:'2.0',id:'atlas',method:'broadcast_tx_commit',params:[signed[index]]}),signal:AbortSignal.timeout(45000)});
+      const body=await response.json();
+      if(!response.ok||body.error||body.result?.status?.Failure)throw new Error('outcome unavailable');
+      results.push(body.result);sent.push(body.result.transaction.hash);
+    }catch(error){error.sent=sent;error.maybeSent=true;error.message=`Step ${index+1} could not be verified; ${sent.length} earlier transaction(s) sent: ${sent.join(', ')}`;throw error;}
+  }
+  const last=results.at(-1);
+  if(built.tokenOut){
+    const amount=receivedToken(last,built.tokenOut,wallet.address);
+    return {ok:amount>=BigInt(built.minimumOut),digest:sent.at(-1),txIds:sent,amountOut:amount.toString()};
+  }
+  return {ok:sentToken(last,built.token,wallet.address,built.to)===BigInt(built.amount),digest:sent.at(-1),txIds:sent};
 }

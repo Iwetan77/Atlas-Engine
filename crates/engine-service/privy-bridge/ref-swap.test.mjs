@@ -115,3 +115,36 @@ test('a deposit with its storage registration encodes as one transaction of two 
   assert.equal(bytes[at+4],2);
   assert.equal(bytes.subarray(at+9,at+9+15).toString(),'storage_deposit');
 });
+
+
+test('device NEAR batch builds consecutive nonces from one chain read and verifies every signature before sending',async()=>{
+  const {buildNearCalls,finishNearCalls}=await import('./ref-swap.mjs');
+  const {ed25519}=await import('@noble/curves/ed25519');
+  const {sha256}=await import('@noble/hashes/sha256');
+  const {toBase58}=await import('@mysten/sui/utils');
+  const key=new Uint8Array(32).fill(7),pub=ed25519.getPublicKey(key);
+  const wallet={id:'w',address:Buffer.from(pub).toString('hex'),public_key:'ed25519:'+toBase58(pub)};
+  const original=globalThis.fetch;let reads=0,broadcasts=0;
+  try{
+    globalThis.fetch=async(_url,init)=>{
+      const body=JSON.parse(init.body);
+      if(body.method==='query'){reads++;return new Response(JSON.stringify({result:{nonce:100,block_hash:'11111111111111111111111111111111'}}));}
+      broadcasts++;
+      if(broadcasts===2)throw new Error('connection dropped');
+      return new Response(JSON.stringify({result:{status:{SuccessValue:''},transaction:{hash:'landed-1'},receipts_outcome:[]}}));
+    };
+    const action={method:'near_deposit',args:{},gas:'30000000000000',deposit:'1'};
+    const calls=await buildNearCalls(wallet,[{receiver:'wrap.near',actions:[action]},{receiver:'wrap.near',actions:[action]}]);
+    assert.equal(reads,1);
+    const offset=4+wallet.address.length+1+32;
+    assert.equal(calls[0].bytes.readBigUInt64LE(offset),101n);
+    assert.equal(calls[1].bytes.readBigUInt64LE(offset),102n);
+    const signatures=calls.map(c=>'0x'+Buffer.from(ed25519.sign(sha256(c.bytes),key)).toString('hex'));
+    await assert.rejects(()=>finishNearCalls({wallet,built:{calls},signatures:[signatures[0],'0x'+'00'.repeat(64)]}),/signature did not verify/);
+    assert.equal(broadcasts,0);
+    await assert.rejects(()=>finishNearCalls({wallet,built:{calls},signatures}),error=>{
+      assert.deepEqual(error.sent,['landed-1']);assert.equal(error.maybeSent,true);
+      assert.match(error.message,/Step 2/);return true;
+    });
+  }finally{globalThis.fetch=original;}
+});

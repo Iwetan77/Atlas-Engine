@@ -8,6 +8,7 @@ mod gasless;
 mod hl;
 mod markets;
 mod near_intents;
+mod pending;
 mod positions;
 mod social;
 
@@ -164,6 +165,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/quotes/{quote_id}/execute",
             post(markets::execute_quote),
         )
+        .route("/v1/intents/pending", get(pending::list))
+        .route("/v1/intents/{intent_id}/resume", post(pending::resume))
         .route("/v1/intents/{intent_id}/signed", post(markets::signed))
         .route(
             "/v1/intents/{intent_id}/sale-permission",

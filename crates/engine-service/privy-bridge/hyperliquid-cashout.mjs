@@ -229,3 +229,22 @@ export async function cashOut({wallet, recipient, to, amount, signTyped, relayKe
   }
   return {requestId: checked.requestId, amountOut: checked.amountOut};
 }
+
+// Quote and pin the two typed-data steps before the phone signs either one.
+export async function prepareCashOut({wallet,recipient,to,amount,relayKey}) {
+  const request=cashoutRequest({wallet,recipient,to,amount});
+  const headers={'content-type':'application/json',...(relayKey?{'x-api-key':relayKey}:{})};
+  const quote=await json(await fetch(`${RELAY_API}/quote/v2`,{method:'POST',headers,body:JSON.stringify(request)}),'Relay quote');
+  return checkCashout(quote,{wallet,recipient,to,amount});
+}
+export async function finishCashOut({checked,wallet,signatures,relayKey,post}) {
+  if(signatures.length!==2)throw new Error('two approvals required');
+  // Check both before posting anything.
+  const mapped=checkSigned(checked.mapping,signatures[0],wallet),sent=checkSigned(checked.send,signatures[1],wallet);
+  const signature=mapped.r+mapped.s.slice(2)+mapped.v.toString(16);
+  const headers={'content-type':'application/json',...(relayKey?{'x-api-key':relayKey}:{})};
+  await json(await fetch(`${RELAY_API}/authorize?signature=${signature}`,{method:'POST',headers,body:JSON.stringify(checked.authorizeBody)}),'Relay authorize');
+  const result=await post({action:checked.action,nonce:checked.nonce,signature:sent});
+  if(result?.status!=='ok')throw new Error('Cash transfer was refused; proceeds remain in perps');
+  return {requestId:checked.requestId,amountOut:checked.amountOut};
+}

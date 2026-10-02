@@ -12,6 +12,27 @@ use std::{
 const BASE_USDC_1CLICK: &str = "nep141:base-0x833589fcd6edb6e08f4c7c32d4f71b54bda02913.omft.near";
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
+// A poll or a second next request must not restore a preparation while its commit is in flight.
+static STEP_LOCKS: std::sync::OnceLock<
+    Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+> = std::sync::OnceLock::new();
+async fn step_guard(id: &str) -> Result<tokio::sync::OwnedMutexGuard<()>, ApiError> {
+    let lock = {
+        let mut locks = STEP_LOCKS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .map_err(internal)?;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let lock = locks
+            .get(id)
+            .and_then(std::sync::Weak::upgrade)
+            .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(())));
+        locks.insert(id.into(), Arc::downgrade(&lock));
+        lock
+    };
+    Ok(lock.lock_owned().await)
+}
+
 #[derive(Clone)]
 pub(super) struct NearState {
     client: Client,
@@ -75,10 +96,6 @@ fn recoverable_sui(i: &StoredIntent) -> bool {
 // later step signs that way would strand the money halfway (a paid DEEP buy stopped as SUI), so they're
 // refused up front until that step moves to the user's device approving it, as the finish-a-paid-buy
 // path already does.
-pub(super) const SERVER_SIGNS_AS_USER: bool = false;
-pub(super) const PAUSED_FOR_SIGNING: &str =
-    "Buying this is paused for a short while, so nothing was charged. Your money is safe.";
-// A bridge failure that happened before anything could reach Sui.
 fn nothing_sent(reason: &str) -> bool {
     reason.contains(NOTHING_SENT) || reason.contains("nothing was signed")
 }
@@ -155,6 +172,8 @@ struct StoredIntent {
     #[serde(default)]
     gas_order: Option<String>,
     #[serde(default)]
+    topup: Option<markets::BaseTopup>,
+    #[serde(default)]
     sale: Option<SuiSale>,
     #[serde(default)]
     sale_permission_used: bool,
@@ -171,7 +190,18 @@ struct StoredIntent {
     expected_value: String,
     #[serde(default)]
     handed_nonce: Option<u64>,
+    #[serde(default)]
+    device: Option<DeviceStep>,
 }
+#[derive(Clone, Serialize, Deserialize)]
+struct DeviceStep {
+    prepare_id: String,
+    commit_path: String,
+    transactions: Vec<Value>,
+    expires: u64,
+    kind: String,
+}
+
 // CoinGecko's chain names for the chains Atlas supports, keyed by Atlas's.
 const LISTED_CHAINS: [(&str, &str); 8] = [
     ("sui", "sui"),
@@ -370,32 +400,6 @@ impl NearState {
                 .insert(id.into(), intent);
         }
         Ok(())
-    }
-    // Only one confirmed sell may start signing, including across concurrent Render requests.
-    async fn claim_sui_sell(&self, id: &str, mut intent: StoredIntent) -> Result<bool, ApiError> {
-        intent.status.stage = if intent.sale.is_some() {
-            "fund"
-        } else {
-            "execute"
-        }
-        .into();
-        if let Some(pg) = &self.postgres {
-            let payload = serde_json::to_string(&intent).map_err(internal)?;
-            let changed = pg.execute(
-                "UPDATE atlas_near_intents SET payload=$2,stage=$3 WHERE intent_id=$1 AND stage='validate'",
-                &[&id, &payload, &intent.status.stage],
-            ).await.map_err(internal)?;
-            return Ok(changed == 1);
-        }
-        let mut intents = self.intents.lock().map_err(internal)?;
-        if intents
-            .get(id)
-            .is_none_or(|saved| saved.status.stage != "validate")
-        {
-            return Ok(false);
-        }
-        intents.insert(id.into(), intent);
-        Ok(true)
     }
     pub(super) async fn monad_holdings(
         &self,
@@ -1526,7 +1530,7 @@ fn sui_coin_type(value: &str) -> bool {
         })
 }
 
-// Calls the Privy bridge with the user's own access token (it signs for their wallets only with it).
+// Access tokens identify the wallet owner. Only a device approval authorizes signing.
 async fn bridge(
     state: &AppState,
     headers: &HeaderMap,
@@ -1545,7 +1549,6 @@ async fn bridge(
             "Privy access token required".into(),
         ))?;
     body["accessToken"] = json!(access_token);
-    body["identityToken"] = json!(app_balance::identity_token(headers));
     let response = http
         .post(format!("{bridge_url}{path}"))
         .timeout(Duration::from_secs(90))
@@ -1838,9 +1841,6 @@ async fn sui_quote(
     if let Some(recovery) = sui_recovery_quote(&state, &headers, &req, &user, coin).await? {
         return Ok(Json(recovery));
     }
-    if !SERVER_SIGNS_AS_USER && sui_coin_key(coin) != sui_coin_key("0x2::sui::SUI") {
-        return Err(conflict(PAUSED_FOR_SIGNING));
-    }
     let sui = state
         .near
         .tokens()
@@ -1947,9 +1947,6 @@ async fn ref_buy_quote(
 ) -> Result<Json<Value>, ApiError> {
     if !near_account(coin) {
         return Err(bad("Invalid token contract"));
-    }
-    if !SERVER_SIGNS_AS_USER {
-        return Err(conflict(PAUSED_FOR_SIGNING));
     }
     let sui = state
         .near
@@ -2077,7 +2074,7 @@ async fn ref_assets(state: &AppState, query: &str) -> Result<Vec<Value>, ApiErro
     let response: Value = http
         .post(format!("{bridge_url}/near/ref/search"))
         .timeout(Duration::from_secs(20))
-        .json(&json!({"query":query,"identityToken":null}))
+        .json(&json!({"query":query}))
         .send()
         .await
         .map_err(venue)?
@@ -3092,8 +3089,14 @@ pub(super) async fn sale_permission(
         .as_ref()
         .is_some_and(|s| s.network == "near")
         && !intent.sell_sui;
-    let permitted_stage = if ref_buy { "execute" } else { "fund" };
+    let permitted_stage = if ref_buy {
+        "sign"
+    } else {
+        intent.status.stage.as_str()
+    }
+    .to_string();
     if (!intent.sell_sui && !ref_buy)
+        || !matches!(permitted_stage.as_str(), "validate" | "fund" | "sign")
         || intent.status.stage != permitted_stage
         || intent.status.state != "pending"
         || intent.expires <= now()
@@ -3374,10 +3377,6 @@ pub(super) async fn quote(
         .into_iter()
         .find(|t| format!("near:{}", t.asset_id) == req.asset_id && supported(t))
         .ok_or((StatusCode::NOT_FOUND, "1Click asset not found".into()))?;
-    // Selling a NEAR coin signs as the user from the server: no buying one until that works.
-    if !SERVER_SIGNS_AS_USER && token.blockchain == "near" {
-        return Err(conflict(PAUSED_FOR_SIGNING));
-    }
     let destination = destination(&state, &headers, &token, &user).await?;
     let rate = app_balance::fx_rate(&req.amount.currency).await?;
     let micros = markets::parse_micros(&req.amount.amount)?;
@@ -3530,6 +3529,7 @@ async fn execute_monad_sale(
                 gas_request_id: None,
                 gas_topup: false,
                 gas_order: None,
+                topup: None,
                 sale: None,
                 sale_permission_used: false,
                 ref_wallet: None,
@@ -3537,6 +3537,7 @@ async fn execute_monad_sale(
                 origin_chain: "monad".into(),
                 expected_value: format!("0x{value:x}"),
                 handed_nonce: Some(nonce),
+                device: None,
             },
         )
         .await?;
@@ -3606,6 +3607,7 @@ async fn record_fill(
 }
 async fn execute_sui_sell(
     state: &AppState,
+    headers: &HeaderMap,
     user: &app_balance::VerifiedWallets,
     quote: StoredQuote,
 ) -> Result<Json<Value>, ApiError> {
@@ -3654,21 +3656,35 @@ async fn execute_sui_sell(
                 gas_request_id: None,
                 gas_topup: false,
                 gas_order: None,
+                topup: None,
                 sale_permission_used: false,
                 ref_wallet: None,
                 asset_id: quote.asset_id.clone(),
                 origin_chain: String::new(),
                 expected_value: String::new(),
                 handed_nonce: None,
+                device: None,
             },
         )
         .await?;
+    let mut current = state
+        .near
+        .get_intent(&intent_id)
+        .await?
+        .ok_or_else(|| conflict("Sale unavailable"))?;
+    prepare_sell_step(state, headers, &intent_id, &mut current).await?;
+    let transactions = current
+        .device
+        .as_ref()
+        .map(|d| d.transactions.clone())
+        .unwrap_or_default();
+    state.near.save_intent(&intent_id, current).await?;
     Ok(Json(json!({"intentId":intent_id,"kind":"sell",
         "summary":[
             {"label":"You sell","value":sell_label},
             {"label":"You receive (at least)","value":markets::say_money(quote.minimum_out,&quote.currency,rate)}
         ],
-        "transactions":[],"expiresAtUnixMs":expires
+        "transactions":transactions,"expiresAtUnixMs":expires
     })))
 }
 pub(super) async fn execute(
@@ -3776,7 +3792,7 @@ pub(super) async fn execute(
         return Err(conflict("quote already used; request a fresh quote"));
     }
     if stored.sell_sui {
-        return execute_sui_sell(&state, &user, stored).await;
+        return execute_sui_sell(&state, &headers, &user, stored).await;
     }
     if stored.monad_sale {
         return execute_monad_sale(&state, &user, stored).await;
@@ -3869,6 +3885,16 @@ pub(super) async fn execute(
             None,
         )
     };
+    let prepared_topup = if gas_topup {
+        Some(markets::prepare_base_topup(&state, &stored.wallet).await?)
+    } else {
+        None
+    };
+    let transactions = if let Some(t) = &prepared_topup {
+        markets::topup_steps(t)
+    } else {
+        transactions
+    };
     let intent_id = id("intent");
     let status = markets::IntentStatus {
         intent_id: intent_id.clone(),
@@ -3902,12 +3928,14 @@ pub(super) async fn execute(
                 gas_request_id,
                 gas_topup,
                 gas_order: None,
+                topup: prepared_topup,
                 sale_permission_used: false,
                 ref_wallet: Some(stored.recipient.clone()),
                 asset_id: stored.asset_id.clone(),
                 origin_chain: String::new(),
                 expected_value: String::new(),
                 handed_nonce: None,
+                device: None,
             },
         )
         .await?;
@@ -3945,248 +3973,263 @@ pub(super) async fn execute(
         "transactions":transactions,"expiresAtUnixMs":expires}),
     ))
 }
-async fn signed_sui_sell(
-    state: &AppState,
-    headers: &HeaderMap,
-    id: &str,
-    user: &app_balance::VerifiedWallets,
-    mut current: StoredIntent,
-    body: markets::Submission,
-) -> Result<Json<markets::IntentStatus>, ApiError> {
-    if current.expires < now() {
-        return Err(conflict("quote expired; request a fresh quote"));
-    }
-    if !body.sent.is_empty() || !body.signed.is_empty() {
-        return Err(bad(
-            "cashout confirmation must not include app transactions",
-        ));
-    }
-    if !state.near.claim_sui_sell(id, current.clone()).await? {
-        let latest = state
-            .near
-            .get_intent(id)
-            .await?
-            .ok_or((StatusCode::NOT_FOUND, "intent not found".into()))?;
-        return Ok(Json(latest.status));
-    }
-    current.status.stage = if current.sale.is_some() {
-        "fund"
-    } else {
-        "execute"
-    }
-    .into();
-    let response = current.status.clone();
-    let (state, headers, id, user) = (
-        state.clone(),
-        headers.clone(),
-        id.to_owned(),
-        user.user_id.clone(),
-    );
-    tokio::spawn(async move {
-        if let Err((_, reason)) = run_sui_sell(&state, &headers, &id, &user, current).await {
-            eprintln!("sale worker {id}: {reason}");
-            if let Ok(Some(mut latest)) = state.near.get_intent(&id).await {
-                if latest.status.state == "pending" && latest.deposit_address.is_empty() {
-                    latest.status.state = "failed".into();
-                    latest.status.error = Some(
-                        "The sale could not be verified. Check your wallet before trying again."
-                            .into(),
-                    );
-                    let _ = state.near.save_intent(&id, latest).await;
-                }
-            }
-        }
-    });
-    Ok(Json(response))
+
+fn prepared_step(body: &Value, commit_path: &str, kind: &str) -> Result<DeviceStep, ApiError> {
+    let requests = body["requests"]
+        .as_array()
+        .cloned()
+        .or_else(|| body.get("request").map(|r| vec![r.clone()]))
+        .ok_or_else(|| venue("Approval request unavailable; nothing was sent"))?;
+    let prepare_id = body["prepareId"]
+        .as_str()
+        .filter(|id| id.len() == 36)
+        .ok_or_else(|| venue("Approval preparation unavailable"))?;
+    Ok(DeviceStep {
+        prepare_id: prepare_id.into(),
+        commit_path: commit_path.into(),
+        kind: kind.into(),
+        expires: body["expiresAtUnixMs"]
+            .as_u64()
+            .unwrap_or_else(|| now() + 180_000),
+        transactions: requests
+            .into_iter()
+            .map(|request| json!({"chain":"privy","request":request}))
+            .collect(),
+    })
 }
-async fn run_sui_sell(
+async fn prepare_sell_step(
     state: &AppState,
     headers: &HeaderMap,
     id: &str,
-    user: &str,
-    mut current: StoredIntent,
-) -> Result<Json<markets::IntentStatus>, ApiError> {
-    let is_near = current
+    current: &mut StoredIntent,
+) -> Result<(), ApiError> {
+    current.expires = now() + 180_000;
+    let sale_first = current
         .sale
         .as_ref()
-        .is_some_and(|sale| matches!(sale.network.as_str(), "near" | "nearintents"));
-    // A NEAR coin sold straight to 1Click: no swap first, the coin itself is the deposit.
+        .is_some_and(|s| s.network != "nearintents")
+        && current.status.tx_ids.is_empty();
     let direct = current
         .sale
         .as_ref()
-        .filter(|sale| sale.network == "nearintents")
-        .map(|sale| sale.symbol.clone());
-    if let Some(sale) = current.sale.clone().filter(|_| direct.is_none()) {
-        let prepared = bridge(
-            state,
-            headers,
-            if is_near {
-                "/near/ref/prepare"
-            } else {
-                "/sui/sale/prepare"
-            },
-            json!({"intentId":id}),
-        )
-        .await;
-        current.sale_permission_used = true;
-        let prepared = match prepared {
-            Ok(p) => p,
-            Err(_) => {
-                current.status.state = "failed".into();
-                current.status.error = Some(format!(
-                    "The sale could not start. Your {} is still in your wallet.",
-                    sale.symbol
-                ));
-                state.near.save_intent(id, current.clone()).await?;
-                return Ok(Json(current.status));
-            }
-        };
-        let sent = bridge(
-            state,
-            headers,
-            if is_near {
-                "/near/ref/commit"
-            } else {
-                "/sui/sale/commit"
-            },
-            json!({"saleId":prepared["saleId"],"scope":prepared["scope"]}),
-        )
-        .await;
-        match sent {
-            Ok(body)
-                if body["ok"].as_bool() == Some(true)
-                    && body["userId"].as_str() == Some(user)
-                    && body["address"].as_str() == current.sui_wallet.as_deref() =>
-            {
-                if let Some(hash) = body["digest"].as_str() {
-                    current.status.tx_ids.push(hash.into());
-                }
-                current.amount = body["amountOut"]
-                    .as_str()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0);
-                if current.amount == 0 {
-                    current.status.state = "failed".into();
-                    current.status.error = Some(
-                        "The sale settled but its proceeds could not be read. Check your wallet."
-                            .into(),
-                    );
-                    state.near.save_intent(id, current.clone()).await?;
-                    return Ok(Json(current.status));
-                }
-                state.near.save_intent(id, current.clone()).await?;
-            }
-            result => {
-                current.status.state = "failed".into();
-                current.status.error = Some(if result.is_ok() {
-                    format!(
-                        "The sale did not settle. Your {} is still in your wallet.",
-                        sale.symbol
-                    )
-                } else {
-                    "The sale outcome could not be verified. Check your wallet before trying again."
-                        .into()
-                });
-                state.near.save_intent(id, current.clone()).await?;
-                return Ok(Json(current.status));
-            }
-        }
-    }
-    // A direct sale's bounds come only from this intent (the bridge asks for its permission).
-    let prepared = if direct.is_some() {
-        bridge(state, headers, "/near/sell/prepare", json!({"intentId":id})).await
-    } else {
-        bridge(
-            state,
-            headers,
-            if is_near {
-                "/near/cashout/prepare"
-            } else {
-                "/sui/cashout/prepare"
-            },
-            json!({"amount":current.amount.to_string(),
-                "minimumOut":current.minimum_out.to_string()}),
-        )
-        .await
-    };
-    current.sale_permission_used |= direct.is_some();
-    let prepared = match prepared {
-        Ok(value) => value,
-        Err(_) => {
-            current.status.state = "failed".into();
-            current.status.error = Some(if let Some(symbol) = &direct {
-                format!("The sale didn't start. Your {symbol} is still in your NEAR wallet.")
-            } else if current.sale.is_some() {
-                "Your sale settled, but cashout is unavailable. The proceeds are still in your wallet.".into()
-            } else {
-                "Cashout route is unavailable; nothing was sent".into()
-            });
-            state.near.save_intent(id, current.clone()).await?;
-            return Ok(Json(current.status));
-        }
-    };
-    let expected_wallet = current.sui_wallet.as_deref().unwrap_or("");
-    let address = prepared["depositAddress"].as_str().unwrap_or("");
-    let cashout_id = prepared["cashoutId"].as_str().unwrap_or("");
-    if prepared["userId"].as_str() != Some(user)
-        || prepared["address"].as_str() != Some(expected_wallet)
-        || (if is_near {
-            address.len() < 2
-                || address.len() > 128
-                || !address
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-        } else {
-            address.len() != 66
-                || !address.starts_with("0x")
-                || !address[2..].bytes().all(|b| b.is_ascii_hexdigit())
-        })
-        || cashout_id.len() != 36
-    {
-        current.status.state = "failed".into();
-        current.status.error = Some("Cashout preparation was invalid; nothing was sent".into());
-        state.near.save_intent(id, current.clone()).await?;
-        return Ok(Json(current.status));
-    }
-    current.deposit_address = address.into();
-    current.expires = now() + 240_000;
-    // Persist before any signing: a lost bridge response can still be followed by deposit address.
+        .is_some_and(|s| s.network == "nearintents");
+    let near = current
+        .sale
+        .as_ref()
+        .is_some_and(|s| matches!(s.network.as_str(), "near" | "nearintents"));
+    // Save bounds before the bridge loads the one-use scope; no signature exists at this point.
+    current.sale_permission_used = false;
     state.near.save_intent(id, current.clone()).await?;
-    let result = bridge(
-        state,
-        headers,
-        if direct.is_some() {
-            "/near/sell/commit"
-        } else if is_near {
-            "/near/cashout/commit"
+    let path = if sale_first {
+        if near {
+            "/near/ref/prepare"
         } else {
-            "/sui/cashout/commit"
-        },
-        json!({"cashoutId":cashout_id,"scope":prepared["scope"]}),
-    )
-    .await;
-    current.status.stage = "settle".into();
-    match result {
+            "/sui/sale/prepare"
+        }
+    } else if direct {
+        "/near/sell/prepare"
+    } else if near {
+        "/near/cashout/prepare"
+    } else {
+        "/sui/cashout/prepare"
+    };
+    let args = if sale_first || direct {
+        json!({"intentId":id})
+    } else {
+        json!({"amount":current.amount.to_string(),"minimumOut":current.minimum_out.to_string()})
+    };
+    let body = bridge(state, headers, path, args).await?;
+    if body["userId"].as_str() != Some(&current.owner)
+        || body["address"].as_str() != current.sui_wallet.as_deref()
+    {
+        return Err(venue("Approval wallet changed; nothing was sent"));
+    }
+    if !sale_first {
+        let address = body["depositAddress"]
+            .as_str()
+            .ok_or_else(|| venue("Cashout destination unavailable"))?;
+        current.deposit_address = address.into();
+    }
+    let commit_path = path.replace("/prepare", "/commit");
+    current.device = Some(prepared_step(
+        &body,
+        &commit_path,
+        if sale_first { "sale" } else { "cashout" },
+    )?);
+    current.sale_permission_used |= sale_first || direct;
+    Ok(())
+}
+async fn prepare_buy_step(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+    current: &mut StoredIntent,
+) -> Result<(), ApiError> {
+    let swap = current
+        .then_swap
+        .clone()
+        .ok_or_else(|| conflict("Nothing waiting to finish"))?;
+    current.expires = now() + 180_000;
+    current.sale_permission_used = false;
+    state.near.save_intent(id, current.clone()).await?;
+    let (path, args) = if swap.network == "near" {
+        ("/near/ref/prepare", json!({"intentId":id}))
+    } else {
+        (
+            "/sui/swap/prepare",
+            json!({"coinType":swap.coin_type,"amount":swap.sui_in.to_string(),
+        "reserve":SUI_GAS_RESERVE.to_string(),"minimumOut":(swap.expected_out*99/100).to_string(),
+        "expiresAtUnixMs":current.expires,"expectedWallet":current.ref_wallet}),
+        )
+    };
+    let body = bridge(state, headers, path, args).await?;
+    if body["userId"].as_str() != Some(&current.owner)
+        || body["address"].as_str() != current.ref_wallet.as_deref()
+    {
+        return Err(venue("Approval wallet changed; nothing was sent"));
+    }
+    current.device = Some(prepared_step(
+        &body,
+        &path.replace("/prepare", "/commit"),
+        "buy",
+    )?);
+    current.sale_permission_used = swap.network == "near";
+    Ok(())
+}
+async fn commit_device_step(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+    mut current: StoredIntent,
+    body: markets::Submission,
+) -> Result<markets::IntentStatus, ApiError> {
+    let device = current
+        .device
+        .clone()
+        .ok_or_else(|| conflict("Approval expired; request it again"))?;
+    if device.expires <= now() {
+        return Err(conflict("Approval expired; request it again"));
+    }
+    if !body.sent.is_empty()
+        || body.signed.len() != device.transactions.len()
+        || body
+            .signed
+            .iter()
+            .enumerate()
+            .any(|(index, s)| s.index != index)
+    {
+        return Err(bad("Approvals do not match this step"));
+    }
+    let previous_stage = current.status.stage.clone();
+    current.device = None;
+    current.status.stage = "execute".into();
+    let claimed = if let Some(pg) = &state.near.postgres {
+        let payload = serde_json::to_string(&current).map_err(internal)?;
+        pg.execute("UPDATE atlas_near_intents SET payload=$4,stage='execute' WHERE intent_id=$1 AND owner=$2 AND stage=$3 AND payload::jsonb->'device'->>'prepare_id'=$5",
+            &[&id,&current.owner,&previous_stage,&payload,&device.prepare_id]).await.map_err(internal)?==1
+    } else {
+        let mut intents = state.near.intents.lock().map_err(internal)?;
+        if intents.get(id).is_some_and(|i| {
+            i.device
+                .as_ref()
+                .is_some_and(|d| d.prepare_id == device.prepare_id)
+        }) {
+            intents.insert(id.into(), current.clone());
+            true
+        } else {
+            false
+        }
+    };
+    if !claimed {
+        return Ok(state
+            .near
+            .get_intent(id)
+            .await?
+            .ok_or_else(|| conflict("Intent changed"))?
+            .status);
+    }
+    let signatures: Vec<_> = body.signed.iter().map(|s| s.transaction.clone()).collect();
+    let args = if device.commit_path == "/sui/swap/commit" {
+        json!({"prepareId":device.prepare_id,"signature":signatures[0]})
+    } else {
+        json!({"prepareId":device.prepare_id,"signatures":signatures})
+    };
+    match bridge(state, headers, &device.commit_path, args).await {
         Ok(sent)
             if sent["ok"].as_bool() == Some(true)
-                && sent["userId"].as_str() == Some(user)
-                && sent["address"].as_str() == Some(expected_wallet) =>
+                && (device.kind == "cashout"
+                    || sent["amountOut"]
+                        .as_str()
+                        .and_then(|v| v.parse::<u128>().ok())
+                        .is_some_and(|n| n > 0)) =>
         {
-            if let Some(digest) = sent["digest"].as_str() {
-                current.status.tx_ids.push(digest.into());
+            if let Some(ids) = sent["txIds"].as_array() {
+                current
+                    .status
+                    .tx_ids
+                    .extend(ids.iter().filter_map(|v| v.as_str().map(str::to_owned)));
+            } else if let Some(hash) = sent["digest"].as_str() {
+                current.status.tx_ids.push(hash.into());
+            }
+            if device.kind == "sale" {
+                current.amount = sent["amountOut"]
+                    .as_str()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| venue("Sale proceeds could not be read; check your wallet"))?;
+                let reserve = if current.sale.as_ref().is_some_and(|s| s.network == "near") {
+                    NEAR_GAS_RESERVE
+                } else {
+                    SUI_GAS_RESERVE
+                };
+                current.amount = current.amount.saturating_sub(reserve);
+                if current.amount == 0 {
+                    current.status.state = "failed".into();
+                    current.status.error=Some("Your sale proceeds are in your wallet, but they do not cover the cash-out and network reserve.".into());
+                }
+                current.status.stage = "sign".into();
+                current.deposit_address.clear();
+                // Next prepares a fresh cash deposit using exactly the actual swap proceeds.
+            } else if device.kind == "buy" {
+                let got = sent["amountOut"]
+                    .as_str()
+                    .and_then(|v| v.parse::<u128>().ok())
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| venue("Received coins could not be read; check your wallet"))?;
+                current.status.stage = "settle".into();
+                current.status.state = "filled".into();
+                let tx = current.status.tx_ids.last().cloned();
+                record_fill(state, id, &current, "buy", got, current.amount, tx).await;
+            } else {
+                current.status.stage = "settle".into();
             }
         }
-        Ok(sent) if sent["ok"].as_bool() == Some(false) => {
+        result => {
             current.status.state = "failed".into();
-            current.status.error = Some("Cashout transfer did not complete".into());
-        }
-        _ => {
-            // The bridge may have sent before losing its response. Never retry the transfer.
-            current.status.error = Some("Checking your cashout transfer".into());
+            let reason = match result {
+                Err(error) => error.1,
+                Ok(sent) => {
+                    if let Some(ids) = sent["txIds"].as_array() {
+                        current
+                            .status
+                            .tx_ids
+                            .extend(ids.iter().filter_map(|v| v.as_str().map(str::to_owned)));
+                    } else if let Some(hash) = sent["digest"].as_str() {
+                        current.status.tx_ids.push(hash.into());
+                    }
+                    sent["error"]
+                        .as_str()
+                        .unwrap_or(
+                            "Received amount could not be verified; check your asset balance",
+                        )
+                        .to_string()
+                }
+            };
+            current.status.error=Some(format!("This step could not complete ({reason}). Check your asset balance; no new cash payment is needed."));
         }
     }
     state.near.save_intent(id, current.clone()).await?;
-    Ok(Json(current.status))
+    Ok(current.status)
 }
 pub(super) async fn signed(
     state: AppState,
@@ -4194,6 +4237,7 @@ pub(super) async fn signed(
     id: String,
     body: markets::Submission,
 ) -> Result<Json<markets::IntentStatus>, ApiError> {
+    let _step = step_guard(&id).await?;
     let user = app_balance::verified_wallets(&state, &headers).await?;
     let mut current = state
         .near
@@ -4205,6 +4249,11 @@ pub(super) async fn signed(
             StatusCode::FORBIDDEN,
             "intent belongs to another user".into(),
         ));
+    }
+    if current.device.is_some() && matches!(current.status.stage.as_str(), "validate" | "sign") {
+        return commit_device_step(&state, &headers, &id, current, body)
+            .await
+            .map(Json);
     }
     let recovery = state
         .near
@@ -4236,7 +4285,7 @@ pub(super) async fn signed(
         return Ok(Json(current.status));
     }
     if current.sell_sui {
-        return signed_sui_sell(&state, &headers, &id, &user, current, body).await;
+        return Err(conflict("Ask for a fresh sale quote before confirming"));
     }
     if current.from_solana {
         let main = usize::from(current.gas_request_id.is_some());
@@ -4282,23 +4331,44 @@ pub(super) async fn signed(
         state.near.save_intent(&id, current).await?;
         return Ok(Json(result));
     }
-    if current.gas_topup && !second_step {
-        if !body.sent.is_empty() || !body.signed.is_empty() {
-            return Err(bad("signed report does not match 1Click deposit plan"));
+    if current.topup.as_ref().is_some_and(|t| t.uid.is_none()) {
+        if !body.sent.is_empty() || body.signed.len() != 1 || body.signed[0].index != 0 {
+            return Err(bad("Top-up approval does not match"));
         }
-        current.status.stage = "fund".into();
-        state.near.save_intent(&id, current.clone()).await?;
-        match markets::run_base_topup(&state, &headers, &current.wallet).await {
-            Ok(uid) => current.gas_order = Some(uid),
+        let stage = current.status.stage.clone();
+        current.status.stage = "execute".into();
+        if let Some(pg) = &state.near.postgres {
+            let payload = serde_json::to_string(&current).map_err(internal)?;
+            if pg.execute("UPDATE atlas_near_intents SET payload=$3,stage='execute' WHERE intent_id=$1 AND stage=$2",
+                &[&id,&stage,&payload]).await.map_err(internal)?!=1{
+                return Ok(Json(state.near.get_intent(&id).await?.ok_or_else(||conflict("Intent changed"))?.status));
+            }
+        } else {
+            state.near.save_intent(&id, current.clone()).await?;
+        }
+        match markets::advance_base_topup(
+            &state,
+            &headers,
+            &current.wallet,
+            current.topup.clone().expect("topup"),
+            &body.signed[0].transaction,
+        )
+        .await
+        {
+            Ok(t) => {
+                current.gas_order = t.uid.clone();
+                current.status.stage = if t.uid.is_some() { "fund" } else { "sign" }.into();
+                current.topup = Some(t);
+            }
             Err(reason) => {
-                eprintln!("intent {id}: gas top-up not started: {reason}");
                 current.status.state = "failed".into();
-                current.status.error = Some(markets::GAS_NOT_READY.into());
+                current.status.error = Some(format!(
+                    "Gas could not be prepared ({reason}); no purchase payment was sent."
+                ));
             }
         }
-        let result = current.status.clone();
-        state.near.save_intent(&id, current).await?;
-        return Ok(Json(result));
+        state.near.save_intent(&id, current.clone()).await?;
+        return Ok(Json(current.status));
     }
     if !body.signed.is_empty()
         || body.sent.len() != 1
@@ -4319,6 +4389,7 @@ pub(super) async fn status(
     headers: HeaderMap,
     id: String,
 ) -> Result<Json<markets::IntentStatus>, ApiError> {
+    let _step = step_guard(&id).await?;
     let user = app_balance::verified_wallets(&state, &headers).await?;
     let mut current = state
         .near
@@ -4333,6 +4404,9 @@ pub(super) async fn status(
     }
     let mut result = current.status.clone();
     if current.sell_sui && result.state == "pending" {
+        if matches!(result.stage.as_str(), "validate" | "sign" | "execute") {
+            return Ok(Json(result));
+        }
         if current.deposit_address.is_empty() {
             if now() > current.expires && result.stage == "validate" {
                 result.state = "failed".into();
@@ -4458,7 +4532,9 @@ pub(super) async fn status(
     if result.stage != "settle" || result.state != "pending" {
         return Ok(Json(result));
     }
-    let hash = result.tx_ids[0].clone();
+    let Some(hash) = result.tx_ids.first().cloned() else {
+        return Ok(Json(result));
+    };
     match deposit_landed(&state, &current, &hash).await? {
         Ok(false) => return Ok(Json(result)),
         Err(message) => {
@@ -4475,6 +4551,14 @@ pub(super) async fn status(
             match venue_status.status.as_str() {
                 "SUCCESS" => {
                     let got = delivered(&venue_status).unwrap_or(current.minimum_out);
+                    if let Some(swap) = &mut current.then_swap {
+                        let reserve = if swap.network == "near" {
+                            NEAR_GAS_RESERVE
+                        } else {
+                            SUI_GAS_RESERVE
+                        };
+                        swap.sui_in = swap.sui_in.min(got.saturating_sub(reserve));
+                    }
                     let hashes = venue_status
                         .swap_details
                         .map(|s| {
@@ -4488,109 +4572,10 @@ pub(super) async fn status(
                         return Ok(Json(result));
                     }
                     result.tx_ids.extend(hashes);
-                    if let Some(swap) = current.then_swap.clone() {
-                        // The SUI is in the user's Sui wallet: swap it now, once (the stage moves
-                        // first, so a second poll can't start another swap).
-                        if swap.network == "near" {
-                            let claimed = if let Some(pg) = &state.near.postgres {
-                                {
-                                    let mut claimed = current.clone();
-                                    claimed.status.stage = "execute".into();
-                                    claimed.expires = now() + 180_000;
-                                    let payload =
-                                        serde_json::to_string(&claimed).map_err(internal)?;
-                                    pg.execute("UPDATE atlas_near_intents SET stage='execute',payload=$3 WHERE intent_id=$1 AND owner=$2 AND stage='settle'", &[&id,&current.owner,&payload]).await.map_err(internal)?==1
-                                }
-                            } else {
-                                let mut intents = state.near.intents.lock().map_err(internal)?;
-                                if let Some(i) = intents.get_mut(&id) {
-                                    if i.status.stage == "settle" {
-                                        i.status.stage = "execute".into();
-                                        true
-                                    } else {
-                                        false
-                                    }
-                                } else {
-                                    false
-                                }
-                            };
-                            if !claimed {
-                                return Ok(Json(
-                                    state
-                                        .near
-                                        .get_intent(&id)
-                                        .await?
-                                        .map_or(result, |i| i.status),
-                                ));
-                            }
-                        }
-                        result.stage = "execute".into();
+                    if current.then_swap.is_some() {
+                        result.stage = "sign".into();
                         current.expires = now() + 180_000;
-                        current.status = result.clone();
-                        state.near.save_intent(&id, current.clone()).await?;
-                        let swapped = if swap.network == "near" {
-                            let prepared = bridge(
-                                &state,
-                                &headers,
-                                "/near/ref/prepare",
-                                json!({"intentId":id}),
-                            )
-                            .await;
-                            current.sale_permission_used = true;
-                            match prepared {
-                                Ok(p) => {
-                                    bridge(
-                                        &state,
-                                        &headers,
-                                        "/near/ref/commit",
-                                        json!({"saleId":p["saleId"],"scope":p["scope"]}),
-                                    )
-                                    .await
-                                }
-                                Err(e) => Err(e),
-                            }
-                        } else {
-                            bridge(&state,&headers,"/sui/swap",json!({"coinType":swap.coin_type,"amount":swap.sui_in.to_string(),"reserve":SUI_GAS_RESERVE.to_string()})).await
-                        };
-                        match swapped {
-                            Ok(body) if body["ok"].as_bool() == Some(true) => {
-                                if let Some(digest) = body["digest"].as_str() {
-                                    result.tx_ids.push(digest.into());
-                                }
-                                result.stage = "settle".into();
-                                result.state = "filled".into();
-                                let bought = body["amountOut"]
-                                    .as_str()
-                                    .and_then(|v| v.parse().ok())
-                                    .unwrap_or(swap.expected_out);
-                                let tx = result.tx_ids.last().cloned();
-                                record_fill(
-                                    &state,
-                                    &id,
-                                    &current,
-                                    "buy",
-                                    bought,
-                                    current.amount,
-                                    tx,
-                                )
-                                .await;
-                            }
-                            Ok(body) => {
-                                result.state = "failed".into();
-                                result.error = Some(format!(
-                                    "Your cash arrived, but the swap to {} didn't go through ({}). The proceeds are in your wallet.",
-                                    swap.symbol,
-                                    body["error"].as_str().unwrap_or("swap failed")
-                                ));
-                            }
-                            Err((_, reason)) => {
-                                result.state = "failed".into();
-                                result.error = Some(format!(
-                                    "The swap to {} could not be verified ({reason}). Check your token and cash balances before trying again.",
-                                    swap.symbol
-                                ));
-                            }
-                        }
+                        // The coins wait in the user's wallet until their phone approves /next.
                     } else {
                         result.state = "filled".into();
                         let tx = result.tx_ids.first().cloned();
@@ -4739,8 +4724,9 @@ pub(super) async fn next(
     headers: HeaderMap,
     id: String,
 ) -> Result<Json<Value>, ApiError> {
+    let _step = step_guard(&id).await?;
     let user = app_balance::verified_wallets(&state, &headers).await?;
-    let current = state
+    let mut current = state
         .near
         .get_intent(&id)
         .await?
@@ -4751,14 +4737,253 @@ pub(super) async fn next(
             "intent belongs to another user".into(),
         ));
     }
+    if current.status.stage == "sign" {
+        if let Some(t) = current.topup.as_ref().filter(|t| t.uid.is_none()) {
+            if markets::topup_expired(t) {
+                current.topup = Some(markets::prepare_base_topup(&state, &current.wallet).await?);
+                current.expires = now() + 180000;
+                state.near.save_intent(&id, current.clone()).await?;
+            }
+            return Ok(Json(
+                json!({"transactions":markets::topup_steps(current.topup.as_ref().expect("topup"))}),
+            ));
+        }
+    }
+    if current.status.stage == "sign"
+        && current.status.state == "pending"
+        && current.then_swap.is_some()
+    {
+        if current.device.as_ref().is_none_or(|d| d.expires <= now()) {
+            prepare_buy_step(&state, &headers, &id, &mut current).await?;
+            state.near.save_intent(&id, current.clone()).await?;
+        }
+        return Ok(Json(
+            json!({"transactions":current.device.map(|d|d.transactions).unwrap_or_default()}),
+        ));
+    }
+    if current.status.stage == "sign" && current.sell_sui {
+        if current.device.as_ref().is_none_or(|d| d.expires <= now()) {
+            prepare_sell_step(&state, &headers, &id, &mut current).await?;
+            state.near.save_intent(&id, current.clone()).await?;
+        }
+        return Ok(Json(
+            json!({"transactions":current.device.map(|d|d.transactions).unwrap_or_default()}),
+        ));
+    }
     if !current.gas_topup || current.status.stage != "sign" || current.status.state != "pending" {
         return Err(conflict("nothing to sign for this intent"));
     }
     Ok(Json(json!({"transactions":[{"chain":"base","chainId":8453,
         "to":current.expected_to,"data":current.expected_data,"value":"0"}]})))
 }
+
+async fn owned_intents(state: &AppState, owner: &str) -> Result<Vec<StoredIntent>, ApiError> {
+    if let Some(pg) = &state.near.postgres {
+        pg.query(
+            "SELECT payload FROM atlas_near_intents WHERE owner=$1",
+            &[&owner],
+        )
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .map(|row| serde_json::from_str(row.get::<_, &str>(0)).map_err(internal))
+        .collect()
+    } else {
+        Ok(state
+            .near
+            .intents
+            .lock()
+            .map_err(internal)?
+            .values()
+            .filter(|i| i.owner == owner)
+            .cloned()
+            .collect())
+    }
+}
+pub(super) async fn pending_rows(
+    state: &AppState,
+    headers: &HeaderMap,
+    owner: &str,
+) -> Result<Vec<Value>, ApiError> {
+    // A closed app stopped polling. Observe deposits again so Home can offer their next phone step.
+    let mut refresh = tokio::task::JoinSet::new();
+    for intent in owned_intents(state, owner)
+        .await?
+        .into_iter()
+        .filter(|i| {
+            i.status.state == "pending" && matches!(i.status.stage.as_str(), "fund" | "settle")
+        })
+        .take(16)
+    {
+        let state = state.clone();
+        let headers = headers.clone();
+        let id = intent.status.intent_id;
+        refresh.spawn(async move {
+            let _ = tokio::time::timeout(Duration::from_secs(8), status(state, headers, id)).await;
+        });
+    }
+    while refresh.join_next().await.is_some() {}
+    let mut rows = Vec::new();
+    for intent in owned_intents(state, owner).await? {
+        let waiting = intent.status.state == "pending" && intent.status.stage == "sign";
+        let safe_failure = intent.status.state == "failed"
+            && intent.status.stage == "execute"
+            && intent.then_swap.is_some()
+            && intent.status.error.as_deref().is_some_and(nothing_sent);
+        if !waiting && !safe_failure {
+            continue;
+        }
+        if safe_failure
+            && !received_funds_available(state, headers, &intent)
+                .await
+                .unwrap_or(false)
+        {
+            continue;
+        }
+        let symbol = intent
+            .then_swap
+            .as_ref()
+            .map(|s| s.symbol.as_str())
+            .or_else(|| intent.sale.as_ref().map(|s| s.symbol.as_str()))
+            .unwrap_or("purchase");
+        rows.push(json!({"intentId":intent.status.intent_id,"assetId":intent.asset_id,"symbol":symbol,
+            "kind":if intent.sell_sui{"sell"}else{"buy"},"stage":intent.status.stage,"error":intent.status.error}));
+    }
+    Ok(rows)
+}
+async fn received_funds_available(
+    state: &AppState,
+    headers: &HeaderMap,
+    intent: &StoredIntent,
+) -> Result<bool, ApiError> {
+    let swap = intent
+        .then_swap
+        .as_ref()
+        .ok_or_else(|| conflict("Nothing received to finish"))?;
+    let owner = intent
+        .ref_wallet
+        .as_deref()
+        .or(intent.sui_wallet.as_deref())
+        .ok_or_else(|| conflict("Receiving wallet unavailable"))?;
+    if swap.network == "near" {
+        let native = near_native(state, owner).await?;
+        let wrapped = ft_balance(state, WRAP_NEAR, owner).await?;
+        return Ok(wrapped + native.saturating_sub(NEAR_GAS_RESERVE) >= swap.sui_in);
+    }
+    let balance = bridge(state, headers, "/sui/balance", json!({})).await?;
+    Ok(balance["address"].as_str() == Some(owner)
+        && balance["result"]["totalBalance"]
+            .as_str()
+            .and_then(|s| s.parse::<u128>().ok())
+            .is_some_and(|held| held.saturating_sub(SUI_GAS_RESERVE) >= swap.sui_in))
+}
+pub(super) async fn resume(
+    state: AppState,
+    headers: HeaderMap,
+    id: String,
+) -> Result<Json<Value>, ApiError> {
+    let _step = step_guard(&id).await?;
+    let user = app_balance::verified_wallets(&state, &headers).await?;
+    let mut intent = state
+        .near
+        .get_intent(&id)
+        .await?
+        .filter(|i| i.owner == user.user_id)
+        .ok_or((StatusCode::NOT_FOUND, "Purchase not found".into()))?;
+    let failed = intent.status.state == "failed"
+        && intent.status.stage == "execute"
+        && intent.status.error.as_deref().is_some_and(nothing_sent)
+        && intent.then_swap.is_some();
+    if failed {
+        if !received_funds_available(&state, &headers, &intent).await? {
+            return Err(conflict(
+                "This purchase's received funds have already been used. Check your asset balance.",
+            ));
+        }
+        intent.status.stage = "sign".into();
+        intent.status.state = "pending".into();
+        intent.status.error = None;
+        intent.device = None;
+    }
+    if intent.status.stage != "sign" || intent.status.state != "pending" {
+        return Err(conflict("This purchase is not waiting for approval"));
+    }
+    // Returning to Home is a fresh confirmation: show today's output and don't collect new cash.
+    if let Some(mut swap) = intent.then_swap.clone() {
+        let q = bridge(
+            &state,
+            &headers,
+            if swap.network == "near" {
+                "/near/ref/quote"
+            } else {
+                "/sui/quote"
+            },
+            if swap.network == "near" {
+                json!({"token":swap.coin_type,"amount":swap.sui_in.to_string()})
+            } else {
+                json!({"coinType":swap.coin_type,"amount":swap.sui_in.to_string()})
+            },
+        )
+        .await?;
+        swap.expected_out = q["amountOut"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .filter(|n| *n > 0)
+            .ok_or_else(|| venue("Fresh price unavailable"))?;
+        intent.then_swap = Some(swap);
+        intent.device = None;
+        state.near.save_intent(&id, intent.clone()).await?;
+        prepare_buy_step(&state, &headers, &id, &mut intent).await?;
+    } else if intent.sell_sui {
+        prepare_sell_step(&state, &headers, &id, &mut intent).await?;
+    } else {
+        drop(_step);
+        let next = next(state.clone(), headers.clone(), id.clone()).await?.0;
+        return Ok(Json(
+            json!({"intentId":id,"stage":"sign","kind":"buy","summary":[{"label":"Finish purchase","value":"No new purchase payment"}],
+            "transactions":next["transactions"],"expiresAtUnixMs":now()+120000}),
+        ));
+    }
+    let steps = intent
+        .device
+        .as_ref()
+        .ok_or_else(|| conflict("Preparation unavailable"))?;
+    let output = intent.then_swap.as_ref().map(|s| {
+        format!(
+            "{} {}",
+            markets::format_units(s.expected_out, s.decimals),
+            s.symbol
+        )
+    });
+    let plan = json!({"intentId":id,"stage":"sign","kind":if intent.sell_sui{"sell"}else{"buy"},
+        "summary":[{"label":"New cash payment","value":"None — use the funds already received"},{"label":"You get about","value":output.unwrap_or("Cash from your sale".into())}],
+        "transactions":steps.transactions,"expiresAtUnixMs":steps.expires});
+    state.near.save_intent(&id, intent).await?;
+    Ok(Json(plan))
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn preparing_and_reporting_the_same_intent_are_serialised() {
+        let first = super::step_guard("shared-test").await.unwrap();
+        let waiting = tokio::spawn(async { super::step_guard("shared-test").await.unwrap() });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        drop(first);
+        let guard = waiting.await.unwrap();
+        drop(guard);
+    }
+    #[test]
+    fn a_prepared_batch_becomes_one_phone_approval_for_each_exact_request() {
+        let body = serde_json::json!({"prepareId":"00000000-0000-0000-0000-000000000000","expiresAtUnixMs":123,
+            "requests":[{"body":{"params":{"bytes":"0x01"}}},{"body":{"params":{"bytes":"0x02"}}}]});
+        let step = super::prepared_step(&body, "/near/ref/commit", "buy").unwrap();
+        assert_eq!(step.transactions.len(), 2);
+        assert_eq!(step.transactions[1]["request"], body["requests"][1]);
+        assert_eq!(step.commit_path, "/near/ref/commit");
+    }
 
     #[test]
     fn only_a_failed_sui_buy_can_resume_whatever_its_error() {

@@ -80,7 +80,8 @@ test('gRPC execution counts canonical SUI credits and preserves failed outcomes'
 test('recovery requires a live quote and enforces minimum after swap slippage',()=>{
  const good={minimumOut:'970',output:'1000',expiresAtUnixMs:Date.now()+30000};
  assert.doesNotThrow(()=>checkRecoveryQuote(good));
- assert.doesNotThrow(()=>checkRecoveryQuote({...good,output:'970'}));
+ assert.doesNotThrow(()=>checkRecoveryQuote({...good,output:'980'}));
+ assert.throws(()=>checkRecoveryQuote({...good,output:'970'}),/nothing was signed/);
  assert.throws(()=>checkRecoveryQuote({...good,output:'969'}),/nothing was signed/);
  assert.throws(()=>checkRecoveryQuote({...good,expiresAtUnixMs:Date.now()-1}));
  assert.throws(()=>checkRecoveryQuote({...good,minimumOut:undefined}));
@@ -107,4 +108,13 @@ test("the request the device approves is byte for byte the one Privy's SDK sends
     input: auth.formatRequestForAuthorizationSignature(structuredClone(request))});
   assert.equal(device, headers['privy-authorization-signature']);
   assert.equal(headers['privy-request-expiry'], String(requestExpiry));
+});
+
+
+test('a sale needs its actual unsigned gas budget; the later cashout still reserves 0.02 SUI',async()=>{
+  const {checkSaleGas}=await import('./sui-swap.mjs');
+  assert.doesNotThrow(()=>checkSaleGas('1000000',18221624n));
+  assert.throws(()=>checkSaleGas('20000000',18221624n));
+  assert.throws(()=>checkSaleGas(undefined,18221624n));
+  assert.throws(()=>checkSaleGas('0',18221624n));
 });
