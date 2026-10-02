@@ -11,6 +11,11 @@ use thiserror::Error;
 
 const ORDER_URL: &str = "https://api.jup.ag/swap/v2/order";
 const EXECUTE_URL: &str = "https://api.jup.ag/swap/v2/execute";
+// Jupiter covers the fee itself for a low-SOL taker, but only above a minimum ("Minimum $5 for
+// gasless"); below it the order comes back with this code and no transaction.
+const BELOW_GASLESS_MINIMUM: i64 = 3;
+// The taker can't pay what the swap costs (its tokens, or the SOL for fees and a new token account).
+const INSUFFICIENT_FUNDS: i64 = 1;
 
 #[derive(Clone)]
 pub struct JupiterClient {
@@ -92,9 +97,28 @@ impl JupiterClient {
     }
 
     /// Without a taker this returns a real quote but no signable transaction.
-    /// A fresh order with the Privy wallet address must be fetched at confirm.
+    /// A fresh order with the Privy wallet address must be fetched at confirm. A swap too small for
+    /// Jupiter to pay its fee is asked for again with the taker paying from their own SOL.
     pub async fn order(&self, request: &JupiterOrderRequest) -> Result<JupiterOrder, JupiterError> {
         validate_order(request)?;
+        let order = self.fetch_order(request, None).await?;
+        let order = match (&request.taker, own_gas_needed(&order)) {
+            (Some(taker), true) => self.fetch_order(request, Some(taker)).await?,
+            _ => order,
+        };
+        if request.taker.is_some() && order.transaction.as_deref().unwrap_or("").is_empty() {
+            return Err(JupiterError::NotExecutable(not_executable_reason(&order)));
+        }
+        Ok(order)
+    }
+
+    // One /order call; `payer` names who pays the network fee (the taker, to keep Jupiter from
+    // offering to pay it on a swap below its minimum).
+    async fn fetch_order(
+        &self,
+        request: &JupiterOrderRequest,
+        payer: Option<&str>,
+    ) -> Result<JupiterOrder, JupiterError> {
         let mut url = Url::parse(ORDER_URL)?;
         {
             let mut query = url.query_pairs_mut();
@@ -103,6 +127,9 @@ impl JupiterClient {
             query.append_pair("amount", &request.amount_base_units.to_string());
             if let Some(taker) = &request.taker {
                 query.append_pair("taker", taker);
+            }
+            if let Some(payer) = payer {
+                query.append_pair("payer", payer);
             }
         }
         let mut call = self.http.get(url);
@@ -113,15 +140,7 @@ impl JupiterClient {
         if !response.status().is_success() {
             return Err(JupiterError::Rejected(response.status()));
         }
-        let order: JupiterOrder = response.json().await?;
-        if request.taker.is_some() && order.transaction.as_deref().unwrap_or("").is_empty() {
-            return Err(JupiterError::NotExecutable(
-                order
-                    .error_message
-                    .unwrap_or_else(|| format!("code {:?}", order.error_code)),
-            ));
-        }
-        Ok(order)
+        Ok(response.json().await?)
     }
 
     /// The app signs the order with Privy; Jupiter lands the signed transaction.
@@ -152,6 +171,26 @@ impl JupiterClient {
             return Err(JupiterError::ExecutionFailed(result.code));
         }
         Ok(result)
+    }
+}
+
+// Jupiter offered to pay the fee but the swap is below its minimum for that.
+fn own_gas_needed(order: &JupiterOrder) -> bool {
+    order.error_code == Some(BELOW_GASLESS_MINIMUM)
+        && order.transaction.as_deref().unwrap_or("").is_empty()
+}
+
+// What the user reads when Jupiter can't make the swap.
+fn not_executable_reason(order: &JupiterOrder) -> String {
+    match order.error_code {
+        Some(INSUFFICIENT_FUNDS) => {
+            "There isn't enough in this wallet for the swap and its network fee (paid in SOL)"
+                .into()
+        }
+        _ => order
+            .error_message
+            .clone()
+            .unwrap_or_else(|| format!("code {:?}", order.error_code)),
     }
 }
 
@@ -203,6 +242,32 @@ mod tests {
             validate_order(&invalid),
             Err(JupiterError::InvalidRequest)
         ));
+    }
+
+    #[test]
+    fn a_swap_below_the_gasless_minimum_is_asked_for_again_with_the_taker_paying() {
+        // Shape from Jupiter's /order for a ₦500 (about $0.34) buy by a low-SOL taker, 2026-10-02.
+        let refused: JupiterOrder = serde_json::from_value(serde_json::json!({
+            "inputMint":"a","outputMint":"b","inAmount":"340000","outAmount":"1","requestId":"r",
+            "router":"metis","transaction":null,"gasless":true,"errorCode":3,
+            "errorMessage":"Minimum $5 for gasless"
+        }))
+        .unwrap();
+        assert!(own_gas_needed(&refused));
+        // With the taker as payer Jupiter routes normally and the taker's SOL pays.
+        let own: JupiterOrder = serde_json::from_value(serde_json::json!({
+            "inputMint":"a","outputMint":"b","inAmount":"340000","outAmount":"1","requestId":"r",
+            "router":"okx","transaction":"tx","gasless":false
+        }))
+        .unwrap();
+        assert!(!own_gas_needed(&own));
+        let broke: JupiterOrder = serde_json::from_value(serde_json::json!({
+            "inputMint":"a","outputMint":"b","inAmount":"1","outAmount":"1","requestId":"r",
+            "router":"okx","transaction":null,"errorCode":1,"errorMessage":"Insufficient funds"
+        }))
+        .unwrap();
+        assert!(!own_gas_needed(&broke));
+        assert!(not_executable_reason(&broke).contains("network fee"));
     }
 
     #[test]
