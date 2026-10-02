@@ -69,6 +69,10 @@ pub enum SolanaPreflightError {
     InvalidResponse,
     #[error("Solana RPC rejected the request: {0}")]
     Rpc(String),
+    #[error("This swap could not be prepared: {0}")]
+    SwapSimulation(String),
+    #[error("Not enough gas to cover this swap and its account rent")]
+    InsufficientGas,
     #[error("relayer keypair could not be loaded")]
     RelayerKey,
     #[error("relayer has insufficient SOL for ATA rent and transaction fee")]
@@ -93,6 +97,12 @@ impl SolanaAtaPreflight {
             network,
             relayer_keypair_path: relayer_keypair_path.into(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_http(mut self, http: Client) -> Self {
+        self.http = http;
+        self
     }
 
     pub async fn owner_usdc_balance(
@@ -520,6 +530,61 @@ impl SolanaAtaPreflight {
         Ok(STANDARD.encode(bytes))
     }
 
+    /// Simulate the exact user-paid transaction, including fees, wrapping SOL and account rent.
+    /// No signature or submission happens here. Token/liquidity errors stay distinct from gas.
+    pub async fn preflight_swap(&self, transaction: &str) -> Result<u32, SolanaPreflightError> {
+        let simulated = self
+            .rpc(
+                "simulateTransaction",
+                json!([transaction, {
+                    "encoding":"base64", "sigVerify":false, "replaceRecentBlockhash":true,
+                    "commitment":"confirmed"
+                }]),
+            )
+            .await?;
+        let value = &simulated["value"];
+        if !value["err"].is_null() {
+            if simulation_short_of_gas(value) {
+                return Err(SolanaPreflightError::InsufficientGas);
+            }
+            return Err(SolanaPreflightError::SwapSimulation(
+                value["err"].to_string(),
+            ));
+        }
+        value["unitsConsumed"]
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or(SolanaPreflightError::InvalidResponse)
+    }
+
+    pub async fn block_height(&self) -> Result<u64, SolanaPreflightError> {
+        self.rpc("getBlockHeight", json!([{"commitment":"finalized"}]))
+            .await?
+            .as_u64()
+            .ok_or(SolanaPreflightError::InvalidResponse)
+    }
+
+    /// Actual wallet changes from the confirmed swap; rent and fees are excluded from SOL output.
+    pub async fn swap_amounts(
+        &self,
+        signature: &str,
+        wallet: &str,
+        input: &str,
+        output: &str,
+    ) -> Result<Option<(u128, u128)>, SolanaPreflightError> {
+        let tx = self
+            .rpc(
+                "getTransaction",
+                json!([signature, {"encoding":"jsonParsed",
+            "commitment":"confirmed", "maxSupportedTransactionVersion":0}]),
+            )
+            .await?;
+        if tx.is_null() {
+            return Ok(None);
+        }
+        swap_amounts(&tx, wallet, input, output).map(Some)
+    }
+
     /// None while a signature hasn't landed; Some(Ok) once confirmed, Some(Err) if it failed.
     pub async fn signature_status(
         &self,
@@ -593,6 +658,113 @@ impl SolanaAtaPreflight {
     }
 }
 
+fn simulation_short_of_gas(value: &Value) -> bool {
+    if matches!(value["err"].as_str(), Some("InsufficientFundsForFee"))
+        || value["err"].get("InsufficientFundsForRent").is_some()
+    {
+        return true;
+    }
+    // A token-program "insufficient funds" is the asset balance, not gas. Only the system
+    // program's explicit lamport shortage qualifies for the gasless fallback.
+    value["logs"].as_array().is_some_and(|logs| {
+        logs.iter()
+            .filter_map(Value::as_str)
+            .any(|line| line.contains("insufficient lamports"))
+    })
+}
+
+/// Reject a changed message, another fee payer or a bad signature before broadcasting anything.
+pub fn checked_swap_signature(
+    unsigned: &str,
+    signed: &str,
+    wallet: &str,
+) -> Result<String, SolanaPreflightError> {
+    use solana_sdk::transaction::VersionedTransaction;
+    let invalid = || SolanaPreflightError::InvalidResponse;
+    let decode = |s: &str| -> Result<VersionedTransaction, SolanaPreflightError> {
+        bincode::deserialize(&STANDARD.decode(s).map_err(|_| invalid())?).map_err(|_| invalid())
+    };
+    let planned = decode(unsigned)?;
+    let tx = decode(signed)?;
+    let owner = Pubkey::from_str(wallet).map_err(|_| invalid())?;
+    if planned.message != tx.message
+        || tx.signatures.len() != 1
+        || tx.message.header().num_required_signatures != 1
+        || tx.message.static_account_keys().first() != Some(&owner)
+        || !tx.signatures[0].verify(owner.as_ref(), &tx.message.serialize())
+    {
+        return Err(invalid());
+    }
+    Ok(tx.signatures[0].to_string())
+}
+
+fn swap_amounts(
+    tx: &Value,
+    wallet: &str,
+    input: &str,
+    output: &str,
+) -> Result<(u128, u128), SolanaPreflightError> {
+    use std::collections::{HashMap, HashSet};
+    let invalid = || SolanaPreflightError::InvalidResponse;
+    let meta = &tx["meta"];
+    if !meta["err"].is_null() {
+        return Err(invalid());
+    }
+    let mut delta: HashMap<String, i128> = HashMap::new();
+    let mut owned_accounts = HashSet::new();
+    for (field, sign) in [("preTokenBalances", -1_i128), ("postTokenBalances", 1)] {
+        for balance in meta[field].as_array().ok_or_else(invalid)? {
+            if balance["owner"].as_str() != Some(wallet) {
+                continue;
+            }
+            let mint = balance["mint"].as_str().ok_or_else(invalid)?;
+            let amount: i128 = balance["uiTokenAmount"]["amount"]
+                .as_str()
+                .ok_or_else(invalid)?
+                .parse()
+                .map_err(|_| invalid())?;
+            *delta.entry(mint.into()).or_default() += sign * amount;
+            owned_accounts.insert(balance["accountIndex"].as_u64().ok_or_else(invalid)? as usize);
+        }
+    }
+    let keys = tx["transaction"]["message"]["accountKeys"]
+        .as_array()
+        .ok_or_else(invalid)?;
+    let owner = keys
+        .iter()
+        .position(|k| k.as_str().or_else(|| k["pubkey"].as_str()) == Some(wallet))
+        .ok_or_else(invalid)?;
+    let lamports = |field: &str, i: usize| -> Result<i128, SolanaPreflightError> {
+        meta[field][i].as_u64().map(i128::from).ok_or_else(invalid)
+    };
+    let mut native = lamports("postBalances", owner)? - lamports("preBalances", owner)?;
+    // The builder pins the wallet as fee payer. Adding its fee and changes in ATA rent
+    // gives the principal SOL change, including wrap/unwrap instructions.
+    if owner != 0 {
+        return Err(invalid());
+    }
+    native += meta["fee"].as_u64().map(i128::from).ok_or_else(invalid)?;
+    for i in owned_accounts {
+        native += lamports("postBalances", i)? - lamports("preBalances", i)?;
+    }
+    delta.insert(spl_token::native_mint::id().to_string(), native);
+    let paid = delta
+        .get(input)
+        .copied()
+        .ok_or_else(invalid)?
+        .checked_neg()
+        .and_then(|n| u128::try_from(n).ok())
+        .filter(|n| *n > 0)
+        .ok_or_else(invalid)?;
+    let got = delta
+        .get(output)
+        .copied()
+        .and_then(|n| u128::try_from(n).ok())
+        .filter(|n| *n > 0)
+        .ok_or_else(invalid)?;
+    Ok((paid, got))
+}
+
 fn verify_token_account(
     account: &Value,
     owner: &Pubkey,
@@ -618,6 +790,90 @@ fn verify_token_account(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gas_shortage_is_distinct_from_not_enough_tokens() {
+        assert!(simulation_short_of_gas(
+            &json!({"err":"InsufficientFundsForFee"})
+        ));
+        assert!(simulation_short_of_gas(
+            &json!({"err":{"InsufficientFundsForRent":{"account_index":2}}})
+        ));
+        assert!(simulation_short_of_gas(
+            &json!({"err":{"InstructionError":[0,{"Custom":1}]},
+            "logs":["Transfer: insufficient lamports 3000, need 2039280"]})
+        ));
+        assert!(!simulation_short_of_gas(
+            &json!({"err":{"InstructionError":[0,{"Custom":1}]},
+            "logs":["Program log: Error: insufficient funds"]})
+        ));
+    }
+
+    #[test]
+    fn signed_swap_cannot_change_the_plan_or_payer() {
+        use solana_sdk::{
+            message::{Message, VersionedMessage},
+            signature::Keypair,
+            transaction::VersionedTransaction,
+        };
+        let wallet = Keypair::new();
+        let other = Keypair::new();
+        let message = VersionedMessage::Legacy(Message::new(&[], Some(&wallet.pubkey())));
+        let planned = VersionedTransaction {
+            signatures: vec![Default::default()],
+            message: message.clone(),
+        };
+        let signed = VersionedTransaction::try_new(message, &[&wallet]).unwrap();
+        let encoded = |tx: &VersionedTransaction| STANDARD.encode(bincode::serialize(tx).unwrap());
+        assert!(checked_swap_signature(
+            &encoded(&planned),
+            &encoded(&signed),
+            &wallet.pubkey().to_string()
+        )
+        .is_ok());
+        assert!(checked_swap_signature(
+            &encoded(&planned),
+            &encoded(&planned),
+            &wallet.pubkey().to_string()
+        )
+        .is_err());
+        assert!(checked_swap_signature(
+            &encoded(&planned),
+            &encoded(&signed),
+            &other.pubkey().to_string()
+        )
+        .is_err());
+        let mut changed = signed;
+        changed.message.set_recent_blockhash(Hash::new_unique());
+        assert!(checked_swap_signature(
+            &encoded(&planned),
+            &encoded(&changed),
+            &wallet.pubkey().to_string()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn confirmed_swap_uses_actual_token_amounts_and_excludes_sol_rent_and_fees() {
+        let wallet = "owner";
+        let native = spl_token::native_mint::id().to_string();
+        let mut tx = json!({"transaction":{"message":{"accountKeys":[{"pubkey":wallet},{"pubkey":"cash"},{"pubkey":"token"}]}},
+            "meta":{"err":null,"fee":5000,"preBalances":[10_000_000,2_039_280,0], "postBalances":[11_955_720,2_039_280,2_039_280],
+            "preTokenBalances":[{"owner":wallet,"mint":"USDC","accountIndex":1,"uiTokenAmount":{"amount":"1000000"}}],
+            "postTokenBalances":[{"owner":wallet,"mint":"USDC","accountIndex":1,"uiTokenAmount":{"amount":"500000"}},
+                {"owner":wallet,"mint":"OTHER","accountIndex":2,"uiTokenAmount":{"amount":"1"}}]}});
+        assert_eq!(
+            swap_amounts(&tx, wallet, "USDC", &native).unwrap(),
+            (500_000, 4_000_000)
+        );
+        tx["meta"]["postBalances"][0] = json!(7_951_720);
+        tx["meta"]["postTokenBalances"][0]["uiTokenAmount"]["amount"] = json!("1400000");
+        assert_eq!(
+            swap_amounts(&tx, wallet, &native, "USDC").unwrap(),
+            (4_000, 400_000)
+        );
+        tx["meta"]["err"] = json!("failed");
+        assert!(swap_amounts(&tx, wallet, &native, "USDC").is_err());
+    }
     use super::*;
     // A friend send on Solana: a mainnet USDC transfer builds, and says whether it opens an account.
     #[tokio::test]

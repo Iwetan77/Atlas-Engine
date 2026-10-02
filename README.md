@@ -36,7 +36,13 @@ network loses money.
    - Solana → Base through **Layerswap** (with ETH for gas on the way when the wallet has none);
    - perps margin into **Hyperliquid** through Relay (gasless from Base, or one Solana transaction).
 6. **Gas is never Atlas's.** The user pays from their own USDC, and Privy sponsorship is never used:
-   - Solana: Jupiter pays on gasless swaps, otherwise a gasless $0.50 USDC → SOL top-up goes first.
+   - Solana swaps read the wallet's SOL first. With enough for fees and account rent, Jupiter V2
+     `/build` makes a user-paid swap and the engine simulates it before confirmation; this path has
+     no gasless order minimum. Only a wallet that cannot cover those costs tries Jupiter's gasless
+     `/order`. If that route is below its minimum, the swap is refused before sending it. Transfers
+     can still include a gasless $0.50 USDC → SOL top-up when needed.
+     Both swap routes use the same app plan (`submit: "engine"`); user-paid swaps settle from their
+     on-chain signature and actual balance changes. The signature is saved before submission.
    - Base: USDC leaving Base needs no ETH (one signed authorization; the venue's relayer pays). A wallet with
      no ETH first fills its tank with a gasless **CoW** order ($0.50 USDC → ETH, ~$0.004). With neither, the
      user is asked to add about $0.50.

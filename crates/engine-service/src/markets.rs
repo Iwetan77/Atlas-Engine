@@ -1,7 +1,7 @@
 use super::*;
 use axum::extract::Query;
 use engine_execution::swaps::{
-    jupiter::{JupiterClient, JupiterOrderRequest},
+    jupiter::{JupiterClient, JupiterOrderRequest, UserPaidSwap},
     kyberswap::{KyberClient, KyberRoute, KYBER_ROUTER},
     oneinch::BaseSwapRequest,
     uniswap::{BaseV3Quote, UniswapV3Client, BASE_USDC, BASE_WETH, SWAP_ROUTER_02},
@@ -849,6 +849,8 @@ struct StoredIntent {
     chain: String,
     expected: Vec<(String, String)>,
     request_id: Option<String>,
+    #[serde(default)]
+    own_swap: Option<UserPaidSwap>,
     status: IntentStatus,
     // Set for spot buys and sells, so the fill can be kept as a trade.
     trade: Option<PlannedTrade>,
@@ -1081,15 +1083,25 @@ impl MarketState {
         intent: &StoredIntent,
         from: &str,
     ) -> Result<bool, ApiError> {
+        self.claim_execution_to(id, intent, from, "execute").await
+    }
+
+    async fn claim_execution_to(
+        &self,
+        id: &str,
+        intent: &StoredIntent,
+        from: &str,
+        to: &str,
+    ) -> Result<bool, ApiError> {
         let mut claimed = intent.clone();
-        claimed.status.stage = "execute".into();
+        claimed.status.stage = to.into();
         if let Some(pg) = &self.postgres {
             let payload = serde_json::to_string(&claimed).map_err(internal)?;
             let rows = pg
                 .execute(
-                    "UPDATE atlas_intents SET payload=$2,stage='execute',updated_at_ms=$3
+                    "UPDATE atlas_intents SET payload=$2,stage=$5,updated_at_ms=$3
                      WHERE intent_id=$1 AND stage=$4",
-                    &[&id, &payload, &now_i64(), &from],
+                    &[&id, &payload, &now_i64(), &from, &to],
                 )
                 .await
                 .map_err(internal)?;
@@ -1098,7 +1110,7 @@ impl MarketState {
         let mut intents = self.intents.lock().map_err(internal)?;
         match intents.get_mut(id) {
             Some(stored) if stored.status.stage == from => {
-                stored.status.stage = "execute".into();
+                *stored = claimed;
                 Ok(true)
             }
             _ => Ok(false),
@@ -1134,6 +1146,7 @@ impl MarketState {
                     .map(|(to, data)| (to.to_ascii_lowercase(), data.to_ascii_lowercase()))
                     .collect(),
                 request_id: None,
+                own_swap: None,
                 status,
                 trade: None,
                 funding: None,
@@ -2503,6 +2516,19 @@ async fn run_gas_topup(state: &AppState, intent: &StoredIntent, signed: &[Signed
     }
 }
 
+fn swap_error(error: engine_execution::swaps::jupiter::JupiterError) -> ApiError {
+    if matches!(
+        error,
+        engine_execution::swaps::jupiter::JupiterError::Preflight(
+            engine_execution::solana::SolanaPreflightError::InsufficientGas
+        )
+    ) {
+        return (StatusCode::CONFLICT,
+            "There isn't enough gas for this swap. Add a little SOL for network fees, then try again. This swap hasn't been sent.".into());
+    }
+    unavailable(error)
+}
+
 // One Jupiter swap the user signs (Earn moving USDC in or out of Jupiter Lend), settled through the
 // same /signed path as a Solana trade, with a gas top-up first when it needs one. Returns the
 // intent, the transactions to sign and what Jupiter expects to deliver.
@@ -2514,24 +2540,27 @@ pub(super) async fn plan_jupiter_swap(
     output_mint: &str,
     amount: u128,
 ) -> Result<(String, Vec<Value>, u128), ApiError> {
-    let order = state
+    let (order, own_swap) = state
         .markets
         .jupiter
-        .order(&JupiterOrderRequest {
-            input_mint: input_mint.into(),
-            output_mint: output_mint.into(),
-            amount_base_units: amount.try_into().map_err(|_| bad("amount too large"))?,
-            taker: Some(wallet.clone()),
-        })
+        .order_for_wallet(
+            &JupiterOrderRequest {
+                input_mint: input_mint.into(),
+                output_mint: output_mint.into(),
+                amount_base_units: amount.try_into().map_err(|_| bad("amount too large"))?,
+                taker: Some(wallet.clone()),
+            },
+            &state.solana_mainnet,
+        )
         .await
-        .map_err(unavailable)?;
+        .map_err(swap_error)?;
     let out: u128 = order.out_amount.parse().map_err(unavailable)?;
     let main_tx = order.transaction.ok_or((
         StatusCode::BAD_GATEWAY,
         "Jupiter returned no signable transaction".into(),
     ))?;
     let spends = if input_mint == SOL_USDC { amount } else { 0 };
-    let gas = if order.gasless {
+    let gas = if order.gasless || own_swap.is_some() {
         None
     } else {
         gas_topup(state, &wallet, spends).await
@@ -2547,6 +2576,7 @@ pub(super) async fn plan_jupiter_swap(
                 chain: "solana".into(),
                 expected: Vec::new(),
                 request_id: Some(order.request_id),
+                own_swap,
                 status: IntentStatus {
                     intent_id: intent_id.clone(),
                     stage: "validate".into(),
@@ -2592,6 +2622,7 @@ pub(super) async fn plan_solana_transfer(
                 chain: "solana".into(),
                 expected: Vec::new(),
                 request_id: None,
+                own_swap: None,
                 status: IntentStatus {
                     intent_id: intent_id.clone(),
                     stage: "validate".into(),
@@ -3061,6 +3092,7 @@ pub(super) async fn plan_base_with_cash(
                     .map(|(to, data)| (to.to_ascii_lowercase(), data.to_ascii_lowercase()))
                     .collect(),
                 request_id: None,
+                own_swap: None,
                 status: IntentStatus {
                     intent_id: intent_id.clone(),
                     stage: "validate".into(),
@@ -3128,6 +3160,7 @@ pub(super) async fn plan_solana_swap_with_base_cash(
                     .map(|(to, data)| (to.to_ascii_lowercase(), data.to_ascii_lowercase()))
                     .collect(),
                 request_id: None,
+                own_swap: None,
                 status: IntentStatus {
                     intent_id: intent_id.clone(),
                     stage: "validate".into(),
@@ -3245,6 +3278,7 @@ async fn execute_quote_inner(
     let mut transactions = Vec::new();
     let mut expected = Vec::new();
     let mut request_id = None;
+    let mut own_swap = None;
     let mut funding = None;
     let mut gas_request_id = None;
     let mut base_topup = None;
@@ -3392,30 +3426,33 @@ async fn execute_quote_inner(
         funding = Some(cash);
         output = stored.output_units;
     } else {
-        let order = state
+        let (order, prepared) = state
             .markets
             .jupiter
-            .order(&JupiterOrderRequest {
-                input_mint: if stored.side == "buy" {
-                    SOL_USDC
-                } else {
-                    &a.token
-                }
-                .into(),
-                output_mint: if stored.side == "buy" {
-                    &a.token
-                } else {
-                    SOL_USDC
-                }
-                .into(),
-                amount_base_units: stored
-                    .input_units
-                    .try_into()
-                    .map_err(|_| bad("amount too large"))?,
-                taker: Some(wallet.clone()),
-            })
+            .order_for_wallet(
+                &JupiterOrderRequest {
+                    input_mint: if stored.side == "buy" {
+                        SOL_USDC
+                    } else {
+                        &a.token
+                    }
+                    .into(),
+                    output_mint: if stored.side == "buy" {
+                        &a.token
+                    } else {
+                        SOL_USDC
+                    }
+                    .into(),
+                    amount_base_units: stored
+                        .input_units
+                        .try_into()
+                        .map_err(|_| bad("amount too large"))?,
+                    taker: Some(wallet.clone()),
+                },
+                &state.solana_mainnet,
+            )
             .await
-            .map_err(unavailable)?;
+            .map_err(swap_error)?;
         output = order.out_amount.parse().map_err(unavailable)?;
         if output < stored.output_units.saturating_mul(99) / 100 {
             return Err((
@@ -3428,7 +3465,7 @@ async fn execute_quote_inner(
             "Jupiter returned no signable transaction".into(),
         ))?;
         // Jupiter pays the gas on many swaps; otherwise a low wallet gets its tank topped up first.
-        if !order.gasless {
+        if !order.gasless && prepared.is_none() {
             let spends = if stored.side == "buy" {
                 stored.input_units
             } else {
@@ -3440,7 +3477,8 @@ async fn execute_quote_inner(
             }
         }
         transactions.push(json!({"chain":"solana","transaction":main_tx,"submit":"engine"}));
-        request_id = Some(order.request_id);
+        request_id = (!order.request_id.is_empty()).then_some(order.request_id);
+        own_swap = prepared;
     }
     let expires = now()
         + if a.chain == "base" || funding.is_some() {
@@ -3484,6 +3522,7 @@ async fn execute_quote_inner(
                 chain: a.chain.clone(),
                 expected,
                 request_id,
+                own_swap,
                 status,
                 trade: Some(PlannedTrade {
                     asset_id: a.id.clone(),
@@ -3722,6 +3761,38 @@ pub(super) async fn signed(
         {
             return Err(bad("signed report does not match Jupiter execution plan"));
         }
+        if let Some(swap) = &current.own_swap {
+            let signature = engine_execution::solana::checked_swap_signature(
+                &swap.transaction,
+                &body.signed[main].transaction,
+                &current.wallet,
+            )
+            .map_err(|_| bad("signed transaction does not match your swap"))?;
+            let from = current.status.stage.clone();
+            let mut updated = current;
+            updated.status.tx_ids = vec![signature];
+            updated.status.stage = "settle".into();
+            // Atomically save both the claim and the signature before broadcasting. Even a
+            // crash after submission can be recovered by polling, without a second purchase.
+            if !state
+                .markets
+                .claim_execution_to(&intent_id, &updated, &from, "settle")
+                .await?
+            {
+                let latest = state.markets.get_intent(&intent_id).await?;
+                return Ok(Json(latest.map_or(updated.status, |i| i.status)));
+            }
+            // A transport error may mean it was sent. Keep polling the known signature;
+            // never replace this transaction or call the purchase failed while it can land.
+            if let Err(error) = state
+                .solana_mainnet
+                .send_signed(&body.signed[main].transaction)
+                .await
+            {
+                eprintln!("swap {intent_id}: submission unresolved: {error}");
+            }
+            return Ok(Json(updated.status));
+        }
         // A plain USDC transfer: the engine lands it and status follows its signature.
         if current.solana_transfer {
             if !state
@@ -3877,6 +3948,70 @@ pub(super) async fn intent_status(
         updated.status.error = error;
         state.markets.save_intent(&intent_id, &updated).await?;
         return Ok(Json(updated.status));
+    }
+    if let Some(swap) = &current.own_swap {
+        if current.status.state == "pending" && current.status.stage == "settle" {
+            let Some(signature) = current.status.tx_ids.first() else {
+                return Ok(Json(current.status));
+            };
+            let landed = state
+                .solana_mainnet
+                .signature_status(signature)
+                .await
+                .map_err(unavailable)?;
+            let mut status = current.status.clone();
+            match landed {
+                Some(Ok(())) => {
+                    let Some((paid, got)) = state
+                        .solana_mainnet
+                        .swap_amounts(
+                            signature,
+                            &current.wallet,
+                            &swap.input_mint,
+                            &swap.output_mint,
+                        )
+                        .await
+                        .map_err(unavailable)?
+                    else {
+                        return Ok(Json(status));
+                    };
+                    status.state = "filled".into();
+                    keep_trade(
+                        &state.trades,
+                        &intent_id,
+                        &current,
+                        &status,
+                        Some(paid),
+                        Some(got),
+                    )
+                    .await;
+                }
+                Some(Err(_)) => {
+                    status.state = "failed".into();
+                    status.error = Some("The swap didn't go through. Your tokens are still in your wallet; only the network fee may have been spent.".into());
+                }
+                None => {
+                    if state
+                        .solana_mainnet
+                        .block_height()
+                        .await
+                        .map_err(unavailable)?
+                        <= swap.last_valid_block_height
+                    {
+                        return Ok(Json(status));
+                    }
+                    status.state = "failed".into();
+                    status.error = Some(
+                        "The swap expired without landing. Your tokens are still in your wallet."
+                            .into(),
+                    );
+                }
+            }
+            let mut updated = current;
+            updated.status = status;
+            state.markets.save_intent(&intent_id, &updated).await?;
+            return Ok(Json(updated.status));
+        }
     }
     if current.solana_transfer
         && current.status.state == "pending"
@@ -4036,17 +4171,20 @@ pub(super) async fn next_transactions(
             "the cash hasn't reached Solana yet".into(),
         ));
     }
-    let order = state
+    let (order, own_swap) = state
         .markets
         .jupiter
-        .order(&JupiterOrderRequest {
-            input_mint: SOL_USDC.into(),
-            output_mint,
-            amount_base_units: amount.try_into().map_err(|_| bad("amount too large"))?,
-            taker: Some(intent.wallet.clone()),
-        })
+        .order_for_wallet(
+            &JupiterOrderRequest {
+                input_mint: SOL_USDC.into(),
+                output_mint,
+                amount_base_units: amount.try_into().map_err(|_| bad("amount too large"))?,
+                taker: Some(intent.wallet.clone()),
+            },
+            &state.solana_mainnet,
+        )
         .await
-        .map_err(unavailable)?;
+        .map_err(swap_error)?;
     let out: u128 = order.out_amount.parse().map_err(unavailable)?;
     // Prices move while cash crosses over; more than 5% worse than the quote isn't what they agreed to.
     let expected = mul_div_units(plan.get_units, amount, plan.pay_units);
@@ -4066,12 +4204,13 @@ pub(super) async fn next_transactions(
         StatusCode::BAD_GATEWAY,
         "Jupiter returned no signable transaction".into(),
     ))?;
-    let gas = if order.gasless {
+    let gas = if order.gasless || own_swap.is_some() {
         None
     } else {
         gas_topup(&state, &intent.wallet, amount).await
     };
-    intent.request_id = Some(order.request_id);
+    intent.request_id = (!order.request_id.is_empty()).then_some(order.request_id);
+    intent.own_swap = own_swap;
     intent.gas_request_id = gas.as_ref().map(|(id, _)| id.clone());
     if let Some(trade) = intent.trade.as_mut() {
         trade.pay_units = amount;
@@ -4258,6 +4397,7 @@ mod tests {
             chain: "solana".into(),
             expected: Vec::new(),
             request_id: None,
+            own_swap: None,
             status: IntentStatus {
                 intent_id: format!("intent-{side}"),
                 stage: "settle".into(),
@@ -4295,6 +4435,35 @@ mod tests {
         assert_eq!(back.expected, intent.expected);
         assert_eq!(back.request_id.as_deref(), Some("jup-req"));
         assert_eq!(back.status.tx_ids, vec!["sig".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn user_paid_swap_saves_its_signature_with_the_send_once_claim() {
+        let markets = MarketState::new().unwrap();
+        let mut intent = spot_intent("buy", 500_000, 4_000_000);
+        intent.status.stage = "validate".into();
+        intent.status.state = "pending".into();
+        markets.insert_intent("own-swap", &intent).await.unwrap();
+        let mut submitted = intent.clone();
+        submitted.status.stage = "settle".into();
+        submitted.status.tx_ids = vec!["known-before-send".into()];
+        assert!(markets
+            .claim_execution_to("own-swap", &submitted, "validate", "settle")
+            .await
+            .unwrap());
+        assert!(!markets
+            .claim_execution_to("own-swap", &submitted, "validate", "settle")
+            .await
+            .unwrap());
+        let stored = markets.get_intent("own-swap").await.unwrap().unwrap();
+        assert_eq!(stored.status.stage, "settle");
+        assert_eq!(stored.status.tx_ids, vec!["known-before-send"]);
+        let mut older = serde_json::to_value(&intent).unwrap();
+        older.as_object_mut().unwrap().remove("own_swap");
+        assert!(serde_json::from_value::<StoredIntent>(older)
+            .unwrap()
+            .own_swap
+            .is_none());
     }
 
     #[tokio::test]
