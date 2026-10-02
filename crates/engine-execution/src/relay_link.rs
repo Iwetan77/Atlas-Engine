@@ -15,8 +15,12 @@ const API: &str = "https://api.relay.link/";
 const BASE_CHAIN_ID: u64 = 8453;
 pub const ARC_CHAIN_ID: u64 = 5042;
 pub const ARC_USDC: &str = "0x3600000000000000000000000000000000000000";
-const ARC_DEPOSITORY: &str = "0x4cd00e387622c35bddb9b4c962c136462338bc31";
+// Relay's depository: the same address on Arc, Base and Monad.
+const DEPOSITORY: &str = "0x4cd00e387622c35bddb9b4c962c136462338bc31";
 const SOLANA_CHAIN_ID: u64 = 792703809;
+pub const MONAD_CHAIN_ID: u64 = 143;
+// `depositNative(address depositor, bytes32 id)` on the depository.
+const DEPOSIT_NATIVE: &str = "0x49290c1c";
 // Hyperliquid's chain id on Relay, and its USDC (8 decimals there; 6 on Base and Solana).
 const HYPERLIQUID_CHAIN_ID: u64 = 1337;
 const HYPERLIQUID_USDC: &str = "0x00000000000000000000000000000000";
@@ -88,6 +92,52 @@ fn base_dest(wallet: &str) -> Dest<'_> {
     }
 }
 
+fn monad_dest(wallet: &str) -> Dest<'_> {
+    Dest {
+        chain: MONAD_CHAIN_ID,
+        currency: NATIVE,
+        recipient: wallet,
+        scale: 1,
+    }
+}
+
+/// Where a MON swap starts: the user's wallet, its chain and what leaves it.
+#[derive(Clone, Copy)]
+struct Origin<'a> {
+    chain: u64,
+    currency: &'a str,
+    wallet: &'a str,
+}
+
+fn monad_origin(wallet: &str) -> Origin<'_> {
+    Origin {
+        chain: MONAD_CHAIN_ID,
+        currency: NATIVE,
+        wallet,
+    }
+}
+
+// Relay's names for chains inside an order.
+fn chain_name(chain: u64) -> &'static str {
+    match chain {
+        SOLANA_CHAIN_ID => "solana",
+        BASE_CHAIN_ID => "base",
+        MONAD_CHAIN_ID => "monad",
+        _ => "",
+    }
+}
+
+// The same address: exactly on Solana (base58), any case on EVM chains.
+fn same(chain: u64, a: &Value, b: &str) -> bool {
+    let a = a.as_str().unwrap_or_default();
+    !a.is_empty()
+        && if chain == SOLANA_CHAIN_ID {
+            a == b
+        } else {
+            a.eq_ignore_ascii_case(b)
+        }
+}
+
 fn hyperliquid_dest(account: &str) -> Dest<'_> {
     Dest {
         chain: HYPERLIQUID_CHAIN_ID,
@@ -137,7 +187,109 @@ pub struct ArcMove {
     pub transactions: Vec<Value>,
 }
 
+/// MON (Monad's own coin) bought or sold through Relay, exact in: `amount_in_units` leaves, about
+/// `expected_out_units` lands and never less than `minimum_out_units` (or Relay refunds it).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MonadSwap {
+    pub request_id: String,
+    pub amount_in_units: u128,
+    pub expected_out_units: u128,
+    pub minimum_out_units: u128,
+    pub pay: MonadPay,
+}
+
+/// What the user's wallet signs to start a MON swap.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MonadPay {
+    /// Solana USDC: Relay's deposit instructions; the engine builds the transaction and lands it.
+    Solana {
+        instructions: Vec<Value>,
+        lookup_tables: Vec<String>,
+    },
+    /// Base USDC: one gasless EIP-3009 authorization to Relay's receiver.
+    Base { typed_data: Value, api: String },
+    /// MON: the deposit the phone sends on Monad, to Relay's depository with `value` wei.
+    Monad {
+        to: String,
+        data: String,
+        value: u128,
+    },
+}
+
 impl RelayClient {
+    /// Exactly `usdc_in` of the Solana wallet's USDC into MON in the EVM wallet `evm`.
+    pub async fn solana_to_mon(
+        &self,
+        solana_owner: &str,
+        evm: &str,
+        usdc_in: u128,
+    ) -> Result<MonadSwap, RelayError> {
+        let from = Origin {
+            chain: SOLANA_CHAIN_ID,
+            currency: MAINNET_USDC_MINT,
+            wallet: solana_owner,
+        };
+        self.monad_swap(from, monad_dest(evm), usdc_in).await
+    }
+
+    /// Exactly `usdc_in` of the wallet's Base USDC into its MON, gasless.
+    pub async fn base_to_mon(&self, evm: &str, usdc_in: u128) -> Result<MonadSwap, RelayError> {
+        let from = Origin {
+            chain: BASE_CHAIN_ID,
+            currency: BASE_USDC,
+            wallet: evm,
+        };
+        self.monad_swap(from, monad_dest(evm), usdc_in).await
+    }
+
+    /// Exactly `mon_in` wei of the wallet's MON into USDC in the Solana wallet `solana_owner`.
+    pub async fn mon_to_solana(
+        &self,
+        evm: &str,
+        solana_owner: &str,
+        mon_in: u128,
+    ) -> Result<MonadSwap, RelayError> {
+        self.monad_swap(monad_origin(evm), solana_dest(solana_owner), mon_in)
+            .await
+    }
+
+    /// Exactly `mon_in` wei of the wallet's MON into its Base USDC.
+    pub async fn mon_to_base(&self, evm: &str, mon_in: u128) -> Result<MonadSwap, RelayError> {
+        self.monad_swap(monad_origin(evm), base_dest(evm), mon_in)
+            .await
+    }
+
+    async fn monad_swap(
+        &self,
+        from: Origin<'_>,
+        dest: Dest<'_>,
+        amount_in: u128,
+    ) -> Result<MonadSwap, RelayError> {
+        let url = self
+            .base
+            .join("quote/v2")
+            .map_err(|_| RelayError::InvalidResponse("URL"))?;
+        let mut request = json!({
+            "user":from.wallet,"recipient":dest.recipient,"refundTo":from.wallet,
+            "originChainId":from.chain,"destinationChainId":dest.chain,
+            "originCurrency":from.currency.to_string(),"destinationCurrency":dest.currency,
+            "amount":amount_in.to_string(),"tradeType":"EXACT_INPUT",
+            // MON's price moves more than a dollar's; 1% is still far tighter than Relay's default.
+            "slippageTolerance":"100"
+        });
+        if from.chain == BASE_CHAIN_ID {
+            request["originCurrency"] = json!(BASE_USDC.to_ascii_lowercase());
+            request["usePermit"] = json!(true);
+        }
+        let response = self
+            .with_key(self.http.post(url))
+            .json(&request)
+            .send()
+            .await?;
+        let body = checked(response).await?;
+        parse_monad_swap(&body, from, dest, amount_in)
+    }
+
     pub async fn base_to_arc(&self, evm: &str, out: u128) -> Result<GaslessMove, RelayError> {
         self.gasless_move(evm, arc_dest(evm), Exact::Out(out)).await
     }
@@ -386,6 +538,51 @@ fn parse_gasless_move(
     exact: Exact,
 ) -> Result<GaslessMove, RelayError> {
     let invalid = RelayError::InvalidResponse;
+    let details = &body["details"];
+    let (money_in, money_out) = (&details["currencyIn"], &details["currencyOut"]);
+    if text(&money_in["currency"]["chainId"]) != BASE_CHAIN_ID.to_string()
+        || text(&money_in["currency"]["address"]) != BASE_USDC.to_ascii_lowercase()
+        || !lands_at(details, dest)
+    {
+        return Err(invalid("not USDC from Base to this recipient"));
+    }
+    let amount_in_units = units(&money_in["amount"]).ok_or(invalid("amount in"))?;
+    // In Base's units (6 decimals) whatever the destination's.
+    let least_out = units(&money_out["minimumAmount"]).ok_or(invalid("amount out"))? / dest.scale;
+    // What's promised to land: the asked amount, or (sending all of it) the quote's minimum.
+    let amount_out_units = match exact {
+        Exact::Out(asked) if least_out < asked => {
+            return Err(invalid("less would land than asked"));
+        }
+        Exact::Out(asked) => asked,
+        Exact::In(sent) if sent != amount_in_units => {
+            return Err(invalid("amount sent differs from the quote"));
+        }
+        Exact::In(_) => least_out,
+    };
+    // A move costs cents; anything past 2% + $0.50 is a quote to refuse, not to sign.
+    if amount_in_units > amount_out_units + amount_out_units / 50 + 500_000 {
+        return Err(invalid("fee too high"));
+    }
+    let (request_id, typed_data, api) = base_authorization(body, evm, amount_in_units)?;
+    Ok(GaslessMove {
+        request_id,
+        amount_in_units,
+        amount_out_units,
+        typed_data,
+        api,
+    })
+}
+
+// A gasless Base quote's one step: an EIP-3009 authorization from `evm` to Relay's receiver for
+// exactly `amount` of Base USDC, posted back to Relay. Returns the request id, the typed data to
+// sign and Relay's name for the flow.
+fn base_authorization(
+    body: &Value,
+    evm: &str,
+    amount: u128,
+) -> Result<(String, Value, String), RelayError> {
+    let invalid = RelayError::InvalidResponse;
     let [step] = body["steps"].as_array().map(Vec::as_slice).unwrap_or(&[]) else {
         return Err(invalid("expected one step"));
     };
@@ -417,36 +614,10 @@ fn parse_gasless_move(
     {
         return Err(invalid("not a Base USDC authorization"));
     }
-    let details = &body["details"];
-    let (money_in, money_out) = (&details["currencyIn"], &details["currencyOut"]);
-    if text(&money_in["currency"]["chainId"]) != BASE_CHAIN_ID.to_string()
-        || text(&money_in["currency"]["address"]) != BASE_USDC.to_ascii_lowercase()
-        || !lands_at(details, dest)
-    {
-        return Err(invalid("not USDC from Base to this recipient"));
-    }
-    let amount_in_units = units(&money_in["amount"]).ok_or(invalid("amount in"))?;
-    // In Base's units (6 decimals) whatever the destination's.
-    let least_out = units(&money_out["minimumAmount"]).ok_or(invalid("amount out"))? / dest.scale;
-    // What's promised to land: the asked amount, or (sending all of it) the quote's minimum.
-    let amount_out_units = match exact {
-        Exact::Out(asked) if least_out < asked => {
-            return Err(invalid("less would land than asked"));
-        }
-        Exact::Out(asked) => asked,
-        Exact::In(sent) if sent != amount_in_units => {
-            return Err(invalid("amount sent differs from the quote"));
-        }
-        Exact::In(_) => least_out,
-    };
-    // A move costs cents; anything past 2% + $0.50 is a quote to refuse, not to sign.
-    if amount_in_units > amount_out_units + amount_out_units / 50 + 500_000 {
-        return Err(invalid("fee too high"));
-    }
     let message = &sign["value"];
     if text(&message["from"]) != evm.to_ascii_lowercase()
         || text(&message["to"]) != RECEIVER
-        || text(&message["value"]) != amount_in_units.to_string()
+        || text(&message["value"]) != amount.to_string()
     {
         return Err(invalid("authorization differs from the quote"));
     }
@@ -460,13 +631,7 @@ fn parse_gasless_move(
             "nonce":message["nonce"]
         }
     });
-    Ok(GaslessMove {
-        request_id: request_id.into(),
-        amount_in_units,
-        amount_out_units,
-        typed_data,
-        api: api.into(),
-    })
+    Ok((request_id.into(), typed_data, api.into()))
 }
 
 fn parse_solana_move(
@@ -487,30 +652,7 @@ fn parse_solana_move(
         .as_str()
         .filter(|id| id.starts_with("0x") && id.len() == 66)
         .ok_or(invalid("request id"))?;
-    let instructions = item["data"]["instructions"]
-        .as_array()
-        .filter(|list| !list.is_empty())
-        .ok_or(invalid("instructions"))?;
-    // Only Relay's deposit program (and compute budget), and only the user signs.
-    for ix in instructions {
-        if !SOLANA_DEPOSIT_PROGRAMS.contains(&ix["programId"].as_str().unwrap_or_default()) {
-            return Err(invalid("unknown program"));
-        }
-        let keys = ix["keys"].as_array().ok_or(invalid("instruction keys"))?;
-        if keys.iter().any(|k| {
-            k["isSigner"].as_bool() == Some(true) && k["pubkey"].as_str() != Some(solana_owner)
-        }) {
-            return Err(invalid("another signer"));
-        }
-    }
-    let lookup_tables = item["data"]["addressLookupTableAddresses"]
-        .as_array()
-        .map(|list| {
-            list.iter()
-                .filter_map(|a| a.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+    let (instructions, lookup_tables) = solana_deposit(item, solana_owner)?;
     let details = &body["details"];
     let money_in = &details["currencyIn"];
     if step["kind"].as_str() != Some("transaction")
@@ -541,7 +683,7 @@ fn parse_solana_move(
     }
     Ok(SolanaMove {
         request_id: request_id.into(),
-        instructions: instructions.clone(),
+        instructions,
         lookup_tables,
         amount_in_units,
         amount_out_units,
@@ -580,7 +722,7 @@ fn parse_arc_move(
         .filter(|s| is_hash(s))
         .ok_or(invalid("order id"))?;
     let payment = &protocol["paymentDetails"];
-    if text(&payment["depository"]) != ARC_DEPOSITORY
+    if text(&payment["depository"]) != DEPOSITORY
         || text(&payment["currency"]) != ARC_USDC
         || units(&payment["amount"]) != Some(amount)
         || payment["chainId"] != "arc"
@@ -636,7 +778,7 @@ fn parse_arc_move(
             address.trim_start_matches("0x").to_ascii_lowercase()
         )
     };
-    let approval = format!("0x095ea7b3{}{:064x}", word(ARC_DEPOSITORY), amount);
+    let approval = format!("0x095ea7b3{}{:064x}", word(DEPOSITORY), amount);
     let deposit = format!(
         "0xe8017952{}{}{:064x}{}",
         word(evm),
@@ -652,7 +794,7 @@ fn parse_arc_move(
     for (index, step) in steps.iter().enumerate() {
         let last = index + 1 == steps.len();
         let expected_id = if last { "deposit" } else { "approve" };
-        let target = if last { ARC_DEPOSITORY } else { ARC_USDC };
+        let target = if last { DEPOSITORY } else { ARC_USDC };
         let calldata = if last { &deposit } else { &approval };
         let items = step["items"].as_array().ok_or(invalid("items"))?;
         if step["id"] != expected_id
@@ -681,6 +823,201 @@ fn parse_arc_move(
         amount_out_units: out,
         transactions,
     })
+}
+
+// A Solana deposit's instructions (only Relay's deposit program and compute budget, and only the
+// user signs) and its lookup tables.
+fn solana_deposit(
+    item: &Value,
+    solana_owner: &str,
+) -> Result<(Vec<Value>, Vec<String>), RelayError> {
+    let invalid = RelayError::InvalidResponse;
+    let instructions = item["data"]["instructions"]
+        .as_array()
+        .filter(|list| !list.is_empty())
+        .ok_or(invalid("instructions"))?;
+    for ix in instructions {
+        if !SOLANA_DEPOSIT_PROGRAMS.contains(&ix["programId"].as_str().unwrap_or_default()) {
+            return Err(invalid("unknown program"));
+        }
+        let keys = ix["keys"].as_array().ok_or(invalid("instruction keys"))?;
+        if keys.iter().any(|k| {
+            k["isSigner"].as_bool() == Some(true) && k["pubkey"].as_str() != Some(solana_owner)
+        }) {
+            return Err(invalid("another signer"));
+        }
+    }
+    let lookup_tables = item["data"]["addressLookupTableAddresses"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(|a| a.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok((instructions.clone(), lookup_tables))
+}
+
+fn parse_monad_swap(
+    body: &Value,
+    from: Origin<'_>,
+    dest: Dest<'_>,
+    amount_in: u128,
+) -> Result<MonadSwap, RelayError> {
+    let invalid = RelayError::InvalidResponse;
+    // MON on one side, the user's USDC on the other.
+    if (from.chain == MONAD_CHAIN_ID) == (dest.chain == MONAD_CHAIN_ID) || amount_in == 0 {
+        return Err(invalid("not a MON swap"));
+    }
+    let details = &body["details"];
+    let (money_in, money_out) = (&details["currencyIn"], &details["currencyOut"]);
+    if text(&money_in["currency"]["chainId"]) != from.chain.to_string()
+        || !same(from.chain, &money_in["currency"]["address"], from.currency)
+        || units(&money_in["amount"]) != Some(amount_in)
+        || !same(from.chain, &details["sender"], from.wallet)
+        || !lands_at(details, dest)
+    {
+        return Err(invalid("not this swap from this wallet"));
+    }
+    let expected = units(&money_out["amount"]).ok_or(invalid("amount out"))?;
+    let minimum = units(&money_out["minimumAmount"])
+        .filter(|least| *least > 0 && *least <= expected)
+        .ok_or(invalid("minimum out"))?;
+    let order_id = monad_order(body, from, dest, amount_in, minimum)?;
+    let request_id = body["requestId"]
+        .as_str()
+        .filter(|id| is_hash(id))
+        .ok_or(invalid("request id"))?;
+    let [step] = body["steps"].as_array().map(Vec::as_slice).unwrap_or(&[]) else {
+        return Err(invalid("expected one step"));
+    };
+    let [item] = step["items"].as_array().map(Vec::as_slice).unwrap_or(&[]) else {
+        return Err(invalid("expected one item"));
+    };
+    if step["requestId"].as_str() != Some(request_id) {
+        return Err(invalid("request id"));
+    }
+    let pay = match from.chain {
+        BASE_CHAIN_ID => {
+            let (_, typed_data, api) = base_authorization(body, from.wallet, amount_in)?;
+            MonadPay::Base { typed_data, api }
+        }
+        SOLANA_CHAIN_ID => {
+            if step["id"] != "deposit" || step["kind"] != "transaction" {
+                return Err(invalid("not a deposit"));
+            }
+            let (instructions, lookup_tables) = solana_deposit(item, from.wallet)?;
+            MonadPay::Solana {
+                instructions,
+                lookup_tables,
+            }
+        }
+        _ => {
+            // MON sent with `depositNative(user, order)`: the order binds what Relay pays out.
+            let data = format!(
+                "{DEPOSIT_NATIVE}{:0>64}{}",
+                from.wallet.trim_start_matches("0x").to_ascii_lowercase(),
+                &order_id[2..]
+            );
+            let tx = &item["data"];
+            if step["id"] != "deposit"
+                || step["kind"] != "transaction"
+                || !same(MONAD_CHAIN_ID, &tx["from"], from.wallet)
+                || !same(MONAD_CHAIN_ID, &tx["to"], DEPOSITORY)
+                || text(&tx["data"]) != data
+                || units(&tx["value"]) != Some(amount_in)
+                || tx["chainId"].as_u64() != Some(MONAD_CHAIN_ID)
+            {
+                return Err(invalid("deposit transaction changed"));
+            }
+            MonadPay::Monad {
+                to: DEPOSITORY.into(),
+                data,
+                value: amount_in,
+            }
+        }
+    };
+    Ok(MonadSwap {
+        request_id: request_id.into(),
+        amount_in_units: amount_in,
+        expected_out_units: expected,
+        minimum_out_units: minimum,
+        pay,
+    })
+}
+
+// Relay's order for a MON swap: paid in from the user's wallet on the origin chain into Relay's
+// depository, paid out only to the recipient (at least `minimum`), refunded only to the user's own
+// wallets, with no extra calls or fees. Returns its id.
+fn monad_order<'a>(
+    body: &'a Value,
+    from: Origin<'_>,
+    dest: Dest<'_>,
+    amount_in: u128,
+    minimum: u128,
+) -> Result<&'a str, RelayError> {
+    let invalid = RelayError::InvalidResponse;
+    let protocol = &body["protocol"]["v2"];
+    let order_id = protocol["orderId"]
+        .as_str()
+        .filter(|s| is_hash(s))
+        .ok_or(invalid("order id"))?;
+    let (origin, out) = (chain_name(from.chain), chain_name(dest.chain));
+    let depository = if from.chain == SOLANA_CHAIN_ID {
+        SOLANA_DEPOSIT_PROGRAMS[0]
+    } else {
+        DEPOSITORY
+    };
+    let payment = &protocol["paymentDetails"];
+    if payment["chainId"] != origin
+        || !same(from.chain, &payment["depository"], depository)
+        || !same(from.chain, &payment["currency"], from.currency)
+        || units(&payment["amount"]) != Some(amount_in)
+    {
+        return Err(invalid("deposit changed"));
+    }
+    let order = &protocol["orderData"];
+    let [input] = order["inputs"].as_array().map(Vec::as_slice).unwrap_or(&[]) else {
+        return Err(invalid("inputs"));
+    };
+    let [paid] = order["output"]["payments"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+    else {
+        return Err(invalid("outputs"));
+    };
+    if input["payment"]["chainId"] != origin
+        || !same(from.chain, &input["payment"]["currency"], from.currency)
+        || units(&input["payment"]["amount"]) != Some(amount_in)
+        || order["output"]["chainId"] != out
+        || !same(dest.chain, &paid["recipient"], dest.recipient)
+        || !same(dest.chain, &paid["currency"], dest.currency)
+        || units(&paid["minimumAmount"]).unwrap_or(0) < minimum
+        || !order["output"]["calls"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+        || !order["fees"].as_array().is_some_and(Vec::is_empty)
+    {
+        return Err(invalid("order changed"));
+    }
+    let refunds = input["refunds"].as_array().ok_or(invalid("refunds"))?;
+    if refunds.is_empty()
+        || refunds.iter().any(|r| {
+            if r["chainId"] == origin {
+                !same(from.chain, &r["recipient"], from.wallet)
+                    || !same(from.chain, &r["currency"], from.currency)
+            } else if r["chainId"] == out {
+                !same(dest.chain, &r["recipient"], dest.recipient)
+                    || !same(dest.chain, &r["currency"], dest.currency)
+            } else {
+                true
+            }
+        })
+    {
+        return Err(invalid("refund wallet changed"));
+    }
+    Ok(order_id)
 }
 
 fn is_hash(value: &str) -> bool {
@@ -937,6 +1274,278 @@ mod tests {
         plain["details"]["currencyIn"]["amount"] = json!("1424393");
         assert!(parse_solana_move(&plain, SOLANA, base_dest(EVM), 1_400_000, 0).is_ok());
         assert!(parse_solana_move(&plain, SOLANA, base_dest(EVM), 1_400_000, 200_000).is_err());
+    }
+
+    // Captured from Relay's live API on 2026-10-02 (trimmed): 1.5 USDC from Solana or Base into
+    // MON, and 40 MON into Solana USDC.
+    fn mon_quote(name: &str) -> Value {
+        serde_json::from_str(match name {
+            "solana" => include_str!("fixtures/relay-solana-mon.json"),
+            "base" => include_str!("fixtures/relay-base-mon.json"),
+            _ => include_str!("fixtures/relay-mon-solana.json"),
+        })
+        .unwrap()
+    }
+
+    fn with(mut body: Value, path: &[&str], value: Value) -> Value {
+        let mut at = &mut body;
+        for key in path {
+            at = match key.parse::<usize>() {
+                Ok(i) => &mut at[i],
+                Err(_) => &mut at[*key],
+            };
+        }
+        *at = value;
+        body
+    }
+
+    const OTHER: &str = "0x0000000000000000000000000000000000000001";
+    const MON_IN: u128 = 40_000_000_000_000_000_000;
+
+    fn from_solana() -> Origin<'static> {
+        Origin {
+            chain: SOLANA_CHAIN_ID,
+            currency: MAINNET_USDC_MINT,
+            wallet: SOLANA,
+        }
+    }
+
+    fn from_base() -> Origin<'static> {
+        Origin {
+            chain: BASE_CHAIN_ID,
+            currency: BASE_USDC,
+            wallet: EVM,
+        }
+    }
+
+    #[test]
+    fn mon_bought_with_solana_cash_is_one_deposit_of_exactly_that_cash() {
+        let body = mon_quote("solana");
+        let swap = parse_monad_swap(&body, from_solana(), monad_dest(EVM), 1_500_000).unwrap();
+        assert_eq!(swap.expected_out_units, 43_388_356_662_737_351_665);
+        assert_eq!(swap.minimum_out_units, 41_782_987_466_216_069_654);
+        let MonadPay::Solana { lookup_tables, .. } = &swap.pay else {
+            panic!("a Solana deposit")
+        };
+        assert_eq!(lookup_tables.len(), 1);
+        // Another amount or recipient: refused.
+        assert!(parse_monad_swap(&body, from_solana(), monad_dest(EVM), 1_400_000).is_err());
+        assert!(parse_monad_swap(&body, from_solana(), monad_dest(OTHER), 1_500_000).is_err());
+        let ix = ["steps", "0", "items", "0", "data", "instructions", "0"];
+        let order = ["protocol", "v2", "orderData"];
+        for (path, value) in [
+            (
+                [&ix[..], &["programId"]].concat(),
+                json!("11111111111111111111111111111111"),
+            ),
+            ([&ix[..], &["keys", "0", "isSigner"]].concat(), json!(true)),
+            (
+                [&order[..], &["output", "payments", "0", "recipient"]].concat(),
+                json!(OTHER),
+            ),
+            (
+                [&order[..], &["output", "calls"]].concat(),
+                json!([{"to": OTHER}]),
+            ),
+            (
+                [&order[..], &["inputs", "0", "refunds", "0", "recipient"]].concat(),
+                json!("Other1111111111111111111111111111"),
+            ),
+            (
+                vec!["protocol", "v2", "paymentDetails", "depository"],
+                json!("Other1111111111111111111111111111"),
+            ),
+            (
+                vec!["details", "currencyOut", "minimumAmount"],
+                json!("50000000000000000000"),
+            ),
+            (
+                vec!["details", "currencyOut", "currency", "address"],
+                json!(OTHER),
+            ),
+        ] {
+            let bad = with(body.clone(), &path, value);
+            assert!(
+                parse_monad_swap(&bad, from_solana(), monad_dest(EVM), 1_500_000).is_err(),
+                "{path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mon_bought_with_base_cash_is_one_authorization_to_relays_receiver() {
+        let body = mon_quote("base");
+        let swap = parse_monad_swap(&body, from_base(), monad_dest(EVM), 1_500_000).unwrap();
+        assert_eq!(swap.minimum_out_units, 41_516_979_653_237_946_927);
+        let MonadPay::Base { typed_data, api } = &swap.pay else {
+            panic!("a Base authorization")
+        };
+        assert_eq!(api, "swap");
+        assert_eq!(typed_data["message"]["value"], "1500000");
+        assert_eq!(typed_data["message"]["to"], RECEIVER);
+        let sign = ["steps", "0", "items", "0", "data", "sign"];
+        for (path, value) in [
+            ([&sign[..], &["value", "to"]].concat(), json!(OTHER)),
+            ([&sign[..], &["value", "value"]].concat(), json!("9000000")),
+            ([&sign[..], &["value", "from"]].concat(), json!(OTHER)),
+            (
+                vec![
+                    "protocol",
+                    "v2",
+                    "orderData",
+                    "output",
+                    "payments",
+                    "0",
+                    "recipient",
+                ],
+                json!(OTHER),
+            ),
+            (
+                vec!["protocol", "v2", "orderData", "fees"],
+                json!([{"amount": "1"}]),
+            ),
+            (vec!["details", "recipient"], json!(OTHER)),
+        ] {
+            let bad = with(body.clone(), &path, value);
+            assert!(
+                parse_monad_swap(&bad, from_base(), monad_dest(EVM), 1_500_000).is_err(),
+                "{path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mon_sold_is_exactly_the_deposit_bound_to_its_order() {
+        let body = mon_quote("monad");
+        let swap = parse_monad_swap(&body, monad_origin(EVM), solana_dest(SOLANA), MON_IN).unwrap();
+        assert_eq!(swap.expected_out_units, 1_298_017);
+        assert_eq!(swap.minimum_out_units, 1_248_432);
+        assert_eq!(
+            swap.pay,
+            MonadPay::Monad {
+                to: DEPOSITORY.into(),
+                data: "0x49290c1c0000000000000000000000004838b106fce9647bdf1e7877bf73ce8b0bad5f97b06a98c49e67643f9fc55d308e1988e2d85d9db099a3736af137ad27afcc7be9".into(),
+                value: MON_IN,
+            }
+        );
+        assert!(
+            parse_monad_swap(&body, monad_origin(EVM), solana_dest(SOLANA), MON_IN / 2).is_err()
+        );
+        assert!(parse_monad_swap(&body, monad_origin(OTHER), solana_dest(SOLANA), MON_IN).is_err());
+        assert!(parse_monad_swap(&body, monad_origin(EVM), base_dest(EVM), MON_IN).is_err());
+        let tx = ["steps", "0", "items", "0", "data"];
+        for (path, value) in [
+            ([&tx[..], &["to"]].concat(), json!(OTHER)),
+            (
+                [&tx[..], &["value"]].concat(),
+                json!("41000000000000000000"),
+            ),
+            ([&tx[..], &["chainId"]].concat(), json!(8453)),
+            ([&tx[..], &["data"]].concat(), json!("0x49290c1c")),
+            (
+                vec!["protocol", "v2", "orderId"],
+                json!(format!("0x{}", "ab".repeat(32))),
+            ),
+            (
+                vec![
+                    "protocol",
+                    "v2",
+                    "orderData",
+                    "output",
+                    "payments",
+                    "0",
+                    "recipient",
+                ],
+                json!("Other1111111111111111111111111111"),
+            ),
+            (
+                vec![
+                    "protocol",
+                    "v2",
+                    "orderData",
+                    "inputs",
+                    "0",
+                    "refunds",
+                    "0",
+                    "recipient",
+                ],
+                json!(OTHER),
+            ),
+            (
+                vec!["protocol", "v2", "paymentDetails", "depository"],
+                json!(OTHER),
+            ),
+            (
+                vec!["steps", "0", "requestId"],
+                json!(format!("0x{}", "cd".repeat(32))),
+            ),
+        ] {
+            let bad = with(body.clone(), &path, value);
+            assert!(
+                parse_monad_swap(&bad, monad_origin(EVM), solana_dest(SOLANA), MON_IN).is_err(),
+                "{path:?}"
+            );
+        }
+        // USDC to USDC isn't a MON swap.
+        assert!(parse_monad_swap(&body, from_base(), solana_dest(SOLANA), MON_IN).is_err());
+    }
+
+    // cargo test -p engine-execution live_mon -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "live Relay read-only quotes; no funds moved"]
+    async fn live_mon_quotes() {
+        let client = RelayClient::new(std::env::var("RELAY_API_KEY").ok()).unwrap();
+        let mon = |wei: u128| wei as f64 / 1e18;
+        let buy = client.solana_to_mon(SOLANA, EVM, 1_500_000).await.unwrap();
+        println!(
+            "Solana 1.5 USDC -> {:.4} MON (at least {:.4})",
+            mon(buy.expected_out_units),
+            mon(buy.minimum_out_units)
+        );
+        let buy = client.base_to_mon(EVM, 1_500_000).await.unwrap();
+        println!(
+            "Base 1.5 USDC -> {:.4} MON (at least {:.4})",
+            mon(buy.expected_out_units),
+            mon(buy.minimum_out_units)
+        );
+        let sell = client.mon_to_solana(EVM, SOLANA, MON_IN).await.unwrap();
+        println!(
+            "40 MON -> {} Solana USDC units (at least {}); {:?}",
+            sell.expected_out_units, sell.minimum_out_units, sell.pay
+        );
+        let sell = client.mon_to_base(EVM, MON_IN).await.unwrap();
+        println!(
+            "40 MON -> {} Base USDC units (at least {})",
+            sell.expected_out_units, sell.minimum_out_units
+        );
+        // The Solana deposit builds into a transaction, and a fresh request waits for its payment.
+        let buy = client.solana_to_mon(SOLANA, EVM, 1_500_000).await.unwrap();
+        let MonadPay::Solana {
+            instructions,
+            lookup_tables,
+        } = &buy.pay
+        else {
+            panic!("a Solana deposit")
+        };
+        let rpc = crate::solana::SolanaAtaPreflight::new(
+            crate::solana::SolanaNetwork::Mainnet,
+            "https://api.mainnet-beta.solana.com",
+            "",
+        )
+        .unwrap();
+        let tx = rpc
+            .v0_transaction(SOLANA, instructions, lookup_tables)
+            .await
+            .unwrap();
+        println!("Solana deposit transaction: {} base64 chars", tx.len());
+        assert_eq!(
+            client.state(&buy.request_id).await.unwrap(),
+            SwapState::Waiting
+        );
+        let buy = client.base_to_mon(EVM, 1_500_000).await.unwrap();
+        if let MonadPay::Base { typed_data, .. } = &buy.pay {
+            println!("BASE_TYPED {typed_data}");
+        }
     }
 
     #[test]

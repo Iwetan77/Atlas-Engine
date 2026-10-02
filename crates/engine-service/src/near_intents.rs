@@ -1,6 +1,7 @@
 use super::*;
 use base64::Engine;
 use engine_execution::near_intents::{ChainTx, Client, QuoteRequest, Token};
+use engine_execution::relay_link::{MonadPay, MonadSwap};
 use engine_execution::swaps::uniswap::BASE_USDC;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -192,6 +193,20 @@ struct StoredIntent {
     handed_nonce: Option<u64>,
     #[serde(default)]
     device: Option<DeviceStep>,
+    // MON goes through Relay (1Click lists it but quotes no route to or from Monad).
+    #[serde(default)]
+    relay: Option<RelayLeg>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct RelayLeg {
+    request_id: String,
+    // Paid from Base: the authorization the phone signs, and Relay's name for the flow.
+    #[serde(default)]
+    typed_data: Option<Value>,
+    #[serde(default)]
+    api: String,
+    // The quoted amount out (MON wei bought, or USDC units a sale brings), for the trade book.
+    expected_out: u128,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct DeviceStep {
@@ -668,7 +683,7 @@ fn supported(token: &Token) -> bool {
 fn sell_route(blockchain: &str) -> Option<&'static str> {
     match blockchain {
         "near" => Some("1Click from the NEAR wallet, or Ref then 1Click"),
-        "monad" => Some("1Click from the Monad wallet, sent by the phone"),
+        "monad" => Some("Relay from the Monad wallet, sent by the phone"),
         "sui" => Some("1Click from the Sui wallet, after Cetus for other coins"),
         _ => None,
     }
@@ -2684,59 +2699,47 @@ async fn near_coin_sell_quote(
     )))
 }
 
-// Selling a Monad coin: the phone sends it to 1Click's deposit address (one plain transfer, MON
-// itself or an ERC-20 `transfer`), and the cash lands as USDC.
+// Selling MON: Relay quotes exactly this much of it into the user's cash; the phone sends it to
+// Relay's depository on Monad (keeping a little MON for that send's fee).
 async fn monad_sell_quote(
     state: AppState,
     req: markets::QuoteRequest,
     user: app_balance::VerifiedWallets,
     token: Token,
 ) -> Result<Json<Value>, ApiError> {
+    if token.contract_address.is_some() {
+        return Err(bad("Atlas can't sell this coin"));
+    }
     let wallet = user
         .evm_wallet
         .clone()
         .filter(|w| is_evm(w))
         .ok_or_else(|| conflict("Your wallet is still being set up. Try again in a moment."))?;
     let held = state.near.monad_balance(&token, &wallet).await?;
-    let native = token.contract_address.is_none();
-    let gas = if native {
-        held
-    } else {
-        let mon = Token {
-            contract_address: None,
-            ..token.clone()
-        };
-        state.near.monad_balance(&mon, &wallet).await?
-    };
-    if gas < MONAD_GAS_RESERVE {
+    if held < MONAD_GAS_RESERVE {
         return Err(conflict(
             "Selling needs a little MON in your wallet for the network fee (about 0.02 MON).",
         ));
     }
-    let available = if native {
-        held - MONAD_GAS_RESERVE
-    } else {
-        held
-    };
     let price = token_usd(&token);
     let rate = app_balance::fx_rate(&req.amount.currency).await?;
     let desired = markets::parse_micros(&req.amount.amount)?
         .checked_mul(1_000_000)
         .ok_or_else(|| bad("Amount too large"))?
         / rate;
-    let amount = sale_units(available, desired, price, token.decimals, req.all)?;
+    let amount = sale_units(
+        held - MONAD_GAS_RESERVE,
+        desired,
+        price,
+        token.decimals,
+        req.all,
+    )?;
     let value = worth_of(amount, price, token.decimals);
     markets::check_limits(value, &req.amount.currency, rate)?;
-    let q = cash_quote(&state, &user, &token, amount, &wallet, true)
+    let swap = mon_cash_quote(&state, &user, &wallet, amount)
         .await
-        .map_err(|_| {
-            conflict(&format!(
-                "{} can't be sold to cash right now: NEAR Intents isn't taking it. Try again later.",
-                token.symbol
-            ))
-        })?;
-    let receive: u128 = q.amount_out.parse().map_err(internal)?;
-    let minimum = min_out(&q)?;
+        .map_err(|_| conflict("MON can't be sold to cash right now. Try again later."))?;
+    let receive = swap.expected_out_units;
     let quote_id = id("q");
     let expires = now() + 30_000;
     state.near.quotes.lock().map_err(internal)?.insert(
@@ -2747,7 +2750,7 @@ async fn monad_sell_quote(
             recipient: wallet,
             asset: token.clone(),
             amount,
-            minimum_out: minimum,
+            minimum_out: swap.minimum_out_units,
             currency: req.amount.currency.clone(),
             expires,
             then_swap: None,
@@ -2769,6 +2772,138 @@ async fn monad_sell_quote(
         rate,
         expires,
     )))
+}
+// Relay's quote for exactly `mon_in` wei of the wallet's MON into the user's cash: Solana USDC, or
+// Base USDC without a Solana wallet.
+async fn mon_cash_quote(
+    state: &AppState,
+    user: &app_balance::VerifiedWallets,
+    evm: &str,
+    mon_in: u128,
+) -> Result<MonadSwap, ApiError> {
+    match user.solana_wallet.as_deref() {
+        Some(solana) => state.relay_link.mon_to_solana(evm, solana, mon_in).await,
+        None => state.relay_link.mon_to_base(evm, mon_in).await,
+    }
+    .map_err(venue)
+}
+// Buying MON: through Relay (1Click lists it but quotes no route to Monad), into the user's own EVM
+// wallet, where the phone can sell it back. Paid from Base cash with one gasless authorization when
+// that covers it, else from Solana cash in one deposit the engine lands.
+async fn mon_buy_quote(
+    state: AppState,
+    req: markets::QuoteRequest,
+    user: app_balance::VerifiedWallets,
+    token: Token,
+) -> Result<Json<Value>, ApiError> {
+    if token.contract_address.is_some() {
+        return Err(bad("Atlas can't buy this coin"));
+    }
+    let evm = user
+        .evm_wallet
+        .clone()
+        .filter(|w| is_evm(w))
+        .ok_or_else(|| conflict("Your wallet is still being set up. Try again in a moment."))?;
+    let rate = app_balance::fx_rate(&req.amount.currency).await?;
+    let amount = markets::parse_micros(&req.amount.amount)?
+        .checked_mul(1_000_000)
+        .ok_or_else(|| bad("amount too large"))?
+        / rate;
+    markets::check_limits(amount, &req.amount.currency, rate)?;
+    let price = token_usd(&token);
+    // Atlas won't buy a coin it can't sell back to cash.
+    let back = units_worth(amount, price, token.decimals);
+    if back == 0 || mon_cash_quote(&state, &user, &evm, back).await.is_err() {
+        return Err(conflict(
+            "Atlas can't sell MON back to cash right now, so it won't buy it. Try again later.",
+        ));
+    }
+    let (wallet, from_solana, swap) =
+        mon_route(&state, &user, &evm, amount, &req.amount.currency, rate).await?;
+    // What it costs beyond the coin itself; past a tenth of the money, the quote is refused.
+    let worth = worth_of(swap.expected_out_units, price, token.decimals);
+    if worth < amount * 9 / 10 {
+        return Err(conflict(
+            "Buying MON costs too much in fees right now. Try a bigger amount, or try later.",
+        ));
+    }
+    let quote_id = id("q");
+    let expires = now() + 30_000;
+    state.near.quotes.lock().map_err(internal)?.insert(
+        quote_id.clone(),
+        StoredQuote {
+            owner: user.user_id.clone(),
+            wallet,
+            recipient: evm,
+            asset: token.clone(),
+            amount,
+            minimum_out: swap.minimum_out_units,
+            currency: req.amount.currency.clone(),
+            expires,
+            then_swap: None,
+            sell_sui: false,
+            sale: None,
+            from_solana,
+            network_fee: amount.saturating_sub(worth),
+            asset_id: req.asset_id.clone(),
+            monad_sale: false,
+        },
+    );
+    let currency = &req.amount.currency;
+    Ok(Json(
+        json!({"quoteId":quote_id,"assetId":req.asset_id,"side":"buy",
+        "pay":{"amount":markets::format_units(amount,6),"symbol":"USDC","value":money(amount,currency,rate)},
+        "receive":{"amount":markets::format_units(swap.expected_out_units,token.decimals),"symbol":token.symbol,
+            "value":money(worth,currency,rate)},
+        "price":unit_price(amount,swap.expected_out_units,token.decimals,currency,rate),
+        "fee":money(amount.saturating_sub(worth),currency,rate),"expiresAtUnixMs":expires}),
+    ))
+}
+// Where MON is paid from, and Relay's quote for it: Base cash when it covers it (gasless, so an empty
+// gas tank doesn't matter), else Solana cash. Returns the paying wallet and whether it's Solana's.
+async fn mon_route(
+    state: &AppState,
+    user: &app_balance::VerifiedWallets,
+    evm: &str,
+    amount: u128,
+    currency: &str,
+    rate: u128,
+) -> Result<(String, bool, MonadSwap), ApiError> {
+    let unavailable = |_| venue("Couldn't price MON right now; try again shortly");
+    let base_cash = state
+        .markets
+        .base
+        .balance_of(BASE_USDC, evm)
+        .await
+        .unwrap_or(0);
+    if base_cash >= amount {
+        let swap = state
+            .relay_link
+            .base_to_mon(evm, amount)
+            .await
+            .map_err(unavailable)?;
+        return Ok((evm.into(), false, swap));
+    }
+    let solana = user.solana_wallet.as_deref().filter(|w| !w.is_empty());
+    let solana_cash = match solana {
+        Some(s) => markets::solana_cash(state, s).await,
+        None => 0,
+    };
+    if let Some(s) = solana {
+        if solana_cash >= amount && markets::solana_can_send(state, s, amount).await {
+            let swap = state
+                .relay_link
+                .solana_to_mon(s, evm, amount)
+                .await
+                .map_err(unavailable)?;
+            return Ok((s.into(), true, swap));
+        }
+    }
+    Err(markets::not_enough_cash(
+        base_cash + solana_cash,
+        currency,
+        rate,
+    ))
 }
 
 async fn sui_coin_sell_quote(
@@ -3377,6 +3512,9 @@ pub(super) async fn quote(
         .into_iter()
         .find(|t| format!("near:{}", t.asset_id) == req.asset_id && supported(t))
         .ok_or((StatusCode::NOT_FOUND, "1Click asset not found".into()))?;
+    if token.blockchain == "monad" {
+        return mon_buy_quote(state, req, user, token).await;
+    }
     let destination = destination(&state, &headers, &token, &user).await?;
     let rate = app_balance::fx_rate(&req.amount.currency).await?;
     let micros = markets::parse_micros(&req.amount.amount)?;
@@ -3467,8 +3605,8 @@ pub(super) async fn quote(
         "fee":money(network_fee,&req.amount.currency,rate),"expiresAtUnixMs":expires}),
     ))
 }
-// A Monad sale's plan: one transfer to 1Click's deposit address, for the phone to send (MON itself,
-// or an ERC-20 `transfer`). The wallet's nonce is noted: once it moves on, the plan may have gone out.
+// A MON sale's plan: one deposit to Relay's depository on Monad, for the phone to send. The wallet's
+// nonce is noted: once it moves on, the plan may have gone out.
 async fn execute_monad_sale(
     state: &AppState,
     user: &app_balance::VerifiedWallets,
@@ -3476,27 +3614,19 @@ async fn execute_monad_sale(
 ) -> Result<Json<Value>, ApiError> {
     let token = stored.asset.clone();
     let held = state.near.monad_balance(&token, &stored.wallet).await?;
-    let gas = if token.contract_address.is_none() {
-        MONAD_GAS_RESERVE
-    } else {
-        0
-    };
-    if held < stored.amount.saturating_add(gas) {
+    if held < stored.amount.saturating_add(MONAD_GAS_RESERVE) {
         return Err(conflict(&format!(
             "You no longer hold that much {}.",
             token.symbol
         )));
     }
-    let q = cash_quote(state, user, &token, stored.amount, &stored.wallet, false).await?;
-    if min_out(&q)? < stored.minimum_out.saturating_mul(99) / 100 {
+    let swap = mon_cash_quote(state, user, &stored.wallet, stored.amount).await?;
+    if swap.minimum_out_units < stored.minimum_out.saturating_mul(99) / 100 {
         return Err(conflict("route price changed; request a fresh quote"));
     }
-    let deposit = q
-        .deposit_address
-        .clone()
-        .filter(|d| is_evm(d) && q.deposit_memo.is_none())
-        .ok_or_else(|| venue("1Click returned an unsupported deposit destination"))?;
-    let (to, data, value) = monad_transfer(&token, &deposit, stored.amount)?;
+    let MonadPay::Monad { to, data, value } = swap.pay else {
+        return Err(venue("Relay returned an unsupported deposit"));
+    };
     let nonce = state.near.monad_nonce(&stored.wallet).await?;
     let intent_id = id("intent");
     let expires = now() + 120_000;
@@ -3509,7 +3639,7 @@ async fn execute_monad_sale(
                 wallet: stored.wallet.clone(),
                 expected_to: to.clone(),
                 expected_data: data.clone(),
-                deposit_address: deposit,
+                deposit_address: to.clone(),
                 deposit_memo: None,
                 asset: Some(token.clone()),
                 expires,
@@ -3523,7 +3653,7 @@ async fn execute_monad_sale(
                 then_swap: None,
                 sell_sui: false,
                 amount: stored.amount,
-                minimum_out: stored.minimum_out,
+                minimum_out: swap.minimum_out_units,
                 sui_wallet: None,
                 from_solana: false,
                 gas_request_id: None,
@@ -3538,13 +3668,19 @@ async fn execute_monad_sale(
                 expected_value: format!("0x{value:x}"),
                 handed_nonce: Some(nonce),
                 device: None,
+                relay: Some(RelayLeg {
+                    request_id: swap.request_id,
+                    typed_data: None,
+                    api: String::new(),
+                    expected_out: swap.expected_out_units,
+                }),
             },
         )
         .await?;
     let rate = app_balance::fx_rate(&stored.currency).await?;
     let mut summary = vec![
         json!({"label":"You sell","value":format!("{} {}",markets::format_units(stored.amount,token.decimals),token.symbol)}),
-        json!({"label":"You receive (at least)","value":markets::say_money(stored.minimum_out,&stored.currency,rate)}),
+        json!({"label":"You receive (at least)","value":markets::say_money(swap.minimum_out_units,&stored.currency,rate)}),
     ];
     if stored.network_fee > 0 {
         summary.push(json!({"label":"Fees","value":markets::say_money(stored.network_fee,&stored.currency,rate)}));
@@ -3556,26 +3692,134 @@ async fn execute_monad_sale(
     ))
 }
 const MONAD_CHAIN_ID: u64 = 143;
-// The transfer that pays 1Click on Monad: (to, calldata, wei). MON goes as value; an ERC-20 goes as
-// a `transfer(deposit, amount)` call to its contract.
-fn monad_transfer(
-    token: &Token,
-    deposit: &str,
-    amount: u128,
-) -> Result<(String, String, u128), ApiError> {
-    if !is_evm(deposit) || amount == 0 {
-        return Err(bad("invalid transfer"));
+// A MON buy's plan: from Solana, [gas top-up?, Relay deposit] that the engine lands; from Base, the
+// one authorization the phone signs, which the engine checks and hands to Relay.
+async fn execute_mon_buy(
+    state: &AppState,
+    user: &app_balance::VerifiedWallets,
+    stored: StoredQuote,
+) -> Result<Json<Value>, ApiError> {
+    let unavailable = |_| venue("Couldn't price MON right now; nothing was spent. Try again.");
+    let swap = if stored.from_solana {
+        state
+            .relay_link
+            .solana_to_mon(&stored.wallet, &stored.recipient, stored.amount)
+            .await
+    } else {
+        state
+            .relay_link
+            .base_to_mon(&stored.recipient, stored.amount)
+            .await
     }
-    let deposit = deposit.to_ascii_lowercase();
-    match token.contract_address.as_deref() {
-        None => Ok((deposit, "0x".into(), amount)),
-        Some(contract) if is_evm(contract) => Ok((
-            contract.to_ascii_lowercase(),
-            format!("0xa9059cbb{:0>64}{:064x}", &deposit[2..], amount),
-            0,
-        )),
-        Some(_) => Err(venue("invalid Monad token contract")),
+    .map_err(unavailable)?;
+    if swap.minimum_out_units < stored.minimum_out.saturating_mul(99) / 100 {
+        return Err(conflict("route price changed; request a fresh quote"));
     }
+    let balance = if stored.from_solana {
+        markets::solana_cash(state, &stored.wallet).await
+    } else {
+        state
+            .markets
+            .base
+            .balance_of(BASE_USDC, &stored.wallet)
+            .await
+            .map_err(venue)?
+    };
+    if balance < stored.amount {
+        return Err(markets::short_of_cash());
+    }
+    let mut transactions = Vec::new();
+    let mut gas_request_id = None;
+    let (typed_data, api) = match &swap.pay {
+        MonadPay::Solana {
+            instructions,
+            lookup_tables,
+        } => {
+            let deposit = state
+                .solana_mainnet
+                .v0_transaction(&stored.wallet, instructions, lookup_tables)
+                .await
+                .map_err(venue)?;
+            // A Solana wallet with no SOL pays the transaction fee from a gasless top-up first.
+            if let Some((gas_id, gas_tx)) =
+                markets::gas_topup(state, &stored.wallet, stored.amount).await
+            {
+                transactions.push(json!({"chain":"solana","transaction":gas_tx,"submit":"engine"}));
+                gas_request_id = Some(gas_id);
+            }
+            transactions.push(json!({"chain":"solana","transaction":deposit,"submit":"engine"}));
+            (None, String::new())
+        }
+        MonadPay::Base { typed_data, api } => {
+            transactions.push(gasless::step(typed_data, "base"));
+            (Some(typed_data.clone()), api.clone())
+        }
+        MonadPay::Monad { .. } => return Err(venue("Relay returned an unsupported payment")),
+    };
+    let intent_id = id("intent");
+    let expires = now() + 120_000;
+    let token = stored.asset.clone();
+    state
+        .near
+        .insert_intent(
+            &intent_id,
+            StoredIntent {
+                owner: user.user_id.clone(),
+                wallet: stored.wallet.clone(),
+                expected_to: String::new(),
+                expected_data: String::new(),
+                deposit_address: String::new(),
+                deposit_memo: None,
+                asset: Some(token.clone()),
+                expires,
+                status: markets::IntentStatus {
+                    intent_id: intent_id.clone(),
+                    stage: "validate".into(),
+                    state: "pending".into(),
+                    tx_ids: Vec::new(),
+                    error: None,
+                },
+                then_swap: None,
+                sell_sui: false,
+                amount: stored.amount,
+                minimum_out: swap.minimum_out_units,
+                sui_wallet: None,
+                from_solana: stored.from_solana,
+                gas_request_id,
+                gas_topup: false,
+                gas_order: None,
+                topup: None,
+                sale: None,
+                sale_permission_used: false,
+                ref_wallet: Some(stored.recipient.clone()),
+                asset_id: stored.asset_id.clone(),
+                origin_chain: String::new(),
+                expected_value: String::new(),
+                handed_nonce: None,
+                device: None,
+                relay: Some(RelayLeg {
+                    request_id: swap.request_id,
+                    typed_data,
+                    api,
+                    expected_out: swap.expected_out_units,
+                }),
+            },
+        )
+        .await?;
+    let rate = app_balance::fx_rate(&stored.currency).await?;
+    let mut summary = vec![
+        json!({"label":"You pay","value":markets::say_money(stored.amount,&stored.currency,rate)}),
+        json!({"label":"You get (about)","value":format!("{} {}",
+            markets::format_units(swap.expected_out_units,token.decimals),token.symbol)}),
+        json!({"label":"Lands on","value":"Monad"}),
+    ];
+    if stored.network_fee > 0 {
+        summary.push(json!({"label":"Fees","value":markets::say_money(stored.network_fee,&stored.currency,rate)}));
+    }
+    Ok(Json(
+        json!({"intentId":intent_id,"kind":"buy","summary":summary,
+        "transactions":transactions,"expiresAtUnixMs":expires}),
+    ))
 }
 // A filled trade goes into the trade book, so positions and P&L follow it. Keeping it never fails
 // the trade the user already made.
@@ -3664,6 +3908,7 @@ async fn execute_sui_sell(
                 expected_value: String::new(),
                 handed_nonce: None,
                 device: None,
+                relay: None,
             },
         )
         .await?;
@@ -3796,6 +4041,9 @@ pub(super) async fn execute(
     }
     if stored.monad_sale {
         return execute_monad_sale(&state, &user, stored).await;
+    }
+    if stored.asset.blockchain == "monad" {
+        return execute_mon_buy(&state, &user, stored).await;
     }
     let balance = if stored.from_solana {
         markets::solana_cash(&state, &stored.wallet).await
@@ -3936,6 +4184,7 @@ pub(super) async fn execute(
                 expected_value: String::new(),
                 handed_nonce: None,
                 device: None,
+                relay: None,
             },
         )
         .await?;
@@ -4331,6 +4580,43 @@ pub(super) async fn signed(
         state.near.save_intent(&id, current).await?;
         return Ok(Json(result));
     }
+    // MON paid from Base: the phone signed Relay's authorization; it's checked, then handed to Relay.
+    if let Some(leg) = current.relay.clone().filter(|l| l.typed_data.is_some()) {
+        let [approval] = body.signed.as_slice() else {
+            return Err(bad("signed report does not match the purchase plan"));
+        };
+        if !body.sent.is_empty() || approval.index != 0 {
+            return Err(bad("signed report does not match the purchase plan"));
+        }
+        // The stage moves first, so a repeated report can't hand it over twice.
+        current.status.stage = "fund".into();
+        state.near.save_intent(&id, current.clone()).await?;
+        let typed = leg.typed_data.as_ref().expect("filtered");
+        let moved = match gasless::verify(
+            &state,
+            &headers,
+            &current.wallet,
+            typed,
+            &approval.transaction,
+        )
+        .await
+        {
+            Ok(signature) => state
+                .relay_link
+                .submit(&leg.request_id, &leg.api, &signature)
+                .await
+                .map_err(|e| e.to_string()),
+            Err(reason) => Err(reason),
+        };
+        if let Err(reason) = moved {
+            eprintln!("intent {id}: MON payment not started: {reason}");
+            current.status.state = "failed".into();
+            current.status.error = Some(gasless::NOT_MOVED.into());
+        }
+        let result = current.status.clone();
+        state.near.save_intent(&id, current).await?;
+        return Ok(Json(result));
+    }
     if current.topup.as_ref().is_some_and(|t| t.uid.is_none()) {
         if !body.sent.is_empty() || body.signed.len() != 1 || body.signed[0].index != 0 {
             return Err(bad("Top-up approval does not match"));
@@ -4401,6 +4687,9 @@ pub(super) async fn status(
             StatusCode::FORBIDDEN,
             "intent belongs to another user".into(),
         ));
+    }
+    if let Some(leg) = current.relay.clone() {
+        return relay_status(&state, &id, current, leg).await.map(Json);
     }
     let mut result = current.status.clone();
     if current.sell_sui && result.state == "pending" {
@@ -4605,6 +4894,108 @@ pub(super) async fn status(
     current.status = result.clone();
     state.near.save_intent(&id, current).await?;
     Ok(Json(result))
+}
+
+// A MON trade through Relay: the user's payment lands first (the engine's Solana deposit, or the
+// phone's send on Monad; a Base payment was handed to Relay at /signed), then Relay says when it
+// filled. A sale nobody reported is followed by its wallet nonce, as with 1Click.
+async fn relay_status(
+    state: &AppState,
+    id: &str,
+    mut current: StoredIntent,
+    leg: RelayLeg,
+) -> Result<markets::IntentStatus, ApiError> {
+    let mut result = current.status.clone();
+    if result.state != "pending" {
+        return Ok(result);
+    }
+    let sale = current.origin_chain == "monad";
+    let symbol = current
+        .asset
+        .as_ref()
+        .map_or("coin", |a| a.symbol.as_str())
+        .to_owned();
+    match result.stage.as_str() {
+        "validate" => {
+            if now() <= current.expires {
+                return Ok(result);
+            }
+            let moved = match (sale, current.handed_nonce) {
+                (true, Some(handed)) => state.near.monad_nonce(&current.wallet).await? > handed,
+                (true, None) => true,
+                // A buy's payment goes out only through /signed, which moves the stage first.
+                (false, _) => false,
+            };
+            if !moved {
+                result.state = "failed".into();
+                result.error = Some(if sale {
+                    format!("Nothing was sent, so your {symbol} is still in your wallet.")
+                } else {
+                    NOT_SENT.into()
+                });
+                current.status = result.clone();
+                state.near.save_intent(id, current).await?;
+                return Ok(result);
+            }
+        }
+        "settle" => {
+            let Some(hash) = result.tx_ids.first().cloned() else {
+                return Ok(result);
+            };
+            match deposit_landed(state, &current, &hash).await? {
+                Ok(false) => return Ok(result),
+                Ok(true) => {}
+                Err(message) => {
+                    result.state = "failed".into();
+                    result.error = Some(message);
+                    current.status = result.clone();
+                    state.near.save_intent(id, current).await?;
+                    return Ok(result);
+                }
+            }
+        }
+        "fund" => {}
+        _ => return Ok(result),
+    }
+    match state
+        .relay_link
+        .state(&leg.request_id)
+        .await
+        .map_err(venue)?
+    {
+        engine_execution::layerswap::SwapState::Waiting => {
+            if result.stage == "validate" {
+                result.error = Some(
+                    "It may have gone through. Checking with Relay before saying more.".into(),
+                );
+            }
+            return Ok(result);
+        }
+        engine_execution::layerswap::SwapState::Completed => {
+            result.stage = "settle".into();
+            result.state = "filled".into();
+            result.error = None;
+            let tx = result.tx_ids.first().cloned();
+            let (side, coin, cash) = if sale {
+                ("sell", current.amount, leg.expected_out)
+            } else {
+                ("buy", leg.expected_out, current.amount)
+            };
+            record_fill(state, id, &current, side, coin, cash, tx).await;
+        }
+        engine_execution::layerswap::SwapState::Failed(reason) => {
+            eprintln!("intent {id}: Relay {reason}");
+            result.state = "failed".into();
+            result.error = Some(if sale {
+                format!("The sale didn't go through. Relay returns your {symbol} to your wallet.")
+            } else {
+                "The purchase didn't go through. Relay returns your money to your wallet.".into()
+            });
+        }
+    }
+    current.status = result.clone();
+    state.near.save_intent(id, current).await?;
+    Ok(result)
 }
 
 // What 1Click says reached the recipient, once settled.
@@ -5095,34 +5486,6 @@ mod tests {
         let mut quoted = token("near", "X", None, 24, 0.0);
         quoted.price = Some(json!("0.25"));
         assert_eq!(token_usd(&quoted), 0.25);
-    }
-    #[test]
-    fn a_monad_sale_is_one_plain_transfer_to_the_deposit() {
-        let deposit = "0x1111111111111111111111111111111111111111";
-        let mon = token("monad", "MON", None, 18, 0.03);
-        assert_eq!(
-            monad_transfer(&mon, deposit, 5).unwrap(),
-            (deposit.into(), "0x".into(), 5)
-        );
-        let usd = token(
-            "monad",
-            "COIN",
-            Some("0x754704BC059F8C67012FED69BC8A327A5AAFB603"),
-            6,
-            1.0,
-        );
-        let (to, data, value) = monad_transfer(&usd, deposit, 255).unwrap();
-        assert_eq!(to, "0x754704bc059f8c67012fed69bc8a327a5aafb603");
-        assert_eq!(value, 0);
-        assert_eq!(
-            data,
-            format!(
-                "0xa9059cbb{:0>64}{:064x}",
-                "1111111111111111111111111111111111111111", 255
-            )
-        );
-        assert!(monad_transfer(&mon, "not-an-address", 5).is_err());
-        assert!(monad_transfer(&mon, deposit, 0).is_err());
     }
     #[test]
     fn a_reported_monad_transfer_must_be_exactly_the_plan() {
