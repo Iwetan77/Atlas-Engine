@@ -36,13 +36,12 @@ network loses money.
    - Solana → Base through **Layerswap** (with ETH for gas on the way when the wallet has none);
    - perps margin into **Hyperliquid** through Relay (gasless from Base, or one Solana transaction).
 6. **Gas is never Atlas's.** The user pays from their own USDC, and Privy sponsorship is never used:
-   - Solana swaps read the wallet's SOL first. With enough for fees and account rent, Jupiter V2
-     `/build` makes a user-paid swap and the engine simulates it before confirmation; this path has
-     no gasless order minimum. Only a wallet that cannot cover those costs tries Jupiter's gasless
-     `/order`. If that route is below its minimum, the swap is refused before sending it. Transfers
-     can still include a gasless $0.50 USDC → SOL top-up when needed.
-     Both swap routes use the same app plan (`submit: "engine"`); user-paid swaps settle from their
-     on-chain signature and actual balance changes. The signature is saved before submission.
+   - Solana swaps simulate the user's own transaction first, including fees and account rent.
+     If it can pay, Jupiter V2 `/build` is used with no gasless minimum. Otherwise an executable
+     Jupiter gasless order is tried. If neither works, cash buys a fee reserve through **Kora +
+     NEAR Intents 1Click**, described below. Atlas never funds a fee-payer wallet.
+     Plans remain plain transactions (`submit: "engine"`); the phone signs, the engine verifies
+     the exact message and signatures, and settlement reads actual on-chain balance changes.
    - Base: USDC leaving Base needs no ETH (one signed authorization; the venue's relayer pays). A wallet with
      no ETH first fills its tank with a gasless **CoW** order ($0.50 USDC → ETH, ~$0.004). With neither, the
      user is asked to add about $0.50.
@@ -59,7 +58,7 @@ network loses money.
 
 | | What it does in Atlas |
 |---|---|
-| **Privy** | Sign-in, the user's embedded wallets, and signing under the user's own login (JWT) for the few things only a server can do: relaying a Base transaction they confirmed, a gasless USDC authorization, a CoW top-up, a Sui swap. |
+| **Privy** | Sign-in and user-owned wallets. The phone signs transactions, typed data and exact one-use device approvals. The bridge passes approvals to Privy and verifies signatures; it never signs using a user's JWT or an unrestricted server key. |
 | **Jupiter** | Solana spot: ~350 verified assets (memes, xStocks, crypto), gasless orders, price charts, Jupiter Lend savings. |
 | **KyberSwap** | Base swaps: searches every exchange for the best route (router pinned, every built swap decoded and checked: amount in, no fees, pays the user). Any Base token by pasting its address; trending Base coins (GeckoTerminal, CoinGecko-listed only) in Trade. |
 | **Uniswap v3** | Base swaps when Kyber can't answer (one direct pool). |
@@ -311,3 +310,102 @@ New execution plans save their receipt metadata in `atlas_receipts` using `DATAB
 New deposits quoted through `/v1/deposit/quote` are tracked, including pending status and payout IDs. Old direct wallet deposits
 made outside this lifecycle are not backfilled. No signing request, wallet approval, login token or owner ID is returned.
 Pending transfer observations run in the background; listing history never submits a new buy or asks for a signature.
+
+
+## Solana fees paid from cash
+
+**The user pays; Atlas provides no SOL or sponsorship credits.** Helius is an RPC provider, not
+this fee payer. Kora lets an external operator front the SOL while an exact USDC payment in the
+same atomic transaction reimburses it. Our public mainnet operator supports USDC transfers, but
+its live policy excludes Jupiter swaps and wrapped SOL. We therefore use it for a **USDC transfer
+into 1Click**, which converts that cash to native SOL in the user's own wallet. Jupiter then uses
+that reserve. This does not require Atlas to run or fund a Kora node.
+
+### Purchase flow
+
+1. Try the exact swap with the user's existing SOL. Simulate fee, rent and token balances.
+2. If it cannot cover gas, try an executable Jupiter gasless order. Never execute an indicative
+   quote or assume that gasless eligibility/minimums are fixed.
+3. If neither works, quote a reserve separately: 1Click USDC → native SOL, recipient and refund
+   both the same user wallet. Choose from $0.50, $0.75, $1, $1.50 or $2 so the quoted minimum output
+   plus current SOL covers a 0.005 SOL reserve. More expensive or unavailable routes stop before
+   payment. The final swap is simulated again; the reserve isn't a guarantee for every possible route.
+4. Kora estimates the USDC transfer fee, including creating the new deposit account. When cash
+   hasn't landed from Base yet, an unsigned fee-only probe covers the same two signatures and
+   account creation, with no token transfers and no priority-fee instructions. That probe is never
+   signed or sent. After cash arrives, preparation re-estimates and simulates the **actual user's
+   transaction**, enforcing the cap. Its fixed
+   reimbursement is that estimate plus 10% and 0.001 USDC, capped at 1 USDC and shown before confirm.
+   That quoted reimbursement is paid to the operator; the buffer is not an Atlas balance or a refund.
+   A changed fee beyond that fixed amount refuses the plan.
+5. The buy amount is a **total cash budget**: reserve and reimbursement are subtracted first, then
+   the rest buys the requested asset. A too-small budget is refused with the minimum in the user's
+   currency. A sell needs separate cash for this reserve; an unsupported token alone with no SOL
+   cannot bootstrap its own first swap.
+6. The user confirms the whole plan once. The phone signs the USDC transfer already co-signed by
+   Kora's fee payer. The engine verifies both signatures over the exact prepared message and saves
+   the signature/claim before submission. Kora never signs for the user's wallet.
+7. `fund` waits for the transfer to confirm **and** for 1Click to report delivery, checked against
+   the user's real SOL balance. `sign` hands out the fresh user-paid Jupiter swap through `/next`.
+   The phone signs it under the same confirmation. Its on-chain minimum must still match at least
+   99% of the original quote. Only the actual asset swap can fill the intent.
+
+The reserve is an asset still owned by the user, not all a fee. For the live unsigned check on
+2026-10-02: 0.50 USDC bought at least 0.003963077 SOL, the operator reimbursement was 0.302323 USDC,
+with approximately 0.487698 USDC of value kept as SOL. Prices and transfer fees vary; these are
+examples, not fixed pricing. No user signature or payment was submitted in that check.
+
+### App contract and failure handling
+
+Existing endpoints and transaction shapes are unchanged:
+
+- `POST /v1/quotes` has an optional `feeReserve` (`null` when unnecessary):
+  `{ amount: Money, networkFee: Money, kept: Money }`, all in the chosen display currency.
+  `pay.value` includes the reserve for buys, `receive` quotes just the requested asset, and `fee`
+  includes the reserve's transfer/conversion cost (not the SOL value kept). Sell proceeds don't
+  silently pretend the separate cash reimbursement is free.
+- The confirm summary explicitly shows **Kept for future network fees**, **Reserve transfer fee**,
+  and, for sells, **From your cash**. The app renders the engine's summary as usual.
+- `/execute` and `/next` return `{chain:"solana", transaction:base64, submit:"engine"}` steps.
+  Preserve the fee payer's existing signature when adding the user's signature. The installed
+  native Privy SDK does this using `addSignature`; the engine refuses a missing/changed signature.
+- `/signed` progresses `validate → fund → sign → settle`. When cash starts on Base, the existing
+  cash move runs first, then the reserve, then the swap: all behind one confirmation.
+  Cached unsigned steps, atomic signature claims and compare-and-swap polling protect against
+  replay, delayed polls and an interrupted response. History keeps all origin/swap hashes.
+- Reserve transfer validity is 45 seconds; the later swap is cached for 45 seconds, with a five
+  minute overall action window after reserve preparation. If the app closes, cash/SOL waits in
+  the user's wallet; a fresh quote won't collect a reserve when the exact swap can already pay gas.
+- Unknown submissions stay pending until the known signature settles or expires; never assume a
+  dropped response means nothing was sent. Delivery/refund uncertainty stays pending, not filled.
+  A rejected final swap says the reserve and unspent cash/tokens are in the wallet. Conversion and
+  transfer fees may already have been paid; they are not promised back.
+
+Default external endpoint: `https://mainnet.kora-nodes.com` (no API key). Optional operator settings
+are `ATLAS_KORA_RPC_URL` (HTTPS) and `KORA_API_KEY` (sent as `x-api-key`). An alternative operator
+must permit mainnet USDC/ATA instructions and USDC reimbursement, and provide the same Kora RPC
+contract. This isn't an Openfort-specific client or an App-pays sponsorship policy. Existing
+`NEAR_INTENTS_API_KEY` is reused. Atlas stores no operator/private wallet key. Public provider
+rate limits, liquidity, availability and balance remain external dependencies; failures refuse
+preparation before payment or leave an already-sent transfer pending for settlement.
+
+### Reproducible checks (never broadcast)
+
+```sh
+cargo test -p engine-service live_cash_reserve_unsigned_plan -- --ignored --nocapture
+cargo test -p engine-execution live_kora_provider_partial_signature -- --ignored --nocapture
+cargo test -p engine-execution live_kora_empty_cash_wallet_estimate -- --ignored --nocapture
+python3 -B -m unittest discover -s scripts -p test_kora_readiness.py -v
+python3 scripts/check-kora.py --wallet <public-solana-address>
+```
+
+The audit intentionally exits 1 for the public operator's **direct Jupiter** policy; this is why
+we use a USDC transfer to 1Click instead. It requests no signatures. The Rust dry checks build real
+mainnet transactions, simulate, and verify **only the operator's partial signature**; they never
+request a user signature or broadcast. Funded phone signing, reserve delivery, and the subsequent
+Jupiter fill still require an end-to-end check before claiming production reliability.
+
+Sources: [Kora fee abstraction](https://solana.com/docs/payments/send-payments/payment-processing/fee-abstraction),
+[Kora signTransaction](https://solana.com/docs/tools/kora/json-rpc-api/sign-transaction),
+[public operator](https://kora-nodes.com/),
+[NEAR Intents 1Click](https://docs.near-intents.org/near-intents/integration/distribution-channels/1click-api).

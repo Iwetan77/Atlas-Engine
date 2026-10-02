@@ -439,6 +439,96 @@ impl SolanaAtaPreflight {
         Ok((STANDARD.encode(bytes), creates))
     }
 
+    /// Fee-only probe before cash lands: the same two signatures and ATA rent, with no transfers.
+    /// Extra read-only signer does not spend; this unsigned probe never reaches a signing endpoint.
+    pub(crate) async fn usdc_transfer_fee_probe(
+        &self,
+        owner: &str,
+        recipient: &str,
+        payer: &str,
+        payment: &str,
+    ) -> Result<String, SolanaPreflightError> {
+        self.assert_network().await?;
+        let key = |s: &str| Pubkey::from_str(s).map_err(|_| SolanaPreflightError::InvalidResponse);
+        let (owner, recipient, payer, payment) =
+            (key(owner)?, key(recipient)?, key(payer)?, key(payment)?);
+        let instructions = fee_probe_instructions(&owner, &recipient, &payer, &payment)?;
+        let block = self
+            .rpc("getLatestBlockhash", json!([{"commitment":"confirmed"}]))
+            .await?;
+        let hash = Hash::from_str(
+            block["value"]["blockhash"]
+                .as_str()
+                .ok_or(SolanaPreflightError::InvalidResponse)?,
+        )
+        .map_err(|_| SolanaPreflightError::InvalidResponse)?;
+        let mut message = solana_sdk::message::Message::new(&instructions, Some(&payer));
+        message.recent_blockhash = hash;
+        if message.header.num_required_signatures != 2 {
+            return Err(SolanaPreflightError::InvalidResponse);
+        }
+        let tx = solana_sdk::transaction::VersionedTransaction {
+            message: solana_sdk::message::VersionedMessage::Legacy(message),
+            signatures: vec![solana_sdk::signature::Signature::default(); 2],
+        };
+        Ok(STANDARD
+            .encode(bincode::serialize(&tx).map_err(|_| SolanaPreflightError::InvalidResponse)?))
+    }
+
+    /// Cash plus the provider fee are authorized together. The provider pays account rent and SOL;
+    /// it never controls the user's wallet or gets an approval for a separate payment.
+    pub async fn usdc_transfer_with_fee(
+        &self,
+        owner: &str,
+        recipient: &str,
+        amount: u64,
+        payer: &str,
+        payment: &str,
+        fee: u64,
+    ) -> Result<(String, u64), SolanaPreflightError> {
+        use solana_sdk::{
+            message::VersionedMessage, signature::Signature, transaction::VersionedTransaction,
+        };
+        if self.network != SolanaNetwork::Mainnet || amount == 0 || fee == 0 || owner == payer {
+            return Err(SolanaPreflightError::InvalidResponse);
+        }
+        self.assert_network().await?;
+        let key = |s: &str| Pubkey::from_str(s).map_err(|_| SolanaPreflightError::InvalidResponse);
+        let (owner, recipient, payer, payment) =
+            (key(owner)?, key(recipient)?, key(payer)?, key(payment)?);
+        let instructions =
+            fee_transfer_instructions(&owner, &recipient, &payer, &payment, amount, fee)?;
+        let block = self
+            .rpc("getLatestBlockhash", json!([{"commitment":"confirmed"}]))
+            .await?;
+        let hash = Hash::from_str(
+            block["value"]["blockhash"]
+                .as_str()
+                .ok_or(SolanaPreflightError::InvalidResponse)?,
+        )
+        .map_err(|_| SolanaPreflightError::InvalidResponse)?;
+        let height = block["value"]["lastValidBlockHeight"]
+            .as_u64()
+            .ok_or(SolanaPreflightError::InvalidResponse)?;
+        let mut message = solana_sdk::message::Message::new(&instructions, Some(&payer));
+        message.recent_blockhash = hash;
+        if message.header.num_required_signatures != 2
+            || message.account_keys[..2] != [payer, owner]
+        {
+            return Err(SolanaPreflightError::InvalidResponse);
+        }
+        let tx = VersionedTransaction {
+            signatures: vec![Signature::default(); 2],
+            message: VersionedMessage::Legacy(message),
+        };
+        Ok((
+            STANDARD.encode(
+                bincode::serialize(&tx).map_err(|_| SolanaPreflightError::InvalidResponse)?,
+            ),
+            height,
+        ))
+    }
+
     /// An unsigned v0 transaction paid by `payer`, base64: what a venue hands over as instructions
     /// (`{programId, keys: [{pubkey, isSigner, isWritable}], data: hex}`) and lookup tables to use,
     /// for the user to sign (Relay's Solana deposits).
@@ -658,6 +748,74 @@ impl SolanaAtaPreflight {
     }
 }
 
+fn fee_probe_instructions(
+    owner: &Pubkey,
+    recipient: &Pubkey,
+    payer: &Pubkey,
+    payment: &Pubkey,
+) -> Result<Vec<solana_sdk::instruction::Instruction>, SolanaPreflightError> {
+    if owner == payer || owner == recipient || owner == payment || recipient == payment {
+        return Err(SolanaPreflightError::InvalidResponse);
+    }
+    let mint =
+        Pubkey::from_str(MAINNET_USDC_MINT).map_err(|_| SolanaPreflightError::InvalidResponse)?;
+    let mut instructions = vec![
+        create_associated_token_account_idempotent(payer, recipient, &mint, &spl_token::id()),
+        create_associated_token_account_idempotent(payer, payment, &mint, &spl_token::id()),
+    ];
+    instructions[0]
+        .accounts
+        .push(solana_sdk::instruction::AccountMeta::new_readonly(
+            *owner, true,
+        ));
+    Ok(instructions)
+}
+
+fn fee_transfer_instructions(
+    owner: &Pubkey,
+    recipient: &Pubkey,
+    payer: &Pubkey,
+    payment: &Pubkey,
+    amount: u64,
+    fee: u64,
+) -> Result<Vec<solana_sdk::instruction::Instruction>, SolanaPreflightError> {
+    if amount == 0
+        || fee == 0
+        || owner == payer
+        || owner == recipient
+        || owner == payment
+        || recipient == payment
+    {
+        return Err(SolanaPreflightError::InvalidResponse);
+    }
+    let mint =
+        Pubkey::from_str(MAINNET_USDC_MINT).map_err(|_| SolanaPreflightError::InvalidResponse)?;
+    let ata = |wallet: &Pubkey| {
+        get_associated_token_address_with_program_id(wallet, &mint, &spl_token::id())
+    };
+    let source = ata(owner);
+    let mut instructions = vec![
+        create_associated_token_account_idempotent(payer, recipient, &mint, &spl_token::id()),
+        create_associated_token_account_idempotent(payer, payment, &mint, &spl_token::id()),
+    ];
+    for (to, value) in [(recipient, amount), (payment, fee)] {
+        instructions.push(
+            spl_token::instruction::transfer_checked(
+                &spl_token::id(),
+                &source,
+                &mint,
+                &ata(to),
+                owner,
+                &[],
+                value,
+                6,
+            )
+            .map_err(|_| SolanaPreflightError::InvalidResponse)?,
+        );
+    }
+    Ok(instructions)
+}
+
 fn simulation_short_of_gas(value: &Value) -> bool {
     if matches!(value["err"].as_str(), Some("InsufficientFundsForFee"))
         || value["err"].get("InsufficientFundsForRent").is_some()
@@ -790,6 +948,67 @@ fn verify_token_account(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fee_probe_matches_signature_count_and_rent_without_moving_any_token() {
+        let (owner, deposit, payer, payment) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let instructions = fee_probe_instructions(&owner, &deposit, &payer, &payment).unwrap();
+        assert_eq!(instructions.len(), 2);
+        assert!(instructions
+            .iter()
+            .all(|ix| ix.program_id == spl_associated_token_account::id()));
+        let message = solana_sdk::message::Message::new(&instructions, Some(&payer));
+        assert_eq!(message.header.num_required_signatures, 2);
+        assert_eq!(message.account_keys[..2], [payer, owner]);
+    }
+    #[test]
+    fn cash_and_provider_fee_transfer_only_exact_mainnet_usdc() {
+        let (owner, deposit, payer, payment) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let mint = Pubkey::from_str(MAINNET_USDC_MINT).unwrap();
+        let ix = fee_transfer_instructions(&owner, &deposit, &payer, &payment, 500_000, 302_323)
+            .unwrap();
+        assert_eq!(ix.len(), 4);
+        for create in &ix[..2] {
+            assert_eq!(create.program_id, spl_associated_token_account::id());
+            assert_eq!(create.accounts[0].pubkey, payer);
+        }
+        for (transfer, (recipient, amount)) in
+            ix[2..].iter().zip([(deposit, 500_000), (payment, 302_323)])
+        {
+            assert_eq!(transfer.program_id, spl_token::id());
+            assert_eq!(transfer.accounts[1].pubkey, mint);
+            assert_eq!(
+                transfer.accounts[2].pubkey,
+                get_associated_token_address_with_program_id(&recipient, &mint, &spl_token::id())
+            );
+            assert_eq!(transfer.accounts[3].pubkey, owner);
+            assert!(transfer.accounts[3].is_signer);
+            assert_eq!(
+                spl_token::instruction::TokenInstruction::unpack(&transfer.data).unwrap(),
+                spl_token::instruction::TokenInstruction::TransferChecked {
+                    amount,
+                    decimals: 6
+                }
+            );
+        }
+        assert!(
+            fee_transfer_instructions(&owner, &deposit, &owner, &payment, 500_000, 302_323)
+                .is_err()
+        );
+        assert!(
+            fee_transfer_instructions(&owner, &deposit, &payer, &owner, 500_000, 302_323).is_err()
+        );
+    }
+
     #[test]
     fn gas_shortage_is_distinct_from_not_enough_tokens() {
         assert!(simulation_short_of_gas(

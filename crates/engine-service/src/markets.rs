@@ -805,6 +805,8 @@ pub(super) struct MarketState {
     pub(super) base: UniswapV3Client,
     kyber: KyberClient,
     jupiter: JupiterClient,
+    pub(super) kora: engine_execution::kora::Client,
+    pub(super) gas_near: engine_execution::near_intents::Client,
     rpc: reqwest::Url,
     http: reqwest::Client,
     quotes: Arc<Mutex<HashMap<String, StoredQuote>>>,
@@ -840,6 +842,7 @@ struct StoredQuote {
     funding_units: u128,
     // The move's fee inside funding_units, shown as the network fee.
     funding_fee: u128,
+    fee_preview: Option<solana_fees::Preview>,
     expires: u64,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -851,6 +854,10 @@ struct StoredIntent {
     request_id: Option<String>,
     #[serde(default)]
     own_swap: Option<UserPaidSwap>,
+    #[serde(default)]
+    fee_preview: Option<solana_fees::Preview>,
+    #[serde(default)]
+    fee_reserve: Option<solana_fees::Reserve>,
     status: IntentStatus,
     // Set for spot buys and sells, so the fill can be kept as a trade.
     trade: Option<PlannedTrade>,
@@ -970,6 +977,13 @@ impl MarketState {
             base: UniswapV3Client::new(rpc.clone())?,
             kyber: KyberClient::new()?,
             jupiter: JupiterClient::new(env::var("JUPITER_API_KEY").ok()),
+            kora: engine_execution::kora::Client::new(
+                &env_url("ATLAS_KORA_RPC_URL", engine_execution::kora::PUBLIC_MAINNET),
+                env::var("KORA_API_KEY").ok(),
+            )?,
+            gas_near: engine_execution::near_intents::Client::new(
+                env::var("NEAR_INTENTS_API_KEY").ok(),
+            )?,
             rpc,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(20))
@@ -989,6 +1003,29 @@ impl MarketState {
             searches: Arc::new(Mutex::new(HashMap::new())),
             postgres: None,
         })
+    }
+    // /next may race a signature report. Never overwrite a sent step with a fresh unsigned plan.
+    async fn replace_plan(
+        &self,
+        id: &str,
+        before: &StoredIntent,
+        after: &StoredIntent,
+    ) -> Result<bool, ApiError> {
+        let previous = serde_json::to_string(before).map_err(internal)?;
+        let payload = serde_json::to_string(after).map_err(internal)?;
+        if let Some(pg) = &self.postgres {
+            return Ok(pg.execute("UPDATE atlas_intents SET payload=$2,stage=$3,updated_at_ms=$4 WHERE intent_id=$1 AND payload=$5",
+                &[&id,&payload,&after.status.stage,&now_i64(),&previous]).await.map_err(internal)? == 1);
+        }
+        let mut intents = self.intents.lock().map_err(internal)?;
+        let Some(current) = intents.get(id) else {
+            return Ok(false);
+        };
+        if serde_json::to_string(current).map_err(internal)? != previous {
+            return Ok(false);
+        }
+        intents.insert(id.into(), after.clone());
+        Ok(true)
     }
     // Typing a word again, or going back to the list, answers at once; prices are already shared
     // for longer than this.
@@ -1147,6 +1184,8 @@ impl MarketState {
                     .collect(),
                 request_id: None,
                 own_swap: None,
+                fee_preview: None,
+                fee_reserve: None,
                 status,
                 trade: None,
                 funding: None,
@@ -2182,7 +2221,7 @@ pub(super) async fn quote(
         .ok_or_else(|| bad("amount too large"))?
         / rate;
     check_limits(usdc_units, &req.amount.currency, rate)?;
-    let input = if req.side == "buy" {
+    let mut input = if req.side == "buy" {
         usdc_units
     } else if req.all {
         // Everything held; SOL keeps its gas tank (0.01 SOL) for the fees ahead.
@@ -2204,6 +2243,70 @@ pub(super) async fn quote(
     if input == 0 {
         return Err(bad("amount too small for this asset"));
     }
+    let fee_preview = if a.chain == "solana" {
+        let owner = user
+            .solana_wallet
+            .as_deref()
+            .filter(|w| !w.is_empty())
+            .ok_or((StatusCode::CONFLICT, "Your wallet isn't ready yet.".into()))?;
+        let funding_first = req.side == "buy" && solana_cash(&state, owner).await < input;
+        // When the input is already here, simulate the exact route before buying any reserve.
+        let needs_reserve = if funding_first {
+            state
+                .solana_mainnet
+                .owner_sol_balance(owner)
+                .await
+                .map_err(unavailable)?
+                < solana_fees::FLOOR
+        } else {
+            let request = JupiterOrderRequest {
+                input_mint: if req.side == "buy" {
+                    SOL_USDC
+                } else {
+                    &a.token
+                }
+                .into(),
+                output_mint: if req.side == "buy" {
+                    &a.token
+                } else {
+                    SOL_USDC
+                }
+                .into(),
+                amount_base_units: input.try_into().map_err(|_| bad("amount too large"))?,
+                taker: Some(owner.into()),
+            };
+            match state
+                .markets
+                .jupiter
+                .user_paid_order(&request, &state.solana_mainnet)
+                .await
+            {
+                Ok(_) => false,
+                Err(engine_execution::swaps::jupiter::JupiterError::Preflight(
+                    engine_execution::solana::SolanaPreflightError::InsufficientGas,
+                )) => match state.markets.jupiter.gasless_order(&request).await {
+                    Ok(_) => false,
+                    Err(engine_execution::swaps::jupiter::JupiterError::Preflight(
+                        engine_execution::solana::SolanaPreflightError::InsufficientGas,
+                    ))
+                    | Err(engine_execution::swaps::jupiter::JupiterError::NotExecutable(_)) => true,
+                    Err(error) => return Err(swap_error(error)),
+                },
+                Err(error) => return Err(swap_error(error)),
+            }
+        };
+        if needs_reserve {
+            solana_fees::preview(&state, owner, true).await?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let reserve_cash = fee_preview.as_ref().map_or(0, |p| p.cash());
+    if req.side == "buy" {
+        input = purchase_input(usdc_units, fee_preview.as_ref(), &req.amount.currency, rate)?;
+    }
     let (actual_in, actual_out, fee_units) =
         venue_quote(&state.markets, &a, &req.side, input).await?;
     let (asset_units, stable_units) = if req.side == "buy" {
@@ -2213,14 +2316,27 @@ pub(super) async fn quote(
     };
     // Above what they have: say so now, in their currency, rather than at the confirm. A buy can use
     // cash on the other chain too: it moves over first.
+    let cash_needed = actual_in + if req.side == "buy" { reserve_cash } else { 0 };
+    if req.side == "sell" && reserve_cash > 0 {
+        let cash = solana_cash(&state, user.solana_wallet.as_deref().unwrap_or_default()).await;
+        if cash < reserve_cash {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "Keep at least {} in cash to cover this sale and future network fees.",
+                    say_money(reserve_cash, &req.amount.currency, rate)
+                ),
+            ));
+        }
+    }
     let mut funding_units = 0;
     let mut funding_fee = 0;
     if let Some(held) = spot_available(&state, &a, &req.side, &user).await {
-        if held < actual_in && req.side == "buy" && a.chain == "base" {
+        if held < cash_needed && req.side == "buy" && a.chain == "base" {
             (funding_units, funding_fee) =
-                base_cash_from_solana(&state, &user, held, actual_in, &req.amount.currency, rate)
+                base_cash_from_solana(&state, &user, held, cash_needed, &req.amount.currency, rate)
                     .await?;
-        } else if held < actual_in && req.side == "buy" && a.chain == "solana" {
+        } else if held < cash_needed && req.side == "buy" && a.chain == "solana" {
             let base_cash = match user.evm_wallet.as_deref().filter(|w| !w.is_empty()) {
                 Some(evm) => state
                     .markets
@@ -2234,7 +2350,7 @@ pub(super) async fn quote(
                 &state,
                 user.evm_wallet.as_deref().filter(|w| !w.is_empty()),
                 user.solana_wallet.as_deref().filter(|w| !w.is_empty()),
-                actual_in - held,
+                cash_needed - held,
             )
             .await?;
             if base_cash < send {
@@ -2246,7 +2362,7 @@ pub(super) async fn quote(
             }
             funding_units = send;
             funding_fee = fee;
-        } else if held < actual_in {
+        } else if held < cash_needed {
             return Err(if req.side == "buy" {
                 short_of_cash()
             } else {
@@ -2272,7 +2388,7 @@ pub(super) async fn quote(
     )?;
     let (pay, receive) = if req.side == "buy" {
         (
-            json!({"amount":format_units(actual_in,6),"symbol":"USDC","value":money_from_usdc(actual_in,&req.amount.currency,rate)?}),
+            json!({"amount":format_units(cash_needed,6),"symbol":"USDC","value":money_from_usdc(cash_needed,&req.amount.currency,rate)?}),
             json!({"amount":format_units(actual_out,a.decimals),"symbol":a.symbol,"value":money_from_usdc(actual_in,&req.amount.currency,rate)?}),
         )
     } else {
@@ -2305,14 +2421,36 @@ pub(super) async fn quote(
             output_units: actual_out,
             funding_units,
             funding_fee,
+            fee_preview: fee_preview.clone(),
             expires,
         },
     );
     Ok(Json(
-        json!({"quoteId":quote_id,"assetId":a.id,"side":req.side,"pay":pay,"receive":receive,"price":price,"fee":money_from_usdc(fee_usdc,&req.amount.currency,rate)?,
+        json!({"quoteId":quote_id,"assetId":a.id,"side":req.side,"pay":pay,"receive":receive,"price":price,"fee":money_from_usdc(fee_usdc + funding_fee + fee_preview.as_ref().map_or(0, |p| p.network_fee()),&req.amount.currency,rate)?,
             "funding":if funding_units > 0 {json!({"from":if a.chain == "base" {"Solana"} else {"Base"},"to":if a.chain == "base" {"Base"} else {"Solana"},"amount":money_from_usdc(funding_units,&req.amount.currency,rate)?,"fee":money_from_usdc(funding_fee,&req.amount.currency,rate)?})} else {Value::Null},
+            "feeReserve":fee_preview.as_ref().map(|p| json!({"amount":money_from_usdc(p.cash(),&req.amount.currency,rate).ok(),"networkFee":money_from_usdc(p.network_fee(),&req.amount.currency,rate).ok(),"kept":money_from_usdc(p.gas_value,&req.amount.currency,rate).ok()})),
             "expiresAtUnixMs":expires}),
     ))
+}
+
+fn purchase_input(
+    total: u128,
+    preview: Option<&solana_fees::Preview>,
+    currency: &str,
+    rate: u128,
+) -> Result<u128, ApiError> {
+    let reserve = preview.map_or(0, |p| p.cash());
+    let trade = total.saturating_sub(reserve);
+    if trade < MIN_USDC {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "This purchase needs at least {} including a reserve for future network fees.",
+                say_money(reserve + MIN_USDC, currency, rate)
+            ),
+        ));
+    }
+    Ok(trade)
 }
 
 // How much Base USDC to send so at least `shortfall` lands on Solana, and the fee in it. Relay lands
@@ -2577,6 +2715,8 @@ pub(super) async fn plan_jupiter_swap(
                 expected: Vec::new(),
                 request_id: Some(order.request_id),
                 own_swap,
+                fee_preview: None,
+                fee_reserve: None,
                 status: IntentStatus {
                     intent_id: intent_id.clone(),
                     stage: "validate".into(),
@@ -2623,6 +2763,8 @@ pub(super) async fn plan_solana_transfer(
                 expected: Vec::new(),
                 request_id: None,
                 own_swap: None,
+                fee_preview: None,
+                fee_reserve: None,
                 status: IntentStatus {
                     intent_id: intent_id.clone(),
                     stage: "validate".into(),
@@ -3093,6 +3235,8 @@ pub(super) async fn plan_base_with_cash(
                     .collect(),
                 request_id: None,
                 own_swap: None,
+                fee_preview: None,
+                fee_reserve: None,
                 status: IntentStatus {
                     intent_id: intent_id.clone(),
                     stage: "validate".into(),
@@ -3161,6 +3305,8 @@ pub(super) async fn plan_solana_swap_with_base_cash(
                     .collect(),
                 request_id: None,
                 own_swap: None,
+                fee_preview: None,
+                fee_reserve: None,
                 status: IntentStatus {
                     intent_id: intent_id.clone(),
                     stage: "validate".into(),
@@ -3279,6 +3425,7 @@ async fn execute_quote_inner(
     let mut expected = Vec::new();
     let mut request_id = None;
     let mut own_swap = None;
+    let mut fee_reserve = None;
     let mut funding = None;
     let mut gas_request_id = None;
     let mut base_topup = None;
@@ -3425,6 +3572,39 @@ async fn execute_quote_inner(
         }
         funding = Some(cash);
         output = stored.output_units;
+    } else if let Some(preview) = &stored.fee_preview {
+        let required = preview.cash()
+            + if stored.side == "buy" {
+                stored.input_units
+            } else {
+                0
+            };
+        if stored.side == "sell" {
+            let held = state
+                .solana_mainnet
+                .owner_mint_balance(&wallet, &a.token, u64::from(a.decimals))
+                .await
+                .map_err(unavailable)?;
+            let held = if a.token == SOL_MINT {
+                held + state
+                    .solana_mainnet
+                    .owner_sol_balance(&wallet)
+                    .await
+                    .map_err(unavailable)?
+            } else {
+                held
+            };
+            if held < stored.input_units {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "Your holding changed. Refresh the quote; nothing has been sent.".into(),
+                ));
+            }
+        }
+        let reserve = solana_fees::prepare(&state, &wallet, preview, required).await?;
+        transactions.push(solana_fees::step(&reserve));
+        fee_reserve = Some(reserve);
+        output = stored.output_units;
     } else {
         let (order, prepared) = state
             .markets
@@ -3488,15 +3668,15 @@ async fn execute_quote_inner(
         };
     // The confirm sheet speaks their currency: cash as money, the asset as tokens.
     let rate = app_balance::fx_rate(&stored.currency).await?;
-    let summary = if funding.is_some() {
+    let mut summary = if funding.is_some() {
         json!([
-            {"label":"You pay","value":say_money(stored.input_units, &stored.currency, rate)},
+            {"label":"You pay","value":say_money(stored.input_units + stored.fee_preview.as_ref().map_or(0,|p| p.cash()), &stored.currency, rate)},
             {"label":"You get (about)","value":format!("{} {}", format_units(output, a.decimals), a.symbol)},
             {"label":"Network fee","value":say_money(network_fee.max(1), &stored.currency, rate)},
         ])
     } else if stored.side == "buy" {
         json!([
-            {"label":"You pay","value":say_money(stored.input_units, &stored.currency, rate)},
+            {"label":"You pay","value":say_money(stored.input_units + stored.fee_preview.as_ref().map_or(0,|p| p.cash()), &stored.currency, rate)},
             {"label":"You get (about)","value":format!("{} {}", format_units(output, a.decimals), a.symbol)},
         ])
     } else {
@@ -3505,6 +3685,16 @@ async fn execute_quote_inner(
             {"label":"You get (about)","value":say_money(output, &stored.currency, rate)},
         ])
     };
+    if let Some(p) = &stored.fee_preview {
+        let lines = summary.as_array_mut().expect("summary array");
+        if stored.side == "sell" {
+            lines.push(
+                json!({"label":"From your cash","value":say_money(p.cash(),&stored.currency,rate)}),
+            );
+        }
+        lines.push(json!({"label":"Kept for future network fees","value":format!("About {}",say_money(p.gas_value,&stored.currency,rate))}));
+        lines.push(json!({"label":"Reserve transfer fee","value":say_money(p.network_fee(),&stored.currency,rate)}));
+    }
     let status = IntentStatus {
         intent_id: intent_id.clone(),
         stage: "validate".into(),
@@ -3523,6 +3713,8 @@ async fn execute_quote_inner(
                 expected,
                 request_id,
                 own_swap,
+                fee_preview: stored.fee_preview,
+                fee_reserve,
                 status,
                 trade: Some(PlannedTrade {
                     asset_id: a.id.clone(),
@@ -3604,10 +3796,66 @@ pub(super) async fn signed(
     }
     // A Solana buy paid with Base cash signs twice: the Base transfer (validate), then the Jupiter
     // buy once the cash has landed (sign). Anything else is a repeat: answer with the status.
-    let second_step = (current.funding.is_some() || current.base_topup.is_some())
+    let second_step = (current.funding.is_some()
+        || current.base_topup.is_some()
+        || current.fee_reserve.is_some())
         && current.status.stage == "sign";
     if current.status.state != "pending" || (current.status.stage != "validate" && !second_step) {
         return Ok(Json(current.status));
+    }
+    if let Some(reserve) = current
+        .fee_reserve
+        .as_ref()
+        .filter(|r| r.signature.is_none())
+    {
+        if !body.sent.is_empty() || body.signed.len() != 1 || body.signed[0].index != 0 {
+            return Err(bad("signed report does not match the network-fee step"));
+        }
+        if reserve.expires < now()
+            || state
+                .solana_mainnet
+                .block_height()
+                .await
+                .map_err(unavailable)?
+                > reserve.transfer.last_valid_block_height
+        {
+            return expire_fee_submission(&state,&intent_id,&current,"The network-fee step expired. Your unspent cash is in your wallet; request a fresh quote.").await;
+        }
+        let signature = engine_execution::kora::checked(
+            &reserve.transfer.transaction,
+            &body.signed[0].transaction,
+            &current.wallet,
+            &reserve.transfer.payer,
+            true,
+        )
+        .map_err(|_| bad("signed transaction does not match your network-fee step"))?;
+        let from = current.status.stage.clone();
+        let mut updated = current;
+        updated.fee_reserve.as_mut().expect("reserve").signature = Some(signature.clone());
+        updated.status.tx_ids.push(signature);
+        updated.status.stage = "fund".into();
+        if !state
+            .markets
+            .claim_execution_to(&intent_id, &updated, &from, "fund")
+            .await?
+        {
+            return Ok(Json(
+                state
+                    .markets
+                    .get_intent(&intent_id)
+                    .await?
+                    .map_or(updated.status, |i| i.status),
+            ));
+        }
+        if state
+            .solana_mainnet
+            .send_signed(&body.signed[0].transaction)
+            .await
+            .is_err()
+        {
+            eprintln!("intent {intent_id}: network-fee transfer outcome pending");
+        }
+        return Ok(Json(updated.status));
     }
     // An empty Base gas tank: the app sent nothing; now that the user has confirmed, their session
     // signs the CoW top-up, and the Base transactions follow once it fills.
@@ -3700,6 +3948,15 @@ pub(super) async fn signed(
         state.markets.save_intent(&intent_id, &updated).await?;
         return Ok(Json(updated.status));
     }
+    if let Some(reserve) = current
+        .fee_reserve
+        .as_ref()
+        .filter(|r| r.signature.is_some())
+    {
+        if reserve.finish_by < now() || reserve.next_expires < now() {
+            return expire_fee_submission(&state,&intent_id,&current,"The swap step expired. Your network-fee reserve and unspent tokens are in your wallet; request a fresh quote.").await;
+        }
+    }
     let mut status = current.status.clone();
     if current.funding.is_some() && !second_step {
         // Cash moving to Solana starts with a Base transfer the app sent; cash moving to Base with a
@@ -3770,7 +4027,7 @@ pub(super) async fn signed(
             .map_err(|_| bad("signed transaction does not match your swap"))?;
             let from = current.status.stage.clone();
             let mut updated = current;
-            updated.status.tx_ids = vec![signature];
+            updated.status.tx_ids.push(signature);
             updated.status.stage = "settle".into();
             // Atomically save both the claim and the signature before broadcasting. Even a
             // crash after submission can be recovered by polling, without a second purchase.
@@ -3867,6 +4124,27 @@ pub(super) async fn signed(
     Ok(Json(status))
 }
 
+async fn expire_fee_submission(
+    state: &AppState,
+    id: &str,
+    current: &StoredIntent,
+    reason: &str,
+) -> Result<Json<IntentStatus>, ApiError> {
+    let mut expired = current.clone();
+    expired.status.state = "failed".into();
+    expired.status.error = Some(reason.into());
+    if !state.markets.replace_plan(id, current, &expired).await? {
+        return Ok(Json(
+            state
+                .markets
+                .get_intent(id)
+                .await?
+                .map_or(expired.status, |i| i.status),
+        ));
+    }
+    Ok(Json(expired.status))
+}
+
 pub(super) async fn intent_status(
     State(state): State<AppState>,
     Path(intent_id): Path<String>,
@@ -3893,6 +4171,34 @@ pub(super) async fn intent_status(
             "intent belongs to another user".into(),
         ));
     }
+    if current.status.state == "pending" && current.status.stage == "fund" {
+        if let Some(reserve) = &current.fee_reserve {
+            let result = solana_fees::progress(&state, &current.wallet, reserve).await?;
+            let mut updated = current.clone();
+            match result {
+                solana_fees::Progress::Pending => return Ok(Json(updated.status)),
+                solana_fees::Progress::Ready => updated.status.stage = "sign".into(),
+                solana_fees::Progress::Failed(reason) => {
+                    updated.status.state = "failed".into();
+                    updated.status.error = Some(reason.into());
+                }
+            }
+            if !state
+                .markets
+                .replace_plan(&intent_id, &current, &updated)
+                .await?
+            {
+                return Ok(Json(
+                    state
+                        .markets
+                        .get_intent(&intent_id)
+                        .await?
+                        .map_or(updated.status, |i| i.status),
+                ));
+            }
+            return Ok(Json(updated.status));
+        }
+    }
     // Cash moving between chains: Relay or Layerswap says when it has landed; then the rest is signed.
     // A gas top-up filling: CoW says when; then the Base transactions can be sent.
     let topup = current.base_topup.as_ref().and_then(|t| t.uid.clone());
@@ -3901,7 +4207,7 @@ pub(super) async fn intent_status(
         current.status.state.as_str(),
         current.status.stage.as_str(),
     ) {
-        let mut updated = current;
+        let mut updated = current.clone();
         match state.cow.order_state(&uid).await {
             Ok(engine_execution::layerswap::SwapState::Completed) => {
                 updated.status.stage = "sign".into();
@@ -3913,7 +4219,19 @@ pub(super) async fn intent_status(
             }
             _ => return Ok(Json(updated.status)),
         }
-        state.markets.save_intent(&intent_id, &updated).await?;
+        if !state
+            .markets
+            .replace_plan(&intent_id, &current, &updated)
+            .await?
+        {
+            return Ok(Json(
+                state
+                    .markets
+                    .get_intent(&intent_id)
+                    .await?
+                    .map_or(updated.status, |i| i.status),
+            ));
+        }
         return Ok(Json(updated.status));
     }
     if current.status.state == "pending" && current.status.stage == "fund" {
@@ -3942,16 +4260,28 @@ pub(super) async fn intent_status(
         let Some((stage, state_now, error)) = next else {
             return Ok(Json(current.status));
         };
-        let mut updated = current;
+        let mut updated = current.clone();
         updated.status.stage = stage.into();
         updated.status.state = state_now.into();
         updated.status.error = error;
-        state.markets.save_intent(&intent_id, &updated).await?;
+        if !state
+            .markets
+            .replace_plan(&intent_id, &current, &updated)
+            .await?
+        {
+            return Ok(Json(
+                state
+                    .markets
+                    .get_intent(&intent_id)
+                    .await?
+                    .map_or(updated.status, |i| i.status),
+            ));
+        }
         return Ok(Json(updated.status));
     }
     if let Some(swap) = &current.own_swap {
         if current.status.state == "pending" && current.status.stage == "settle" {
-            let Some(signature) = current.status.tx_ids.first() else {
+            let Some(signature) = current.status.tx_ids.last() else {
                 return Ok(Json(current.status));
             };
             let landed = state
@@ -4007,9 +4337,21 @@ pub(super) async fn intent_status(
                     );
                 }
             }
-            let mut updated = current;
+            let mut updated = current.clone();
             updated.status = status;
-            state.markets.save_intent(&intent_id, &updated).await?;
+            if !state
+                .markets
+                .replace_plan(&intent_id, &current, &updated)
+                .await?
+            {
+                return Ok(Json(
+                    state
+                        .markets
+                        .get_intent(&intent_id)
+                        .await?
+                        .map_or(updated.status, |i| i.status),
+                ));
+            }
             return Ok(Json(updated.status));
         }
     }
@@ -4025,7 +4367,7 @@ pub(super) async fn intent_status(
             .signature_status(&signature)
             .await
             .map_err(unavailable)?;
-        let mut updated = current;
+        let mut updated = current.clone();
         match landed {
             None => return Ok(Json(updated.status)),
             Some(Ok(())) => updated.status.state = "filled".into(),
@@ -4034,7 +4376,19 @@ pub(super) async fn intent_status(
                 updated.status.error = Some(format!("The transfer didn't go through ({error})"));
             }
         }
-        state.markets.save_intent(&intent_id, &updated).await?;
+        if !state
+            .markets
+            .replace_plan(&intent_id, &current, &updated)
+            .await?
+        {
+            return Ok(Json(
+                state
+                    .markets
+                    .get_intent(&intent_id)
+                    .await?
+                    .map_or(updated.status, |i| i.status),
+            ));
+        }
         return Ok(Json(updated.status));
     }
     if current.status.state != "pending"
@@ -4084,9 +4438,21 @@ pub(super) async fn intent_status(
             keep_trade(&state.trades, &intent_id, &current, &status, None, got).await;
         }
     }
-    let mut updated = current;
+    let mut updated = current.clone();
     updated.status = status.clone();
-    state.markets.save_intent(&intent_id, &updated).await?;
+    if !state
+        .markets
+        .replace_plan(&intent_id, &current, &updated)
+        .await?
+    {
+        return Ok(Json(
+            state
+                .markets
+                .get_intent(&intent_id)
+                .await?
+                .map_or(updated.status, |i| i.status),
+        ));
+    }
     Ok(Json(status))
 }
 
@@ -4146,6 +4512,9 @@ pub(super) async fn next_transactions(
             )
             .collect();
         return Ok(Json(json!({"transactions":txs})));
+    }
+    if intent.fee_preview.is_some() {
+        return next_fee_step(&state, &intent_id, intent).await;
     }
     let plan = intent
         .trade
@@ -4223,6 +4592,116 @@ pub(super) async fn next_transactions(
     }
     transactions.push(json!({"chain":"solana","transaction":transaction,"submit":"engine"}));
     Ok(Json(json!({ "transactions": transactions })))
+}
+
+// Cash for the reserve is already here. Only the exact amount and fee confirmed earlier can leave.
+async fn next_fee_step(
+    state: &AppState,
+    id: &str,
+    current: StoredIntent,
+) -> Result<Json<Value>, ApiError> {
+    let mut intent = current.clone();
+    if intent.fee_reserve.is_none() {
+        let preview = intent
+            .fee_preview
+            .as_ref()
+            .ok_or_else(|| unavailable("network-fee quote missing"))?;
+        let required = preview.cash()
+            + intent
+                .trade
+                .as_ref()
+                .filter(|t| t.side == "buy")
+                .map_or(0, |t| t.pay_units);
+        let reserve = match solana_fees::prepare(state, &intent.wallet, preview,required).await {
+            Ok(reserve) => reserve,
+            Err(_) => return fail_fee_step(state,id,&intent,"Your cash move is recorded in history, but network fees couldn't be prepared. The purchase wasn't sent; check your balance before requesting a fresh quote.").await,
+        };
+        intent.fee_reserve = Some(reserve);
+        if !state.markets.replace_plan(id, &current, &intent).await? {
+            return Err((
+                StatusCode::CONFLICT,
+                "This step changed; refresh its status.".into(),
+            ));
+        }
+    }
+    let reserve = intent.fee_reserve.as_ref().expect("reserve");
+    if reserve.signature.is_none() {
+        if reserve.expires < now() {
+            return fail_fee_step(state,id,&intent,"The network-fee step expired. Your unspent cash is in your wallet; request a fresh quote.").await;
+        }
+        return Ok(Json(json!({"transactions":[solana_fees::step(reserve)]})));
+    }
+    if reserve.finish_by < now() {
+        return fail_fee_step(state,id,&intent,"The purchase quote expired. Your network-fee reserve and unspent cash are in your wallet; request a fresh quote.").await;
+    }
+    if let Some(transaction) = &reserve.next_transaction {
+        if reserve.next_expires < now() {
+            return fail_fee_step(state,id,&intent,"The swap step expired without being sent. Your network-fee reserve and unspent cash are in your wallet; request a fresh quote.").await;
+        }
+        return Ok(Json(
+            json!({"transactions":[{"chain":"solana","transaction":transaction,"submit":"engine"}]}),
+        ));
+    }
+    let plan = intent
+        .trade
+        .as_ref()
+        .ok_or_else(|| unavailable("intent has no trade"))?;
+    let asset = find_asset(&state.markets, &plan.asset_id).await?;
+    let (input, output) = if plan.side == "buy" {
+        (SOL_USDC, &*asset.token)
+    } else {
+        (&*asset.token, SOL_USDC)
+    };
+    let request = JupiterOrderRequest {
+        input_mint: input.into(),
+        output_mint: output.into(),
+        amount_base_units: plan
+            .pay_units
+            .try_into()
+            .map_err(|_| bad("amount too large"))?,
+        taker: Some(intent.wallet.clone()),
+    };
+    let (order,own_swap) = match state.markets.jupiter.order_for_wallet(&request,&state.solana_mainnet).await {
+        Ok(order) => order,
+        Err(_) => return fail_fee_step(state,id,&intent,"The purchase couldn't be prepared. Your network-fee reserve and unspent tokens are in your wallet; request a fresh quote.").await,
+    };
+    let out: u128 = order.out_amount.parse().map_err(unavailable)?;
+    if out == 0
+        || !own_swap
+            .as_ref()
+            .is_some_and(|s| s.minimum_out >= plan.get_units.saturating_mul(99) / 100)
+    {
+        return fail_fee_step(state,id,&intent,"The price moved beyond your confirmed quote. Your network-fee reserve and unspent tokens are in your wallet; request a fresh quote.").await;
+    }
+    let transaction = order
+        .transaction
+        .ok_or_else(|| unavailable("no signable swap"))?;
+    intent.own_swap = own_swap;
+    intent.request_id = (!order.request_id.is_empty()).then_some(order.request_id);
+    let reserve = intent.fee_reserve.as_mut().expect("reserve");
+    reserve.next_transaction = Some(transaction.clone());
+    reserve.next_expires = now() + 45_000;
+    if !state.markets.replace_plan(id, &current, &intent).await? {
+        return Err((
+            StatusCode::CONFLICT,
+            "This step changed; refresh its status.".into(),
+        ));
+    }
+    Ok(Json(
+        json!({"transactions":[{"chain":"solana","transaction":transaction,"submit":"engine"}]}),
+    ))
+}
+async fn fail_fee_step(
+    state: &AppState,
+    id: &str,
+    intent: &StoredIntent,
+    reason: &str,
+) -> Result<Json<Value>, ApiError> {
+    let mut failed = intent.clone();
+    failed.status.state = "failed".into();
+    failed.status.error = Some(reason.into());
+    state.markets.replace_plan(id, intent, &failed).await?;
+    Err((StatusCode::CONFLICT, reason.into()))
 }
 
 // The wallet's next nonce on Base, counting transactions still waiting to be mined.
@@ -4398,6 +4877,8 @@ mod tests {
             expected: Vec::new(),
             request_id: None,
             own_swap: None,
+            fee_preview: None,
+            fee_reserve: None,
             status: IntentStatus {
                 intent_id: format!("intent-{side}"),
                 stage: "settle".into(),
@@ -4917,6 +5398,62 @@ mod tests {
         assert_eq!(&order[3..6], &["meme2", "stock2", "meme3"]);
         // Not rising: last, most traded first.
         assert_eq!(&order[6..], &["down", "flat"]);
+    }
+    #[test]
+    fn reserve_is_inside_the_buy_budget_and_small_buys_stop_before_payment() {
+        let preview = solana_fees::Preview {
+            amount: 500_000,
+            fee: 302_746,
+            gas_value: 487_000,
+            min_lamports: 3_955_581,
+        };
+        assert_eq!(
+            purchase_input(10_000_000, Some(&preview), "USD", 1_000_000).unwrap(),
+            9_197_254
+        );
+        assert_eq!(
+            purchase_input(10_000_000, None, "USD", 1_000_000).unwrap(),
+            10_000_000
+        );
+        let error = purchase_input(800_000, Some(&preview), "NGN", 1_504_690_000).unwrap_err();
+        assert!(error.1.contains("₦"));
+        assert!(!error.1.contains("USDC") && !error.1.contains("USD"));
+    }
+    #[tokio::test]
+    async fn stale_next_and_poll_cannot_replace_a_sent_fee_step() {
+        let state = MarketState::new().unwrap();
+        let mut waiting = spot_intent("buy", 1_000_000, 10);
+        waiting.status.stage = "sign".into();
+        waiting.fee_preview = Some(solana_fees::Preview {
+            amount: 500_000,
+            fee: 302_746,
+            gas_value: 487_000,
+            min_lamports: 3_955_581,
+        });
+        state.insert_intent("reserve-race", &waiting).await.unwrap();
+        let mut sent = waiting.clone();
+        sent.status.stage = "fund".into();
+        sent.status.tx_ids.push("known-reserve-signature".into());
+        assert!(state
+            .replace_plan("reserve-race", &waiting, &sent)
+            .await
+            .unwrap());
+        assert!(!state
+            .replace_plan("reserve-race", &waiting, &waiting)
+            .await
+            .unwrap());
+        assert!(!state
+            .claim_execution_to("reserve-race", &sent, "sign", "fund")
+            .await
+            .unwrap());
+        let current = state.get_intent("reserve-race").await.unwrap().unwrap();
+        assert_eq!(current.status.stage, "fund");
+        assert_eq!(current.status.tx_ids, ["sig", "known-reserve-signature"]);
+        let mut old = serde_json::to_value(spot_intent("buy", 1_000_000, 10)).unwrap();
+        old.as_object_mut().unwrap().remove("fee_preview");
+        old.as_object_mut().unwrap().remove("fee_reserve");
+        let old: StoredIntent = serde_json::from_value(old).unwrap();
+        assert!(old.fee_preview.is_none() && old.fee_reserve.is_none());
     }
     #[test]
     fn limits_and_shortfalls_speak_the_users_currency() {

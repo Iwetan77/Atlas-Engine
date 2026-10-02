@@ -76,6 +76,8 @@ pub struct UserPaidSwap {
     pub input_mint: String,
     pub output_mint: String,
     pub last_valid_block_height: u64,
+    #[serde(default)]
+    pub minimum_out: u128,
 }
 
 #[derive(Debug, Deserialize)]
@@ -313,7 +315,25 @@ impl JupiterClient {
                 Err(error) => return Err(error),
             }
         }
-        let order = self.fetch_order(request, None).await?;
+        self.gasless_order(request).await.map(|order| (order, None))
+    }
+
+    /// An executable route only. An indicative quote never authorizes a fee-paid transfer.
+    pub async fn gasless_order(
+        &self,
+        request: &JupiterOrderRequest,
+    ) -> Result<JupiterOrder, JupiterError> {
+        validate_order(request)?;
+        let order = match self.fetch_order(request, None).await {
+            Err(JupiterError::Rejected { status, reason, .. })
+                if status == reqwest::StatusCode::BAD_REQUEST
+                    && reason.to_ascii_lowercase().contains("gasless")
+                    && reason.to_ascii_lowercase().contains("minimum") =>
+            {
+                return Err(SolanaPreflightError::InsufficientGas.into())
+            }
+            result => result?,
+        };
         if order.transaction.as_deref().unwrap_or("").is_empty() {
             if own_gas_needed(&order) || (order.router != "jupiterz" && order.error_code == Some(2))
             {
@@ -324,10 +344,11 @@ impl JupiterClient {
         if !order.gasless {
             return Err(SolanaPreflightError::InsufficientGas.into());
         }
-        Ok((order, None))
+        Ok(order)
     }
 
-    async fn user_paid_order(
+    /// Build and simulate only the user-paid route; never fall back to a gasless minimum.
+    pub async fn user_paid_order(
         &self,
         request: &JupiterOrderRequest,
         solana: &SolanaAtaPreflight,
@@ -369,6 +390,10 @@ impl JupiterClient {
             input_mint: quote.input_mint.clone(),
             output_mint: quote.output_mint.clone(),
             last_valid_block_height: quote.blockhash_with_metadata.last_valid_block_height,
+            minimum_out: quote
+                .other_amount_threshold
+                .parse()
+                .map_err(|_| JupiterError::InvalidRequest)?,
         };
         Ok((
             JupiterOrder {

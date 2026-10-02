@@ -1,0 +1,64 @@
+{
+  "capturedAt": "2026-10-02",
+  "config": {
+    "fee_payers": [
+      "Hejav6DnaNd7XeAbV7Muu7PiifgYHPzXpZQDcqYNSNNg"
+    ],
+    "validation_config": {
+      "allowed_programs": [
+        "11111111111111111111111111111111",
+        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+        "ComputeBudget111111111111111111111111111111",
+        "AddressLookupTab1e1111111111111111111111111",
+        "CCTPV2vPZJS2u2BBsUoscuikbYjnpFmbFsvVuJdgUMQe",
+        "CCTPV2Sm4AdWt5296sk4P66VBZ7bEhcARwFaaS9YPbeC"
+      ],
+      "allowed_tokens": [
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+      ],
+      "allowed_spl_paid_tokens": [
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+      ]
+    },
+    "enabled_methods": {
+      "liveness": true,
+      "estimate_transaction_fee": true,
+      "get_supported_tokens": true,
+      "get_payer_signer": true,
+      "sign_transaction": true,
+      "sign_and_send_transaction": true,
+      "transfer_transaction": false,
+      "get_blockhash": true,
+      "get_config": true,
+      "get_version": true,
+      "estimate_bundle_fee": false,
+      "sign_and_send_bundle": false,
+      "sign_bundle": false
+    }
+  },
+  "quote": {
+    "inputMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "outputMint": "So11111111111111111111111111111111111111112",
+    "inAmount": "500000",
+    "outAmount": "4090025",
+    "computeBudgetInstructions": [
+      {
+        "programId": "ComputeBudget111111111111111111111111111111"
+      }
+    ],
+    "setupInstructions": [
+      {
+        "programId": "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+      }
+    ],
+    "swapInstruction": {
+      "programId": "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"
+    },
+    "cleanupInstruction": {
+      "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+    }
+  }
+}

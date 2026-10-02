@@ -12,6 +12,7 @@ mod near_intents;
 mod pending;
 mod positions;
 mod social;
+mod solana_fees;
 mod transactions;
 
 use std::{

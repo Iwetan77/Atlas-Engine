@@ -640,7 +640,7 @@ fn valid_hash(hash: &str) -> bool {
     hash.len() == 66 && hash.starts_with("0x") && hash[2..].bytes().all(|b| b.is_ascii_hexdigit())
 }
 // UTC civil date from Unix days; no shell clock or local timezone dependence.
-fn deadline_utc(seconds_from_now: u64) -> String {
+pub(super) fn deadline_utc(seconds_from_now: u64) -> String {
     let unix = now() / 1000 + seconds_from_now;
     let z = (unix / 86400) as i64 + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
