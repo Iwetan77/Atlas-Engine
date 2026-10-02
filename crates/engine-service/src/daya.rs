@@ -1431,7 +1431,14 @@ pub(super) fn keep_checked(state: AppState) {
                 daya.banks()
             );
             let check = match result {
-                Ok(_) => json!({"ok": true, "at": now_ms()}),
+                // Daya's public fee schedule too, so what the app charges can be checked against it.
+                Ok((_, _, fees, _)) => json!({"ok": true, "at": now_ms(), "fees": {
+                    "ngnDepositPercent": markets::format_units(fees.deposit_pct, 6),
+                    "ngnDepositCap": markets::format_units(fees.deposit_cap, 6),
+                    "usdcPayoutUsd": markets::format_units(fees.usdc_payout_fee, 6),
+                    "ngnPayoutPercent": markets::format_units(fees.payout_pct, 6),
+                    "ngnPayoutCap": markets::format_units(fees.payout_cap, 6),
+                }}),
                 Err((_, error)) => json!({"ok": false, "at": now_ms(), "error": error}),
             };
             if let Ok(mut held) = CHECK.lock() {

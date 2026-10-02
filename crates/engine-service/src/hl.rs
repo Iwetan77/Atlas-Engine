@@ -475,6 +475,8 @@ async fn market(state: &AppState, market_id: &str) -> Result<Market, ApiError> {
 #[derive(Deserialize)]
 pub(super) struct CurrencyQuery {
     currency: Option<String>,
+    // Closing: how much of the position, in percent (25, 50, 75; all of it when absent).
+    percent: Option<u32>,
 }
 
 fn currency_of(q: Option<String>) -> Result<String, ApiError> {
@@ -772,9 +774,26 @@ pub(super) async fn close_quote(
         .cloned()
         .ok_or((StatusCode::NOT_FOUND, "no such position".into()))?;
     let m = market(&state, &market_id(&position.coin)).await?;
-    let trade_fee = position.size.abs() * m.mark * TAKER_FEE * m.fee_scale;
-    let pnl = position.unrealized_pnl - trade_fee;
-    let freed = (position.margin + pnl).max(0.0);
+    // Part of the position: that share of its size (rounded down to what Hyperliquid trades), its
+    // profit or loss and its margin.
+    let share = match q.percent {
+        None | Some(100) => 1.0,
+        Some(p @ 1..=99) => f64::from(p) / 100.0,
+        Some(_) => return Err(bad("close between 1% and 100%")),
+    };
+    let size = if share < 1.0 {
+        let step = 10f64.powi(m.sz_decimals as i32);
+        (position.size.abs() * share * step).floor() / step
+    } else {
+        position.size.abs()
+    };
+    if size <= 0.0 {
+        return Err(bad("That's too small a part of this position to close"));
+    }
+    let share = size / position.size.abs();
+    let trade_fee = size * m.mark * TAKER_FEE * m.fee_scale;
+    let pnl = position.unrealized_pnl * share - trade_fee;
+    let freed = (position.margin * share + pnl).max(0.0);
     // What it frees comes back to cash (less Relay's cents); under $1 it stays in perps.
     let cashout = if freed * 1_000_000.0 >= CASHOUT_MIN_UNITS as f64 {
         cashout_fee(freed)
@@ -793,7 +812,7 @@ pub(super) async fn close_quote(
             sz_decimals: m.sz_decimals,
             side: if position.size > 0.0 { "long" } else { "short" }.into(),
             leverage: position.leverage,
-            size: trim(position.size.abs()),
+            size: trim(size),
             mark: m.mark,
             close: true,
             funding_units: 0,
