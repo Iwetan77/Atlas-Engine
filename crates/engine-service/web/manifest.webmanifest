@@ -1,0 +1,5 @@
+{
+  "id": "/", "name": "Atlas", "short_name": "Atlas", "description": "One balance. Your world.",
+  "start_url": "/", "scope": "/", "display": "standalone", "background_color": "#292C33", "theme_color": "#292C33",
+  "icons": [{"src": "/atlas-icon.png", "sizes": "1024x1024", "type": "image/png", "purpose": "any"}]
+}

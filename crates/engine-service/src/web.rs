@@ -22,6 +22,54 @@ pub(super) async fn claim() -> Response {
 pub(super) async fn index() -> Response {
     file("index.html").await
 }
+// Only exported page names can be opened directly; API paths and arbitrary files are not pages.
+pub(super) async fn page(uri: Uri) -> Response {
+    match page_file(uri.path()) {
+        Some(relative) => file(relative).await,
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+fn page_file(path: &str) -> Option<&'static str> {
+    let path = path.trim_end_matches('/');
+    match path {
+        "" => Some("index.html"),
+        "/sign-in" => Some("sign-in.html"),
+        "/sign-in-email" => Some("sign-in-email.html"),
+        "/install" => Some("install.html"),
+        "/trade" => Some("trade.html"),
+        "/perps" => Some("perps.html"),
+        "/send" => Some("send.html"),
+        "/more" => Some("more.html"),
+        "/transactions" => Some("transactions.html"),
+        "/earn" => Some("earn.html"),
+        "/deposit" => Some("deposit.html"),
+        "/add-bank" => Some("add-bank.html"),
+        "/profile" => Some("profile.html"),
+        "/handle" => Some("handle.html"),
+        "/browse" => Some("browse.html"),
+        "/send/friend" => Some("send/friend.html"),
+        "/send/bank" => Some("send/bank.html"),
+        "/send/link" => Some("send/link.html"),
+        _ => {
+            let parts: Vec<_> = path.strip_prefix('/')?.split('/').collect();
+            match parts.as_slice() {
+                ["trade", id] if valid_id(id) => Some("trade/[assetId].html"),
+                ["perps", "close", id] if valid_id(id) => Some("perps/close/[positionId].html"),
+                ["perps", id] if valid_id(id) => Some("perps/[marketId].html"),
+                ["transaction", id] if valid_id(id) => Some("transaction/[id].html"),
+                ["mini", id] if valid_id(id) => Some("mini/[appId].html"),
+                ["claim", id] if valid_id(id) => Some("claim/[linkId].html"),
+                _ => None,
+            }
+        }
+    }
+}
+
+fn valid_id(id: &str) -> bool {
+    !id.is_empty() && id != "." && id != ".."
+}
+
 // GET /_expo/…, /assets/…, /favicon.ico: the build's scripts, fonts and images.
 pub(super) async fn asset(uri: Uri) -> Response {
     file(uri.path().trim_start_matches('/')).await
@@ -42,6 +90,7 @@ async fn file(relative: &str) -> Response {
         "js" => "text/javascript; charset=utf-8",
         "css" => "text/css; charset=utf-8",
         "json" => "application/json",
+        "webmanifest" => "application/manifest+json",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "svg" => "image/svg+xml",
@@ -63,4 +112,39 @@ async fn file(relative: &str) -> Response {
         body,
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_links_resolve_only_exported_pages() {
+        assert_eq!(page_file("/install"), Some("install.html"));
+        assert_eq!(page_file("/install/"), Some("install.html"));
+        assert_eq!(page_file("/sign-in-email"), Some("sign-in-email.html"));
+        assert_eq!(
+            page_file("/trade/near%3Acoin"),
+            Some("trade/[assetId].html")
+        );
+        assert_eq!(
+            page_file("/perps/close/123"),
+            Some("perps/close/[positionId].html")
+        );
+        assert_eq!(page_file("/transaction/123"), Some("transaction/[id].html"));
+        assert_eq!(page_file("/claim/123"), Some("claim/[linkId].html"));
+        for path in [
+            "/v1/me",
+            "/v1/intents/123",
+            "/.env",
+            "/Cargo.toml",
+            "/unknown",
+            "/trade/../.env",
+            "/trade/..",
+            "/trade//bad",
+            "/perps/close/../key",
+        ] {
+            assert_eq!(page_file(path), None, "{path}");
+        }
+    }
 }

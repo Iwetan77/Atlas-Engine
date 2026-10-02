@@ -409,3 +409,10 @@ Sources: [Kora fee abstraction](https://solana.com/docs/payments/send-payments/p
 [Kora signTransaction](https://solana.com/docs/tools/kora/json-rpc-api/sign-transaction),
 [public operator](https://kora-nodes.com/),
 [NEAR Intents 1Click](https://docs.near-intents.org/near-intents/integration/distribution-channels/1click-api).
+
+
+## Atlas website on Render
+
+The Docker image serves the app's production Expo web export from `crates/engine-service/web/`. The app source lives in `Iwetan77/Atlas` (desktop-web/mainnet); rebuild there with both `EXPO_PUBLIC_ENGINE_URL` and `EXPO_PUBLIC_WEB_URL` set to `https://atlas-engine-djed.onrender.com`, then replace this directory with the export. Run `python3 scripts/normalize-web-export.py crates/engine-service/web` before the diff gate: it packages public font/icon files under `assets/vendor` instead of ignored `node_modules` paths, updates their URLs, clears whitespace-only license-comment lines retained by Expo, and rehashes the entry URL. Signing code and license text are preserved. No local QA previews belong in the build. All runtime static files are copied by the existing Dockerfile.
+
+Desktop browsers get the Atlas website and dashboard; phone browsers keep the phone layout. `/install` is public: Android says Coming soon until the app's public `EXPO_PUBLIC_ANDROID_APK_URL` is set and rebuilt. iPhone shows Safari Add to Home Screen instructions for the website. The manifest and existing Atlas icon are served without authentication; account APIs still require their normal Privy token. Only exported page routes are resolved by the GET fallback; unknown API paths and arbitrary files remain 404.
