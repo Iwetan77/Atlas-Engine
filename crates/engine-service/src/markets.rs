@@ -821,6 +821,8 @@ pub(super) struct MarketState {
     multipliers: Arc<Mutex<HashMap<String, (Instant, bool)>>>,
     chart_pools: Arc<Mutex<HashMap<String, (Instant, String)>>>,
     charts: ChartCache,
+    // Complete list and search answers, by currency, chip and words, for a few seconds.
+    searches: Arc<Mutex<HashMap<String, (Instant, Value)>>>,
     // Spot, send and Earn intents outlive a restart here; without DATABASE_URL they stay in `intents`.
     postgres: Option<Arc<tokio_postgres::Client>>,
 }
@@ -982,8 +984,22 @@ impl MarketState {
             multipliers: Arc::new(Mutex::new(HashMap::new())),
             chart_pools: Arc::new(Mutex::new(HashMap::new())),
             charts: Arc::new(Mutex::new(HashMap::new())),
+            searches: Arc::new(Mutex::new(HashMap::new())),
             postgres: None,
         })
+    }
+    // Typing a word again, or going back to the list, answers at once; prices are already shared
+    // for longer than this.
+    fn recent_search(&self, key: &str) -> Option<Value> {
+        let held = self.searches.lock().ok()?;
+        let (at, answer) = held.get(key)?;
+        (at.elapsed() < SEARCH_TTL).then(|| answer.clone())
+    }
+    fn keep_search(&self, key: String, answer: &Value) {
+        if let Ok(mut held) = self.searches.lock() {
+            held.retain(|_, (at, _)| at.elapsed() < SEARCH_TTL);
+            held.insert(key, (Instant::now(), answer.clone()));
+        }
     }
     pub(super) async fn with_database(mut self) -> Result<Self, Box<dyn std::error::Error>> {
         if let Ok(url) = env::var("DATABASE_URL") {
@@ -1581,7 +1597,6 @@ pub(super) async fn assets(
     Query(q): Query<AssetsQuery>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    app_balance::verified_wallets(&state, &headers).await?;
     let currency = q.currency.unwrap_or_else(|| "NGN".into());
     checked_currency(&currency)?;
     let category = q.category.unwrap_or_else(|| "popular".into());
@@ -1592,11 +1607,53 @@ pub(super) async fn assets(
         "crypto" => Some("crypto"),
         _ => return Err(bad("unsupported asset category")),
     };
-    let rate = app_balance::fx_rate(&currency).await?;
     let raw = q.q.unwrap_or_default();
     let raw = raw.trim();
+    // The sign-in check, the currency's rate and the coin list don't wait on each other.
+    let ((), rate, catalog) = tokio::try_join!(
+        app_balance::signed_in(&state, &headers),
+        app_balance::fx_rate(&currency),
+        catalog(&state.markets),
+    )?;
+    let key = format!("{currency}|{category}|{raw}");
+    if let Some(answer) = state.markets.recent_search(&key) {
+        return Ok(Json(answer));
+    }
+    // Other chains (NEAR, Sui, Monad) are searched while Atlas's own list is priced, not after it.
+    let other_chains = async {
+        if !raw.is_empty() && kind.is_none_or(|k| k == "crypto") {
+            Some(near_intents::search_assets(&state, raw, &currency, rate).await)
+        } else {
+            None
+        }
+    };
+    let (listed, found) = tokio::join!(
+        listed_assets(&state, &catalog, raw, kind, &currency, rate),
+        other_chains
+    );
+    let (mut result, mut search_complete) = listed?;
+    if let Some(found) = found {
+        search_complete &= found.complete;
+        result.extend(found.assets);
+    }
+    let answer = json!({"assets":result,"searchComplete":search_complete});
+    if search_complete {
+        state.markets.keep_search(key, &answer);
+    }
+    Ok(Json(answer))
+}
+
+// Atlas's own coins (Solana and Base, plus a pasted address) matching a search, priced live, and
+// whether every one of them got a price in time.
+async fn listed_assets(
+    state: &AppState,
+    catalog: &[Asset],
+    raw: &str,
+    kind: Option<&str>,
+    currency: &str,
+    rate: u128,
+) -> Result<(Vec<Value>, bool), ApiError> {
     let query = raw.to_ascii_lowercase();
-    let catalog = catalog(&state.markets).await?;
     // A pasted token address finds that token, listed or not, whatever chip is selected: a Solana
     // mint, or a 0x address on Base (verified only if CoinGecko lists that exact contract there).
     let base_address = looks_like_evm_address(raw);
@@ -1628,7 +1685,7 @@ pub(super) async fn assets(
     let trending_base = if by_address {
         Arc::default()
     } else {
-        tokio::time::timeout(SEARCH_SOURCE_LIMIT, base_trending(&state))
+        tokio::time::timeout(SEARCH_SOURCE_LIMIT, base_trending(state))
             .await
             .unwrap_or_default()
     };
@@ -1685,28 +1742,52 @@ pub(super) async fn assets(
     } else {
         100
     });
+    // Solana prices (Jupiter) and Base prices (a live $1 quote each) are read at the same time.
+    // Each lookup runs on its own task: one that misses the deadline still finishes and is cached,
+    // so the next search (or the app's retry) has it.
     let mints: Vec<String> = picked
         .iter()
         .filter(|a| a.chain == "solana")
         .map(|a| a.token.clone())
         .collect();
-    let prices = usd_prices(&state.markets, &mints).await?;
-    // Base coins are priced by a live $1 quote each, all at once.
+    let solana = {
+        let markets = state.markets.clone();
+        tokio::spawn(async move { usd_prices(&markets, &mints).await })
+    };
+    let base: Vec<_> = picked
+        .iter()
+        .filter(|a| a.chain == "base")
+        .map(|a| {
+            let (markets, a) = (state.markets.clone(), (*a).clone());
+            tokio::spawn(async move { (a.token.clone(), base_rate(&markets, &a).await) })
+        })
+        .collect();
+    // Base prices that come back by the deadline are kept; the ones still out are left out.
     let mut base_rates = HashMap::new();
-    let mut quotes = tokio::task::JoinSet::new();
-    for a in picked.iter().filter(|a| a.chain == "base") {
-        let (markets, a) = (state.markets.clone(), (*a).clone());
-        quotes.spawn(async move { (a.token.clone(), base_rate(&markets, &a).await) });
-    }
-    // A Base coin whose price doesn't come back in time is left out rather than holding the list.
-    let _ = tokio::time::timeout(SEARCH_SOURCE_LIMIT * 2, async {
-        while let Some(done) = quotes.join_next().await {
-            if let Ok((token, Some(rate))) = done {
+    let base = async {
+        for quote in base {
+            if let Ok((token, Some(rate))) = quote.await {
                 base_rates.insert(token, rate);
             }
         }
-    })
-    .await;
+    };
+    // The plain Trade list has nothing to show without Solana prices, so it waits for them.
+    let solana_limit = if query.is_empty() {
+        Duration::from_secs(30)
+    } else {
+        SEARCH_SOURCE_LIMIT * 2
+    };
+    let (prices, _) = tokio::join!(
+        tokio::time::timeout(solana_limit, solana),
+        tokio::time::timeout(SEARCH_SOURCE_LIMIT * 2, base),
+    );
+    let prices = match prices {
+        Ok(Ok(Ok(prices))) => prices,
+        // The plain Trade list still says Jupiter is down; a search keeps whatever else it found.
+        Ok(Ok(Err(error))) if query.is_empty() => return Err(error),
+        _ if query.is_empty() => return Err(unavailable("Solana prices unavailable")),
+        _ => HashMap::new(),
+    };
     let picked_count = picked.len();
     let mut result = Vec::with_capacity(picked_count);
     for a in picked {
@@ -1716,35 +1797,30 @@ pub(super) async fn assets(
                 continue;
             };
             (
-                money_from_usd(*usd, &currency, rate)?,
+                money_from_usd(*usd, currency, rate)?,
                 change.map(|c| format!("{c:.2}")),
             )
         } else {
+            // A Base coin whose price doesn't come back in time is left out rather than holding the list.
             let Some(out) = base_rates.get(&a.token) else {
                 continue;
             };
             (
-                json!(unit_price(1_000_000, *out, a.decimals, &currency, rate)?),
+                json!(unit_price(1_000_000, *out, a.decimals, currency, rate)?),
                 (a.change_24h != 0.0).then(|| format!("{:.2}", a.change_24h)),
             )
         };
         result.push(json!({"assetId":a.id,"symbol":a.symbol,"name":a.name,"kind":a.kind,"chain":a.chain,"price":price,"change24hPct":change,"iconUrl":a.icon_url,"verified":a.verified}));
     }
     // Each source owns its deadline; a slow source must not erase another source's matches.
-    let mut search_complete = query.is_empty() || result.len() == picked_count;
-    if !raw.is_empty() && kind.is_none_or(|k| k == "crypto") {
-        let found = near_intents::search_assets(&state, raw, &currency, rate).await;
-        search_complete &= found.complete;
-        result.extend(found.assets);
-    }
-    Ok(Json(
-        json!({"assets":result,"searchComplete":search_complete}),
-    ))
+    let complete = query.is_empty() || result.len() == picked_count;
+    Ok((result, complete))
 }
 
 // How long one optional source (trending lists, prices for a few Base coins, other chains' search)
 // may hold a search or a list before it's answered without that source.
 const SEARCH_SOURCE_LIMIT: Duration = Duration::from_secs(2);
+const SEARCH_TTL: Duration = Duration::from_secs(10);
 
 #[derive(Deserialize)]
 pub(super) struct ChartQuery {

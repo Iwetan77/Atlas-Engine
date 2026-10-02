@@ -608,6 +608,34 @@ pub(super) async fn verified_wallets(
     Ok(user)
 }
 
+// The Trade list and search only need to know the caller is signed in. A token the bridge verified
+// in the last minute isn't sent to Privy again on every keystroke; anything that moves money still
+// calls `verified_wallets` each time.
+const SIGNED_IN_TTL: Duration = Duration::from_secs(60);
+static SIGNED_IN: std::sync::LazyLock<Mutex<HashMap<String, Instant>>> =
+    std::sync::LazyLock::new(Default::default);
+pub(super) async fn signed_in(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    if !matches!(state.auth, AuthMode::Privy { .. }) {
+        return Ok(());
+    }
+    let token = headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .filter(|v| !v.is_empty());
+    if let Some(at) = token.and_then(|t| SIGNED_IN.lock().ok()?.get(t).copied()) {
+        if at.elapsed() < SIGNED_IN_TTL {
+            return Ok(());
+        }
+    }
+    verified_wallets(state, headers).await?;
+    if let (Some(token), Ok(mut seen)) = (token, SIGNED_IN.lock()) {
+        seen.retain(|_, at| at.elapsed() < SIGNED_IN_TTL);
+        seen.insert(token.to_owned(), Instant::now());
+    }
+    Ok(())
+}
+
 // The Base tokens outside the fixed list someone has traded through Atlas, once each.
 fn base_tokens_bought(trades: &[positions::Trade]) -> Vec<&str> {
     let mut ids: Vec<&str> = trades
@@ -666,15 +694,37 @@ fn add_holding(
     Ok(())
 }
 
+// One rate per currency is shared for a minute: every list, search and quote used to fetch it
+// again, on a new connection, before doing anything else.
+const FX_TTL: Duration = Duration::from_secs(60);
+static FX_RATES: std::sync::LazyLock<Mutex<HashMap<String, (Instant, u128)>>> =
+    std::sync::LazyLock::new(Default::default);
+static FX_HTTP: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .unwrap_or_default()
+});
+
 // Rate is represented as destination-currency micros per USD.
 pub(super) async fn fx_rate(currency: &str) -> Result<u128, ApiError> {
     if currency == "USD" {
         return Ok(1_000_000);
     }
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .build()
-        .map_err(internal)?;
+    if let Some((at, rate)) = FX_RATES.lock().map_err(internal)?.get(currency) {
+        if at.elapsed() < FX_TTL {
+            return Ok(*rate);
+        }
+    }
+    let rate = fetch_fx_rate(currency).await?;
+    FX_RATES
+        .lock()
+        .map_err(internal)?
+        .insert(currency.to_owned(), (Instant::now(), rate));
+    Ok(rate)
+}
+async fn fetch_fx_rate(currency: &str) -> Result<u128, ApiError> {
+    let client = &*FX_HTTP;
     let frankfurter = client
         .get(format!(
             "https://api.frankfurter.dev/v2/rate/USD/{currency}"
