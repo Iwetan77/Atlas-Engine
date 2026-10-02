@@ -52,8 +52,8 @@ struct SendQuote {
     plan: Option<Value>,
     // An Atlas Link: its escrow, the note, and what the claimer gets (`usdc_units` adds the claim fee).
     link: Option<(String, Option<String>, u128)>,
-    // A bank withdrawal through Daya, and the naira its quote showed the bank getting.
-    bank: Option<(daya::Payout, u128)>,
+    // A bank withdrawal through Daya: where, the naira the bank gets, and Daya's fee on top.
+    bank: Option<(daya::Payout, u128, u128)>,
 }
 #[derive(Deserialize)]
 pub(super) struct HandleBody {
@@ -578,10 +578,26 @@ pub(super) async fn send_quote(
     }
     let rate = app_balance::fx_rate(&req.amount.currency).await?;
     let amount = parse_micros(&req.amount.amount)?;
-    let gift_units = amount
-        .checked_mul(1_000_000)
-        .ok_or_else(|| bad("amount too large"))?
-        / rate;
+    // A bank withdrawal names what the bank gets, in naira; Daya's fee goes on top.
+    let bank = match bank {
+        Some(mut payout) => {
+            if req.amount.currency != "NGN" {
+                return Err(bad("Bank withdrawals are in naira"));
+            }
+            let (usdc, fee) = state.daya.payout_cost(&mut payout, amount).await?;
+            Some((payout, usdc, fee))
+        }
+        None => None,
+    };
+    let gift_units = match &bank {
+        Some((_, usdc, _)) => *usdc,
+        None => {
+            amount
+                .checked_mul(1_000_000)
+                .ok_or_else(|| bad("amount too large"))?
+                / rate
+        }
+    };
     markets::check_limits(gift_units, &req.amount.currency, rate)?;
     // A link also carries the few cents that pay out its claim, so the friend gets it all.
     let fee_units = if link.is_some() {
@@ -617,13 +633,6 @@ pub(super) async fn send_quote(
         )
         .await?;
     }
-    let bank = match bank {
-        Some(mut payout) => {
-            let (get, fee) = state.daya.payout_amounts(&mut payout, usdc_units).await?;
-            Some((payout, get, fee))
-        }
-        None => None,
-    };
     let quote_id = format!(
         "send-{:x}-{:x}",
         now(),
@@ -644,14 +653,17 @@ pub(super) async fn send_quote(
             expires,
             plan: None,
             link: link.map(|(escrow, note)| (escrow, note, gift_units)),
-            bank: bank.as_ref().map(|(payout, get, _)| (payout.clone(), *get)),
+            bank: bank
+                .as_ref()
+                .map(|(payout, _, fee)| (payout.clone(), amount, *fee)),
         },
     );
     let send = money_usdc(usdc_units, &req.amount.currency, rate)?;
-    // The bank gets naira at Daya's rate, after Daya's payout fee.
-    if let Some((_, get, fee)) = bank {
+    // The bank gets exactly what was asked; the user pays that plus Daya's fee, at Daya's rate.
+    if let Some((_, _, fee)) = bank {
+        let naira = |micros: u128| money_usdc(micros, "NGN", 1_000_000);
         return Ok(Json(
-            json!({"quoteId":quote_id,"destinationLabel":label,"send":send,"receive":money_usdc(get,"NGN",1_000_000)?,"fee":money_usdc(fee,"NGN",1_000_000)?,"eta":"Usually within minutes","expiresAtUnixMs":expires}),
+            json!({"quoteId":quote_id,"destinationLabel":label,"send":naira(amount + fee)?,"receive":naira(amount)?,"fee":naira(fee)?,"eta":"Usually within minutes","expiresAtUnixMs":expires}),
         ));
     }
     let receive = money_usdc(gift_units, &req.amount.currency, rate)?;
@@ -690,9 +702,9 @@ async fn execute_send_inner(
     if user.evm_wallet.as_deref() != Some(quote.sender_wallet.as_str()) {
         return Err((StatusCode::CONFLICT, "Privy wallet changed".into()));
     }
-    if let Some((payout, get)) = &quote.bank {
+    if let Some((payout, get, fee)) = &quote.bank {
         let (plan, funding_account, expires) =
-            bank_plan(&state, &user, &quote_id, &quote, payout, *get).await?;
+            bank_plan(&state, &user, &quote_id, &quote, payout, *get, *fee).await?;
         {
             let mut quotes = state.social.quotes.lock().map_err(internal)?;
             let stored = quotes
@@ -860,6 +872,7 @@ async fn bank_plan(
     quote: &SendQuote,
     payout: &daya::Payout,
     get: u128,
+    fee: u128,
 ) -> Result<(Value, String, u64), ApiError> {
     let rate = app_balance::fx_rate(&quote.currency).await?;
     let base_cash = state
@@ -879,7 +892,7 @@ async fn bank_plan(
         .daya
         .open_payout(user, payout, chain, &format!("atlas-{quote_id}"))
         .await?;
-    let (intent_id, transactions, fee) = match (&quote.sender_solana, on_solana) {
+    let (intent_id, transactions, network_fee) = match (&quote.sender_solana, on_solana) {
         (Some(from), true) => {
             let (intent_id, transactions) = markets::plan_solana_transfer(
                 state,
@@ -912,12 +925,13 @@ async fn bank_plan(
     };
     let mut summary = vec![
         json!({"label":"Send to","value":quote.label}),
-        json!({"label":"Amount","value":markets::say_money(quote.usdc_units,&quote.currency,rate)}),
-        json!({"label":"Bank gets","value":format!("about {}", markets::say_micros(get, "NGN"))}),
+        json!({"label":"Bank gets","value":markets::say_micros(get, "NGN")}),
+        json!({"label":"Daya fee","value":markets::say_micros(fee, "NGN")}),
+        json!({"label":"You pay","value":markets::say_micros(get + fee, "NGN")}),
         json!({"label":"Rate","value":payout.rate_line()}),
         json!({"label":"Bank payout","value":"Waiting for your USDC"}),
     ];
-    if let Some(fee) = fee {
+    if let Some(fee) = network_fee {
         summary.push(
             json!({"label":"Network fee","value":markets::say_money(fee,&quote.currency,rate)}),
         );

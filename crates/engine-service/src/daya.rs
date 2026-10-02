@@ -286,10 +286,52 @@ impl DayaState {
         if banks.is_empty() {
             return Err(busy());
         }
+        // Daya lists no logos; nigerianbanks.xyz (free, no key) has them, matched by code then name.
+        let logos = self.bank_logos().await;
+        for bank in &mut banks {
+            let code = bank["code"].as_str().unwrap_or("").to_owned();
+            let name = bank_key(bank["name"].as_str().unwrap_or(""));
+            if let Some(logo) = logos
+                .iter()
+                .find(|(c, _, _)| *c == code)
+                .or_else(|| logos.iter().find(|(_, n, _)| !n.is_empty() && *n == name))
+            {
+                bank["logo"] = json!(logo.2);
+            }
+        }
         banks.sort_by_key(|b| b["name"].as_str().unwrap_or("").to_ascii_lowercase());
         let banks = Arc::new(banks);
         *self.banks.lock().map_err(internal)? = Some((Instant::now(), banks.clone()));
         Ok(banks)
+    }
+
+    // (code, name key, logo URL) for Nigerian banks; empty when the list can't be read.
+    async fn bank_logos(&self) -> Vec<(String, String, String)> {
+        let list: Option<Vec<Value>> = async {
+            self.http
+                .get("https://nigerianbanks.xyz")
+                .timeout(Duration::from_secs(6))
+                .send()
+                .await
+                .ok()?
+                .error_for_status()
+                .ok()?
+                .json()
+                .await
+                .ok()
+        }
+        .await;
+        list.into_iter()
+            .flatten()
+            .filter_map(|b| {
+                let logo = b["logo"].as_str().filter(|l| l.starts_with("https://"))?;
+                Some((
+                    b["code"].as_str().unwrap_or("").to_owned(),
+                    bank_key(b["name"].as_str().unwrap_or("")),
+                    logo.to_owned(),
+                ))
+            })
+            .collect()
     }
 
     // The account holder's name, or None when the bank has no such account. Shared for ten minutes.
@@ -546,30 +588,29 @@ impl DayaState {
         })
     }
 
-    // What the bank gets for this much USDC at Daya's current rate: (naira, fee), both in micros.
-    // The payout charge is taken off, so the bank never gets less than shown.
-    pub(super) async fn payout_amounts(
+    // What a bank payout of `ngn` costs: (USDC to send, Daya's payout fee), the fee in naira micros.
+    // The fee goes on top, so the bank gets exactly `ngn` at Daya's current rate.
+    pub(super) async fn payout_cost(
         &self,
         payout: &mut Payout,
-        usdc_units: u128,
+        ngn: u128,
     ) -> Result<(u128, u128), ApiError> {
         let (rate, fees) = tokio::try_join!(self.rate("SELL"), self.fees())?;
         payout.ngn_per_usdc = rate.ngn_per_usdc;
-        let gross = usdc_units * rate.ngn_per_usdc / 1_000_000;
-        let fee = fees.payout(gross);
-        let get = gross.saturating_sub(fee);
         let least = fees.payout_min.max(rate.min_ngn);
-        if get < least || gross < rate.min_ngn {
+        if ngn < least {
             return Err(bad(&format!(
-                "The smallest bank withdrawal is about {}",
-                markets::say_micros(least + fee, "NGN")
+                "The smallest bank withdrawal is {}",
+                markets::say_micros(least.div_ceil(1_000_000) * 1_000_000, "NGN")
             )));
         }
-        Ok((get, fee))
+        let fee = fees.payout(ngn);
+        let usdc = payout_usdc(ngn + fee, rate.ngn_per_usdc);
+        Ok((usdc, fee))
     }
 
     // Opens the one-time USDC address that pays the bank, on the chain the cash is sent from.
-    // Refused when Daya's rate dropped since the quote, so the bank never gets less than shown.
+    // Refused when Daya's rate dropped at all since the quote, so the bank gets exactly what it showed.
     pub(super) async fn open_payout(
         &self,
         user: &app_balance::VerifiedWallets,
@@ -578,7 +619,7 @@ impl DayaState {
         idempotency: &str,
     ) -> Result<(String, String, u64), ApiError> {
         let (rate, customer) = tokio::try_join!(self.rate("SELL"), self.customer(user))?;
-        if rate.ngn_per_usdc * 1000 < payout.ngn_per_usdc * 995 {
+        if rate.ngn_per_usdc < payout.ngn_per_usdc {
             return Err((
                 StatusCode::CONFLICT,
                 "The naira rate just changed. Check the new amount and try again.".into(),
@@ -1218,6 +1259,24 @@ pub(super) fn health() -> Value {
     })
 }
 
+// A bank name for matching across lists: "Access Bank Plc" and "ACCESS BANK" both → "access".
+fn bank_key(name: &str) -> String {
+    name.to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| {
+            !w.is_empty()
+                && !matches!(
+                    *w,
+                    "bank" | "plc" | "limited" | "ltd" | "nigeria" | "of" | "the"
+                )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+// USDC (micros) that converts to at least `ngn` naira micros at `ngn_per_usdc`, rounded up.
+fn payout_usdc(ngn: u128, ngn_per_usdc: u128) -> u128 {
+    (ngn * 1_000_000).div_ceil(ngn_per_usdc)
+}
 fn naira(micros: u128) -> Value {
     json!({"amount": format!("{}.{:02}", micros / 1_000_000, micros % 1_000_000 / 10_000), "currency": "NGN"})
 }
@@ -1434,6 +1493,15 @@ mod tests {
     }
 
     #[test]
+    fn payouts_send_enough_for_the_exact_amount() {
+        // ₦2,000 to the bank plus the ₦20 fee at ₦1,465.50 per USDC.
+        let usdc = payout_usdc(2_020_000_000, 1_465_500_000);
+        assert_eq!(usdc, 1_378_370);
+        assert!(usdc * 1_465_500_000 / 1_000_000 >= 2_020_000_000);
+        assert!((usdc - 1) * 1_465_500_000 / 1_000_000 < 2_020_000_000);
+    }
+
+    #[test]
     fn webhooks_need_the_right_signature() {
         // openssl dgst -sha256 -hmac secret over the body below.
         let body = br#"{"event":"deposit.completed"}"#;
@@ -1471,6 +1539,13 @@ mod tests {
         let address = json!({"instructions":[{"type":"CRYPTO_ADDRESS","status":"ACTIVE","address":"0x742d35cc6634c0532925a3b844bc9e7595f2bd18"}]});
         assert!(ready_instruction(&address, "CRYPTO_ADDRESS").is_some());
         assert!(ready_instruction(&address, "NGN_VIRTUAL_ACCOUNT").is_none());
+    }
+
+    #[test]
+    fn bank_names_match_across_lists() {
+        assert_eq!(bank_key("Access Bank Plc"), bank_key("ACCESS BANK"));
+        assert_eq!(bank_key("First Bank of Nigeria"), "first");
+        assert_ne!(bank_key("Kuda Bank"), bank_key("Opay"));
     }
 
     #[test]

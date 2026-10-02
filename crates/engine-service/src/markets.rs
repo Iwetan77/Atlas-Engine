@@ -1882,7 +1882,9 @@ pub(super) struct ChartQuery {
 const GECKOTERMINAL: &str = "https://api.geckoterminal.com/api/v2/networks/";
 const JUPITER_CHARTS: &str = "https://datapi.jup.ag/v2/charts/";
 // A second source for Base charts: CoinGecko's price history by contract address.
-const COINGECKO_BASE_CHART: &str = "https://api.coingecko.com/api/v3/coins/base/contract/";
+const COINGECKO: &str = "https://api.coingecko.com/api/v3/";
+// A chain's own coin, which has no token address (native MON).
+pub(super) const NATIVE_COIN: &str = "native";
 
 // Jupiter chart candles: {"candles":[{"time": unix seconds, "close": usd, ...}]}, oldest first.
 fn jupiter_closes(body: &Value) -> Vec<(u64, f64)> {
@@ -2059,6 +2061,9 @@ async fn chart_points(
         jupiter_closes(&body)
     } else {
         let from_gecko = async {
+            if token == NATIVE_COIN {
+                return Ok(Vec::new());
+            }
             let pool = deepest_pool(state, network, token_path).await?;
             let body: Value = gecko(
                 state,
@@ -2069,12 +2074,12 @@ async fn chart_points(
             .await?;
             Ok::<_, ApiError>(ohlcv_closes(&body))
         };
-        match from_gecko.await {
-            Ok(points) if !points.is_empty() => points,
-            Err(_) | Ok(_) if network == "base" => {
-                coingecko_base_closes(state, token, days).await?
-            }
-            other => other?,
+        // GeckoTerminal's free limit is per IP and often spent on Render's shared one: CoinGecko,
+        // which counts separately, has the same coins by contract or coin id.
+        match (from_gecko.await, coingecko_coin(network, token)) {
+            (Ok(points), _) if !points.is_empty() => points,
+            (_, Some(coin)) => coingecko_closes_for(state, &coin, days).await?,
+            (other, None) => other?,
         }
     };
     if points.is_empty() {
@@ -2083,16 +2088,40 @@ async fn chart_points(
     Ok(points)
 }
 
-// CoinGecko's price history for a Base token: (ms, price) pairs, oldest first.
-async fn coingecko_base_closes(
+// Where CoinGecko keeps a coin's price history: by contract on its chain, or by coin id for a
+// chain's own coin. None for a chain it isn't asked about.
+fn coingecko_coin(network: &str, token: &str) -> Option<String> {
+    let native = |id: &str| Some(format!("coins/{id}"));
+    let contract = |platform: &str| Some(format!("coins/{platform}/contract/{token}"));
+    match network {
+        "sui-network"
+            if token.trim_start_matches("0x").trim_start_matches('0') == "2::sui::SUI" =>
+        {
+            native("sui")
+        }
+        "sui-network" => contract("sui"),
+        "near" if token == "wrap.near" => native("near"),
+        "near" => contract("near-protocol"),
+        "monad" if token == NATIVE_COIN => native("monad"),
+        "monad" => contract("monad"),
+        "base" => contract("base"),
+        "eth" => contract("ethereum"),
+        "arbitrum" => contract("arbitrum-one"),
+        "bsc" => contract("binance-smart-chain"),
+        _ => None,
+    }
+}
+
+// CoinGecko's price history for a coin (a `coingecko_coin` path): (ms, price) pairs, oldest first.
+async fn coingecko_closes_for(
     state: &MarketState,
-    token: &str,
+    coin: &str,
     days: u32,
 ) -> Result<Vec<(u64, f64)>, ApiError> {
     let body: Value = state
         .http
         .get(format!(
-            "{COINGECKO_BASE_CHART}{token}/market_chart?vs_currency=usd&days={days}"
+            "{COINGECKO}{coin}/market_chart?vs_currency=usd&days={days}"
         ))
         .header("accept", "application/json")
         .header("user-agent", "Atlas/1.0")
@@ -4869,6 +4898,27 @@ fn received_units(receipt: &Value, token: &str, wallet: &str) -> Option<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn charts_have_a_coingecko_twin() {
+        let deep = "0xdeeb7a4662eec9f2f3def03fb937a663dddaa2e215b8078a284d026b7946c270::deep::DEEP";
+        assert_eq!(
+            coingecko_coin("sui-network", "0x2::sui::SUI").as_deref(),
+            Some("coins/sui")
+        );
+        assert_eq!(
+            coingecko_coin("sui-network", deep),
+            Some(format!("coins/sui/contract/{deep}"))
+        );
+        assert_eq!(
+            coingecko_coin("near", "wrap.near").as_deref(),
+            Some("coins/near")
+        );
+        assert_eq!(
+            coingecko_coin("monad", NATIVE_COIN).as_deref(),
+            Some("coins/monad")
+        );
+        assert_eq!(coingecko_coin("solana", "x"), None);
+    }
     fn spot_intent(side: &str, pay: u128, get: u128) -> StoredIntent {
         StoredIntent {
             owner: "did:privy:a".into(),

@@ -2403,6 +2403,8 @@ pub(super) async fn chart_token(
         (Some(address), _) if !address.is_empty() => address,
         (_, "sui") => "0x2::sui::SUI".into(),
         (_, "near") => "wrap.near".into(),
+        // Native MON has no address; its history comes from CoinGecko by coin id.
+        (_, "monad") => markets::NATIVE_COIN.into(),
         _ => return Ok(None),
     };
     Ok(Some((network, address)))
