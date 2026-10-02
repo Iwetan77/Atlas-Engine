@@ -987,11 +987,92 @@ fn sui_coin_key(value: &str) -> String {
         None => value.into(),
     }
 }
+// The price from the most liquid DexScreener pair that prices this coin (not one where it's the
+// quote side).
+fn best_sui_price(pairs: &Value, coin: &str) -> Option<f64> {
+    pairs
+        .as_array()?
+        .iter()
+        .filter(|p| {
+            p["baseToken"]["address"]
+                .as_str()
+                .is_some_and(|a| sui_coin_key(a) == sui_coin_key(coin))
+        })
+        .max_by(|a, b| {
+            let l = |p: &Value| p["liquidity"]["usd"].as_f64().unwrap_or(0.0);
+            l(a).total_cmp(&l(b))
+        })
+        .and_then(|p| p["priceUsd"].as_str()?.parse::<f64>().ok())
+        .filter(|p| p.is_finite() && *p > 0.0)
+}
+type SuiHolding = (String, String, String, u32, u128, u128, Option<String>);
+// The user's Sui coins for the balance. A failed read of the Sui wallet shows the last one from the
+// past ten minutes, so SUI and DEEP don't flicker out of the total when one lookup fails.
 pub(super) async fn sui_holdings(
     state: &AppState,
     headers: &HeaderMap,
     user: &app_balance::VerifiedWallets,
-) -> Result<Vec<(String, String, String, u32, u128, u128, Option<String>)>, ApiError> {
+) -> Result<Vec<SuiHolding>, ApiError> {
+    static LAST: std::sync::LazyLock<Mutex<HashMap<String, (Instant, Vec<SuiHolding>)>>> =
+        std::sync::LazyLock::new(Default::default);
+    match sui_holdings_now(state, headers, user).await {
+        Ok(held) => {
+            if let Ok(mut last) = LAST.lock() {
+                last.insert(user.user_id.clone(), (Instant::now(), held.clone()));
+            }
+            Ok(held)
+        }
+        Err(error) => LAST
+            .lock()
+            .ok()
+            .and_then(|last| last.get(&user.user_id).cloned())
+            .filter(|(at, _)| at.elapsed() < Duration::from_secs(600))
+            .map(|(_, held)| held)
+            .ok_or(error),
+    }
+}
+// A Sui coin's dollar price from its most liquid DexScreener pair, shared for 30 seconds. When
+// DexScreener is slow or refuses, the last price from the past half hour stands: a held coin never
+// drops out of the balance because one lookup failed.
+async fn sui_coin_price(http: reqwest::Client, coin: String) -> Option<f64> {
+    static PRICES: std::sync::LazyLock<Mutex<HashMap<String, (Instant, f64)>>> =
+        std::sync::LazyLock::new(Default::default);
+    let last = PRICES.lock().ok()?.get(&coin).copied();
+    if let Some((at, price)) = last {
+        if at.elapsed() < Duration::from_secs(30) {
+            return Some(price);
+        }
+    }
+    let pairs: Option<Value> = async {
+        http.get(format!("https://api.dexscreener.com/tokens/v1/sui/{coin}"))
+            .timeout(Duration::from_secs(4))
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()
+    }
+    .await;
+    match pairs.and_then(|pairs| best_sui_price(&pairs, &coin)) {
+        Some(price) => {
+            if let Ok(mut held) = PRICES.lock() {
+                held.insert(coin, (Instant::now(), price));
+            }
+            Some(price)
+        }
+        None => last
+            .filter(|(at, _)| at.elapsed() < Duration::from_secs(30 * 60))
+            .map(|(_, price)| price),
+    }
+}
+async fn sui_holdings_now(
+    state: &AppState,
+    headers: &HeaderMap,
+    user: &app_balance::VerifiedWallets,
+) -> Result<Vec<SuiHolding>, ApiError> {
     let coins = state.near.sui_coins(&user.user_id).await?;
     let tokens = state.near.tokens().await?;
     let Some(sui) = tokens
@@ -1037,35 +1118,26 @@ pub(super) async fn sui_holdings(
             state.near.icon_for(sui),
         ));
     }
-    for coin in coins {
-        let units = held(&coin.coin_type);
-        if units == 0 {
-            continue;
-        }
-        // DexScreener's price for the coin's most liquid Sui pair.
-        let pairs: Value = match state
-            .near
-            .icon_http
-            .get(format!(
-                "https://api.dexscreener.com/tokens/v1/sui/{}",
-                coin.coin_type
+    // Every held coin's price at once.
+    let held_coins: Vec<_> = coins
+        .into_iter()
+        .map(|coin| (held(&coin.coin_type), coin))
+        .filter(|(units, _)| *units > 0)
+        .collect();
+    let lookups: Vec<_> = held_coins
+        .iter()
+        .map(|(_, coin)| {
+            tokio::spawn(sui_coin_price(
+                state.near.icon_http.clone(),
+                coin.coin_type.clone(),
             ))
-            .send()
-            .await
-        {
-            Ok(r) => r.json().await.unwrap_or(Value::Null),
-            Err(_) => Value::Null,
-        };
-        let price = pairs
-            .as_array()
-            .into_iter()
-            .flatten()
-            .max_by(|a, b| {
-                let l = |p: &Value| p["liquidity"]["usd"].as_f64().unwrap_or(0.0);
-                l(a).total_cmp(&l(b))
-            })
-            .and_then(|p| p["priceUsd"].as_str()?.parse::<f64>().ok())
-            .filter(|p| p.is_finite() && *p > 0.0);
+        })
+        .collect();
+    let mut prices = Vec::with_capacity(lookups.len());
+    for lookup in lookups {
+        prices.push(lookup.await.ok().flatten());
+    }
+    for ((units, coin), price) in held_coins.into_iter().zip(prices) {
         let Some(price) = price else {
             continue;
         };
@@ -5598,6 +5670,18 @@ mod tests {
     }
 
     use super::*;
+    #[test]
+    fn sui_prices_come_from_pairs_that_price_the_coin() {
+        let deep = "0xdeeb7a4662eec9f2f3def03fb937a663dddaa2e215b8078a284d026b7946c270::deep::DEEP";
+        let pairs = json!([
+            {"baseToken":{"address":"0x2::sui::SUI"},"quoteToken":{"address":deep},"priceUsd":"3.10","liquidity":{"usd":9_000_000.0}},
+            {"baseToken":{"address":deep},"priceUsd":"0.0236","liquidity":{"usd":800_000.0}},
+            {"baseToken":{"address":deep},"priceUsd":"0.0240","liquidity":{"usd":20_000.0}},
+        ]);
+        assert_eq!(best_sui_price(&pairs, deep), Some(0.0236));
+        assert_eq!(best_sui_price(&json!([]), deep), None);
+        assert_eq!(best_sui_price(&json!({"error":"rate limited"}), deep), None);
+    }
     #[test]
     #[ignore = "live dry Ref quotes; no signing"]
     fn live_ref_quotes() {
