@@ -1,7 +1,7 @@
 function approvalFailure(error,fallback){const reason=error.message??fallback;return error.maybeSent||error.sent?.length?reason:reason+'; nothing was sent';}
 import {DeviceApprovals,deviceSign} from './device-approval.mjs';
 import {coinBalance,walletBalances} from './sui-swap.mjs';
-import {buildRef,buildNearCashout,finishNearCalls,prepareRef,quoteRef,searchRef,tokenInfo,prepareCashout as prepareNearCashout,prepareSale as prepareNearSale,view as nearView} from './ref-swap.mjs';
+import {buildRef,buildNearCashout,finishNearCalls,keepRefWarm,prepareRef,quoteRef,searchRef,tokenInfo,prepareCashout as prepareNearCashout,prepareSale as prepareNearSale,view as nearView} from './ref-swap.mjs';
 import {createServer} from 'node:http';
 import {createHash, randomUUID} from 'node:crypto';
 import {PrivyClient} from '@privy-io/node';
@@ -378,3 +378,4 @@ const server = createServer(async (request, response) => {
   }
 });
 server.listen(port, '127.0.0.1');
+keepRefWarm();

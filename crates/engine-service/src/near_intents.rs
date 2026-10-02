@@ -908,7 +908,11 @@ pub(super) async fn near_holdings(
 
 // NEAR RPC: one `query`, answered as the RPC sends it (errors included, for the caller to read).
 async fn near_query(state: &AppState, params: Value) -> Result<Value, ApiError> {
-    let rpc = env_url("ATLAS_NEAR_MAINNET_RPC_URL", "https://rpc.mainnet.near.org");
+    // rpc.mainnet.near.org is deprecated and refuses requests.
+    let rpc = env_url(
+        "ATLAS_NEAR_MAINNET_RPC_URL",
+        "https://free.rpc.fastnear.com",
+    );
     state
         .near
         .icon_http
@@ -2558,19 +2562,36 @@ async fn search_listed(
 ) -> Result<SearchAssets, ApiError> {
     let list = state.near.tokens().await?;
     let query = query.to_ascii_lowercase();
+    // Closest first: the symbol itself, then symbols starting with it, then containing it, then
+    // coins that only match by their chain's name ("near" lists every NEAR coin, NEAR first).
+    let mut matches: Vec<(u8, &Token, String)> = list
+        .iter()
+        .filter(|t| supported(t))
+        .filter_map(|t| {
+            let symbol = display_symbol(t);
+            let lower = symbol.to_ascii_lowercase();
+            let rank = if query.is_empty() || lower == query {
+                0
+            } else if lower.starts_with(&query) {
+                1
+            } else if lower.contains(&query) {
+                2
+            } else if t.blockchain.to_ascii_lowercase().contains(&query)
+                || t.contract_address
+                    .as_deref()
+                    .unwrap_or("")
+                    .eq_ignore_ascii_case(&query)
+            {
+                3
+            } else {
+                return None;
+            };
+            Some((rank, t, symbol))
+        })
+        .collect();
+    matches.sort_by_key(|(rank, _, _)| *rank);
     let mut out = Vec::new();
-    for t in list.iter().filter(|t| supported(t)) {
-        if !query.is_empty()
-            && !t.symbol.to_ascii_lowercase().contains(&query)
-            && !t.blockchain.to_ascii_lowercase().contains(&query)
-            && !t
-                .contract_address
-                .as_deref()
-                .unwrap_or("")
-                .eq_ignore_ascii_case(&query)
-        {
-            continue;
-        }
+    for (_, t, symbol) in matches {
         let usd = t
             .price
             .as_ref()
@@ -2586,9 +2607,14 @@ async fn search_listed(
         }
         let display = usd * (rate as f64 / 1_000_000.0);
         let icon = state.near.icon_for(t);
+        let name = if symbol == "NEAR" {
+            "NEAR".to_owned()
+        } else {
+            format!("{} on {}", t.symbol, t.blockchain)
+        };
         out.push(
-            json!({"assetId":format!("near:{}", t.asset_id),"symbol":t.symbol,
-            "name":format!("{} on {}",t.symbol,t.blockchain),"kind":"crypto","chain":t.blockchain,
+            json!({"assetId":format!("near:{}", t.asset_id),"symbol":symbol,
+            "name":name,"kind":"crypto","chain":t.blockchain,
             "price":{"amount":format!("{display:.12}").trim_end_matches('0').trim_end_matches('.'),
                 "currency":currency},"change24hPct":null,"iconUrl":icon,"verified":true}),
         );
@@ -2600,6 +2626,14 @@ async fn search_listed(
         assets: out,
         complete: true,
     })
+}
+// NEAR is listed as wNEAR (the token form Atlas holds); people know it as NEAR.
+fn display_symbol(t: &Token) -> String {
+    if t.blockchain == "near" && t.symbol.eq_ignore_ascii_case("wNEAR") {
+        "NEAR".into()
+    } else {
+        t.symbol.clone()
+    }
 }
 // A NEAR Intents coin's live price and what the user holds of it, for its position card: NEAR and
 // Monad coins from 1Click's list, and NEAR coins found on Ref.

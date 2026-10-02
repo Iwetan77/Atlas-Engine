@@ -943,6 +943,9 @@ pub(super) struct AssetsQuery {
     currency: Option<String>,
     category: Option<String>,
     q: Option<String>,
+    // A search in two answers: "listed" (Atlas's own coins, fast) or "other" (other chains and Base
+    // coins by name, slower). Both when absent.
+    part: Option<String>,
 }
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1676,20 +1679,26 @@ pub(super) async fn assets(
         app_balance::fx_rate(&currency),
         catalog(&state.markets),
     )?;
-    let key = format!("{currency}|{category}|{raw}");
+    let part = q.part.as_deref().unwrap_or("all").to_owned();
+    if !matches!(part.as_str(), "all" | "listed" | "other") {
+        return Err(bad("part must be listed or other"));
+    }
+    let (want_listed, want_other) = (part != "other", part != "listed");
+    let key = format!("{currency}|{category}|{part}|{raw}");
     if let Some(answer) = state.markets.recent_search(&key) {
         return Ok(Json(answer));
     }
     // Other chains (NEAR, Sui, Monad) are searched while Atlas's own list is priced, not after it.
     let other_chains = async {
-        if !raw.is_empty() && kind.is_none_or(|k| k == "crypto") {
+        if want_other && !raw.is_empty() && kind.is_none_or(|k| k == "crypto") {
             Some(near_intents::search_assets(&state, raw, &currency, rate).await)
         } else {
             None
         }
     };
     let base_by_name = async {
-        if raw.len() >= 2
+        if want_other
+            && raw.len() >= 2
             && !looks_like_evm_address(raw)
             && !looks_like_mint(raw)
             && kind.is_none_or(|k| k == "crypto")
@@ -1699,20 +1708,29 @@ pub(super) async fn assets(
             Vec::new()
         }
     };
-    let (listed, found, base_found) = tokio::join!(
-        listed_assets(&state, &catalog, raw, kind, &currency, rate),
-        other_chains,
-        base_by_name
-    );
-    let (mut result, mut search_complete) = listed?;
-    for row in base_found {
-        if !result.iter().any(|r| r["assetId"] == row["assetId"]) {
-            result.push(row);
+    let listed = async {
+        if want_listed {
+            listed_assets(&state, &catalog, raw, kind, &currency, rate).await
+        } else {
+            Ok((Vec::new(), true))
         }
-    }
+    };
+    let (listed, found, base_found) = tokio::join!(listed, other_chains, base_by_name);
+    let (mut result, mut search_complete) = listed?;
     if let Some(found) = found {
         search_complete &= found.complete;
         result.extend(found.assets);
+    }
+    // Base coins found by name come last, and never as a second coin with a symbol already shown
+    // (a Base "NEAR" next to NEAR itself is a copy or a look-alike).
+    let symbol = |r: &Value| r["symbol"].as_str().unwrap_or("").to_ascii_uppercase();
+    for row in base_found {
+        if !result
+            .iter()
+            .any(|r| r["assetId"] == row["assetId"] || symbol(r) == symbol(&row))
+        {
+            result.push(row);
+        }
     }
     let answer = json!({"assets":result,"searchComplete":search_complete});
     if search_complete {

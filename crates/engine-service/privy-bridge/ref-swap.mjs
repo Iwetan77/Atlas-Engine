@@ -6,7 +6,8 @@ import {PreparedSales,salePermission} from './prepared-sale.mjs';
 import {fromBase58, toBase58} from '@mysten/sui/utils';
 export const REF = 'v2.ref-finance.near';
 export const WRAP = 'wrap.near';
-const RPC = process.env.ATLAS_NEAR_MAINNET_RPC_URL ?? 'https://rpc.mainnet.near.org';
+// rpc.mainnet.near.org is deprecated and refuses requests: FastNEAR's public endpoints instead.
+const RPC = process.env.ATLAS_NEAR_MAINNET_RPC_URL ?? 'https://free.rpc.fastnear.com';
 export const GAS_RESERVE = 50000000000000000000000n; // 0.05 NEAR, including storage.
 export function account(value) {
   if (typeof value !== 'string' || value.length < 2 || value.length > 64 ||
@@ -14,7 +15,7 @@ export function account(value) {
   return value;
 }
 export async function rpc(method, params) {
-  for(const endpoint of [RPC,'https://free.rpc.fastnear.com']) {
+  for(const endpoint of [RPC,'https://rpc.mainnet.fastnear.com']) {
     try {
       const response = await fetch(endpoint,{method:'POST',headers:{'content-type':'application/json'},
         body:JSON.stringify({jsonrpc:'2.0',id:'atlas',method,params}),signal:AbortSignal.timeout(12000)});
@@ -32,8 +33,14 @@ export async function view(contract, method, args={}) {
   return JSON.parse(Buffer.from(result.result).toString());
 }
 let poolCache;
-export async function pools() {
+// Search reads the last list at once and refreshes it behind the scenes; swaps keep the 5-minute rule.
+let poolRefresh;
+export async function pools({stale=false}={}) {
   if(poolCache && Date.now()-poolCache.at<300000)return poolCache.value;
+  if(stale && poolCache){poolRefresh??=fetchPools().finally(()=>{poolRefresh=undefined;});poolRefresh.catch(()=>{});return poolCache.value;}
+  return fetchPools();
+}
+async function fetchPools() {
   // The indexer sometimes refuses stale blocks. Fall back to contract views, not stale quotes.
   let value;
   try {
@@ -62,16 +69,34 @@ export function directPools(list,token,nearPrice){
     p.token_account_ids.includes(token) && p.token_account_ids.includes(WRAP) &&
     Number(p.amounts[p.token_account_ids.indexOf(WRAP)])/1e24*nearPrice>=2500);
 }
+const infoCache=new Map();
 export async function tokenInfo(token){
-  account(token);const metadata=await view(token,'ft_metadata');
+  account(token);
+  const held=infoCache.get(token);
+  if(held && Date.now()-held.at<3600000)return held.value;
+  const metadata=await view(token,'ft_metadata');
   if(!Number.isInteger(metadata.decimals)||metadata.decimals<0||metadata.decimals>24||
       typeof metadata.symbol!=='string'||typeof metadata.name!=='string')throw new Error('token details unavailable');
+  infoCache.set(token,{at:Date.now(),value:metadata});
   return metadata;
 }
-let priceCache;
-export async function prices(){
+
+// Search stays fast: Ref's pool, token and price lists load when the bridge starts and refresh
+// every four minutes.
+export function keepRefWarm(){
+  const warm=()=>{fetchPools().catch(()=>{});fetchTokenList().catch(()=>{});fetchPrices().catch(()=>{});};
+  warm();
+  setInterval(warm,240000).unref();
+}
+let priceCache,priceRefresh;
+// Ref's price list can take 15 s: quotes wait for a fresh one; search uses the last copy meanwhile.
+export async function prices({stale=false}={}){
   if(priceCache && Date.now()-priceCache.at<60000)return priceCache.value;
-  const r=await fetch('https://indexer.ref.finance/list-token-price',{signal:AbortSignal.timeout(10000)});
+  if(stale && priceCache){priceRefresh??=fetchPrices().finally(()=>{priceRefresh=undefined;});priceRefresh.catch(()=>{});return priceCache.value;}
+  return fetchPrices();
+}
+async function fetchPrices(){
+  const r=await fetch('https://indexer.ref.finance/list-token-price',{signal:AbortSignal.timeout(25000)});
   if(!r.ok)throw new Error('prices unavailable');
   priceCache={at:Date.now(),value:await r.json()};return priceCache.value;
 }
@@ -209,22 +234,27 @@ export async function commitRef({saleId,scope,wallet,userId,userJwt,rawSign}){
     return {ok:true,digest:result.transaction.hash,amountOut:amount.toString()};
   } finally {active.delete(wallet.id);}
 }
-let listCache;
+let listCache,listRefresh;
 async function tokenList(){
   if(listCache && Date.now()-listCache.at<300000)return listCache.value;
+  if(listCache){listRefresh??=fetchTokenList().finally(()=>{listRefresh=undefined;});listRefresh.catch(()=>{});return listCache.value;}
+  return fetchTokenList();
+}
+async function fetchTokenList(){
   const r=await fetch('https://indexer.ref.finance/list-token',{signal:AbortSignal.timeout(10000)});
   if(!r.ok)throw new Error('token list unavailable');
   listCache={at:Date.now(),value:await r.json()};return listCache.value;
 }
 export async function searchRef(query){
   if(typeof query!=='string'||query.length<2||query.length>64)return [];
-  const priceMap=await prices();
-  const catalog=await tokenList();
+  // Lists load together, and an expired one answers from its last copy while it refreshes.
+  // A list that can't load yet doesn't sink the search: prices fall back to the pool's own.
+  const [priceMap,catalog,list]=await Promise.all([
+    prices({stale:true}).catch(()=>({})),tokenList().catch(()=>({})),pools({stale:true}).catch(()=>[])]);
   const candidates=query.endsWith('.near')?[query]:Object.keys(catalog).filter(k=>
     [catalog[k]?.symbol,catalog[k]?.name].some(v=>typeof v==='string'&&v.toLowerCase().includes(query.toLowerCase()))).slice(0,5);
-  const list=await pools(),nearPrice=Number(priceMap[WRAP]?.price);
-  const found=[];
-  for(const token of candidates){
+  const nearPrice=Number(priceMap[WRAP]?.price);
+  const found=await Promise.all(candidates.map(async token=>{
     try{
       const metadata=await tokenInfo(token),pairs=directPools(list,token,nearPrice);
       let price=Number(priceMap[token]?.price??0);
@@ -232,10 +262,10 @@ export async function searchRef(query){
         const pool=pairs[0],i=pool.token_account_ids.indexOf(token),j=1-i;
         price=Number(pool.amounts[j])/1e24*nearPrice/(Number(pool.amounts[i])/10**metadata.decimals);
       }
-      found.push({token,...metadata,price:String(price),tradeable:pairs.length>0&&Number.isFinite(price)&&price>0});
-    }catch{}
-  }
-  return found;
+      return {token,...metadata,price:String(price),tradeable:pairs.length>0&&Number.isFinite(price)&&price>0};
+    }catch{return null;}
+  }));
+  return found.filter(Boolean);
 }
 
 // Where a sale's cash lands: the user's own Solana USDC, or Base USDC without a Solana wallet. The
