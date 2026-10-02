@@ -13,6 +13,9 @@ RUN npm ci --omit=dev
 COPY crates/engine-service/privy-bridge/*.mjs ./
 COPY --from=rust-build /src/target/release/engine-service /usr/local/bin/engine-service
 COPY scripts/run-render.sh /usr/local/bin/run-render
+# The web app build that Atlas Links open in.
+COPY crates/engine-service/web /app/web
+ENV ATLAS_WEB_DIR=/app/web
 RUN chmod 755 /usr/local/bin/run-render
 ENV PRIVY_BRIDGE_URL=http://127.0.0.1:3101
 EXPOSE 10000

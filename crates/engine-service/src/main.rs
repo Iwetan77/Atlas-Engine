@@ -14,6 +14,7 @@ mod positions;
 mod social;
 mod solana_fees;
 mod transactions;
+mod web;
 
 use std::{
     collections::HashMap,
@@ -151,6 +152,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = Router::new()
         .merge(perps_routes)
         .route("/health", get(health))
+        // The web app's build, for Atlas Links in any browser.
+        .route("/", get(web::index))
+        .route("/claim/{id}", get(web::claim))
+        .route("/_expo/{*path}", get(web::asset))
+        .route("/assets/{*path}", get(web::asset))
+        .route("/favicon.ico", get(web::asset))
         .route("/v1/balance", get(app_balance::balance))
         .route("/v1/transactions", get(transactions::list))
         .route("/v1/transactions/{id}", get(transactions::detail))
