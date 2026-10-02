@@ -170,6 +170,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/users/resolve", get(social::resolve_user))
         .route("/v1/offramp/banks", get(social::banks))
         .route("/v1/offramp/resolve", post(social::resolve_bank))
+        .route("/v1/offramp/guess", post(daya::guess))
+        .route(
+            "/v1/offramp/recipients",
+            get(daya::recipients).post(daya::favorite),
+        )
         .route("/v1/onramp/bank/quote", post(daya::onramp_quote))
         .route("/v1/onramp/bank", post(daya::onramp_open))
         .route("/v1/onramp/bank/{id}", get(daya::onramp_status))

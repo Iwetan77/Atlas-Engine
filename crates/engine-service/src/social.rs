@@ -716,6 +716,10 @@ async fn execute_send_inner(
             }
             stored.plan = Some(plan.clone());
         }
+        // The account goes to the top of Send to bank's recents.
+        if let Err((_, error)) = state.daya.paid(&user.user_id, payout).await {
+            eprintln!("bank recipient not kept: {error}");
+        }
         // Only the plan that stands is tied to the payout, so Daya's updates reach its receipt.
         let intent_id = plan["intentId"].as_str().unwrap_or("");
         if let Err((_, error)) = state

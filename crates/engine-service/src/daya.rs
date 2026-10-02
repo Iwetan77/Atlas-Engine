@@ -38,6 +38,21 @@ pub(super) struct DayaState {
     rates: Arc<Mutex<HashMap<&'static str, Rate>>>,
     fees: Arc<Mutex<Option<(Instant, Fees)>>>,
     polled: Arc<Mutex<HashMap<String, Instant>>>,
+    // Without DATABASE_URL, bank recipients live here: (owner, bank, number) → recipient.
+    recipients: Arc<Mutex<HashMap<(String, String, String), Recipient>>>,
+}
+
+// A bank account someone has paid or saved: Send to bank lists them as recents and favorites.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Recipient {
+    bank_code: String,
+    bank_name: String,
+    account_number: String,
+    account_name: String,
+    favorite: bool,
+    // 0 when saved but never paid.
+    last_used_at_unix_ms: u64,
 }
 
 // One Daya funding account Atlas opened for a user, and what became of it.
@@ -189,6 +204,7 @@ impl DayaState {
             rates: Default::default(),
             fees: Default::default(),
             polled: Default::default(),
+            recipients: Default::default(),
         };
         if let Ok(url) = env::var("DATABASE_URL") {
             let (pg, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
@@ -200,7 +216,10 @@ impl DayaState {
             pg.batch_execute(
                 "CREATE TABLE IF NOT EXISTS atlas_daya_ramps (funding_account TEXT PRIMARY KEY,
                     receipt TEXT NOT NULL, owner TEXT NOT NULL, payload TEXT NOT NULL);
-                CREATE INDEX IF NOT EXISTS atlas_daya_ramps_receipt ON atlas_daya_ramps(receipt)",
+                CREATE INDEX IF NOT EXISTS atlas_daya_ramps_receipt ON atlas_daya_ramps(receipt);
+                CREATE TABLE IF NOT EXISTS atlas_bank_recipients (owner TEXT NOT NULL,
+                    bank_code TEXT NOT NULL, account_number TEXT NOT NULL, payload TEXT NOT NULL,
+                    PRIMARY KEY (owner, bank_code, account_number))",
             )
             .await?;
             state.postgres = Some(Arc::new(pg));
@@ -291,12 +310,8 @@ impl DayaState {
         for bank in &mut banks {
             let code = bank["code"].as_str().unwrap_or("").to_owned();
             let name = bank_key(bank["name"].as_str().unwrap_or(""));
-            if let Some(logo) = logos
-                .iter()
-                .find(|(c, _, _)| *c == code)
-                .or_else(|| logos.iter().find(|(_, n, _)| !n.is_empty() && *n == name))
-            {
-                bank["logo"] = json!(logo.2);
+            if let Some(logo) = logo_for(&logos, &code, &name) {
+                bank["logo"] = json!(logo);
             }
         }
         banks.sort_by_key(|b| b["name"].as_str().unwrap_or("").to_ascii_lowercase());
@@ -584,6 +599,8 @@ impl DayaState {
             label: format!("{bank_name} · {account_number} · {name}"),
             bank_code: bank_code.into(),
             account_number: account_number.into(),
+            account_name: name,
+            bank_name,
             ngn_per_usdc: 0,
         })
     }
@@ -695,6 +712,178 @@ impl DayaState {
         .await
     }
 
+    // The banks this account number could be at, with the holder's name at each where it exists.
+    // A number's last digit is a check (NUBAN) against the bank's code, so it fits only a few of the
+    // popular banks; OPay, PalmPay and Moniepoint also use phone numbers as account numbers. Every
+    // candidate is confirmed with Daya, so only real accounts come back.
+    pub(super) async fn guess_banks(&self, account_number: &str) -> Result<Vec<Value>, ApiError> {
+        if account_number.len() != 10 || !account_number.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(bad("invalid Nigerian bank details"));
+        }
+        let banks = self.banks().await?;
+        let mut candidates: Vec<&Value> = Vec::new();
+        if phone_like(account_number) {
+            candidates.extend(banks.iter().filter(|b| {
+                let key = bank_key(b["name"].as_str().unwrap_or(""));
+                PHONE_BANKS.iter().any(|p| key.split(' ').any(|w| w == *p))
+            }));
+        }
+        candidates.extend(banks.iter().filter(|b| {
+            let key = bank_key(b["name"].as_str().unwrap_or(""));
+            POPULAR_BANKS.iter().any(|p| key.contains(p))
+                && institution(b["code"].as_str().unwrap_or(""))
+                    .is_some_and(|code| nuban_fits(&code, account_number))
+        }));
+        let mut seen = std::collections::HashSet::new();
+        candidates.retain(|b| seen.insert(b["code"].as_str().unwrap_or("").to_owned()));
+        candidates.truncate(8);
+        let mut lookups = tokio::task::JoinSet::new();
+        for (rank, bank) in candidates.into_iter().enumerate() {
+            let (daya, bank, number) = (self.clone(), bank.clone(), account_number.to_owned());
+            lookups.spawn(async move {
+                let code = bank["code"].as_str().unwrap_or("").to_owned();
+                let name = daya.account_name(&code, &number).await.ok().flatten();
+                (rank, bank, name)
+            });
+        }
+        let mut found = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(8), async {
+            while let Some(done) = lookups.join_next().await {
+                if let Ok((rank, mut bank, Some(name))) = done {
+                    bank["accountName"] = json!(name);
+                    found.push((rank, bank));
+                }
+            }
+        })
+        .await;
+        found.sort_by_key(|(rank, _)| *rank);
+        Ok(found.into_iter().map(|(_, bank)| bank).collect())
+    }
+
+    // The user's bank recipients, most recently paid first (favorites never fall off).
+    pub(super) async fn recipients(&self, owner: &str) -> Result<Vec<Value>, ApiError> {
+        let mut list: Vec<Recipient> = if let Some(pg) = &self.postgres {
+            pg.query(
+                "SELECT payload FROM atlas_bank_recipients WHERE owner=$1",
+                &[&owner],
+            )
+            .await
+            .map_err(internal)?
+            .iter()
+            .filter_map(|row| serde_json::from_str(row.get::<_, &str>(0)).ok())
+            .collect()
+        } else {
+            self.recipients
+                .lock()
+                .map_err(internal)?
+                .iter()
+                .filter(|((o, _, _), _)| o == owner)
+                .map(|(_, r)| r.clone())
+                .collect()
+        };
+        list.sort_by(|a, b| b.last_used_at_unix_ms.cmp(&a.last_used_at_unix_ms));
+        list.retain(|r| r.favorite || r.last_used_at_unix_ms > 0);
+        list.truncate(50);
+        let logos = self.banks().await.unwrap_or_default();
+        Ok(list
+            .into_iter()
+            .map(|r| {
+                let mut value = json!(r);
+                value["logo"] = logos
+                    .iter()
+                    .find(|b| b["code"] == r.bank_code)
+                    .map(|b| b["logo"].clone())
+                    .unwrap_or(Value::Null);
+                value
+            })
+            .collect())
+    }
+    async fn recipient(
+        &self,
+        owner: &str,
+        bank_code: &str,
+        account_number: &str,
+    ) -> Result<Option<Recipient>, ApiError> {
+        if let Some(pg) = &self.postgres {
+            return pg
+                .query_opt(
+                    "SELECT payload FROM atlas_bank_recipients WHERE owner=$1 AND bank_code=$2 AND account_number=$3",
+                    &[&owner, &bank_code, &account_number],
+                )
+                .await
+                .map_err(internal)?
+                .map(|row| serde_json::from_str(row.get::<_, &str>(0)).map_err(internal))
+                .transpose();
+        }
+        Ok(self
+            .recipients
+            .lock()
+            .map_err(internal)?
+            .get(&(owner.into(), bank_code.into(), account_number.into()))
+            .cloned())
+    }
+    async fn keep_recipient(&self, owner: &str, r: &Recipient) -> Result<(), ApiError> {
+        if let Some(pg) = &self.postgres {
+            pg.execute(
+                "INSERT INTO atlas_bank_recipients(owner,bank_code,account_number,payload) VALUES($1,$2,$3,$4)
+                ON CONFLICT(owner,bank_code,account_number) DO UPDATE SET payload=$4",
+                &[&owner, &r.bank_code, &r.account_number, &serde_json::to_string(r).map_err(internal)?],
+            )
+            .await
+            .map_err(internal)?;
+        } else {
+            self.recipients.lock().map_err(internal)?.insert(
+                (owner.into(), r.bank_code.clone(), r.account_number.clone()),
+                r.clone(),
+            );
+        }
+        Ok(())
+    }
+    // A bank account was just paid: it goes to the top of recents (a favorite stays one).
+    pub(super) async fn paid(&self, owner: &str, payout: &Payout) -> Result<(), ApiError> {
+        let favorite = self
+            .recipient(owner, &payout.bank_code, &payout.account_number)
+            .await?
+            .is_some_and(|r| r.favorite);
+        self.keep_recipient(
+            owner,
+            &Recipient {
+                bank_code: payout.bank_code.clone(),
+                bank_name: payout.bank_name.clone(),
+                account_number: payout.account_number.clone(),
+                account_name: payout.account_name.clone(),
+                favorite,
+                last_used_at_unix_ms: now_ms(),
+            },
+        )
+        .await
+    }
+    // Saves or unsaves a bank account as a favorite (checked with the bank first if it's new).
+    async fn set_favorite(
+        &self,
+        owner: &str,
+        bank_code: &str,
+        account_number: &str,
+        favorite: bool,
+    ) -> Result<(), ApiError> {
+        let mut r = match self.recipient(owner, bank_code, account_number).await? {
+            Some(r) => r,
+            None => {
+                let payout = self.payout_to(bank_code, account_number).await?;
+                Recipient {
+                    bank_code: payout.bank_code,
+                    bank_name: payout.bank_name,
+                    account_number: payout.account_number,
+                    account_name: payout.account_name,
+                    favorite,
+                    last_used_at_unix_ms: 0,
+                }
+            }
+        };
+        r.favorite = favorite;
+        self.keep_recipient(owner, &r).await
+    }
+
     async fn keep(&self, ramp: &Ramp) -> Result<(), ApiError> {
         if let Some(pg) = &self.postgres {
             pg.execute(
@@ -753,6 +942,8 @@ pub(super) struct Payout {
     pub(super) label: String,
     bank_code: String,
     account_number: String,
+    account_name: String,
+    bank_name: String,
     ngn_per_usdc: u128,
 }
 impl Payout {
@@ -1262,6 +1453,7 @@ pub(super) fn health() -> Value {
 // A bank name for matching across lists: "Access Bank Plc" and "ACCESS BANK" both → "access".
 fn bank_key(name: &str) -> String {
     name.to_ascii_lowercase()
+        .replace("microfinance", "mfb")
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|w| {
             !w.is_empty()
@@ -1273,6 +1465,148 @@ fn bank_key(name: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
+// A bank's logo: by code, then the same name, then the shortest listed name holding every word of
+// it ("Opay" → "OPay Digital Services Limited (OPay)").
+fn logo_for(logos: &[(String, String, String)], code: &str, name: &str) -> Option<String> {
+    if let Some((_, _, logo)) = logos.iter().find(|(c, _, _)| c == code) {
+        return Some(logo.clone());
+    }
+    if name.is_empty() {
+        return None;
+    }
+    if let Some((_, _, logo)) = logos.iter().find(|(_, n, _)| n == name) {
+        return Some(logo.clone());
+    }
+    let words: Vec<&str> = name.split(' ').collect();
+    logos
+        .iter()
+        .filter(|(_, n, _)| {
+            let theirs: Vec<&str> = n.split(' ').collect();
+            words.iter().all(|w| theirs.contains(w))
+        })
+        .min_by_key(|(_, n, _)| n.len())
+        .map(|(_, _, logo)| logo.clone())
+}
+// The popular banks a number is checked against (by name), and those whose account numbers can be
+// phone numbers.
+const POPULAR_BANKS: &[&str] = &[
+    "access",
+    "guaranty",
+    "zenith",
+    "united for africa",
+    "first",
+    "fidelity",
+    "union",
+    "sterling",
+    "stanbic",
+    "wema",
+    "first city monument",
+    "fcmb",
+    "ecobank",
+    "polaris",
+    "keystone",
+    "providus",
+    "kuda",
+    "moniepoint",
+    "opay",
+    "palmpay",
+];
+const PHONE_BANKS: &[&str] = &["opay", "palmpay", "moniepoint"];
+// A Nigerian mobile number without its leading 0 (OPay and the like use it as the account number).
+fn phone_like(account: &str) -> bool {
+    ["70", "80", "81", "90", "91"]
+        .iter()
+        .any(|p| account.starts_with(p))
+}
+// The six-digit institution code NUBAN check digits use: a bank's three-digit code with 000 in
+// front, a microfinance bank's five-digit code with a 9.
+fn institution(code: &str) -> Option<String> {
+    if !code.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    match code.len() {
+        3 => Some(format!("000{code}")),
+        5 => Some(format!("9{code}")),
+        6 => Some(code.to_owned()),
+        _ => None,
+    }
+}
+// NUBAN: weights 3, 7, 3 over the institution code and the first nine digits; the tenth digit is
+// what brings the sum up to a multiple of ten.
+fn nuban_fits(institution: &str, account: &str) -> bool {
+    let digits: Vec<u32> = institution
+        .chars()
+        .chain(account.chars().take(9))
+        .filter_map(|c| c.to_digit(10))
+        .collect();
+    let Some(check) = account.chars().nth(9).and_then(|c| c.to_digit(10)) else {
+        return false;
+    };
+    if digits.len() != 15 {
+        return false;
+    }
+    let sum: u32 = digits
+        .iter()
+        .zip([3, 7, 3].iter().cycle())
+        .map(|(d, w)| d * w)
+        .sum();
+    (10 - sum % 10) % 10 == check
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct GuessBody {
+    account_number: String,
+}
+// POST /v1/offramp/guess { accountNumber } → { banks: [{ code, name, logo, accountName }] }
+pub(super) async fn guess(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<GuessBody>,
+) -> Result<Json<Value>, ApiError> {
+    app_balance::signed_in(&state, &headers).await?;
+    Ok(Json(
+        json!({"banks": state.daya.guess_banks(body.account_number.trim()).await?}),
+    ))
+}
+// GET /v1/offramp/recipients → { recipients: [...] }, most recently paid first.
+pub(super) async fn recipients(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let user = app_balance::verified_wallets(&state, &headers).await?;
+    Ok(Json(
+        json!({"recipients": state.daya.recipients(&user.user_id).await?}),
+    ))
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct FavoriteBody {
+    bank_code: String,
+    account_number: String,
+    favorite: bool,
+}
+// POST /v1/offramp/recipients { bankCode, accountNumber, favorite } → the updated list.
+pub(super) async fn favorite(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<FavoriteBody>,
+) -> Result<Json<Value>, ApiError> {
+    let user = app_balance::verified_wallets(&state, &headers).await?;
+    state
+        .daya
+        .set_favorite(
+            &user.user_id,
+            &body.bank_code,
+            &body.account_number,
+            body.favorite,
+        )
+        .await?;
+    Ok(Json(
+        json!({"recipients": state.daya.recipients(&user.user_id).await?}),
+    ))
+}
+
 // USDC (micros) that converts to at least `ngn` naira micros at `ngn_per_usdc`, rounded up.
 fn payout_usdc(ngn: u128, ngn_per_usdc: u128) -> u128 {
     (ngn * 1_000_000).div_ceil(ngn_per_usdc)
@@ -1539,6 +1873,55 @@ mod tests {
         let address = json!({"instructions":[{"type":"CRYPTO_ADDRESS","status":"ACTIVE","address":"0x742d35cc6634c0532925a3b844bc9e7595f2bd18"}]});
         assert!(ready_instruction(&address, "CRYPTO_ADDRESS").is_some());
         assert!(ready_instruction(&address, "NGN_VIRTUAL_ACCOUNT").is_none());
+    }
+
+    #[test]
+    fn account_numbers_fit_only_their_banks() {
+        // Moniepoint MFB (50515) accounts from a real transfer list.
+        let moniepoint = institution("50515").unwrap();
+        for account in ["5016107344", "8225107279", "5013020091"] {
+            assert!(nuban_fits(&moniepoint, account));
+        }
+        assert!(!nuban_fits(&moniepoint, "5016107345"));
+        assert_eq!(institution("044").as_deref(), Some("000044"));
+        assert_eq!(institution("ABC"), None);
+        assert!(phone_like("9033935622"));
+        assert!(!phone_like("5016107344"));
+    }
+
+    #[test]
+    fn logos_match_short_names() {
+        let logos = vec![
+            (
+                "999992".into(),
+                bank_key("OPay Digital Services Limited (OPay)"),
+                "opay.png".into(),
+            ),
+            (
+                "50515".into(),
+                bank_key("Moniepoint MFB"),
+                "moniepoint.png".into(),
+            ),
+            ("044".into(), bank_key("Access Bank"), "access.png".into()),
+            (
+                "063".into(),
+                bank_key("Access Bank (Diamond)"),
+                "diamond.png".into(),
+            ),
+        ];
+        assert_eq!(
+            logo_for(&logos, "100004", &bank_key("Opay")).as_deref(),
+            Some("opay.png")
+        );
+        assert_eq!(
+            logo_for(&logos, "090405", &bank_key("Moniepoint Microfinance Bank")).as_deref(),
+            Some("moniepoint.png")
+        );
+        assert_eq!(
+            logo_for(&logos, "000", &bank_key("Access Bank Plc")).as_deref(),
+            Some("access.png")
+        );
+        assert_eq!(logo_for(&logos, "000", &bank_key("Unknown Bank")), None);
     }
 
     #[test]
