@@ -134,6 +134,11 @@ impl Receipt {
             .iter()
             .map(|line| {
                 let mut line = line.clone();
+                for key in ["label", "value"] {
+                    if let Some(plain) = line[key].as_str().and_then(unbranded) {
+                        line[key] = json!(plain);
+                    }
+                }
                 if let Some(usd) = line["value"]
                     .as_str()
                     .and_then(|v| v.strip_prefix('$'))
@@ -144,11 +149,23 @@ impl Receipt {
                 line
             })
             .collect();
+        let error = self.error.as_deref().map(|e| unbranded(e).unwrap_or(e));
         json!({"id":self.id,"intentId":self.intent_id,"kind":self.kind,"title":self.title,
             "symbol":self.symbol,"assetId":self.asset_id,"iconUrl":self.icon_url,
             "createdAtUnixMs":self.created_at_unix_ms,"state":self.state,"stage":self.stage,
-            "amount":amount,"txIds":self.tx_ids,"error":self.error,"summary":summary})
+            "amount":amount,"txIds":self.tx_ids,"error":error,"summary":summary})
     }
+}
+// Older bank-transfer receipts named the payment partner; receipts just say what happened.
+fn unbranded(text: &str) -> Option<&'static str> {
+    Some(match text {
+        "Daya fee" => "Fee",
+        "Being checked by Daya" => "Being checked",
+        "The money arrived after the account expired, so Daya is reviewing it. Contact support if it isn't sorted within a day." => "The money arrived after the account expired, so it's being reviewed. Contact support if it isn't sorted within a day.",
+        "Daya is checking this payment. It usually clears; contact support if it takes more than a day." => "This payment is being checked. It usually clears; contact support if it takes more than a day.",
+        "Daya reversed this payment. Contact support." => "This payment was reversed. Contact support.",
+        _ => return None,
+    })
 }
 fn text(v: &Value, k: &str) -> String {
     v[k].as_str().unwrap_or("").into()
@@ -634,6 +651,28 @@ fn internal(_: impl std::fmt::Display) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn older_bank_receipts_do_not_name_the_payment_partner() {
+        let mut r = Receipt::ramp(
+            "alice",
+            "onramp-1",
+            "onramp",
+            vec![
+                json!({"label":"Daya fee","value":"₦100"}),
+                json!({"label":"Status","value":"Being checked by Daya"}),
+            ],
+            1_000_000,
+        );
+        r.set_error(Some("Daya reversed this payment. Contact support.".into()));
+        let public = r.public("NGN", 1_500_000_000);
+        assert_eq!(public["summary"][0]["label"], "Fee");
+        assert_eq!(public["summary"][1]["value"], "Being checked");
+        assert_eq!(
+            public["error"],
+            "This payment was reversed. Contact support."
+        );
+        assert!(!public.to_string().contains("Daya"));
+    }
     #[test]
     fn receipts_never_return_signing_payloads_or_owner() {
         let r = Receipt::plan(

@@ -930,7 +930,7 @@ async fn bank_plan(
     let mut summary = vec![
         json!({"label":"Send to","value":quote.label}),
         json!({"label":"Bank gets","value":markets::say_micros(get, "NGN")}),
-        json!({"label":"Daya fee","value":markets::say_micros(fee, "NGN")}),
+        json!({"label":"Fee","value":markets::say_micros(fee, "NGN")}),
         json!({"label":"You pay","value":markets::say_micros(get + fee, "NGN")}),
         json!({"label":"Rate","value":payout.rate_line()}),
         json!({"label":"Bank payout","value":"Waiting for your USDC"}),

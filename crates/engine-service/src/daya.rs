@@ -267,7 +267,7 @@ impl DayaState {
                     code: error["code"].as_str().unwrap_or("").into(),
                     message: error["message"]
                         .as_str()
-                        .unwrap_or("Daya refused the request")
+                        .unwrap_or("The bank transfer was refused")
                         .into(),
                 }
             }
@@ -572,7 +572,7 @@ impl DayaState {
         );
         Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            note.unwrap_or("Daya couldn't open the account just now. Try again in a minute.")
+            note.unwrap_or("The account couldn't be opened just now. Try again in a minute.")
                 .into(),
         ))
     }
@@ -972,8 +972,8 @@ async fn apply(state: &AppState, deposit: &Value) -> Result<(), ApiError> {
         "REQUIRES_REVIEW" | "FLAGGED" => (
             "review",
             Some(match deposit["flag_code"].as_str() {
-                Some("late_deposit") => "The money arrived after the account expired, so Daya is reviewing it. Contact support if it isn't sorted within a day.",
-                _ => "Daya is checking this payment. It usually clears; contact support if it takes more than a day.",
+                Some("late_deposit") => "The money arrived after the account expired, so it's being reviewed. Contact support if it isn't sorted within a day.",
+                _ => "This payment is being checked. It usually clears; contact support if it takes more than a day.",
             }),
         ),
         "FAILED" => (
@@ -984,7 +984,7 @@ async fn apply(state: &AppState, deposit: &Value) -> Result<(), ApiError> {
                 "The bank payout failed. Contact support with this receipt."
             }),
         ),
-        "REVERSED" => ("failed", Some("Daya reversed this payment. Contact support.")),
+        "REVERSED" => ("failed", Some("This payment was reversed. Contact support.")),
         _ => return Ok(()),
     };
     if ramp.done() && next != "failed" {
@@ -1035,7 +1035,7 @@ async fn update_receipt(state: &AppState, ramp: &Ramp) -> Result<(), ApiError> {
                 "waiting" => "Waiting for your transfer",
                 "received" => "Naira received",
                 "processing" => "Sending USDC to your wallet",
-                "review" => "Being checked by Daya",
+                "review" => "Being checked",
                 "completed" => "Added to your balance",
                 "expired" => "Expired",
                 _ => "Failed",
@@ -1049,7 +1049,7 @@ async fn update_receipt(state: &AppState, ramp: &Ramp) -> Result<(), ApiError> {
         let line = match ramp.status.as_str() {
             "waiting" => "Waiting for your USDC".into(),
             "received" | "processing" => "Paying your bank".into(),
-            "review" => "Being checked by Daya".into(),
+            "review" => "Being checked".into(),
             "completed" => match ramp.paid_ngn.as_deref().and_then(|n| n.parse().ok()) {
                 Some(ngn) => format!("Paid {}", markets::say_micros(ngn, "NGN")),
                 None => "Paid".into(),
@@ -1328,7 +1328,7 @@ pub(super) async fn onramp_open(
         vec![
             json!({"label":"You pay","value":format!("₦{exact}")}),
             json!({"label":"To","value":format!("{} · {}", details["bank_name"].as_str().unwrap_or(""), details["account_number"].as_str().unwrap_or(""))}),
-            json!({"label":"Daya fee","value":markets::say_micros(fee, "NGN")}),
+            json!({"label":"Fee","value":markets::say_micros(fee, "NGN")}),
             json!({"label":"Rate","value":format!("{} per $1", markets::say_micros(rate.ngn_per_usdc, "NGN"))}),
         ],
         usdc,
