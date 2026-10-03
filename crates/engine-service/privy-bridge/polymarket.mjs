@@ -300,7 +300,7 @@ export async function redemption(owner,tokenId){
   payout+=holding*numerator/denominator;
  }
  if(payout<=0n)throw new Error('There are no winning shares to claim.');
- return {side:'redeem',tokenId,conditionId:p.conditionId,question:p.question,outcome:p.outcome,negRisk:raw.negRisk===true,
+ return {side:'redeem',tokenId,conditionId:p.conditionId,question:p.question,outcome:p.outcome,iconUrl:p.iconUrl,negRisk:raw.negRisk===true,
   maximumSpend:'0',minimumReceive:payout.toString(),feeUnits:'0',units:'0',expiresAtUnixMs:Date.now()+60000};
 }
 export async function prepare(owner,userId,input){

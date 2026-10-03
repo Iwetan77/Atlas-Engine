@@ -563,9 +563,23 @@ pub(super) async fn execute(
     let mut receipt = transactions::Receipt::plan(&user.user_id, &plan);
     receipt.title = format!("Prediction · {}", text(&q, "question"));
     receipt.icon_url = q["iconUrl"].as_str().map(str::to_string);
-    receipt.set_usdc(number(&q, "maximumSpend")?);
+    receipt.set_usdc(receipt_amount(&q)?);
     state.history.put(&receipt).await?;
     Ok(Json(plan))
+}
+fn receipt_amount(q: &Value) -> Result<u128, ApiError> {
+    if q["side"] == "buy" {
+        number(
+            q,
+            if q["funding"].is_null() {
+                "maximumSpend"
+            } else {
+                "spendBudget"
+            },
+        )
+    } else {
+        number(q, "minimumReceive")
+    }
 }
 fn plan(id: &str, current: &Value) -> Value {
     let q = &current["quote"];
@@ -1217,6 +1231,17 @@ mod tests {
             changed[key] = value;
             assert!(!bridge_matches(&changed, &intent, false));
         }
+    }
+    #[test]
+    fn activity_records_the_confirmed_budget_and_claim_proceeds() {
+        assert_eq!(receipt_amount(&json!({"side":"buy","funding":{},"spendBudget":"10000000","maximumSpend":"9500000"})).unwrap(),10_000_000);
+        assert_eq!(
+            receipt_amount(
+                &json!({"side":"redeem","maximumSpend":"0","minimumReceive":"20000000"})
+            )
+            .unwrap(),
+            20_000_000
+        );
     }
     #[test]
     fn display_money_keeps_decimal_strings() {
