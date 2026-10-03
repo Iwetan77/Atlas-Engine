@@ -160,6 +160,7 @@ fn now() -> u64 {
         .as_millis() as u64
 }
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+const DRAFT_MS: u64 = 10 * 60 * 1000;
 fn created_ms(id: &str) -> u64 {
     // Market ids use hex milliseconds, cross-chain ids use decimal milliseconds.
     id.split('-')
@@ -475,6 +476,15 @@ async fn records(state: &AppState, owner: &str) -> Result<Vec<Receipt>, ApiError
         r.title = title(&r.kind, &r.symbol);
     }
     let mut rows: Vec<_> = rows.into_values().collect();
+    // A plan is saved when its confirmation opens. One nobody confirmed (cancelled, or left
+    // unsigned) expires after two minutes and moved nothing, so after ten it's not history.
+    let now = now();
+    rows.retain(|r| {
+        !(r.state == "pending"
+            && r.stage == "validate"
+            && r.tx_ids.is_empty()
+            && now.saturating_sub(r.created_at_unix_ms) > DRAFT_MS)
+    });
     rows.sort_by(|a, b| (b.created_at_unix_ms, &b.id).cmp(&(a.created_at_unix_ms, &a.id)));
     Ok(rows)
 }
