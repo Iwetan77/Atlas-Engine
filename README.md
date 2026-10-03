@@ -168,6 +168,7 @@ user's display currency.
 | GET · POST | `/v1/cashlinks/{escrow}` (public) · `/v1/cashlinks/{escrow}/claim` | An Atlas Link, and claiming it |
 | POST | `/v1/sends/quote` → `/v1/sends/quote/{id}/execute` | Send to a friend |
 | GET | `/v1/deposit/networks` · POST `/v1/deposit/quote` · GET `/v1/deposit/status` | Deposits from other networks |
+| GET · POST | `/v1/predictions/markets/{id}/comments` · POST `/v1/predictions/comments/{id}/delete` | A market's comments (newest first, 30 a page) signed with @handles; posting needs a handle, one line up to 280 characters, no links, one every 15 seconds and 30 an hour; only your own can be deleted |
 | GET | `/v1/withdrawals/networks` · POST `/v1/withdrawals/quote` → `/v1/withdrawals/quote/{id}/execute` | Withdraw to a wallet: cash leaves as USDC on Solana or Base, or any deposit coin, sent by 1Click to a pasted address, less a 1% fee |
 
 ---

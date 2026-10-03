@@ -94,7 +94,7 @@ export function marketView(m){
  const labels=array(m.outcomes),prices=array(m.outcomePrices),ids=array(m.clobTokenIds);
  if(!/^\d+$/.test(String(m.id))||!/^0x[0-9a-fA-F]{64}$/.test(m.conditionId??'')||labels.length!==2||prices.length!==2||ids.length!==2||ids.some(v=>!/^\d+$/.test(v))||
   prices.some(v=>!Number.isFinite(Number(v))||Number(v)<0||Number(v)>1))return null;
- return {marketId:String(m.id),conditionId:m.conditionId,question:m.question,description:m.description??'',iconUrl:m.icon??m.image??null,
+ return {marketId:String(m.id),conditionId:m.conditionId,question:m.question,description:m.description??'',iconUrl:m.icon||m.image||m.events?.[0]?.icon||m.events?.[0]?.image||null,
   endDate:m.endDate??null,volumeUsd:String(m.volumeNum??m.volume??0),closed:m.closed===true,
   tradeable:m.active===true&&m.closed===false&&m.acceptingOrders===true,
   outcomes:labels.map((label,i)=>({label,tokenId:ids[i],probability:String(prices[i])})),negRisk:m.negRisk===true};

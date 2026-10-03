@@ -3,6 +3,7 @@
 
 mod app_balance;
 mod cashlinks;
+mod comments;
 mod daya;
 mod earn;
 mod gasless;
@@ -50,6 +51,7 @@ struct AppState {
     relay_link: engine_execution::relay_link::RelayClient,
     cow: engine_execution::cow::CowClient,
     links: cashlinks::LinkStore,
+    comments: comments::CommentStore,
     hl: hl::HlState,
     earn: earn::EarnState,
     social: social::SocialState,
@@ -117,6 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         relay_link: engine_execution::relay_link::RelayClient::new(env::var("RELAY_API_KEY").ok())?,
         cow: engine_execution::cow::CowClient::new()?,
         links: cashlinks::LinkStore::new().await?,
+        comments: comments::CommentStore::new().await?,
         hl: hl::HlState::new().await?,
         earn: earn::EarnState::default(),
         social: social::SocialState::new().await?,
@@ -223,6 +226,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/v1/predictions/markets", get(predictions::markets))
         .route("/v1/predictions/markets/{id}", get(predictions::market))
+        .route(
+            "/v1/predictions/markets/{id}/comments",
+            get(comments::list).post(comments::post),
+        )
+        .route(
+            "/v1/predictions/comments/{id}/delete",
+            post(comments::delete),
+        )
         .route(
             "/v1/predictions/availability",
             get(predictions::availability),

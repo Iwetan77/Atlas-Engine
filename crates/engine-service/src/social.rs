@@ -278,6 +278,10 @@ impl SocialState {
             .find(|r| r.user_id == user_id)
             .cloned())
     }
+    // The user's @handle, if they've picked one (comments are signed with it).
+    pub(super) async fn handle_of(&self, user_id: &str) -> Result<Option<String>, ApiError> {
+        Ok(self.find_user(user_id).await?.map(|r| r.handle))
+    }
     async fn find_handle(&self, handle: &str) -> Result<Option<HandleRecord>, ApiError> {
         if let Some(pg) = &self.postgres {
             let row = pg.query_opt("SELECT user_id, handle, display_name, evm_wallet, solana_wallet FROM atlas_handles WHERE handle=$1", &[&handle]).await.map_err(internal)?;

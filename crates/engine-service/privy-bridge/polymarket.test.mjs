@@ -17,6 +17,11 @@ test('captured live markets pair each outcome with its exact token and price',()
  assert.equal(marketView({...captured.market,outcomePrices:'["NaN","1"]'}),null);
  assert.equal(marketView({...captured.market,closed:true}).tradeable,false);
 });
+test('a market without its own picture shows its event\'s',()=>{
+ const event={icon:'https://polymarket-upload.s3.us-east-2.amazonaws.com/fed.png'};
+ assert.equal(marketView({...captured.market,icon:'',image:null,events:[event]}).iconUrl,event.icon);
+ assert.equal(marketView({...captured.market,icon:null,image:null}).iconUrl,null);
+});
 test('captured live book includes fees without exceeding the approved budget',()=>{
  const q=quote();
  assert.ok(BigInt(q.maximumSpend)<=10000000n);
