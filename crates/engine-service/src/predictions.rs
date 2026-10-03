@@ -973,6 +973,17 @@ pub(super) async fn status(
                             current["status"]["state"] = json!("failed");
                         }
                     }
+                } else {
+                    let arrived = current["cashArrivedAt"].as_u64().unwrap_or_else(now);
+                    current["cashArrivedAt"] = json!(arrived);
+                    if now().saturating_sub(arrived) > 30_000 {
+                        let q = current["quote"].clone();
+                        let rate = text(&q, "rate").parse().unwrap_or(1_000_000);
+                        current["status"]["state"] = json!("failed");
+                        current["status"]["error"] = json!(format!(
+                            "Your cash arrived, but it cannot cover the confirmed order. You have {} in Predictions. Request a fresh quote or return the cash; no shares were bought.",
+                            markets::say_money(number(&account,"cashUnits")?,text(&q,"currency"),rate)));
+                    }
                 }
             } else if matched.is_some_and(|r| r["status"] == "FAILED") {
                 current["status"]["state"] = json!("failed");
