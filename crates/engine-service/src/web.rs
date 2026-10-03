@@ -43,6 +43,8 @@ fn page_file(path: &str) -> Option<&'static str> {
         "/more" => Some("more.html"),
         "/transactions" => Some("transactions.html"),
         "/earn" => Some("earn.html"),
+        "/predictions" => Some("predictions.html"),
+        "/predictions/cash" => Some("predictions/cash.html"),
         "/deposit" => Some("deposit.html"),
         "/add-bank" => Some("add-bank.html"),
         "/profile" => Some("profile.html"),
@@ -56,6 +58,7 @@ fn page_file(path: &str) -> Option<&'static str> {
             match parts.as_slice() {
                 ["trade", id] if valid_id(id) => Some("trade/[assetId].html"),
                 ["perps", "close", id] if valid_id(id) => Some("perps/close/[positionId].html"),
+                ["predictions", id] if valid_id(id) => Some("predictions/[marketId].html"),
                 ["perps", id] if valid_id(id) => Some("perps/[marketId].html"),
                 ["transaction", id] if valid_id(id) => Some("transaction/[id].html"),
                 ["mini", id] if valid_id(id) => Some("mini/[appId].html"),

@@ -4072,6 +4072,9 @@ pub(super) async fn signed(
     headers: HeaderMap,
     Json(body): Json<Submission>,
 ) -> Result<Json<IntentStatus>, ApiError> {
+    if intent_id.starts_with("prediction-") {
+        return predictions::signed(state, headers, intent_id, body).await;
+    }
     if intent_id.starts_with("near-intent-") {
         return near_intents::signed(state, headers, intent_id, body).await;
     }
@@ -4446,6 +4449,9 @@ pub(super) async fn intent_status(
     Path(intent_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<IntentStatus>, ApiError> {
+    if intent_id.starts_with("prediction-") {
+        return predictions::status(state, headers, intent_id).await;
+    }
     if intent_id.starts_with("near-intent-") {
         return near_intents::status(state, headers, intent_id).await;
     }
@@ -4760,6 +4766,9 @@ pub(super) async fn next_transactions(
     Path(intent_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
+    if intent_id.starts_with("prediction-") {
+        return predictions::next(state, headers, intent_id).await;
+    }
     if intent_id.starts_with("near-intent-") {
         return near_intents::next(state, headers, intent_id).await;
     }

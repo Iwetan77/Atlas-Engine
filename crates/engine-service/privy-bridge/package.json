@@ -10,7 +10,8 @@
     "@mysten/sui": "2.33.2",
     "@noble/curves": "1.9.7",
     "@noble/hashes": "1.8.0",
-    "@privy-io/node": "0.22.0"
+    "@privy-io/node": "0.22.0",
+    "viem": "2.56.0"
   },
   "engines": {
     "node": ">=20"

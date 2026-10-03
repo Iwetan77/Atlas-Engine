@@ -12,6 +12,7 @@ pub(super) async fn list(
     // spend it at a price nobody agreed to.
     let mut rows = near_intents::pending_rows(&state, &headers, &user.user_id).await?;
     rows.extend(hl::pending_rows(&state, &user.user_id).await?);
+    rows.extend(state.predictions.pending(&user.user_id).await?);
     Ok(Json(json!({"intents":rows})))
 }
 pub(super) async fn resume(
@@ -19,6 +20,9 @@ pub(super) async fn resume(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
+    if id.starts_with("prediction-") {
+        return predictions::resume(state, headers, id).await;
+    }
     if id.starts_with("near-intent-") {
         return near_intents::resume(state, headers, id).await;
     }

@@ -416,3 +416,94 @@ Sources: [Kora fee abstraction](https://solana.com/docs/payments/send-payments/p
 The Docker image serves the app's production Expo web export from `crates/engine-service/web/`. The app source lives in `Iwetan77/Atlas` (desktop-web/mainnet); rebuild there with both `EXPO_PUBLIC_ENGINE_URL` and `EXPO_PUBLIC_WEB_URL` set to `https://atlas-engine-djed.onrender.com`, then replace this directory with the export. Run `python3 scripts/normalize-web-export.py crates/engine-service/web` before the diff gate: it packages public font/icon files under `assets/vendor` instead of ignored `node_modules` paths, updates their URLs, clears whitespace-only license-comment lines retained by Expo, and rehashes the entry URL. Signing code and license text are preserved. No local QA previews belong in the build. All runtime static files are copied by the existing Dockerfile.
 
 Desktop browsers get the Atlas website and dashboard; phone browsers keep the phone layout. `/install` is public: Android says Coming soon until the app's public `EXPO_PUBLIC_ANDROID_APK_URL` is set and rebuilt. iPhone shows Safari Add to Home Screen instructions for the website. The manifest and existing Atlas icon are served without authentication; account APIs still require their normal Privy token. Only exported page routes are resolved by the GET fallback; unknown API paths and arbitrary files remain 404.
+
+
+## Atlas Predictions (Polymarket)
+
+Open **More → Predictions**. Explore live events, choose an outcome, buy in your display currency,
+sell shares, claim resolved winnings, and return unused Predictions cash to Atlas.
+Atlas uses Polymarket's current Polygon pUSD Deposit Wallet and direct Base/Solana USDC bridge,
+without an extra NEAR Intents hop.
+
+The user's embedded EVM wallet signs authentication, allowances, orders, claims and cash return on
+their device. The service verifies and forwards signatures. It has no user signing key or server
+signer. Polymarket's Builder relayer handles supported Polygon operations; source-wallet fees belong
+to the user. Any needed $0.50 fee reserve stays **inside** the spending budget and is shown separately
+from venue fees. Existing native gas pays ordinary transfer fees. FOK orders fill all shares or none,
+within the confirmed price and fee, and only become filled after matching trades confirm.
+A losing share can become worth zero; resolution rules and probabilities come from the venue.
+
+### Configuration
+
+Public market data is keyless. Trading refuses **before funding** until these server-only settings
+exist and both the user's connection and service region pass Polymarket's availability check:
+
+```text
+POLYMARKET_BUILDER_API_KEY=
+POLYMARKET_BUILDER_SECRET=
+POLYMARKET_BUILDER_PASSPHRASE=
+# Optional dedicated Polygon mainnet RPC; default https://polygon.drpc.org
+POLYGON_RPC_URL=
+```
+
+Create the Builder profile and credentials in Polymarket → Settings → Builders. Save them in the
+ignored engine environment and Render, never in an EXPO_PUBLIC_ variable. DATABASE_URL persists
+quotes, intents, private CLOB request credentials and progress across restarts. One prediction action
+per user can be active at a time. Cancelled unconfirmed previews can be replaced; confirmed actions
+cannot. Node preparations expire within three minutes and are one-use. Expired unsigned steps are
+rebuilt within the same confirmed bounds. Unknown order-submission outcomes are polled by their
+deterministic order hash and never submitted again.
+
+Sources checked 2026-10-03:
+[wallet authentication](https://docs.polymarket.com/trading/wallets-auth),
+[order signing](https://docs.polymarket.com/trading/place-orders),
+[fees](https://docs.polymarket.com/trading/fees),
+[bridge quotes](https://docs.polymarket.com/trading/bridge/quote),
+[Data API v2 migration](https://docs.polymarket.com/migrate/data-api-v1-to-v2).
+
+### App API
+
+All endpoints require Authorization: Bearer <Privy access token>. JSON is camelCase.
+Money = {amount: "<decimal>", currency: "NGN|USD|EUR|GBP|ZAR|KES|GHS"}.
+
+- GET /v1/predictions/markets?q=&offset=0 → {markets: [Market], nextOffset: number|null}.
+- GET /v1/predictions/markets/{marketId} → Market.
+  Market = {marketId, conditionId, question, description, iconUrl, endDate, volumeUsd,
+  tradeable, closed, negRisk, outcomes: [{label, tokenId, probability}]}.
+- GET /v1/predictions/availability → {configured, serverAllowed, reason: string|null}.
+- GET /v1/predictions/account?currency=NGN → {wallet, cash: Money, cashUnits, deployed,
+  positions: [{positionId, tokenId, marketId, conditionId, question, outcome, shares,
+  value: Money, pnl: Money, redeemable, iconUrl}]}.
+  Data API v2 cursor pages cover OPEN, REDEEMABLE and REDEEMABLE_LOST. Missing valuations fail
+  explicitly instead of silently showing a zero balance.
+- POST /v1/predictions/quotes:
+  buy {side:"buy", marketId, tokenId, amount:Money, geoAllowed:true};
+  sell {side:"sell", marketId, tokenId, shares:"10", amount:Money, geoAllowed:true};
+  return {side:"withdraw", amount:Money, from?:"solana"|"base", geoAllowed:true};
+  claim {side:"redeem", tokenId, amount:{amount:"1",currency:"NGN"}, geoAllowed:true}.
+  Claim's amount selects display currency and is never charged.
+  → {quoteId, marketId, tokenId, side, question, outcome, shares, pay:Money, receive:Money,
+  potentialPayout:Money|null, price:Money, fee:Money, gasReserve:Money, expiresAtUnixMs}.
+  Quote shares use six-decimal base units; account shares are decimal strings. Buy receive and
+  potentialPayout mean the **winning payout**, not the shares' current value.
+- POST /v1/predictions/quotes/{quoteId}/execute {} → normal ExecutionPlan, beginning with
+  {chain:"polygon", typedData:{domain, types, primaryType, message}}.
+  Later steps use /v1/intents/{id}/next and /signed with
+  signed:[{index,transaction:"0x…signature"}]. Funding uses normal Base/Solana planned transfers.
+  The user confirms once.
+- Normal /v1/intents/{id}, /v1/intents/pending and resume support prediction-… ids. Home includes
+  pUSD and outcome shares with location:"predictions". Activity shows status and transaction ids.
+  Cash in transit can temporarily leave Home's available balance; Activity keeps it pending.
+
+### Verification and remaining funded checks
+
+Inside crates/engine-service/privy-bridge, run `node polymarket-dry-run.mjs` for read-only mainnet
+market data, buy/sell book quotes, actual balances, bridge quotes, pinned contract checks and unsigned
+payload hashes. It never signs or submits. The tests cover captured Gamma/CLOB and **nonempty** Data
+API v2 JSON; price/fee bounds; owner, amount, market, expiry and replay refusal; wallet call targets;
+complete confirmed settlement; and Rust preparation concurrency.
+
+**Unverified with user funds:** device CLOB authentication, Builder relayer nonce/deployment and
+gas quota, funded Base/Solana deposits, buy/sell fills, wallet cash return and winning redemption.
+Configure and check Builder credentials before a funded trial. Read-only dry runs do not prove
+these paths have settled.

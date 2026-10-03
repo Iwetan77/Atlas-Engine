@@ -1,3 +1,4 @@
+import {handle as predictions} from './polymarket.mjs';
 function approvalFailure(error,fallback){const reason=error.message??fallback;return error.maybeSent||error.sent?.length?reason:reason+'; nothing was sent';}
 import {DeviceApprovals,deviceSign} from './device-approval.mjs';
 import {coinBalance,walletBalances} from './sui-swap.mjs';
@@ -55,6 +56,7 @@ async function ensureReceivingWallet(userId, chainType) {
 }
 
 const server = createServer(async (request, response) => {
+  const predictionRoute=request.method==='POST'&&request.url.startsWith('/predictions/')?request.url.slice('/predictions/'.length):null;
   const verifyOnly = request.method === 'POST' && request.url === '/verify';
   const ensureWallet = request.method === 'POST' && request.url === '/wallet/ensure';
   const signAuthorization = request.method === 'POST' && request.url === '/evm/sign-authorization';
@@ -72,7 +74,7 @@ const server = createServer(async (request, response) => {
   const suiSwapCommit = request.method === 'POST' && request.url === '/sui/swap/commit';
   const suiCashoutPrepare = request.method === 'POST' && request.url === '/sui/cashout/prepare';
   const suiCashoutCommit = request.method === 'POST' && request.url === '/sui/cashout/commit';
-  if (!verifyOnly && !ensureWallet && !signAuthorization && !signEscrow && !hyperliquid && !suiQuote &&
+  if (!predictionRoute && !verifyOnly && !ensureWallet && !signAuthorization && !signEscrow && !hyperliquid && !suiQuote &&
       !suiBalanceRead && !suiSale && !refRoute && !suiCashoutPrepare && !suiCashoutCommit &&
       !suiSwapPrepare && !suiSwapCommit) {
     response.writeHead(404).end();
@@ -119,6 +121,11 @@ const server = createServer(async (request, response) => {
     const evm = wallets.find((account) => account.chain_type === 'ethereum');
     const evmWallet = evm?.address ?? null;
     const solanaWallet = wallets.find((account) => account.chain_type === 'solana')?.address ?? null;
+    if(predictionRoute){
+      try{send(response,200,await predictions(predictionRoute,input,{owner:evmWallet,userId,solanaWallet}));}
+      catch(error){send(response,error.maybeSent?503:409,{error:error.message??'Predictions unavailable',minimumUnits:error.minimumUnits??null});}
+      return;
+    }
     if (verifyOnly) {
       // Bank transfers register the user with Daya by their sign-in email (and Google name).
       const emailAccount = user.linked_accounts.find((account) => account.type === 'email');

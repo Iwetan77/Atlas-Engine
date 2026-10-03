@@ -240,6 +240,28 @@ pub(super) async fn balance(
             .checked_add(units)
             .ok_or((StatusCode::BAD_GATEWAY, "balance overflow".into()))?;
     }
+    // Cash and outcome shares in Predictions remain part of what the user owns.
+    for p in predictions::portfolio(&state, &headers, &user.user_id).await? {
+        let units = p["units"]
+            .as_str()
+            .and_then(|v| v.parse::<u128>().ok())
+            .ok_or_else(|| internal("Predictions value unavailable"))?;
+        total = total
+            .checked_add(units)
+            .ok_or_else(|| internal("Portfolio value overflow"))?;
+        holdings.push(Holding {
+            asset_id: p["assetId"].as_str().unwrap_or_default().into(),
+            symbol: p["symbol"].as_str().unwrap_or_default().into(),
+            name: p["name"].as_str().unwrap_or_default().into(),
+            kind: p["kind"].as_str().unwrap_or("crypto").into(),
+            chain: "polygon".into(),
+            amount: p["amount"].as_str().unwrap_or_default().into(),
+            value: money(units, &currency, rate)?,
+            value_usd: usd(units),
+            location: "predictions",
+            icon_url: p["iconUrl"].as_str().map(str::to_string),
+        });
+    }
     let catalog = markets::catalog(&state.markets).await?;
     // Base assets: the fixed list, plus every other Base token they bought through Atlas (found by
     // its address). Each is read and valued through the same live route as the trade preview.

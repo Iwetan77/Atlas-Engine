@@ -11,6 +11,7 @@ mod markets;
 mod near_intents;
 mod pending;
 mod positions;
+mod predictions;
 mod social;
 mod solana_fees;
 mod transactions;
@@ -55,6 +56,7 @@ struct AppState {
     trades: positions::TradeBook,
     history: transactions::HistoryStore,
     daya: daya::DayaState,
+    predictions: predictions::PredictionState,
 }
 
 #[derive(Clone)]
@@ -121,6 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         trades: positions::TradeBook::new().await?,
         history: transactions::HistoryStore::new().await?,
         daya: daya::DayaState::new().await?,
+        predictions: predictions::PredictionState::new().await?,
     };
     let bind: SocketAddr = env::var("ATLAS_BALANCE_BIND")
         .unwrap_or_else(|_| "127.0.0.1:3000".into())
@@ -208,6 +211,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/deposit/networks", get(near_intents::deposit_networks))
         .route("/v1/deposit/quote", post(near_intents::deposit_quote))
         .route("/v1/deposit/status", get(near_intents::deposit_status))
+        .route("/v1/predictions/markets", get(predictions::markets))
+        .route("/v1/predictions/markets/{id}", get(predictions::market))
+        .route(
+            "/v1/predictions/availability",
+            get(predictions::availability),
+        )
+        .route("/v1/predictions/account", get(predictions::account))
+        .route("/v1/predictions/quotes", post(predictions::quote))
+        .route(
+            "/v1/predictions/quotes/{id}/execute",
+            post(predictions::execute),
+        )
         .route("/v1/earn/options", get(earn::options))
         .route("/v1/earn/positions", get(earn::positions))
         .route("/v1/earn/quotes", post(earn::quote))
