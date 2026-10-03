@@ -163,6 +163,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/favicon.ico", get(web::asset))
         .route("/atlas-icon.png", get(web::asset))
         .route("/manifest.webmanifest", get(web::asset))
+        .route("/og.png", get(web::asset))
         .fallback_service(get(web::page))
         .route("/v1/balance", get(app_balance::balance))
         .route("/v1/transactions", get(transactions::list))
