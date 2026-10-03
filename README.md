@@ -198,7 +198,7 @@ cargo run -p engine-service          # http://127.0.0.1:3000
 | `ATLAS_MONAD_MAINNET_RPC_URL`, `ATLAS_NEAR_MAINNET_RPC_URL`, `ATLAS_ARC_RPC_URL`, `SUI_FULLNODE_URL` | RPC overrides (public by default) |
 | `JUPITER_API_KEY`, `NEAR_INTENTS_API_KEY`, `RELAY_API_KEY` | Optional venue keys (higher limits, lower 1Click fees) |
 | `ATLAS_FEE_NEAR_ACCOUNT` | Where Atlas's share of the 1% fee on withdrawals to a wallet goes: a NEAR account (`atlasfees.near`, or a 64-character implicit one) or an EVM address (`0x…`). It builds up as a NEAR Intents balance of that address as each withdrawal settles (a refunded one pays nothing); with the API key, 1Click keeps half of the fee. Withdraw it at near-intents.org by signing in with that wallet. Withdraw to wallet shows Soon until it's set (`/health` → `keys.withdrawFeeAccount`) |
-| `ATLAS_ALLOWED_ORIGINS` | CORS for the web app |
+| `ATLAS_ALLOWED_ORIGINS` | Additional exact CORS origins for the web app; https://justatlas.xyz is always included |
 | `ATLAS_BALANCE_BIND` | Listen address (default `127.0.0.1:3000`) |
 
 Never commit secrets; `.env*` files are ignored.

@@ -306,6 +306,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hosted_website_and_configured_local_tests_are_allowed_without_wildcards() {
+        let origins =
+            cors_origins("http://localhost:8081,http://localhost:8765,https://justatlas.xyz/")
+                .unwrap();
+        assert_eq!(origins.len(), 3);
+        assert!(origins.contains(&HeaderValue::from_static("https://justatlas.xyz")));
+        assert!(origins.contains(&HeaderValue::from_static("http://localhost:8081")));
+        assert_eq!(cors_origins("").unwrap().len(), 1);
+        for invalid in [
+            "*",
+            "http://untrusted.example",
+            "https://justatlas.xyz/path",
+            "https://justatlas.xyz?bad=1",
+            "https://user@justatlas.xyz",
+        ] {
+            assert!(cors_origins(invalid).is_err());
+        }
+    }
+
+    #[test]
     fn pasted_rpc_urls_are_forgiven_or_refused() {
         let helius = "https://mainnet.helius-rpc.com/?api-key=abc";
         assert_eq!(clean_url(helius).as_deref(), Some(helius));
@@ -322,11 +342,23 @@ mod tests {
 
 fn configured_cors() -> Result<Option<CorsLayer>, Box<dyn std::error::Error>> {
     let configured = env::var("ATLAS_ALLOWED_ORIGINS").unwrap_or_default();
-    if configured.trim().is_empty() {
-        return Ok(None);
-    }
-    let mut origins = Vec::new();
-    for raw in configured.split(',') {
+    let origins = cors_origins(&configured)?;
+    Ok(Some(
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(origins))
+            .allow_methods([Method::GET, Method::POST])
+            .allow_headers([
+                header::AUTHORIZATION,
+                header::CONTENT_TYPE,
+                header::HeaderName::from_static("privy-id-token"),
+            ]),
+    ))
+}
+
+// Atlas's hosted website calls this API through its Render URL.
+fn cors_origins(configured: &str) -> Result<Vec<HeaderValue>, Box<dyn std::error::Error>> {
+    let mut origins = vec![HeaderValue::from_static("https://justatlas.xyz")];
+    for raw in configured.split(',').filter(|raw| !raw.trim().is_empty()) {
         let origin = raw.trim().trim_end_matches('/');
         let parsed = reqwest::Url::parse(origin)?;
         let is_local = matches!(parsed.host_str(), Some("localhost" | "127.0.0.1"));
@@ -340,18 +372,12 @@ fn configured_cors() -> Result<Option<CorsLayer>, Box<dyn std::error::Error>> {
         {
             return Err("ATLAS_ALLOWED_ORIGINS must contain exact HTTPS origins (HTTP is allowed only for localhost)".into());
         }
-        origins.push(HeaderValue::from_str(origin)?);
+        let value = HeaderValue::from_str(origin)?;
+        if !origins.contains(&value) {
+            origins.push(value);
+        }
     }
-    Ok(Some(
-        CorsLayer::new()
-            .allow_origin(AllowOrigin::list(origins))
-            .allow_methods([Method::GET, Method::POST])
-            .allow_headers([
-                header::AUTHORIZATION,
-                header::CONTENT_TYPE,
-                header::HeaderName::from_static("privy-id-token"),
-            ]),
-    ))
+    Ok(origins)
 }
 
 // Display currencies Atlas prices in. FX comes from Frankfurter with Coinbase as the fallback.
