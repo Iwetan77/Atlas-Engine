@@ -42,6 +42,15 @@ pub struct QuoteRequest<'a> {
     pub refund_to: &'a str,
     pub refund_type: &'static str,
     pub deadline: &'a str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub app_fees: Vec<AppFee>,
+}
+/// A fee 1Click takes for the app out of what it swaps, in basis points, paid to a NEAR account when
+/// the swap settles (a refunded swap pays none).
+#[derive(Clone, Debug, Serialize)]
+pub struct AppFee {
+    pub recipient: String,
+    pub fee: u32,
 }
 impl<'a> QuoteRequest<'a> {
     /// A deposit from another chain: the user sends about `amount` (at least 99% of it) to the deposit
@@ -68,6 +77,7 @@ impl<'a> QuoteRequest<'a> {
             refund_to: refund_to_near,
             refund_type: "INTENTS",
             deadline,
+            app_fees: Vec::new(),
         }
     }
     pub fn exact_input(
@@ -92,6 +102,7 @@ impl<'a> QuoteRequest<'a> {
             refund_to,
             refund_type: "ORIGIN_CHAIN",
             deadline,
+            app_fees: Vec::new(),
         }
     }
 }
