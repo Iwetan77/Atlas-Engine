@@ -1,7 +1,9 @@
 //! Layerswap moves USDC between the user's Base and Solana wallets (the fallback to Relay). No API
 //! key: the public v2 API quotes, creates swaps and reports status.
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use reqwest::{Client, Url};
 use serde_json::{json, Value};
+use solana_sdk::{signature::Signature, transaction::VersionedTransaction};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -41,7 +43,8 @@ pub struct BaseDeposit {
     pub amount_units: u128,
 }
 
-/// The one Solana transaction that funds a Solana → Base swap, unsigned, base64.
+/// The one Solana transaction that funds a Solana → Base swap, unsigned, base64, with one empty
+/// signature slot for the user's wallet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SolanaDeposit {
     pub swap_id: String,
@@ -148,7 +151,7 @@ impl LayerswapClient {
             .send()
             .await?;
         let body = checked(response).await?;
-        parse_solana_deposit(&body, amount_units)
+        parse_solana_deposit(&body, solana_owner, amount_units)
     }
 
     async fn fee(
@@ -294,7 +297,11 @@ fn parse_base_deposit(body: &Value, amount_units: u128) -> Result<BaseDeposit, L
     })
 }
 
-fn parse_solana_deposit(body: &Value, amount_units: u128) -> Result<SolanaDeposit, LayerswapError> {
+fn parse_solana_deposit(
+    body: &Value,
+    solana_owner: &str,
+    amount_units: u128,
+) -> Result<SolanaDeposit, LayerswapError> {
     let data = &body["data"];
     let swap_id = data["swap"]["id"]
         .as_str()
@@ -322,9 +329,29 @@ fn parse_solana_deposit(body: &Value, amount_units: u128) -> Result<SolanaDeposi
         .ok_or(LayerswapError::InvalidResponse("transaction"))?;
     Ok(SolanaDeposit {
         swap_id: swap_id.into(),
-        transaction: transaction.into(),
+        transaction: signable(transaction, solana_owner)?,
         amount_units,
     })
+}
+
+// Layerswap sends the deposit with no signature slots at all, which wallets (Privy's included)
+// refuse to read: it gets the one empty slot its message asks for. Only the user's wallet may sign
+// it, and it pays its own fee.
+fn signable(call_data: &str, solana_owner: &str) -> Result<String, LayerswapError> {
+    let invalid = || LayerswapError::InvalidResponse("transaction");
+    let bytes = STANDARD.decode(call_data).map_err(|_| invalid())?;
+    let mut tx: VersionedTransaction = bincode::deserialize(&bytes).map_err(|_| invalid())?;
+    let signers = tx.message.header().num_required_signatures;
+    let payer = tx
+        .message
+        .static_account_keys()
+        .first()
+        .map(|k| k.to_string());
+    if signers != 1 || payer.as_deref() != Some(solana_owner) {
+        return Err(LayerswapError::InvalidResponse("deposit signer"));
+    }
+    tx.signatures = vec![Signature::default()];
+    Ok(STANDARD.encode(bincode::serialize(&tx).map_err(|_| invalid())?))
 }
 
 fn quote_fee_units(body: &Value) -> Result<u128, LayerswapError> {
@@ -354,19 +381,39 @@ fn parse_swap_state(body: &Value) -> SwapState {
 mod tests {
     use super::*;
 
+    // A Solana → Base deposit exactly as Layerswap's live API sent it on 2026-10-03 (5 USDC): a legacy
+    // transaction with no signature slots.
+    const SOLANA_OWNER: &str = "9UvwZJQKz5bgbkRNisLLq17yDEAs6kvpDFegq6CjWPaD";
+    const LIVE_CALL_DATA: &str = "AAEABgl+BSsKaOx2zy7GKF+hNiLBwViRAcmq2hp64xhi+XY55jwc7VyaYPKhA79OgDw58SDAbhXBRc6OxbpdVHG1YS91ai6M5fZaPjXB5UVDb44tHzHmB57FKYNZAbM8+0n+Q04AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIyXJY9OJInxuz0QKRSODYMLWhOZ2v8QhASOe9jb6fhZxvp6877brTo9ZfNqq8l0MbG75MLS9uDkfKYCA0UvXWEFSlNQ+F3IgtYUpVZyeIopbd8eq6vQpgZ4iEky9O72oAan1RcZLFxRIYzJTD1K8X9Y2u4Im6H9ROPb2YoAAAAABt324ddloZPZy+FGzut5rBy0he1fWzeROoz1hX7/AKnxl4OzOLlDEn18ITMERnU3WRfT1SQ/vMNBaLdFEnuLVAMEBwACAAUDCAcBAQgDAgEACQNAS0wAAAAAAAYBAA80MjAwMDAwMTg1MzgzMDI=";
+
     #[test]
     fn a_solana_deposit_is_one_transfer_of_the_asked_amount() {
-        // Shape captured from Layerswap's live API on 2026-09-30 (Solana → Base, 5 USDC).
         let body = |amount: &str, network: &str| {
             json!({"data":{"swap":{"id":"s1","status":"user_transfer_pending"},"deposit_actions":[{"step":"deposit",
                 "type":"transfer","to_address":"2ZUoHEPcN7bsSXw6YTj85CMrU8xNtcYNGiSMXPLomaa2","amount":5,
-                "amount_in_base_units":amount,"call_data":"AAEAAgV+jAiH","network":{"name":network}}]},"error":null})
+                "amount_in_base_units":amount,"call_data":LIVE_CALL_DATA,"network":{"name":network}}]},"error":null})
         };
-        let deposit = parse_solana_deposit(&body("5000000", "SOLANA_MAINNET"), 5_000_000).unwrap();
+        let deposit =
+            parse_solana_deposit(&body("5000000", "SOLANA_MAINNET"), SOLANA_OWNER, 5_000_000)
+                .unwrap();
         assert_eq!(deposit.swap_id, "s1");
-        assert_eq!(deposit.transaction, "AAEAAgV+jAiH");
-        assert!(parse_solana_deposit(&body("6000000", "SOLANA_MAINNET"), 5_000_000).is_err());
-        assert!(parse_solana_deposit(&body("5000000", "BASE_MAINNET"), 5_000_000).is_err());
+        let ok =
+            |amount, network| parse_solana_deposit(&body(amount, network), SOLANA_OWNER, 5_000_000);
+        assert!(ok("6000000", "SOLANA_MAINNET").is_err());
+        assert!(ok("5000000", "BASE_MAINNET").is_err());
+        // Someone else's wallet would have to sign it: refused.
+        let other = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM";
+        assert!(
+            parse_solana_deposit(&body("5000000", "SOLANA_MAINNET"), other, 5_000_000).is_err()
+        );
+
+        // What the wallet gets has one empty slot for its signature, and the message is untouched.
+        let raw = STANDARD.decode(LIVE_CALL_DATA).unwrap();
+        assert_eq!(raw[0], 0);
+        let padded = STANDARD.decode(&deposit.transaction).unwrap();
+        assert_eq!(padded[0], 1);
+        assert_eq!(&padded[1..65], &[0u8; 64][..]);
+        assert_eq!(&padded[65..], &raw[1..]);
     }
 
     #[test]
