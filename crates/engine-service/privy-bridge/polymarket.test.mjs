@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {privateKeyToAccount} from 'viem/accounts';
 import {hashTypedData,keccak256,toHex} from 'viem';
-import {walletReceipt,deviceRequests,deviceReport,relayMatches,handle,availabilityView,Approvals,authTyped,depositWallet,orderTyped,wrapOrderSignature,orderQuote,marketView,units,hmac,C,batchTyped,setupCalls,redeemCalls,withdrawCalls,settlementView,positionView} from './polymarket.mjs';
+import {commit,walletEnvelopeExpired,walletReceipt,deviceRequests,deviceReport,relayMatches,handle,availabilityView,Approvals,authTyped,depositWallet,orderTyped,wrapOrderSignature,orderQuote,marketView,units,hmac,C,batchTyped,setupCalls,redeemCalls,withdrawCalls,settlementView,positionView} from './polymarket.mjs';
 import captured from './polymarket-fixture.mjs';
 // Public test vector, never a funded wallet.
 const signer=privateKeyToAccount('0x'+'01'.padStart(64,'0'));
@@ -237,4 +237,31 @@ test('a successful receipt must pay the approved recipient and exact amount befo
  assert.equal(walletReceipt({...receipt,logs:[{...log,topics:[...log.topics.slice(0,2),addressTopic(scope.owner)]}]},expected,wallet),false);
  assert.equal(walletReceipt({...receipt,logs:[{...log,data:'0x1'}]},expected,wallet),false);
  assert.equal(walletReceipt({...receipt,logs:[{...log,address:C.ctf}]},expected,wallet),false);
+});
+
+test('an unsubmitted wallet batch fails only after chain expiry with its nonce still unused',()=>{
+ const expected={type:'WALLET',nonce:'4',depositWalletParams:{deadline:'100'}};
+ assert.equal(walletEnvelopeExpired(expected,101n,4n),true);
+ assert.equal(walletEnvelopeExpired(expected,100n,4n),false);
+ assert.equal(walletEnvelopeExpired(expected,101n,5n),false);
+ assert.equal(walletEnvelopeExpired({...expected,type:'WALLET-CREATE'},101n,4n),false);
+});
+
+test('HTTP 500 after an order or wallet POST is reconciled instead of allowing another charge',async()=>{
+ for(const kind of ['order','setup']){
+  const q={...quote(),side:'buy'};
+  const typed=kind==='order'?orderTyped(scope.owner,q):batchTyped(scope.owner,setupCalls(q),'7',Math.floor(Date.now()/1000)+180);
+  const signature=await signer.signTypedData(typed),store=new Approvals();
+  const expectedOrderId=kind==='order'?hashTypedData({domain:typed.domain,types:{Order:typed.types.Order},primaryType:'Order',message:typed.message.contents}):null;
+  const prepared=store.put(scope.owner,scope.userId,scope.intentId,kind,typed,{quote:q,expectedOrderId});
+  const item=store.items.get(prepared.prepareId);
+  item.envelope=deviceRequests(item,signature,fakeCredentials,false,()=>({}));
+  item.issuedSignature=signature;
+  const report={signature,geoAllowed:true,results:[{id:kind==='order'?'order':'relay',status:500,body:{error:'reply unavailable'}}]};
+  const result=await commit(scope.owner,scope.userId,{intentId:scope.intentId,prepareId:prepared.prepareId,report},store);
+  assert.equal(result.failure,undefined);
+  if(kind==='order'){assert.equal(result.orderId,expectedOrderId);assert.equal(result.submissionUnknown,true);}
+  else{assert.equal(result.relayId,null);assert.equal(result.relayRequest.signature,signature);}
+  await assert.rejects(commit(scope.owner,scope.userId,{intentId:scope.intentId,prepareId:prepared.prepareId,report},store),/used/);
+ }
 });

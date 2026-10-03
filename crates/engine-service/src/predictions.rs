@@ -1045,6 +1045,14 @@ fn bridge_matches(row: &Value, intent: &Value, withdraw: bool) -> bool {
             .as_u64()
             .is_some_and(|t| t + 30_000 >= started)
 }
+fn abandoned_auth(current: &Value, at: u64) -> bool {
+    current["status"]["state"] == "pending"
+        && current["deviceIssued"] == true
+        && current["step"] == "auth"
+        && current["approval"]["expiresAtUnixMs"]
+            .as_u64()
+            .is_some_and(|expiry| expiry <= at)
+}
 pub(super) async fn status(
     state: AppState,
     headers: HeaderMap,
@@ -1055,6 +1063,16 @@ pub(super) async fn status(
     if current["status"]["state"] != "pending"
         || matches!(text(&current["status"], "stage"), "sign" | "validate")
     {
+        return Ok(Json(status_of(&current)?));
+    }
+    if abandoned_auth(&current, now()) {
+        current["status"]["state"] = json!("failed");
+        current["status"]["error"] = json!("Wallet setup expired before this action was funded. Your money stays in your wallets. Request a fresh quote.");
+        if state.predictions.replace(&id, &old, &current).await? {
+            record(&state, &id, &current).await?;
+        } else {
+            current = owned(&state, &headers, &id).await?;
+        }
         return Ok(Json(status_of(&current)?));
     }
     let step = text(&current, "step").to_string();
@@ -1246,7 +1264,16 @@ pub(super) async fn next(
     }
     if current["approval"]["expiresAtUnixMs"].as_u64().unwrap_or(0) <= now() {
         let step = text(&current, "step").to_string();
-        prepare(&state, &headers, &id, &mut current, &step).await?;
+        if let Err((code, reason)) = prepare(&state, &headers, &id, &mut current, &step).await {
+            if code == StatusCode::CONFLICT {
+                current["status"]["state"] = json!("failed");
+                current["status"]["error"] = json!(format!("{reason} Your unused cash and shares remain in Predictions. Request a fresh quote or return the cash."));
+                if state.predictions.replace(&id, &old, &current).await? {
+                    record(&state, &id, &current).await?;
+                }
+            }
+            return Err((code, reason));
+        }
         if state.predictions.replace(&id, &old, &current).await? {
             record(&state, &id, &current).await?;
         } else {
@@ -1304,6 +1331,17 @@ pub(super) async fn portfolio(
 mod tests {
     use super::*;
 
+    #[test]
+    fn an_abandoned_auth_releases_the_action_before_funding_but_never_a_sent_order() {
+        let pending = json!({"status":{"state":"pending"},"deviceIssued":true,"step":"auth","approval":{"expiresAtUnixMs":100}});
+        assert!(!abandoned_auth(&pending, 99));
+        assert!(abandoned_auth(&pending, 100));
+        for step in ["funding", "setup_wait", "order_wait", "withdraw_wait"] {
+            let mut sent = pending.clone();
+            sent["step"] = json!(step);
+            assert!(!abandoned_auth(&sent, 1000));
+        }
+    }
     #[test]
     fn device_checkpoint_uses_only_the_expected_order_or_signed_wallet_request() {
         let approval = json!({"expectedOrderId":"approved-order","depositAddress":"own-deposit","receiveUnits":"123"});

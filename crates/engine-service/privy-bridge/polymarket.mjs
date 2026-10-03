@@ -416,11 +416,11 @@ function failure(result){
  const message=String(result.body?.errorMsg??result.body?.error??result.body?.message??'The request was refused.').slice(0,180);
  return result.status===403?'Predictions is not available from this device connection. Nothing new was purchased.':'Predictions returned '+result.status+': '+message;
 }
-export async function commit(owner,userId,input){
- const report=deviceReport(input.report),item=await approvals.check({...signingInput(input),owner,userId,report:true});
+export async function commit(owner,userId,input,store=approvals){
+ const report=deviceReport(input.report),item=await store.check({...signingInput(input),owner,userId,report:true});
  if(!item.envelope||report.signature!==item.issuedSignature||report.results.some(r=>!item.envelope.requests.some(q=>q.id===r.id)))
   throw new Error('Device report does not match the prepared action.');
- await approvals.take({...signingInput(input),owner,userId,report:true});
+ await store.take({...signingInput(input),owner,userId,report:true});
  const result=id=>report.results.find(r=>r.id===id),relay=result('relay');
  const relayRequest=item.envelope.requests.find(r=>r.id==='relay');
  const expected=relayRequest?JSON.parse(relayRequest.body):null;
@@ -429,19 +429,19 @@ export async function commit(owner,userId,input){
   if(!successful(auth)||!credentials?.apiKey||!credentials.secret||!credentials.passphrase)throw new Error(failure(auth));
   // Authenticate the returned credentials independently before allowing any cash transfer.
   await clobCall(owner,credentials,'/auth/api-keys');
-  if(expected&&relay?.status&& !successful(relay))throw new Error(failure(relay));
+  if(expected&&relay?.status&&relay.status<500&&!successful(relay))throw new Error(failure(relay));
   if(expected&&!relay)throw new Error('Wallet setup was not submitted. Nothing was charged.');
   return {credentials,deployId:relayId(relay),deployment:Boolean(expected),relayRequest:expected};
  }
  if(item.kind==='order'){
   const order=result('order'),orderId=item.data.expectedOrderId;
-  if(order?.status&&(!successful(order)||order.body?.success!==true))return {failure:failure(order)};
+  if(order?.status&&order.status<500&&(!successful(order)||order.body?.success!==true))return {failure:failure(order)};
   if(successful(order)&&!same(order.body?.orderID,orderId))throw new Error('Order receipt does not match your approved order.');
   const prerequisite=report.results.find(r=>r.id.startsWith('allowance')&&!successful(r));
   if(!order)return {failure:prerequisite?failure(prerequisite):'The approval expired before the order was sent. Request a fresh quote.'};
   return {orderId,submissionUnknown:!successful(order),txIds:[]};
  }
- if(relay?.status&&!successful(relay))return {failure:failure(relay)};
+ if(relay?.status&&relay.status<500&&!successful(relay))return {failure:failure(relay)};
  if(!relay)throw new Error('The wallet action was not submitted. Nothing was charged.');
  return {relayId:relayId(relay),relayRequest:expected,...item.data};
 }
@@ -498,17 +498,30 @@ export function walletReceipt(receipt,expected,wallet,minimumReceive='0'){
  }
  return Boolean(expected.depositWalletParams?.calls?.length);
 }
+export function walletEnvelopeExpired(expected,blockTimestamp,nonce){
+ return expected?.type==='WALLET'&&/^\d+$/.test(expected.depositWalletParams?.deadline??'')&&
+  BigInt(blockTimestamp)>BigInt(expected.depositWalletParams.deadline)&&BigInt(nonce)===BigInt(expected.nonce);
+}
+async function missingWalletAction(expected,wallet){
+ const deadline=Number(expected.depositWalletParams?.deadline);
+ if(expected.type!=='WALLET'||!Number.isFinite(deadline)||Date.now()<deadline*1000+30000)return {state:'pending',txIds:[]};
+ const [block,nonce]=await Promise.all([rpc('eth_getBlockByNumber',['latest',false]),
+  read(wallet,parseAbi(['function nonce() view returns (uint256)']),'nonce',[])]);
+ return {state:walletEnvelopeExpired(expected,block.timestamp,nonce)?'failed':'pending',txIds:[]};
+}
 export async function progress(owner,input){
  if(input.deployment||input.relayRequest){
   const expected=input.relayRequest,wallet=depositWallet(owner);
   if(!expected||!same(expected.from,owner)||!same(expected.to,C.factory))throw new Error('Wallet settlement does not match your action.');
+  if(expected.type==='WALLET-CREATE'&&await rpc('eth_getCode',[wallet,'latest'])!=='0x')
+   return {state:'filled',txIds:[],wallet};
   let rows;
   if(input.relayId){
    try{rows=await request('relay','/transaction?id='+encodeURIComponent(input.relayId));}
-   catch(e){if(e.status===404)return {state:'pending',txIds:[]};throw e;}
+   catch(e){if(e.status===404)return missingWalletAction(expected,wallet);throw e;}
   }else rows=await builderCall('/transactions');
   const row=(Array.isArray(rows)?rows:[]).find(r=>relayMatches(r,expected));
-  if(!row)return {state:'pending',txIds:[]};
+  if(!row)return missingWalletAction(expected,wallet);
   if(['STATE_FAILED','STATE_INVALID'].includes(row.state))return {state:'failed',txIds:[]};
   if(row.state!=='STATE_CONFIRMED'||!/^0x[0-9a-fA-F]{64}$/.test(row.transactionHash??''))return {state:'pending',txIds:[]};
   const receipt=await rpc('eth_getTransactionReceipt',[row.transactionHash]);
