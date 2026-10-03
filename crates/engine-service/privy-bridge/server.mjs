@@ -1,4 +1,4 @@
-import {handle as predictions} from './polymarket.mjs';
+import {handle as predictions,availability as predictionAvailability} from './polymarket.mjs';
 function approvalFailure(error,fallback){const reason=error.message??fallback;return error.maybeSent||error.sent?.length?reason:reason+'; nothing was sent';}
 import {DeviceApprovals,deviceSign} from './device-approval.mjs';
 import {coinBalance,walletBalances} from './sui-swap.mjs';
@@ -56,6 +56,12 @@ async function ensureReceivingWallet(userId, chainType) {
 }
 
 const server = createServer(async (request, response) => {
+  // Public deployment readiness, never account data, credentials or a signing route.
+  if(request.method==='GET'&&request.url==='/predictions/readiness'){
+    try{send(response,200,await predictionAvailability());}
+    catch{send(response,503,{error:'Predictions availability could not be checked. Try again.'});}
+    return;
+  }
   const predictionRoute=request.method==='POST'&&request.url.startsWith('/predictions/')?request.url.slice('/predictions/'.length):null;
   const verifyOnly = request.method === 'POST' && request.url === '/verify';
   const ensureWallet = request.method === 'POST' && request.url === '/wallet/ensure';

@@ -507,3 +507,24 @@ complete confirmed settlement; and Rust preparation concurrency.
 gas quota, funded Base/Solana deposits, buy/sell fills, wallet cash return and winning redemption.
 Configure and check Builder credentials before a funded trial. Read-only dry runs do not prove
 these paths have settled.
+
+### Predictions credentials and hosting
+1. Sign into the Polymarket account representing Atlas.
+2. Open **Settings → Builders**, complete the builder profile if prompted, and create an API key.
+3. Copy **API Key**, **Secret**, and **Passphrase** into the Atlas Engine web service's Render Environment:
+   `POLYMARKET_BUILDER_API_KEY`, `POLYMARKET_BUILDER_SECRET`, and `POLYMARKET_BUILDER_PASSPHRASE`.
+4. Save and redeploy. Do not put these credentials in Expo public configuration. Do not substitute a personal Relayer key.
+5. Check `GET /v1/predictions/availability`. This public readiness endpoint returns
+   `{configured, serverAllowed, serviceCountry, blockedBy, reason}`. It never returns IP addresses or secret values.
+   `blockedBy` is `service_region`, `builder_setup`, or null. User eligibility is independently checked on the device.
+
+The existing Render service is in Oregon, USA. Polymarket's check tests the requesting server IP, so a Nigerian user can
+pass the device check while the Oregon service is restricted. Keep trading blocked before funding in that case.
+Render currently offers US, Germany and Singapore locations, all restricted for this trading flow.
+Polymarket documents Ireland (`eu-west-1`) as its nearest unrestricted server location. Deploy the trading service on
+eligible infrastructure, verify its geoblock result there, and retain the user's device eligibility check. Changing
+only the wording or forwarding an invented user IP does not make an ineligible service eligible.
+
+Sources: [Polymarket account setup](https://docs.polymarket.com/trading/wallets-auth),
+[geographic restrictions](https://docs.polymarket.com/api-reference/geoblock),
+[Render regions](https://render.com/docs/regions).

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {privateKeyToAccount} from 'viem/accounts';
 import {hashTypedData} from 'viem';
-import {Approvals,authTyped,depositWallet,orderTyped,wrapOrderSignature,orderQuote,marketView,units,hmac,C,batchTyped,setupCalls,redeemCalls,withdrawCalls,settlementView,positionView} from './polymarket.mjs';
+import {availabilityView,Approvals,authTyped,depositWallet,orderTyped,wrapOrderSignature,orderQuote,marketView,units,hmac,C,batchTyped,setupCalls,redeemCalls,withdrawCalls,settlementView,positionView} from './polymarket.mjs';
 import captured from './polymarket-fixture.mjs';
 // Public test vector, never a funded wallet.
 const signer=privateKeyToAccount('0x'+'01'.padStart(64,'0'));
@@ -115,4 +115,23 @@ test('missing position prices fail explicitly instead of showing a zero balance'
  assert.equal(positionView(p).pnlUsd,'-2');
  assert.throws(()=>positionView({...p,current_value:undefined}),/values/);
  assert.throws(()=>positionView({...p,current_size:'NaN'}),/values/);
+});
+
+test('availability distinguishes the server connection from user eligibility and omits IPs',()=>{
+ const us=availabilityView({blocked:true,country:'US',region:'OR',ip:'private-ip'},true);
+ assert.equal(us.serverAllowed,false);
+ assert.equal(us.serviceCountry,'US');
+ assert.equal(us.blockedBy,'service_region');
+ assert.match(us.reason,/server connection/);
+ assert.match(us.reason,/separate from your location/);
+ assert.equal(JSON.stringify(us).includes('private-ip'),false);
+ const ng=availabilityView({blocked:false,country:'NG'},true);
+ assert.equal(ng.serverAllowed,true);
+ assert.equal(ng.blockedBy,null);
+ assert.equal(ng.reason,null);
+ const missing=availabilityView({blocked:false,country:'NG'},false);
+ assert.equal(missing.blockedBy,'builder_setup');
+ assert.match(missing.reason,/credentials/);
+ assert.equal(availabilityView({blocked:false,country:'malformed'},true).serviceCountry,null);
+ assert.throws(()=>availabilityView({country:'NG'},true),/could not be checked/);
 });

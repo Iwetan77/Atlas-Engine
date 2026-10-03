@@ -60,11 +60,20 @@ export function depositWallet(owner){
   '0xb3582b35133d50545afa5036515af43d6000803e604d573d6000fd5b3d6000f3',args]);
  return getCreate2Address({from:C.factory,salt:keccak256(args),bytecodeHash:keccak256(code)});
 }
+// Only the provider's country code leaves this check; IP addresses never leave the bridge.
+export function availabilityView(geo,isConfigured){
+ if(typeof geo?.blocked!=='boolean')throw new Error('Predictions availability could not be checked.');
+ const serviceCountry=/^[A-Z]{2}$/.test(geo.country??'')?geo.country:null;
+ const blockedBy=geo.blocked?'service_region':!isConfigured?'builder_setup':null;
+ const reason=geo.blocked?
+  "Polymarket restricts Atlas's server connection. This is separate from your location. You can browse markets while trading is unavailable.":
+  !isConfigured?'Atlas Predictions is waiting for its trading credentials. You can browse markets.':null;
+ return {configured:isConfigured,serverAllowed:!geo.blocked,serviceCountry,blockedBy,reason};
+}
 export async function availability(){
  const r=await fetch('https://polymarket.com/api/geoblock',{signal:AbortSignal.timeout(10000)});
- if(!r.ok)throw new Error('Availability check unavailable');const geo=await r.json();
- if(typeof geo?.blocked!=='boolean')throw new Error('Availability check unavailable');
- return {configured:configured(),serverAllowed:!geo.blocked,reason:geo.blocked?'Trading is not available from this service region.':!configured()?'Predictions trading is not available yet.':null};
+ if(!r.ok)throw new Error('Predictions availability could not be checked.');
+ return availabilityView(await r.json(),configured());
 }
 export async function networkCheck(){
  const [chain,beacon,scale]=await Promise.all([rpc('eth_chainId',[]),

@@ -299,13 +299,24 @@ pub(super) async fn market(
         bridge(&state, &headers, "market", json!({"marketId":id})).await?,
     ))
 }
-pub(super) async fn availability(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
-    Ok(Json(
-        bridge(&state, &headers, "availability", json!({})).await?,
-    ))
+// Public readiness contains no user data. The country is the service's egress, never the user's.
+pub(super) async fn availability(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let AuthMode::Privy { bridge_url, http } = &state.auth else {
+        return Err(conflict("Predictions needs its trading service"));
+    };
+    let response = http
+        .get(format!("{bridge_url}/predictions/readiness"))
+        .send()
+        .await
+        .map_err(|_| internal("Predictions availability could not be checked. Try again."))?;
+    if !response.status().is_success() {
+        return Err(internal(
+            "Predictions availability could not be checked. Try again.",
+        ));
+    }
+    Ok(Json(response.json().await.map_err(|_| {
+        internal("Predictions availability could not be checked. Try again.")
+    })?))
 }
 #[derive(Deserialize)]
 pub(super) struct Currency {
