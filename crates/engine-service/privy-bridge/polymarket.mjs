@@ -68,7 +68,7 @@ export function availabilityView(geo,isConfigured){
  const reason=geo.blocked?
   "Polymarket restricts Atlas's server connection. This is separate from your location. You can browse markets while trading is unavailable.":
   !isConfigured?'Atlas Predictions is waiting for its trading credentials. You can browse markets.':null;
- return {configured:isConfigured,serverAllowed:!geo.blocked,serviceCountry,blockedBy,reason};
+ return {configured:isConfigured,serverAllowed:!geo.blocked,serviceCountry,blockedBy,reason,deviceSubmission:true};
 }
 export async function availability(){
  const r=await fetch('https://polymarket.com/api/geoblock',{signal:AbortSignal.timeout(10000)});
@@ -83,8 +83,9 @@ export async function networkCheck(){
  if(BigInt(scale)!==6n)throw new Error('Predictions cash scale changed; nothing was charged.');
  return {chainId:137,factoryVerified:true,cashDecimals:6};
 }
-async function ready(){
- const a=await availability();if(!a.configured||!a.serverAllowed)throw new Error(a.reason+' Nothing was charged.');
+async function ready(deviceSubmission){
+ if(deviceSubmission!==true)throw new Error('Update Atlas to submit Predictions from your own device. Nothing was charged.');
+ if(!configured())throw new Error('Atlas Builder setup is still needed. Nothing was charged.');
  await networkCheck();
 }
 
@@ -179,7 +180,7 @@ export function orderQuote(raw,book,side,budget){
   tokenId:book.asset_id,negRisk:book.neg_risk===true,tickSize:book.tick_size};
 }
 export async function preview(owner,input){
- await ready();const {raw,view}=await market(input.marketId);
+ await ready(input.deviceSubmission);const {raw,view}=await market(input.marketId);
  if(!view.tradeable)throw new Error('This market has stopped taking orders.');
  const outcome=view.outcomes.find(o=>o.tokenId===input.tokenId);if(!outcome)throw new Error('Outcome does not belong to this market');
  const book=await request('clob','/book?token_id='+input.tokenId);
@@ -206,8 +207,8 @@ export async function bridgeQuote(owner,{units:amount,from='base',withdraw=false
  return {units:amount.toString(),receiveUnits:q.estToTokenBaseUnit,feeUnits:(amount>BigInt(q.estToTokenBaseUnit)?amount-BigInt(q.estToTokenBaseUnit):0n).toString(),
   from,withdraw,wallet,recipient};
 }
-export async function deposit(owner){
- await ready();const r=await request('bridge','/deposit',{address:depositWallet(owner)});address(r?.address?.evm);
+export async function deposit(owner,input){
+ await ready(input.deviceSubmission);const r=await request('bridge','/deposit',{address:depositWallet(owner)});address(r?.address?.evm);
  if(typeof r.address.svm!=='string'||r.address.svm.length<32)throw new Error('Deposit address unavailable');return r.address;
 }
 
@@ -240,16 +241,16 @@ export function wrapOrderSignature(typed,signature){
 export class Approvals{
  items=new Map();
  put(owner,userId,intentId,kind,typed,data,expires=Date.now()+180000){
-  for(const [id,v]of this.items)if(v.expires<=Date.now())this.items.delete(id);
+  for(const [id,v]of this.items)if(v.expires+(v.envelope?600000:0)<=Date.now())this.items.delete(id);
   if(this.items.size>=1000)throw new Error('Predictions queue is busy.');
   if(!intentId.startsWith('prediction-')||expires<=Date.now()||expires>Date.now()+180000)throw new Error('Invalid prediction approval');
   const prepareId=randomUUID();
   this.items.set(prepareId,{owner,userId,intentId,kind,typed:structuredClone(typed),data:structuredClone(data),expires});
-  return {prepareId,transactions:[{chain:'polygon',typedData:typed}],expiresAtUnixMs:expires};
+  return {prepareId,transactions:[{chain:'polygon',typedData:typed,prediction:{prepareId,intentId,expiresAtUnixMs:expires}}],expiresAtUnixMs:expires};
  }
- async check({prepareId,owner,userId,intentId,signature}){
+ async check({prepareId,owner,userId,intentId,signature,report}){
   const item=this.items.get(prepareId);
-  if(!item||!same(item.owner,owner)||item.userId!==userId||item.intentId!==intentId||item.expires<=Date.now())
+  if(!item||!same(item.owner,owner)||item.userId!==userId||item.intentId!==intentId||item.expires+(report&&item.envelope?600000:0)<=Date.now())
    throw new Error('Approval expired, used, or belongs to another purchase.');
   if(!/^0x[0-9a-fA-F]{130}$/.test(signature??''))throw new Error('Invalid prediction signature.');
   const recovered=await recoverTypedDataAddress({...item.typed,signature});
@@ -269,9 +270,8 @@ export function batchTyped(owner,calls,nonce,deadline){
    Batch:[{name:'wallet',type:'address'},{name:'nonce',type:'uint256'},{name:'deadline',type:'uint256'},{name:'calls',type:'Call[]'}]},
   primaryType:'Batch',message:{wallet,nonce:String(nonce),deadline:String(deadline),calls}};
 }
-async function batch(owner,calls){
- const r=await builderCall('/v1/account/transactions/params?address='+owner+'&type=WALLET');
- if(!same(r.address,owner))throw new Error('Wallet nonce unavailable');
+export async function batch(owner,calls){
+ const r=await request('relay','/nonce?address='+owner+'&type=WALLET');
  return batchTyped(owner,calls,r.nonce,Math.floor(Date.now()/1000)+180);
 }
 export function setupCalls(q){
@@ -313,7 +313,7 @@ export async function redemption(owner,tokenId){
   maximumSpend:'0',minimumReceive:payout.toString(),feeUnits:'0',units:'0',expiresAtUnixMs:Date.now()+60000};
 }
 export async function prepare(owner,userId,input){
- await ready();const q=input.quote,kind=input.kind,wallet=depositWallet(owner);let typed,data={};
+ await ready(input.quote?.deviceSubmission);const q=input.quote,kind=input.kind,wallet=depositWallet(owner);let typed,data={};
  if(kind==='auth')typed=authTyped(owner);
  else if(kind==='setup'){
   typed=await batch(owner,setupCalls(q));
@@ -353,35 +353,102 @@ export async function prepare(owner,userId,input){
  return {...approvals.put(owner,userId,input.intentId,kind,typed,data,
   Math.min(Date.now()+180000,kind==='order'?q.expiresAtUnixMs:Date.now()+180000)),...data};
 }
-export async function commit(owner,userId,input){
- const item=await approvals.take({...input,owner,userId}),typed=item.typed,signature=input.signature;
+// The server signs only short-lived HMAC headers for requests rebuilt from a checked wallet approval.
+export function deviceRequests(item,signature,credentials,undeployed=false,authBuilder=builderHeaders){
+ const typed=item.typed,owner=item.owner,requests=[];
+ const add=(id,service,path,body,headers,onFailure)=>{
+  const method=body===undefined?'GET':'POST';
+  requests.push({id,url:URLS[service]+path,method,headers:{Accept:'application/json',...(body===undefined?{}:{'Content-Type':'application/json'}),...headers},
+   ...(body===undefined?{}:{body:JSON.stringify(body)}),...(onFailure?{onFailure}: {})});
+ };
  if(item.kind==='auth'){
   const headers={POLY_ADDRESS:owner,POLY_SIGNATURE:signature,POLY_TIMESTAMP:typed.message.timestamp,POLY_NONCE:typed.message.nonce};
-  let credentials;try{credentials=await request('clob','/auth/derive-api-key',undefined,headers);}
-  catch(e){if(e.status!==400&&e.status!==404)throw e;credentials=await request('clob','/auth/api-key',{},headers);}
-  if(!credentials?.apiKey||!credentials.secret||!credentials.passphrase)throw new Error('Predictions authentication failed.');
-  let deployId=null;
-  if(await rpc('eth_getCode',[depositWallet(owner),'latest'])==='0x'){
-   const r=await builderCall('/submit',{type:'WALLET-CREATE',from:owner,to:C.factory,metadata:input.intentId});
-   deployId=r.transactionID;if(!deployId)throw new Error('Wallet deployment response unavailable.');
+  add('auth','clob','/auth/derive-api-key',undefined,headers);
+  add('authCreate','clob','/auth/api-key',{},headers,{id:'auth',statuses:[400,404]});
+  if(undeployed){
+   const body={type:'WALLET-CREATE',from:owner,to:C.factory,metadata:item.intentId};
+   add('relay','relay','/submit',body,authBuilder('POST','/submit',body));
   }
-  return {credentials,deployId};
+ }else if(item.kind==='order'){
+  const q=item.data.quote,c=typed.message.contents;
+  const order={...c,salt:Number(c.salt),side:c.side===0?'BUY':'SELL',expiration:'0',signature:wrapOrderSignature(typed,signature)};
+  const paths=['/balance-allowance/update?asset_type=COLLATERAL&signature_type=3'];
+  if(q.side==='sell')paths.push('/balance-allowance/update?asset_type=CONDITIONAL&token_id='+q.tokenId+'&signature_type=3');
+  paths.forEach((path,i)=>add('allowance'+i,'clob',path,undefined,clobHeaders(owner,credentials,'GET',path.split('?')[0])));
+  const body={deferExec:false,order,orderType:'FOK',owner:credentials.apiKey};
+  add('order','clob','/order',body,clobHeaders(owner,credentials,'POST','/order',body));
+ }else if(['setup','withdraw','redeem'].includes(item.kind)){
+  const body={type:'WALLET',from:owner,to:C.factory,nonce:typed.message.nonce,signature,metadata:item.intentId,
+   depositWalletParams:{depositWallet:typed.message.wallet,deadline:typed.message.deadline,calls:typed.message.calls}};
+  add('relay','relay','/submit',body,authBuilder('POST','/submit',body));
+ }else throw new Error('Unsupported prediction action');
+ return {expiresAtUnixMs:item.expires,requests};
+}
+export async function device(owner,userId,input){
+ const item=await approvals.check({...input,owner,userId});
+ if(item.envelope){
+  if(item.issuedSignature!==input.signature)throw new Error('This approval was already prepared with a different signature.');
+  return item.envelope;
+ }
+ // Check deployment before building the envelope, then recheck ownership after this asynchronous read.
+ const undeployed=item.kind==='auth'&&await rpc('eth_getCode',[depositWallet(owner),'latest'])==='0x';
+ await approvals.check({...input,owner,userId});
+ if(!item.envelope){item.envelope=deviceRequests(item,input.signature,input.credentials,undeployed);item.issuedSignature=input.signature;}
+ return item.envelope;
+}
+export function deviceReport(raw){
+ let report;try{report=typeof raw==='string'?JSON.parse(raw):raw;}catch{throw new Error('Prediction device report is invalid.');}
+ if(!report||typeof report.signature!=='string'||!Array.isArray(report.results)||report.results.length>5||report.geoAllowed!==true)
+  throw new Error('Prediction must be submitted from your own device.');
+ const seen=new Set();
+ for(const r of report.results){
+  if(!r||typeof r.id!=='string'||seen.has(r.id)||!Number.isInteger(r.status)||r.status<0||r.status>599)
+   throw new Error('Prediction device report is invalid.');
+  seen.add(r.id);
+ }
+ return report;
+}
+const signingInput=input=>({...input,signature:deviceReport(input.report).signature});
+const successful=r=>r&&r.status>=200&&r.status<300;
+const relayId=r=>{const id=r?.body?.transactionID;return typeof id==='string'&&/^[a-zA-Z0-9-]{1,100}$/.test(id)?id:null;};
+function failure(result){
+ if(!result||result.status===0)return 'The device lost its connection. Check Activity before trying again.';
+ const message=String(result.body?.errorMsg??result.body?.error??result.body?.message??'The request was refused.').slice(0,180);
+ return result.status===403?'Predictions is not available from this device connection. Nothing new was purchased.':'Predictions returned '+result.status+': '+message;
+}
+export async function commit(owner,userId,input){
+ const report=deviceReport(input.report),item=await approvals.check({...signingInput(input),owner,userId,report:true});
+ if(!item.envelope||report.signature!==item.issuedSignature||report.results.some(r=>!item.envelope.requests.some(q=>q.id===r.id)))
+  throw new Error('Device report does not match the prepared action.');
+ await approvals.take({...signingInput(input),owner,userId,report:true});
+ const result=id=>report.results.find(r=>r.id===id),relay=result('relay');
+ const relayRequest=item.envelope.requests.find(r=>r.id==='relay');
+ const expected=relayRequest?JSON.parse(relayRequest.body):null;
+ if(item.kind==='auth'){
+  const auth=successful(result('auth'))?result('auth'):result('authCreate'),credentials=auth?.body;
+  if(!successful(auth)||!credentials?.apiKey||!credentials.secret||!credentials.passphrase)throw new Error(failure(auth));
+  // Authenticate the returned credentials independently before allowing any cash transfer.
+  await clobCall(owner,credentials,'/auth/api-keys');
+  if(expected&&relay?.status&& !successful(relay))throw new Error(failure(relay));
+  if(expected&&!relay)throw new Error('Wallet setup was not submitted. Nothing was charged.');
+  return {credentials,deployId:relayId(relay),deployment:Boolean(expected),relayRequest:expected};
  }
  if(item.kind==='order'){
-  const q=item.data.quote,c=typed.message.contents,order={...c,salt:Number(c.salt),side:c.side===0?'BUY':'SELL',expiration:'0',
-   signature:wrapOrderSignature(typed,signature)};
-  await clobCall(owner,input.credentials,'/balance-allowance/update?asset_type=COLLATERAL&signature_type=3');
-  if(q.side==='sell')await clobCall(owner,input.credentials,'/balance-allowance/update?asset_type=CONDITIONAL&token_id='+q.tokenId+'&signature_type=3');
-  let r;
-  try{r=await clobCall(owner,input.credentials,'/order',{deferExec:false,order,orderType:'FOK',owner:input.credentials.apiKey});}
-  catch(error){error.maybeSent=!error.status||error.status>=500;throw error;}
-  if(r.success!==true||!r.orderID)throw new Error(String(r.errorMsg??'Order did not fill. Your cash or shares remain in Predictions.').slice(0,180));
-  return {orderId:r.orderID,tradeIds:r.tradeIDs??[],txIds:r.transactionsHashes??[],status:r.status};
+  const order=result('order'),orderId=item.data.expectedOrderId;
+  if(order?.status&&(!successful(order)||order.body?.success!==true))return {failure:failure(order)};
+  if(successful(order)&&!same(order.body?.orderID,orderId))throw new Error('Order receipt does not match your approved order.');
+  const prerequisite=report.results.find(r=>r.id.startsWith('allowance')&&!successful(r));
+  if(!order)return {failure:prerequisite?failure(prerequisite):'The approval expired before the order was sent. Request a fresh quote.'};
+  return {orderId,submissionUnknown:!successful(order),txIds:[]};
  }
- const r=await builderCall('/submit',{type:'WALLET',from:owner,to:C.factory,nonce:typed.message.nonce,signature,metadata:input.intentId,
-  depositWalletParams:{depositWallet:typed.message.wallet,deadline:typed.message.deadline,calls:typed.message.calls}});
- if(!r.transactionID)throw new Error('Wallet action response unavailable. Check activity before trying again.');
- return {relayId:r.transactionID,...item.data};
+ if(relay?.status&&!successful(relay))return {failure:failure(relay)};
+ if(!relay)throw new Error('The wallet action was not submitted. Nothing was charged.');
+ return {relayId:relayId(relay),relayRequest:expected,...item.data};
+}
+export function relayMatches(row,expected){
+ if(!row||!expected||!same(row.from,expected.from)||!same(row.to,expected.to)||row.type!==expected.type)return false;
+ if(expected.type==='WALLET')return String(row.nonce)===expected.nonce&&same(row.signature,expected.signature);
+ return row.metadata===expected.metadata;
 }
 export function settlementView(order,rows,input){
  const result={state:'pending',txIds:[]};
@@ -400,11 +467,57 @@ export function settlementView(order,rows,input){
  if(size!==BigInt(q.shares)||units(order.size_matched)!==BigInt(q.shares))return result;
  return {state:'filled',txIds:[...new Set(related.map(t=>t.transaction_hash))]};
 }
+// A relayer acknowledgement alone is never a completed wallet action.
+export function walletReceipt(receipt,expected,wallet,minimumReceive='0'){
+ if(receipt?.status!=='0x1'||!Array.isArray(receipt.logs))return false;
+ const topicAddress=a=>'0x'+a.slice(2).toLowerCase().padStart(64,'0');
+ const topic=event=>keccak256(toHex(event));
+ const matches=(log,target,event,from,to)=>same(log.address,target)&&same(log.topics?.[0],topic(event))&&
+  same(log.topics?.[1],topicAddress(from))&&same(log.topics?.[2],topicAddress(to));
+ let redeem=false;
+ for(const call of expected.depositWalletParams?.calls??[]){
+  if(same(call.target,C.cash)&&call.data.startsWith('0x095ea7b3')){
+   const spender='0x'+call.data.slice(34,74),amount=BigInt('0x'+call.data.slice(74,138));
+   if(!receipt.logs.some(l=>matches(l,C.cash,'Approval(address,address,uint256)',wallet,spender)&&BigInt(l.data)===amount))return false;
+  }else if(same(call.target,C.ctf)&&call.data.startsWith('0xa22cb465')){
+   const operator='0x'+call.data.slice(34,74);
+   if(!receipt.logs.some(l=>matches(l,C.ctf,'ApprovalForAll(address,address,bool)',wallet,operator)&&BigInt(l.data)===1n))return false;
+  }else if(same(call.target,C.cash)&&call.data.startsWith('0xa9059cbb')){
+   const recipient='0x'+call.data.slice(34,74),amount=BigInt('0x'+call.data.slice(74,138));
+   if(!receipt.logs.some(l=>matches(l,C.cash,'Transfer(address,address,uint256)',wallet,recipient)&&BigInt(l.data)===amount))return false;
+  }else if(same(call.target,C.adapter)||same(call.target,C.negativeAdapter))redeem=true;
+  else return false;
+ }
+ if(redeem){
+  let net=0n;
+  for(const log of receipt.logs.filter(l=>same(l.address,C.cash)&&same(l.topics?.[0],topic('Transfer(address,address,uint256)')))){
+   if(same(log.topics?.[2],topicAddress(wallet)))net+=BigInt(log.data);
+   if(same(log.topics?.[1],topicAddress(wallet)))net-=BigInt(log.data);
+  }
+  if(net<=0n||net<BigInt(minimumReceive))return false;
+ }
+ return Boolean(expected.depositWalletParams?.calls?.length);
+}
 export async function progress(owner,input){
- if(input.relayId){
-  const r=await builderCall('/v1/account/transactions/'+encodeURIComponent(input.relayId));
-  return {state:r.state==='STATE_CONFIRMED'?'filled':['STATE_FAILED','STATE_INVALID'].includes(r.state)?'failed':'pending',
-   txIds:r.transaction_hash?[r.transaction_hash]:[],wallet:depositWallet(owner)};
+ if(input.deployment||input.relayRequest){
+  const expected=input.relayRequest,wallet=depositWallet(owner);
+  if(!expected||!same(expected.from,owner)||!same(expected.to,C.factory))throw new Error('Wallet settlement does not match your action.');
+  let rows;
+  if(input.relayId){
+   try{rows=await request('relay','/transaction?id='+encodeURIComponent(input.relayId));}
+   catch(e){if(e.status===404)return {state:'pending',txIds:[]};throw e;}
+  }else rows=await builderCall('/transactions');
+  const row=(Array.isArray(rows)?rows:[]).find(r=>relayMatches(r,expected));
+  if(!row)return {state:'pending',txIds:[]};
+  if(['STATE_FAILED','STATE_INVALID'].includes(row.state))return {state:'failed',txIds:[]};
+  if(row.state!=='STATE_CONFIRMED'||!/^0x[0-9a-fA-F]{64}$/.test(row.transactionHash??''))return {state:'pending',txIds:[]};
+  const receipt=await rpc('eth_getTransactionReceipt',[row.transactionHash]);
+  if(!receipt)return {state:'pending',txIds:[]};
+  if(receipt.status!=='0x1')return {state:'failed',txIds:[row.transactionHash]};
+  if(expected.type==='WALLET-CREATE'&&await rpc('eth_getCode',[wallet,'latest'])==='0x')return {state:'pending',txIds:[]};
+  if(expected.type==='WALLET'&&!walletReceipt(receipt,expected,wallet,input.quote?.minimumReceive))
+   throw new Error('Wallet settlement did not match the approved action. Check Activity.');
+  return {state:'filled',txIds:[row.transactionHash],wallet};
  }
  if(input.orderId){
   let o;
@@ -426,9 +539,10 @@ export async function handle(route,input,{owner,userId,solanaWallet}){
  case 'preview':return preview(owner,input);
  case 'redemption':return redemption(owner,input.tokenId);
  case 'bridge-quote':return bridgeQuote(owner,{...input,solanaWallet});
- case 'deposit':return deposit(owner);
+ case 'deposit':return deposit(owner,input);
  case 'prepare':return prepare(owner,userId,{...input,solanaWallet});
- case 'check':await approvals.check({...input,owner,userId});return {valid:true};
+ case 'device':return device(owner,userId,input);
+ case 'check':await approvals.check({...signingInput(input),owner,userId,report:true});return {valid:true};
  case 'commit':return commit(owner,userId,input);
  case 'progress':return progress(owner,input);
  default:throw new Error('Unsupported prediction route');

@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {privateKeyToAccount} from 'viem/accounts';
-import {hashTypedData} from 'viem';
-import {availabilityView,Approvals,authTyped,depositWallet,orderTyped,wrapOrderSignature,orderQuote,marketView,units,hmac,C,batchTyped,setupCalls,redeemCalls,withdrawCalls,settlementView,positionView} from './polymarket.mjs';
+import {hashTypedData,keccak256,toHex} from 'viem';
+import {walletReceipt,deviceRequests,deviceReport,relayMatches,handle,availabilityView,Approvals,authTyped,depositWallet,orderTyped,wrapOrderSignature,orderQuote,marketView,units,hmac,C,batchTyped,setupCalls,redeemCalls,withdrawCalls,settlementView,positionView} from './polymarket.mjs';
 import captured from './polymarket-fixture.mjs';
 // Public test vector, never a funded wallet.
 const signer=privateKeyToAccount('0x'+'01'.padStart(64,'0'));
@@ -134,4 +134,107 @@ test('availability distinguishes the server connection from user eligibility and
  assert.match(missing.reason,/credentials/);
  assert.equal(availabilityView({blocked:false,country:'malformed'},true).serviceCountry,null);
  assert.throws(()=>availabilityView({country:'NG'},true),/could not be checked/);
+});
+
+const fakeCredentials={apiKey:'public-test-key',secret:Buffer.from('public-secret').toString('base64'),passphrase:'public-passphrase'};
+test('device envelope pins order bytes, signer, FOK and HMAC without exposing a secret',async()=>{
+ const q={...quote(),side:'buy'},typed=orderTyped(scope.owner,q),signature=await signer.signTypedData(typed);
+ const item={...scope,kind:'order',typed,data:{quote:q},expires:Date.now()+45000};
+ const envelope=deviceRequests(item,signature,fakeCredentials);
+ const order=envelope.requests.find(r=>r.id==='order'),body=JSON.parse(order.body);
+ assert.equal(order.url,'https://clob.polymarket.com/order');assert.equal(order.method,'POST');
+ assert.equal(body.orderType,'FOK');assert.equal(body.order.maker,depositWallet(scope.owner));
+ assert.equal(body.order.makerAmount,q.notional);assert.equal(body.order.tokenId,q.tokenId);
+ assert.equal(order.headers.POLY_ADDRESS,scope.owner);
+ assert.equal(order.headers.POLY_SIGNATURE,hmac(fakeCredentials.secret,order.headers.POLY_TIMESTAMP,'POST','/order',order.body));
+ assert.ok(!JSON.stringify(envelope).includes(fakeCredentials.secret));
+ assert.equal(envelope.requests.some(r=>r.method==='POST'&&r.url.includes('onrender.com')),false);
+});
+test('device wallet envelope signs only the original batch and exact serialized builder body',async()=>{
+ const calls=withdrawCalls(other.address,1234567n),typed=batchTyped(scope.owner,calls,'9',Math.floor(Date.now()/1000)+180);
+ const signature=await signer.signTypedData(typed),secret=Buffer.from('public-builder-secret').toString('base64');
+ const issuer=(method,path,body)=>({POLY_BUILDER_TIMESTAMP:'123',POLY_BUILDER_SIGNATURE:hmac(secret,'123',method,path,JSON.stringify(body))});
+ const envelope=deviceRequests({...scope,kind:'withdraw',typed,data:{},expires:Date.now()+180000},signature,null,false,issuer);
+ const request=envelope.requests[0],body=JSON.parse(request.body);
+ assert.equal(request.url,'https://relayer-v2.polymarket.com/submit');
+ assert.deepEqual(body.depositWalletParams.calls,calls);
+ assert.equal(body.nonce,'9');assert.equal(body.from,scope.owner);assert.equal(body.to,C.factory);
+ assert.equal(body.signature,signature);
+ assert.equal(request.headers.POLY_BUILDER_SIGNATURE,hmac(secret,'123','POST','/submit',request.body));
+ assert.ok(!JSON.stringify(envelope).includes(secret));
+});
+test('device auth falls back only on missing key and deployment stays bound to the signed owner',async()=>{
+ const typed=authTyped(scope.owner),signature=await signer.signTypedData(typed);
+ const envelope=deviceRequests({...scope,kind:'auth',typed,expires:Date.now()+180000},signature,null,true,()=>({}));
+ assert.deepEqual(envelope.requests.map(r=>r.id),['auth','authCreate','relay']);
+ assert.deepEqual(envelope.requests[1].onFailure,{id:'auth',statuses:[400,404]});
+ assert.equal(JSON.parse(envelope.requests[2].body).from,scope.owner);
+ assert.equal(envelope.requests[0].headers.POLY_TIMESTAMP,typed.message.timestamp);
+});
+test('device reports reject plain signatures, duplicates, bad status and missing eligibility',()=>{
+ assert.throws(()=>deviceReport('0x123'),/invalid/);
+ assert.throws(()=>deviceReport({signature:'sig',results:[],geoAllowed:false}),/device/);
+ assert.throws(()=>deviceReport({signature:'sig',geoAllowed:true,results:[{id:'order',status:NaN}]}),/invalid/);
+ assert.throws(()=>deviceReport({signature:'sig',geoAllowed:true,results:[{id:'order',status:200},{id:'order',status:200}]}),/invalid/);
+ assert.equal(deviceReport({signature:'sig',results:[{id:'order',status:0}],geoAllowed:true}).results[0].status,0);
+});
+test('relayer settlement rejects another owner, batch, nonce or reused unrelated receipt',()=>{
+ const expected={type:'WALLET',from:scope.owner,to:C.factory,nonce:'4',signature:'0x1234'};
+ assert.equal(relayMatches(expected,expected),true);
+ for(const changed of [{from:other.address},{to:C.cash},{nonce:'5'},{signature:'0x5678'},{type:'SAFE'}])
+  assert.equal(relayMatches({...expected,...changed},expected),false);
+ const deployment={type:'WALLET-CREATE',from:scope.owner,to:C.factory,metadata:scope.intentId};
+ assert.equal(relayMatches(deployment,deployment),true);
+ assert.equal(relayMatches({...deployment,metadata:'another'},deployment),false);
+});
+test('issued reports can be reconciled after expiry but cannot get a fresh device envelope',async()=>{
+ const store=new Approvals(),typed=authTyped(scope.owner);
+ const p=store.put(scope.owner,scope.userId,scope.intentId,'auth',typed,{});
+ const signature=await signer.signTypedData(typed),input={...scope,prepareId:p.prepareId,signature};
+ const item=store.items.get(p.prepareId);item.envelope={requests:[]};item.expires=Date.now()-1;
+ await assert.rejects(store.check(input),/expired/);
+ await store.take({...input,report:true});
+ await assert.rejects(store.take({...input,report:true}),/used/);
+});
+test('prepare and device auth never submit from the server, and commit only verifies the device result',async()=>{
+ const savedFetch=globalThis.fetch,vars=['POLYMARKET_BUILDER_API_KEY','POLYMARKET_BUILDER_SECRET','POLYMARKET_BUILDER_PASSPHRASE'];
+ const saved=vars.map(k=>process.env[k]);vars.forEach((k,i)=>process.env[k]=['test',fakeCredentials.secret,'test'][i]);
+ const calls=[];
+ globalThis.fetch=async(url,options={})=>{
+  calls.push([String(url),options.method??'GET']);
+  let body;
+  if(String(url).includes('polygon.drpc.org')){
+   const request=JSON.parse(options.body);
+   const result=request.method==='eth_chainId'?'0x89':request.method==='eth_getCode'?'0x':
+    request.params[0].to.toLowerCase()===C.factory.toLowerCase()?'0x'+C.beacon.slice(2).padStart(64,'0'):'0x6';
+   body={jsonrpc:'2.0',id:1,result};
+  }else if(String(url).endsWith('/auth/api-keys'))body={apiKeys:[fakeCredentials.apiKey]};
+  else throw new Error('Unexpected request: '+url);
+  return new Response(JSON.stringify(body),{status:200});
+ };
+ try{
+  const prepared=await handle('prepare',{intentId:scope.intentId,kind:'auth',quote:{deviceSubmission:true}},scope);
+  const typed=prepared.transactions[0].typedData,signature=await signer.signTypedData(typed);
+  const input={intentId:scope.intentId,prepareId:prepared.prepareId,signature};
+  const envelope=await handle('device',input,scope);
+  assert.deepEqual(await handle('device',input,scope),envelope);
+  const report={signature,geoAllowed:true,results:[{id:'auth',status:200,body:fakeCredentials},{id:'relay',status:200,body:{transactionID:'relay-test'}}]};
+  const result=await handle('commit',{intentId:scope.intentId,prepareId:prepared.prepareId,report},scope);
+  assert.equal(result.deployId,'relay-test');
+  assert.equal(calls.some(([url,method])=>url.includes('polymarket.com')&&method==='POST'),false);
+  await assert.rejects(handle('commit',{intentId:scope.intentId,prepareId:prepared.prepareId,report},scope),/used/);
+ }finally{globalThis.fetch=savedFetch;vars.forEach((k,i)=>{if(saved[i]===undefined)delete process.env[k];else process.env[k]=saved[i];});}
+});
+
+test('a successful receipt must pay the approved recipient and exact amount before cash return advances',()=>{
+ const wallet=depositWallet(scope.owner),recipient=other.address,amount=1234567n;
+ const expected={depositWalletParams:{calls:withdrawCalls(recipient,amount)}};
+ const addressTopic=a=>'0x'+a.slice(2).toLowerCase().padStart(64,'0');
+ const log={address:C.cash,topics:[keccak256(toHex('Transfer(address,address,uint256)')),addressTopic(wallet),addressTopic(recipient)],data:'0x'+amount.toString(16).padStart(64,'0')};
+ const receipt={status:'0x1',logs:[log]};
+ assert.equal(walletReceipt(receipt,expected,wallet),true);
+ assert.equal(walletReceipt({...receipt,status:'0x0'},expected,wallet),false);
+ assert.equal(walletReceipt({...receipt,logs:[{...log,topics:[...log.topics.slice(0,2),addressTopic(scope.owner)]}]},expected,wallet),false);
+ assert.equal(walletReceipt({...receipt,logs:[{...log,data:'0x1'}]},expected,wallet),false);
+ assert.equal(walletReceipt({...receipt,logs:[{...log,address:C.ctf}]},expected,wallet),false);
 });

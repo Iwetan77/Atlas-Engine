@@ -428,8 +428,10 @@ Atlas uses Polymarket's current Polygon pUSD Deposit Wallet and direct Base/Sola
 without an extra NEAR Intents hop.
 
 The user's embedded EVM wallet signs authentication, allowances, orders, claims and cash return on
-their device. The service verifies and forwards signatures. It has no user signing key or server
-signer. Polymarket's Builder relayer handles supported Polygon operations; source-wallet fees belong
+their device. Authentication, order submission and Builder wallet submission also originate from
+the user's own connection. The service verifies wallet signatures and supplies short-lived HMAC
+headers only for the exact prepared request; the Builder secret stays on the server. It has no user
+signing key or server signer. Polymarket's Builder relayer handles supported Polygon operations; source-wallet fees belong
 to the user. Any needed $0.50 fee reserve stays **inside** the spending budget and is shown separately
 from venue fees. Existing native gas pays ordinary transfer fees. FOK orders fill all shares or none,
 within the confirmed price and fee, and only become filled after matching trades confirm.
@@ -438,7 +440,9 @@ A losing share can become worth zero; resolution rules and probabilities come fr
 ### Configuration
 
 Public market data is keyless. Trading refuses **before funding** until these server-only settings
-exist and both the user's connection and service region pass Polymarket's availability check:
+exist, the app supports device submission, and the user's own connection passes Polymarket's
+availability check. Older app builds refuse before funding; updating only the server cannot change
+their submission flow:
 
 ```text
 POLYMARKET_BUILDER_API_KEY=
@@ -517,15 +521,27 @@ these paths have settled.
    `POLYMARKET_BUILDER_API_KEY`, `POLYMARKET_BUILDER_SECRET`, and `POLYMARKET_BUILDER_PASSPHRASE`.
 4. Save and redeploy. Do not put these credentials in Expo public configuration. Do not substitute a personal Relayer key.
 5. Check `GET /v1/predictions/availability`. This public readiness endpoint returns
-   `{configured, serverAllowed, serviceCountry, blockedBy, reason}`. It never returns IP addresses or secret values.
+   `{configured, serverAllowed, serviceCountry, blockedBy, reason, deviceSubmission}`. It never returns IP addresses or secret values.
    `blockedBy` is `service_region`, `builder_setup`, or null. User eligibility is independently checked on the device.
 
-The existing Render service is in Oregon, USA. Polymarket's check tests the requesting server IP, so a Nigerian user can
-pass the device check while the Oregon service is restricted. Keep trading blocked before funding in that case.
-Render currently offers US, Germany and Singapore locations, all restricted for this trading flow.
-Polymarket documents Ireland (`eu-west-1`) as its nearest unrestricted server location. Deploy the trading service on
-eligible infrastructure, verify its geoblock result there, and retain the user's device eligibility check. Changing
-only the wording or forwarding an invented user IP does not make an ineligible service eligible.
+The existing Render service is in Oregon, USA. Its diagnostic check still reports its own region,
+but updated clients do not submit trades from that server. They check Polymarket's geoblock directly
+and submit authentication, orders and signed wallet batches directly to Polymarket. No proxy,
+invented IP header or GPS location is used. Restricted device connections still cannot trade.
+
+A Polygon typed-data plan step includes a `prediction` object with `prepareId`, `intentId` and
+`expiresAtUnixMs`. After signing, the app calls authenticated
+`POST /v1/predictions/intents/{id}/device` with `{prepareId, signature, geoAllowed}`. The engine
+returns `{expiresAtUnixMs, requests:[{id,url,method,headers,body?,onFailure?}]}`. `body` is the exact
+serialized string covered by the HMAC. Only pinned CLOB authentication/allowance/order endpoints
+and the Builder `/submit` endpoint are permitted. Device submissions never auto-retry a mutation.
+
+The app reports `{signature,geoAllowed,results:[{id,status,body}]}` as the signed entry's JSON
+string through the existing `/v1/intents/{id}/signed`. A lost submission response has `status:0`.
+The engine records the issued step before exposing a request, reconciles an order by its deterministic
+hash or a batch by its signed nonce and signature, and checks venue confirmations and Polygon
+receipts before advancing. A wallet action is not filled just because the device reports success.
+No further confirm sheet is shown for subsequent steps of the same action.
 
 Sources: [Polymarket account setup](https://docs.polymarket.com/trading/wallets-auth),
 [geographic restrictions](https://docs.polymarket.com/api-reference/geoblock),

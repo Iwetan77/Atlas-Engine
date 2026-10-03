@@ -230,6 +230,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/predictions/account", get(predictions::account))
         .route("/v1/predictions/quotes", post(predictions::quote))
         .route(
+            "/v1/predictions/intents/{id}/device",
+            post(predictions::device_request),
+        )
+        .route(
             "/v1/predictions/quotes/{id}/execute",
             post(predictions::execute),
         )

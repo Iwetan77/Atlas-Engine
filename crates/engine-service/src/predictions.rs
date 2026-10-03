@@ -348,6 +348,8 @@ pub(super) struct Request {
     shares: Option<String>,
     from: Option<String>,
     geo_allowed: bool,
+    #[serde(default)]
+    device_submission: bool,
 }
 #[derive(Deserialize)]
 pub(super) struct Amount {
@@ -363,6 +365,11 @@ pub(super) async fn quote(
         return Err((
             StatusCode::FORBIDDEN,
             "Predictions is unavailable in your location".into(),
+        ));
+    }
+    if !input.device_submission {
+        return Err(conflict(
+            "Update Atlas to trade Predictions from your own device. Nothing was charged.",
         ));
     }
     let user = app_balance::verified_wallets(&state, &headers).await?;
@@ -431,13 +438,14 @@ pub(super) async fn quote(
             &headers,
             "preview",
             json!({"marketId":input.market_id,"tokenId":input.token_id,
-            "side":input.side,"units":units.to_string(),"currency":currency}),
+            "side":input.side,"units":units.to_string(),"currency":currency,"deviceSubmission":true}),
         )
         .await?
     };
     if input.side == "sell" {
         markets::check_limits(number(&q, "notional")?, currency, rate)?;
     }
+    q["deviceSubmission"] = json!(true);
     q["owner"] = json!(user.user_id);
     q["currency"] = json!(currency);
     q["rate"] = json!(rate.to_string());
@@ -487,7 +495,7 @@ pub(super) async fn quote(
             &headers,
             "preview",
             json!({"marketId":input.market_id,"tokenId":input.token_id,
-            "side":"buy","units":effective.to_string(),"currency":currency}),
+            "side":"buy","units":effective.to_string(),"currency":currency,"deviceSubmission":true}),
         )
         .await?;
         q["owner"] = json!(user.user_id);
@@ -496,6 +504,7 @@ pub(super) async fn quote(
         q["cashBefore"] = json!(cash.to_string());
         q["funding"] = funding;
     }
+    q["deviceSubmission"] = json!(true);
     let quote_id = id("prediction-quote");
     q["quoteId"] = json!(quote_id);
     q["spendBudget"] = json!(requested.to_string());
@@ -537,6 +546,8 @@ async fn prepare(
     let result = bridge(state,headers,"prepare",json!({"intentId":id,"kind":kind,"quote":q,
         "units":q["units"],"from":q["from"],"minimumOut":q["minimumReceive"],"currency":q["currency"]})).await?;
     current["approval"] = result;
+    current["deviceIssued"] = json!(false);
+    current["deviceStep"] = Value::Null;
     current["step"] = json!(kind);
     current["status"]["stage"] = json!("sign");
     Ok(())
@@ -551,6 +562,11 @@ pub(super) async fn execute(
     if let Some(existing) = q["intentId"].as_str() {
         let current = state.predictions.get(existing, &user.user_id).await?;
         return Ok(Json(plan(existing, &current)));
+    }
+    if q["deviceSubmission"] != true {
+        return Err(conflict(
+            "Request a fresh quote in the updated Atlas app. Nothing was charged.",
+        ));
     }
     if q["expiresAtUnixMs"].as_u64().unwrap_or(0) <= now() {
         return Err(conflict("Price expired. Request a new quote."));
@@ -653,6 +669,81 @@ async fn record(state: &AppState, id: &str, current: &Value) -> Result<(), ApiEr
     }
     Ok(())
 }
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct DeviceRequest {
+    prepare_id: String,
+    signature: String,
+    geo_allowed: bool,
+}
+fn device_progress(approval: &Value, envelope: &Value, step: &str) -> Result<Value, ApiError> {
+    if step == "order" {
+        return Ok(json!({"orderId":approval["expectedOrderId"]}));
+    }
+    let request = envelope["requests"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|r| r["id"] == "relay");
+    match request.and_then(|r| r["body"].as_str()) {
+        Some(body) => Ok(
+            json!({"relayRequest":serde_json::from_str::<Value>(body).map_err(|_|internal("Wallet request unavailable"))?, "depositAddress":approval["depositAddress"],"receiveUnits":approval["receiveUnits"]}),
+        ),
+        None => Ok(Value::Null),
+    }
+}
+pub(super) async fn device_request(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<DeviceRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if !input.geo_allowed {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Predictions is unavailable from your device connection".into(),
+        ));
+    }
+    let old = owned(&state, &headers, &id).await?;
+    if old["status"]["state"] != "pending"
+        || old["approval"]["prepareId"] != input.prepare_id
+        || (!matches!(text(&old["status"], "stage"), "validate" | "sign")
+            && old["deviceIssued"] != true)
+    {
+        return Err(conflict("This approval no longer matches your purchase"));
+    }
+    let envelope = bridge(
+        &state,
+        &headers,
+        "device",
+        json!({"intentId":id,"prepareId":input.prepare_id,
+        "signature":input.signature,"credentials":old["credentials"]}),
+    )
+    .await?;
+    if old["deviceIssued"] == true {
+        return Ok(Json(envelope));
+    }
+    let step = text(&old, "step");
+    let mut current = old.clone();
+    current["deviceIssued"] = json!(true);
+    current["deviceStep"] = json!(step);
+    current["status"]["stage"] = json!("execute");
+    current["progress"] = device_progress(&old["approval"], &envelope, step)?;
+    current["step"] = json!(match step {
+        "order" => "order_wait",
+        "setup" => "setup_wait",
+        "redeem" => "redeem_wait",
+        "withdraw" => "withdraw_wait",
+        _ => step,
+    });
+    if !state.predictions.replace(&id, &old, &current).await? {
+        return Err(conflict(
+            "This purchase moved to its next step. Check Activity.",
+        ));
+    }
+    record(&state, &id, &current).await?;
+    Ok(Json(envelope))
+}
 pub(super) async fn signed(
     state: AppState,
     headers: HeaderMap,
@@ -661,11 +752,17 @@ pub(super) async fn signed(
 ) -> Result<Json<markets::IntentStatus>, ApiError> {
     let old = owned(&state, &headers, &id).await?;
     if old["status"]["state"] != "pending"
-        || !matches!(text(&old["status"], "stage"), "validate" | "sign")
+        || (!matches!(text(&old["status"], "stage"), "validate" | "sign")
+            && old["deviceIssued"] != true)
     {
         return Ok(Json(status_of(&old)?));
     }
     let mut current = old.clone();
+    let step = if old["deviceIssued"] == true {
+        text(&old, "deviceStep")
+    } else {
+        text(&old, "step")
+    };
     if let Some(child) = old["child"].as_str().filter(|_| old["step"] == "funding") {
         // The child verifies only the planned cash transfer; the parent never guesses a tx hash.
         let result = Box::pin(markets::signed(
@@ -696,7 +793,9 @@ pub(super) async fn signed(
     if !body.sent.is_empty() || body.signed.len() != 1 || body.signed[0].index != 0 {
         return Err(conflict("Approval does not match this purchase"));
     }
-    if old["approval"]["expiresAtUnixMs"].as_u64().unwrap_or(0) <= now() {
+    if old["deviceIssued"] != true
+        && old["approval"]["expiresAtUnixMs"].as_u64().unwrap_or(0) <= now()
+    {
         return Err(conflict(
             "Approval expired. Your unused money is safe; finish from Predictions.",
         ));
@@ -706,11 +805,12 @@ pub(super) async fn signed(
         &headers,
         "check",
         json!({"intentId":id,"prepareId":old["approval"]["prepareId"],
-        "signature":body.signed[0].transaction}),
+        "report":body.signed[0].transaction}),
     )
     .await?;
     current["status"]["stage"] = json!("execute");
-    if old["step"] == "order" {
+    current["deviceIssued"] = json!(false);
+    if step == "order" {
         current["step"] = json!("order_wait");
         current["progress"] = json!({"orderId":old["approval"]["expectedOrderId"]});
     }
@@ -723,16 +823,20 @@ pub(super) async fn signed(
         &headers,
         "commit",
         json!({"intentId":id,"prepareId":old["approval"]["prepareId"],
-        "signature":body.signed[0].transaction,"credentials":old["credentials"]}),
+        "report":body.signed[0].transaction,"credentials":old["credentials"]}),
     )
     .await;
     match answer {
         Ok(answer) => {
-            let step = text(&old, "step");
-            if step == "auth" {
+            if let Some(reason) = answer["failure"].as_str() {
+                current["status"]["state"] = json!("failed");
+                current["status"]["error"] = json!(format!(
+                    "{reason} Your unused cash and shares stay in Predictions."
+                ));
+            } else if step == "auth" {
                 current["credentials"] = answer["credentials"].clone();
-                if answer["deployId"].is_string() {
-                    current["progress"] = json!({"relayId":answer["deployId"]});
+                if answer["deployment"] == true {
+                    current["progress"] = json!({"relayId":answer["deployId"],"deployment":true,"relayRequest":answer["relayRequest"]});
                     current["step"] = json!("deploy");
                 } else {
                     let kind = if current["quote"]["side"] == "withdraw" {
@@ -772,7 +876,7 @@ pub(super) async fn signed(
             current["status"]["error"] = json!(format!(
                 "{reason} Check Predictions cash and Activity before trying again."
             ));
-            if code == StatusCode::BAD_GATEWAY && old["step"] == "order" {
+            if code == StatusCode::BAD_GATEWAY && step == "order" {
                 current["status"]["stage"] = json!("settle");
             } else {
                 current["status"]["state"] = json!("failed");
@@ -836,7 +940,13 @@ async fn funding(
     {
         return Err(conflict("The network fee reserve changed. Request a new quote; nothing was paid for this purchase."));
     }
-    let deposit = bridge(state, headers, "deposit", json!({})).await?;
+    let deposit = bridge(
+        state,
+        headers,
+        "deposit",
+        json!({"deviceSubmission":q["deviceSubmission"]}),
+    )
+    .await?;
     let amount = number(&q["funding"], "units")?;
     let (child, steps) = if q["funding"]["from"] == "solana" {
         markets::plan_solana_transfer(
@@ -1193,6 +1303,39 @@ pub(super) async fn portfolio(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_checkpoint_uses_only_the_expected_order_or_signed_wallet_request() {
+        let approval = json!({"expectedOrderId":"approved-order","depositAddress":"own-deposit","receiveUnits":"123"});
+        let envelope = json!({"requests":[
+            {"id":"auth","headers":{"credential":"never-persisted"}},
+            {"id":"relay","body":r#"{"from":"owner","nonce":"7","signature":"approved"}"#}
+        ]});
+        let order = device_progress(&approval, &envelope, "order").unwrap();
+        assert_eq!(order, json!({"orderId":"approved-order"}));
+        let withdrawal = device_progress(&approval, &envelope, "withdraw").unwrap();
+        assert_eq!(withdrawal["relayRequest"]["nonce"], "7");
+        assert_eq!(withdrawal["depositAddress"], "own-deposit");
+        assert!(!withdrawal.to_string().contains("never-persisted"));
+        assert!(device_progress(
+            &approval,
+            &json!({"requests":[{"id":"relay","body":"invalid"}]}),
+            "setup"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn old_clients_cannot_opt_into_device_submission_by_omitting_the_capability() {
+        let mut body =
+            json!({"side":"buy","geoAllowed":true,"amount":{"amount":"1500","currency":"NGN"}});
+        let old: Request = serde_json::from_value(body.clone()).unwrap();
+        assert!(!old.device_submission);
+        body["deviceSubmission"] = json!(true);
+        let new: Request = serde_json::from_value(body).unwrap();
+        assert!(new.device_submission);
+    }
+
     #[tokio::test]
     async fn a_report_can_only_claim_its_exact_preparation() {
         let store = PredictionState {

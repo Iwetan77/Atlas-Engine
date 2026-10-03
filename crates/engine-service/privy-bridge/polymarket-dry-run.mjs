@@ -1,7 +1,7 @@
 // Read-only mainnet checks. No signing, deposit address creation or submission.
 import {hashTypedData} from 'viem';
 import {networkCheck,availability,markets,market,request,account,bridgeQuote,orderQuote,orderTyped,
- batchTyped,setupCalls,redeemCalls,withdrawCalls} from './polymarket.mjs';
+ batch,setupCalls,redeemCalls,withdrawCalls} from './polymarket.mjs';
 const owner=process.env.PREDICTIONS_DRY_OWNER||'0xEe8646AF9e1DDA672716389aB64a7bD0Fd202ba7';
 console.log('network',JSON.stringify(await networkCheck()));
 console.log('availability',JSON.stringify(await availability()));
@@ -19,12 +19,11 @@ console.log('live return quote',JSON.stringify(await bridgeQuote(owner,{units:'1
 const unsigned=orderTyped(owner,q);
 console.log('unsigned order',JSON.stringify({chainId:unsigned.domain.chainId,exchange:unsigned.domain.verifyingContract,
  wallet:unsigned.message.contents.maker,signatureType:unsigned.message.contents.signatureType,digest:hashTypedData(unsigned)}));
-const deadline=Math.floor(Date.now()/1000)+180;
-// Structural nonce only, never submitted. The authenticated relayer nonce needs Builder credentials.
+// Read the actual public wallet nonce; no deployment or transaction is submitted.
 for(const [kind,calls]of [
  ['setup',setupCalls(q)],['return',withdrawCalls(owner,10000000n)],
  ['claim',redeemCalls({conditionId:view.conditionId,negRisk:view.negRisk})]]){
- const typed=batchTyped(owner,calls,'0',deadline);
- console.log('unsigned wallet batch',JSON.stringify({kind,targets:calls.map(c=>c.target),digest:hashTypedData(typed),nonce:'structural-only'}));
+ const typed=await batch(owner,calls);
+ console.log('unsigned wallet batch',JSON.stringify({kind,targets:calls.map(c=>c.target),digest:hashTypedData(typed),nonce:typed.message.nonce}));
 }
-console.log('No funds moved. Live user authentication, relayer nonce/deploy and funded order/return/claim remain unverified.');
+console.log('No funds moved. Live user authentication, wallet deployment and funded order/return/claim remain unverified.');
