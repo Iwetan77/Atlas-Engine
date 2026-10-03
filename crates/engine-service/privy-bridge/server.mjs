@@ -8,8 +8,8 @@ import {createHash, randomUUID} from 'node:crypto';
 import {PrivyClient} from '@privy-io/node';
 import {buildSale,finishSale,buildSuiTransfer,finishSuiTransfer,quoteSwap, buildSuiSwap, finishSuiSwap, rawSignRequest, prepareSuiCashout, quoteSale, prepareSale} from './sui-swap.mjs';
 import {checkSignature, signable, signForEscrow} from './base-authorization.mjs';
-import {agentFor, approveAction, approveTypedData, checkApproval, leverageAction, moveAction, orderAction,
-  post as hlPost, signAsAgent} from './hyperliquid.mjs';
+import {agentFor, approveAction, approveTypedData, cancelAction, checkApproval, leverageAction, moveAction,
+  orderAction, post as hlPost, signAsAgent, tpslAction} from './hyperliquid.mjs';
 import {prepareCashOut,finishCashOut} from './hyperliquid-cashout.mjs';
 
 const SUI_COIN_TYPE = /^0x[0-9a-fA-F]{1,64}::[A-Za-z_][A-Za-z0-9_]*::[A-Za-z_][A-Za-z0-9_]*$/;
@@ -69,7 +69,7 @@ const server = createServer(async (request, response) => {
   const signEscrow = request.method === 'POST' && request.url === '/escrow/sign-authorization';
   const hlRoute = request.method === 'POST' && request.url.startsWith('/hyperliquid/') ?
     request.url.slice('/hyperliquid/'.length) : null;
-  const hyperliquid = ['agent', 'approve_prepare', 'approve', 'leverage', 'order', 'move', 'cashout_prepare', 'cashout'].includes(hlRoute);
+  const hyperliquid = ['agent', 'approve_prepare', 'approve', 'leverage', 'order', 'tpsl', 'cancel', 'move', 'cashout_prepare', 'cashout'].includes(hlRoute);
   const refRoute = request.method === 'POST' && ['/near/ref/search','/near/ref/quote','/near/ref/prepare','/near/ref/commit','/near/ref/balance','/near/cashout/prepare','/near/cashout/commit','/near/sell/prepare','/near/sell/commit'].includes(request.url);
   const suiSale = request.method === 'POST' && ['/sui/sale/quote','/sui/sale/prepare','/sui/sale/commit'].includes(request.url);
   const suiBalanceRead=request.method==='POST' && ['/sui/balance','/sui/balances'].includes(request.url);
@@ -378,6 +378,8 @@ const server = createServer(async (request, response) => {
         }
         const nonce=nextNonce();
         const action = hlRoute === 'order' ? orderAction(input) :
+          hlRoute === 'tpsl' ? tpslAction(input) :
+          hlRoute === 'cancel' ? cancelAction(input) :
           hlRoute === 'move' ? moveAction({wallet: evmWallet, from: input.from, to: input.to, amount: input.amount}, nonce) :
           leverageAction(input);
         return answer(await hlPost({action, nonce, signature: signAsAgent(agent.key, action, nonce), vaultAddress: null}));

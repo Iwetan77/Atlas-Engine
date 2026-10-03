@@ -508,6 +508,60 @@ async fn records(state: &AppState, owner: &str) -> Result<Vec<Receipt>, ApiError
     rows.sort_by(|a, b| (b.created_at_unix_ms, &b.id).cmp(&(a.created_at_unix_ms, &a.id)));
     Ok(rows)
 }
+// A receipt as an email tells it: the same lines the app shows, in the reader's currency.
+pub(super) struct Told {
+    pub(super) id: String,
+    pub(super) kind: String,
+    pub(super) symbol: String,
+    pub(super) state: String,
+    pub(super) error: Option<String>,
+    pub(super) lines: Vec<(String, String)>,
+    pub(super) units: Option<u128>,
+}
+impl Told {
+    pub(super) fn line(&self, label: &str) -> Option<&str> {
+        self.lines
+            .iter()
+            .find(|(l, _)| l == label)
+            .map(|(_, v)| v.as_str())
+    }
+}
+pub(super) async fn told(
+    state: &AppState,
+    owner: &str,
+    id: &str,
+    currency: &str,
+) -> Result<Option<Told>, ApiError> {
+    let rate = app_balance::fx_rate(currency).await?;
+    let Some(r) = records(state, owner)
+        .await?
+        .into_iter()
+        .find(|r| r.id == id)
+    else {
+        return Ok(None);
+    };
+    let public = r.public(currency, rate);
+    let lines = public["summary"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|l| {
+            Some((
+                l["label"].as_str()?.to_owned(),
+                l["value"].as_str()?.to_owned(),
+            ))
+        })
+        .collect();
+    Ok(Some(Told {
+        id: r.id,
+        kind: r.kind,
+        symbol: r.symbol,
+        state: r.state,
+        error: public["error"].as_str().map(str::to_owned),
+        lines,
+        units: r.usdc_units.and_then(|u| u.parse().ok()),
+    }))
+}
 #[derive(Deserialize)]
 pub(super) struct HistoryQuery {
     currency: Option<String>,
@@ -583,10 +637,14 @@ fn refresh(state: &AppState, headers: &HeaderMap, owner: &str, rows: &[Receipt])
                 )
                 .await
                 {
-                    let _ = state
+                    if state
                         .history
                         .observe_deposit(&owner, &address, &status)
-                        .await;
+                        .await
+                        .is_ok()
+                    {
+                        emails::deposit_changed(&state, &owner, &address, &status.status);
+                    }
                 }
             });
             continue;
@@ -598,7 +656,7 @@ fn refresh(state: &AppState, headers: &HeaderMap, owner: &str, rows: &[Receipt])
         tokio::spawn(async move {
             let _ = tokio::time::timeout(
                 Duration::from_secs(8),
-                markets::intent_status(State(state), Path(id), headers),
+                emails::intent_status(State(state), Path(id), headers),
             )
             .await;
         });

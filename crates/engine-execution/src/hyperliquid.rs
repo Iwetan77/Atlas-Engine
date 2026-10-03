@@ -78,6 +78,31 @@ pub struct Fill {
     pub fee: f64,
 }
 
+/// A resting take-profit or stop-loss on a whole position (Hyperliquid's "position TP/SL").
+#[derive(Clone, Debug, PartialEq)]
+pub struct PositionTrigger {
+    pub coin: String,
+    pub oid: u64,
+    // "tp" or "sl".
+    pub kind: &'static str,
+    pub trigger_price: f64,
+}
+
+/// A fill as the watcher reads it: which order it came from, what it did ("Close Long",
+/// "Open Short"…), and whether it was the account being liquidated.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AccountFill {
+    pub coin: String,
+    pub oid: u64,
+    pub tid: u64,
+    pub time_ms: u64,
+    pub dir: String,
+    pub price: f64,
+    pub size: f64,
+    pub closed_pnl: f64,
+    pub liquidated: bool,
+}
+
 fn num(v: &Value) -> Option<f64> {
     match v {
         Value::String(s) => s.parse().ok(),
@@ -175,6 +200,42 @@ impl HyperliquidClient {
             .collect())
     }
 
+    /// The position TP/SLs resting on one dex ("" for Hyperliquid's own perps).
+    pub async fn position_triggers(
+        &self,
+        user: &str,
+        dex: &str,
+    ) -> Result<Vec<PositionTrigger>, HyperliquidError> {
+        let mut body = json!({"type":"frontendOpenOrders","user":user});
+        if !dex.is_empty() {
+            body["dex"] = json!(dex);
+        }
+        Ok(parse_triggers(&self.info(body).await?))
+    }
+
+    /// Fills since `start_ms`, oldest first, across the account's dexes.
+    pub async fn fills_since(
+        &self,
+        user: &str,
+        start_ms: u64,
+    ) -> Result<Vec<AccountFill>, HyperliquidError> {
+        let body = self
+            .info(json!({"type":"userFillsByTime","user":user,"startTime":start_ms}))
+            .await?;
+        Ok(parse_account_fills(&body, user))
+    }
+
+    /// What kind of order `oid` was: "Take Profit Market", "Stop Market", "Limit"…
+    pub async fn order_type(&self, user: &str, oid: u64) -> Result<String, HyperliquidError> {
+        let body = self
+            .info(json!({"type":"orderStatus","user":user,"oid":oid}))
+            .await?;
+        Ok(body["order"]["order"]["orderType"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string())
+    }
+
     /// The agents this account has approved (lowercase addresses).
     pub async fn agents(&self, user: &str) -> Result<Vec<String>, HyperliquidError> {
         let body = self.info(json!({"type":"extraAgents","user":user})).await?;
@@ -241,6 +302,55 @@ fn parse_markets(
         .collect())
 }
 
+fn parse_triggers(body: &Value) -> Vec<PositionTrigger> {
+    body.as_array()
+        .into_iter()
+        .flatten()
+        .filter(|o| o["isTrigger"] == true && o["isPositionTpsl"] == true)
+        .filter_map(|o| {
+            let kind = match o["orderType"].as_str()? {
+                t if t.starts_with("Take Profit") => "tp",
+                t if t.starts_with("Stop") => "sl",
+                _ => return None,
+            };
+            Some(PositionTrigger {
+                coin: o["coin"].as_str()?.to_string(),
+                oid: o["oid"].as_u64()?,
+                kind,
+                trigger_price: num(&o["triggerPx"])?,
+            })
+        })
+        .collect()
+}
+
+fn parse_account_fills(body: &Value, user: &str) -> Vec<AccountFill> {
+    let mut fills: Vec<AccountFill> = body
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|f| {
+            let dir = f["dir"].as_str().unwrap_or_default().to_string();
+            let liquidated = f["liquidation"]["liquidatedUser"]
+                .as_str()
+                .is_some_and(|u| u.eq_ignore_ascii_case(user))
+                || dir.starts_with("Liquidat");
+            Some(AccountFill {
+                coin: f["coin"].as_str()?.to_string(),
+                oid: f["oid"].as_u64()?,
+                tid: f["tid"].as_u64().unwrap_or(0),
+                time_ms: f["time"].as_u64()?,
+                dir,
+                price: num(&f["px"])?,
+                size: num(&f["sz"])?,
+                closed_pnl: num(&f["closedPnl"]).unwrap_or(0.0),
+                liquidated,
+            })
+        })
+        .collect();
+    fills.sort_by_key(|f| (f.time_ms, f.tid));
+    fills
+}
+
 fn parse_account(body: &Value) -> Result<Account, HyperliquidError> {
     let value = num(&body["marginSummary"]["accountValue"])
         .ok_or(HyperliquidError::InvalidResponse("account value"))?;
@@ -305,6 +415,34 @@ fn trim(text: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_position_tpsl_and_liquidations() {
+        // Shapes captured from Hyperliquid's live info API on 2026-10-03.
+        let orders = json!([
+            {"coin":"BTC","oid":564383182882u64,"orderType":"Stop Market","triggerPx":"85848.0","isPositionTpsl":true,"isTrigger":true,"reduceOnly":true,"side":"B","sz":"0.0"},
+            {"coin":"BTC","oid":2u64,"orderType":"Take Profit Market","triggerPx":"70000","isPositionTpsl":true,"isTrigger":true},
+            {"coin":"ETH","oid":3u64,"orderType":"Limit","isPositionTpsl":false,"isTrigger":false,"triggerPx":"0.0"}
+        ]);
+        let t = parse_triggers(&orders);
+        assert_eq!(t.len(), 2);
+        assert_eq!(
+            (t[0].kind, t[0].trigger_price, t[0].oid),
+            ("sl", 85848.0, 564383182882)
+        );
+        assert_eq!(t[1].kind, "tp");
+        let user = "0xabc0000000000000000000000000000000000001";
+        let fills = json!([
+            {"coin":"ONDO","oid":9u64,"tid":2u64,"dir":"Close Long","px":"0.5","sz":"10","closedPnl":"1.5","time":200u64},
+            {"coin":"BTC","oid":8u64,"tid":1u64,"dir":"Close Short","px":"90000","sz":"0.01","closedPnl":"-30","time":100u64,
+             "liquidation":{"liquidatedUser":"0xABC0000000000000000000000000000000000001","markPx":"90010","method":"market"}}
+        ]);
+        let f = parse_account_fills(&fills, user);
+        assert_eq!(f[0].coin, "BTC");
+        assert!(f[0].liquidated);
+        assert!(!f[1].liquidated);
+        assert_eq!(f[1].closed_pnl, 1.5);
+    }
 
     #[test]
     fn reads_markets_and_skips_delisted_ones() {

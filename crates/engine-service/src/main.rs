@@ -6,6 +6,7 @@ mod cashlinks;
 mod comments;
 mod daya;
 mod earn;
+mod emails;
 mod gasless;
 mod hl;
 mod markets;
@@ -52,6 +53,7 @@ struct AppState {
     cow: engine_execution::cow::CowClient,
     links: cashlinks::LinkStore,
     comments: comments::CommentStore,
+    emails: emails::EmailState,
     hl: hl::HlState,
     earn: earn::EarnState,
     social: social::SocialState,
@@ -120,6 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cow: engine_execution::cow::CowClient::new()?,
         links: cashlinks::LinkStore::new().await?,
         comments: comments::CommentStore::new().await?,
+        emails: emails::EmailState::new().await?,
         hl: hl::HlState::new().await?,
         earn: earn::EarnState::default(),
         social: social::SocialState::new().await?,
@@ -138,6 +141,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     hl::keep_warm(state.clone());
     markets::keep_base_trending_warm(state.clone());
     daya::keep_checked(state.clone());
+    // Perps alerts by email (liquidations, take-profit and stop-loss closes, close calls).
+    emails::keep_watching(state.clone());
     let perps_routes = Router::new()
         .route(
             "/v1/perps/onboarding",
@@ -150,6 +155,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/v1/perps/positions/{position_id}/close-quote",
             post(hl::close_quote),
+        )
+        .route(
+            "/v1/perps/positions/{position_id}/tpsl",
+            post(hl::update_tpsl),
         )
         .route(
             "/v1/perps/close-quotes/{quote_id}/execute",
@@ -175,6 +184,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/assets/{asset_id}/chart", get(markets::chart))
         .route("/v1/positions/spot", get(positions::spot))
         .route("/v1/me", get(social::me))
+        .route(
+            "/v1/me/emails",
+            get(emails::settings).post(emails::update_settings),
+        )
         .route("/v1/me/handle", post(social::set_handle))
         .route("/v1/me/avatar", post(social::set_avatar))
         .route("/v1/users/resolve", get(social::resolve_user))
@@ -203,7 +216,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/v1/intents/pending", get(pending::list))
         .route("/v1/intents/{intent_id}/resume", post(pending::resume))
-        .route("/v1/intents/{intent_id}/signed", post(markets::signed))
+        .route("/v1/intents/{intent_id}/signed", post(emails::signed))
         .route(
             "/v1/intents/{intent_id}/sale-permission",
             post(near_intents::sale_permission),
@@ -252,7 +265,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/earn/positions", get(earn::positions))
         .route("/v1/earn/quotes", post(earn::quote))
         .route("/v1/earn/quotes/{quote_id}/execute", post(earn::execute))
-        .route("/v1/intents/{intent_id}", get(markets::intent_status))
+        .route("/v1/intents/{intent_id}", get(emails::intent_status))
         .with_state(state);
     if let Some(cors) = configured_cors()? {
         app = app.layer(cors);
@@ -284,6 +297,8 @@ async fn health() -> Json<serde_json::Value> {
             "relay": env::var("RELAY_API_KEY").is_ok_and(|k| !k.trim().is_empty()),
             // Withdrawals to a wallet take Atlas's fee into this NEAR account; off without it.
             "withdrawFeeAccount": near_intents::fee_account().is_some(),
+            // Emails about money in and out, trades and perps alerts (Senviok); off without it.
+            "emails": emails::configured(),
         },
         // Bank transfers: whether Daya's key and webhook secret are set, and its last no-money check.
         "daya": daya::health(),

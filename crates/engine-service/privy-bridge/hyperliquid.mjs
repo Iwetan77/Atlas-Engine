@@ -88,6 +88,37 @@ export function orderAction({asset, isBuy, price, size, reduceOnly}) {
   };
 }
 
+// A take-profit and/or stop-loss on the whole position ("position TP/SL"): size 0 follows the
+// position as it changes, and both close it at market once the price trades through the trigger.
+// `isBuy` is the closing side (a long closes by selling); `price` is the worst fill allowed.
+export function tpslAction({asset, isBuy, orders}) {
+  if (!ASSET(asset) || typeof isBuy !== 'boolean' || !Array.isArray(orders) || orders.length < 1 ||
+      orders.length > 2 || new Set(orders.map((o) => o?.tpsl)).size !== orders.length) {
+    throw new Error('invalid tpsl');
+  }
+  return {
+    type: 'order',
+    orders: orders.map(({tpsl, trigger, price}) => {
+      if (tpsl !== 'tp' && tpsl !== 'sl') throw new Error('invalid tpsl');
+      const triggerPx = wire(trigger);
+      const p = wire(price);
+      if (Number(triggerPx) <= 0 || Number(p) <= 0) throw new Error('invalid tpsl');
+      // Field order matters: it's what gets hashed.
+      return {a: asset, b: isBuy, p, s: '0', r: true, t: {trigger: {isMarket: true, triggerPx, tpsl}}};
+    }),
+    grouping: 'positionTpsl',
+  };
+}
+
+// Cancels resting orders (a position's TP/SL) by id.
+export function cancelAction({asset, oids}) {
+  if (!ASSET(asset) || !Array.isArray(oids) || oids.length < 1 || oids.length > 10 ||
+      !oids.every((o) => Number.isSafeInteger(o) && o > 0)) {
+    throw new Error('invalid cancel');
+  }
+  return {type: 'cancel', cancels: oids.map((o) => ({a: asset, o}))};
+}
+
 // Cross margin, or margin per position for markets that only allow that.
 export function leverageAction({asset, leverage, isolated = false}) {
   if (!ASSET(asset) || !Number.isInteger(leverage) || leverage < 1 || leverage > 100 ||

@@ -167,6 +167,8 @@ pub(super) async fn balance(
         ));
     }
     let user = verified_wallets(&state, &headers).await?;
+    // Their email and currency, for emails about their money (never fatal to the balance).
+    let _ = state.emails.remember(&user, Some(&currency)).await;
     let evm = user.evm_wallet.clone().filter(|v| !v.is_empty()).ok_or((
         StatusCode::CONFLICT,
         "Privy Ethereum wallet is not ready".into(),

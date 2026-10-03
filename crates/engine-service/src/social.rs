@@ -282,6 +282,10 @@ impl SocialState {
     pub(super) async fn handle_of(&self, user_id: &str) -> Result<Option<String>, ApiError> {
         Ok(self.find_user(user_id).await?.map(|r| r.handle))
     }
+    // Who has this @handle, for telling them a friend paid them.
+    pub(super) async fn user_of_handle(&self, handle: &str) -> Result<Option<String>, ApiError> {
+        Ok(self.find_handle(handle).await?.map(|r| r.user_id))
+    }
     async fn find_handle(&self, handle: &str) -> Result<Option<HandleRecord>, ApiError> {
         if let Some(pg) = &self.postgres {
             let row = pg.query_opt("SELECT user_id, handle, display_name, evm_wallet, solana_wallet FROM atlas_handles WHERE handle=$1", &[&handle]).await.map_err(internal)?;
@@ -345,6 +349,8 @@ pub(super) async fn me(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     let user = app_balance::verified_wallets(&state, &headers).await?;
+    // Where their money emails go (never fatal to opening the app).
+    let _ = state.emails.remember(&user, None).await;
     state.social.require_storage()?;
     let record = state.social.find_user(&user.user_id).await?;
     // Handles claimed before Solana sends existed learn their Solana wallet here.

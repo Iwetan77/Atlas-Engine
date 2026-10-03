@@ -1064,7 +1064,9 @@ async fn update_receipt(state: &AppState, ramp: &Ramp) -> Result<(), ApiError> {
     if let Some(tx) = &ramp.tx {
         receipt.add_tx(tx.clone());
     }
-    state.history.put(&receipt).await
+    state.history.put(&receipt).await?;
+    emails::ramp_changed(state, &ramp.owner, &ramp.receipt, &ramp.kind, &ramp.status);
+    Ok(())
 }
 
 // Asks Daya about a receipt's ramp when its webhook may have been missed: at most every 20 seconds

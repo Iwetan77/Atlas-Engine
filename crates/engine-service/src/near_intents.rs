@@ -1631,6 +1631,7 @@ pub(super) async fn deposit_status(
         .history
         .observe_deposit(&user.user_id, &q.address, &status)
         .await?;
+    emails::deposit_changed(&state, &user.user_id, &q.address, &status.status);
     let state_name = match status.status.as_str() {
         "PENDING_DEPOSIT" => "waiting",
         "KNOWN_DEPOSIT_TX" | "PROCESSING" => "processing",

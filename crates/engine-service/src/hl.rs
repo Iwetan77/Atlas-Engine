@@ -8,7 +8,7 @@
 //! moves margin between the user's own balances there (`agentSendAsset` can't pay anyone else).
 use super::*;
 use axum::extract::Query;
-use engine_execution::hyperliquid::{order_price, order_size, Market, DEXES};
+use engine_execution::hyperliquid::{order_price, order_size, Market, PositionTrigger, DEXES};
 use serde_json::{json, Value};
 
 const QUOTE_MS: u64 = 45_000;
@@ -18,6 +18,9 @@ const REFRESH_EVERY: Duration = Duration::from_secs(10);
 // Hyperliquid's base taker fee (0.045%), and the price room a market order allows (3%).
 const TAKER_FEE: f64 = 0.00045;
 const SLIPPAGE: f64 = 0.03;
+// A take-profit or stop-loss closes at market: it may fill up to 10% past its trigger (Hyperliquid's
+// own setting for these).
+const TPSL_SLIPPAGE: f64 = 0.10;
 // Hyperliquid's smallest order, in dollars of notional.
 const MIN_NOTIONAL: f64 = 10.0;
 // How long margin may take to arrive (Relay usually takes seconds).
@@ -203,6 +206,11 @@ struct HlQuote {
     dex_units: u128,
     #[serde(default)]
     isolated: bool,
+    // An open's take-profit and stop-loss, as a gain or loss on its margin (+50 → +50%).
+    #[serde(default)]
+    take_profit_pct: Option<f64>,
+    #[serde(default)]
+    stop_loss_pct: Option<f64>,
     expires: u64,
 }
 
@@ -338,6 +346,15 @@ impl HlState {
             },
         })
     }
+}
+
+// For the perps alerts: the shared Hyperliquid client, and a market's latest mark price.
+pub(super) fn client(state: &AppState) -> &engine_execution::hyperliquid::HyperliquidClient {
+    &state.hl.client
+}
+pub(super) fn mark_of(state: &AppState, coin: &str) -> Option<f64> {
+    let markets = state.hl.markets.lock().ok()?.clone()?.1;
+    markets.iter().find(|m| m.coin == coin).map(|m| m.mark)
 }
 
 fn now() -> u64 {
@@ -545,7 +562,7 @@ pub(super) async fn positions(
     Query(q): Query<CurrencyQuery>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    let (_, wallet) = wallet_of(&state, &headers).await?;
+    let (user, wallet) = wallet_of(&state, &headers).await?;
     currency_of(q.currency)?;
     let (main, on_dex, fills, markets) = tokio::try_join!(
         async { state.hl.client.account(&wallet).await.map_err(venue) },
@@ -560,6 +577,25 @@ pub(super) async fn positions(
         async { state.hl.client.fills(&wallet).await.map_err(venue) },
         markets_now(&state)
     )?;
+    // Take-profits and stop-losses, from each dex that has something open (none is never fatal).
+    let triggers_on = |dex: &'static str, open: bool| {
+        let client = state.hl.client.clone();
+        let wallet = wallet.clone();
+        async move {
+            if !open {
+                return Vec::new();
+            }
+            client
+                .position_triggers(&wallet, dex)
+                .await
+                .unwrap_or_default()
+        }
+    };
+    let (main_triggers, dex_triggers) = tokio::join!(
+        triggers_on("", !main.positions.is_empty()),
+        triggers_on(DEXES[0].0, !on_dex.positions.is_empty())
+    );
+    let triggers: Vec<PositionTrigger> = main_triggers.into_iter().chain(dex_triggers).collect();
     let rows: Vec<Value> = main
         .positions
         .iter()
@@ -585,7 +621,13 @@ pub(super) async fn positions(
                 .unwrap_or_else(now);
             let kind = category(&p.coin);
             let symbol = split_coin(&p.coin).1;
-            json!({"positionId":p.coin,"openedAtUnixMs":opened,"marketId":market_id(&p.coin),
+            let mine: Vec<PositionTrigger> = triggers
+                .iter()
+                .filter(|t| t.coin == p.coin)
+                .cloned()
+                .collect();
+            let tpsl = tpsl_view(&mine, p.entry, p.size > 0.0, p.leverage);
+            json!({"positionId":p.coin,"takeProfit":tpsl["takeProfit"],"stopLoss":tpsl["stopLoss"],"openedAtUnixMs":opened,"marketId":market_id(&p.coin),
                 "symbol":symbol,"iconUrl":icon_url(symbol, kind),
                 "side":if p.size > 0.0 {"long"} else {"short"},"leverage":p.leverage,
                 "size":trim(p.size.abs()),"entryPrice":usd(p.entry),"markPrice":usd(mark),
@@ -594,6 +636,10 @@ pub(super) async fn positions(
                 "unrealizedPnlPct":format!("{:.2}", p.return_on_equity * 100.0)})
         })
         .collect();
+    if !rows.is_empty() {
+        // Something open: watched for liquidation and take-profit / stop-loss emails.
+        let _ = state.emails.watch_perps(&user.user_id).await;
+    }
     Ok(Json(json!({"positions":rows})))
 }
 
@@ -615,6 +661,10 @@ pub(super) struct OpenRequest {
     side: String,
     margin: Amount,
     leverage: u32,
+    #[serde(default)]
+    take_profit_pct: Option<f64>,
+    #[serde(default)]
+    stop_loss_pct: Option<f64>,
 }
 #[derive(Deserialize)]
 struct Amount {
@@ -637,6 +687,8 @@ pub(super) async fn quote(
     if req.leverage < 1 || req.leverage > m.max_leverage {
         return Err(bad(&format!("leverage must be 1 to {}", m.max_leverage)));
     }
+    let long = req.side == "long";
+    check_tpsl(req.take_profit_pct, req.stop_loss_pct, long, req.leverage)?;
     let margin_units = markets::parse_micros(&req.margin.amount)?
         .checked_mul(1_000_000)
         .ok_or_else(|| bad("amount too large"))?
@@ -726,6 +778,8 @@ pub(super) async fn quote(
             dex: m.dex.clone(),
             dex_units,
             isolated: m.isolated_only,
+            take_profit_pct: req.take_profit_pct,
+            stop_loss_pct: req.stop_loss_pct,
             expires,
         },
     );
@@ -738,7 +792,10 @@ pub(super) async fn quote(
         json!({"quoteId":quote_id,"marketId":req.market_id,"side":req.side,
         "leverage":req.leverage,"funding":funding,"margin":money(margin,&currency,rate),
         "size":size,"notional":money(notional,&currency,rate),"entryPrice":money(m.mark,&currency,rate),
-        "liquidationPrice":null,"fee":money(fee,&currency,rate),"expiresAtUnixMs":expires}),
+        "liquidationPrice":null,"fee":money(fee,&currency,rate),
+        "takeProfitPrice":req.take_profit_pct.map(|p| money(tpsl_price(m.mark, long, req.leverage, p),&currency,rate)),
+        "stopLossPrice":req.stop_loss_pct.map(|p| money(tpsl_price(m.mark, long, req.leverage, -p),&currency,rate)),
+        "expiresAtUnixMs":expires}),
     ))
 }
 
@@ -821,6 +878,8 @@ pub(super) async fn close_quote(
             dex: m.dex.clone(),
             dex_units: 0,
             isolated: m.isolated_only,
+            take_profit_pct: None,
+            stop_loss_pct: None,
             expires,
         },
     );
@@ -961,6 +1020,17 @@ async fn execute_inner(
             format!("{} {}x", if quote.side == "long" {"Long"} else {"Short"}, leverage)}}),
         json!({"label":"Size","value":format!("{size} {symbol}")}),
     ];
+    let long = quote.side == "long";
+    if let Some(pct) = quote.take_profit_pct {
+        let price = tpsl_price(quote.mark, long, quote.leverage, pct);
+        summary.push(json!({"label":"Take profit","value":format!("+{} at {}", say_pct(pct), say_usd(price))}));
+    }
+    if let Some(pct) = quote.stop_loss_pct {
+        let price = tpsl_price(quote.mark, long, quote.leverage, -pct);
+        summary.push(
+            json!({"label":"Stop loss","value":format!("−{} at {}", say_pct(pct), say_usd(price))}),
+        );
+    }
     if quote.funding_units > 0 {
         summary.push(json!({"label":"Margin moved to Hyperliquid",
             "value":format!("${:.2}", quote.funding_units as f64 / 1_000_000.0)}));
@@ -1074,6 +1144,7 @@ pub(super) async fn signed(
         if let Err(error) = state.hl.intents.put(&intent_id, &intent).await {
             eprintln!("hyperliquid intent {intent_id} not saved: {}", error.1);
         }
+        emails::after_status(&state, &headers, &intent.status);
     });
     Ok(Json(answer))
 }
@@ -1235,10 +1306,305 @@ async fn run(
     )
     .await?;
     filled(&placed)?;
+    let (dex, _) = split_coin(&quote.coin);
     if quote.close {
+        // Nothing left open: its take-profit and stop-loss go too.
+        let gone = state
+            .hl
+            .client
+            .account_on(&quote.wallet, dex)
+            .await
+            .is_ok_and(|a| a.positions.iter().all(|p| p.coin != quote.coin));
+        if gone {
+            if let Err(reason) =
+                set_tpsl(state, headers, &quote.wallet, &quote.coin, None, None).await
+            {
+                eprintln!("hyperliquid {} tp/sl not cancelled: {reason}", quote.coin);
+            }
+        }
         cash_out(state, headers, intent).await;
+    } else {
+        let _ = state.emails.watch_perps(&quote.owner).await;
+    }
+    if !quote.close && (quote.take_profit_pct.is_some() || quote.stop_loss_pct.is_some()) {
+        // The trade stands either way; one that couldn't be set shows as unset on the position.
+        if let Err(reason) = set_tpsl(
+            state,
+            headers,
+            &quote.wallet,
+            &quote.coin,
+            quote.take_profit_pct,
+            quote.stop_loss_pct,
+        )
+        .await
+        {
+            eprintln!("hyperliquid {} tp/sl not set: {reason}", quote.coin);
+        }
     }
     Ok(())
+}
+
+// Take-profit and stop-loss as a gain or loss on margin: +50% at 5x is a 10% move in the trade's
+// favour. Take-profit from 1% up, stop-loss 1% to 90% (past that, liquidation comes first).
+fn check_tpsl(tp: Option<f64>, sl: Option<f64>, long: bool, leverage: u32) -> Result<(), ApiError> {
+    if let Some(tp) = tp {
+        // A short's price can't fall below zero.
+        let most = if long {
+            1000.0
+        } else {
+            (99.0 * f64::from(leverage)).min(1000.0)
+        };
+        if !tp.is_finite() || tp < 1.0 || tp > most {
+            return Err(bad(&format!("take profit must be +1% to +{most:.0}%")));
+        }
+    }
+    if let Some(sl) = sl {
+        if !sl.is_finite() || !(1.0..=90.0).contains(&sl) {
+            return Err(bad("stop loss must be −1% to −90%"));
+        }
+    }
+    Ok(())
+}
+
+// The price at which the position has gained (or, negative, lost) `pct` percent of its margin.
+fn tpsl_price(entry: f64, long: bool, leverage: u32, pct: f64) -> f64 {
+    let moved = pct / 100.0 / f64::from(leverage.max(1));
+    entry * if long { 1.0 + moved } else { 1.0 - moved }
+}
+
+// The other way round: what reaching `price` gains (or loses) on margin, in percent.
+fn tpsl_pct(entry: f64, long: bool, leverage: u32, price: f64) -> f64 {
+    if entry <= 0.0 {
+        return 0.0;
+    }
+    let moved = price / entry - 1.0;
+    (if long { moved } else { -moved }) * f64::from(leverage) * 100.0
+}
+
+fn say_pct(pct: f64) -> String {
+    format!("{}%", trim((pct * 10.0).round() / 10.0))
+}
+
+// "$120,000" or "$0.5321": a price as people read it.
+fn say_usd(price: f64) -> String {
+    let text = order_price(price, 0);
+    let (whole, fraction) = text.split_once('.').unwrap_or((&text, ""));
+    let mut grouped = String::new();
+    for (i, digit) in whole.chars().enumerate() {
+        if i > 0 && (whole.len() - i) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    if fraction.is_empty() {
+        format!("${grouped}")
+    } else {
+        format!("${grouped}.{fraction}")
+    }
+}
+
+// Replaces a position's take-profit and stop-loss (None removes one). They're priced off the
+// position's entry and leverage as Hyperliquid has them now, and must still be ahead of the price:
+// one already passed would close the position on the spot. If the new ones can't be placed, the old
+// ones go back.
+async fn set_tpsl(
+    state: &AppState,
+    headers: &HeaderMap,
+    wallet: &str,
+    coin: &str,
+    tp: Option<f64>,
+    sl: Option<f64>,
+) -> Result<Vec<PositionTrigger>, String> {
+    let (dex, _) = split_coin(coin);
+    let m = market(state, &market_id(coin)).await.map_err(|e| e.1)?;
+    let (account, existing) = tokio::try_join!(
+        async {
+            state
+                .hl
+                .client
+                .account_on(wallet, dex)
+                .await
+                .map_err(|e| e.to_string())
+        },
+        async {
+            state
+                .hl
+                .client
+                .position_triggers(wallet, dex)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    )?;
+    let existing: Vec<PositionTrigger> = existing.into_iter().filter(|t| t.coin == coin).collect();
+    let position = account.positions.iter().find(|p| p.coin == coin);
+    let mut orders = Vec::new();
+    if let Some(p) = position.filter(|_| tp.is_some() || sl.is_some()) {
+        let long = p.size > 0.0;
+        let mark = m.mark;
+        for (kind, pct) in [("tp", tp), ("sl", sl.map(|v| -v))] {
+            let Some(pct) = pct else { continue };
+            let trigger = tpsl_price(p.entry, long, p.leverage, pct);
+            // A long's take-profit sits above the price and its stop below; a short's the other way.
+            let ahead = (kind == "tp") == long;
+            if (ahead && trigger <= mark) || (!ahead && trigger >= mark) {
+                return Err(if kind == "tp" {
+                    "Your position is already past that take profit. Pick a higher one.".into()
+                } else {
+                    "Your position is already past that stop loss. Pick a lower one.".into()
+                });
+            }
+            orders.push((kind, trigger));
+        }
+    } else if tp.is_some() || sl.is_some() {
+        return Err("That position isn't open anymore.".into());
+    }
+    let long = position.is_some_and(|p| p.size > 0.0);
+    let place = |orders: &[(&str, f64)]| {
+        let rows: Vec<Value> = orders
+            .iter()
+            .map(|(kind, trigger)| {
+                // A long closes by selling, so its worst fill is below the trigger.
+                let worst = if long {
+                    trigger * (1.0 - TPSL_SLIPPAGE)
+                } else {
+                    trigger * (1.0 + TPSL_SLIPPAGE)
+                };
+                json!({"tpsl":kind,"trigger":order_price(*trigger, m.sz_decimals),
+                    "price":order_price(worst, m.sz_decimals)})
+            })
+            .collect();
+        json!({"asset":m.asset,"isBuy":!long,"orders":rows})
+    };
+    if !existing.is_empty() {
+        let oids: Vec<u64> = existing.iter().map(|t| t.oid).collect();
+        expect_ok(
+            bridge(
+                state,
+                headers,
+                "cancel",
+                json!({"asset":m.asset,"oids":oids}),
+            )
+            .await?,
+            "cancel",
+        )?;
+    }
+    if orders.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placed = bridge(state, headers, "tpsl", place(&orders)).await;
+    let placed = placed.and_then(|answer| {
+        expect_ok(answer.clone(), "take profit / stop loss")?;
+        let statuses = answer["result"]["response"]["data"]["statuses"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        match statuses.iter().find_map(|s| s["error"].as_str()) {
+            Some(reason) => Err(format!("Hyperliquid didn't take it ({reason})")),
+            None => Ok(()),
+        }
+    });
+    if let Err(reason) = placed {
+        if position.is_some() && !existing.is_empty() {
+            let old: Vec<(&str, f64)> =
+                existing.iter().map(|t| (t.kind, t.trigger_price)).collect();
+            let _ = bridge(state, headers, "tpsl", place(&old)).await;
+        }
+        return Err(reason);
+    }
+    Ok(orders
+        .into_iter()
+        .map(|(kind, trigger_price)| PositionTrigger {
+            coin: coin.into(),
+            oid: 0,
+            kind,
+            trigger_price,
+        })
+        .collect())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct TpslRequest {
+    take_profit_pct: Option<f64>,
+    stop_loss_pct: Option<f64>,
+}
+
+// Sets (or clears, with nulls) an open position's take-profit and stop-loss. The user's Atlas agent
+// signs it, as it did the trade.
+pub(super) async fn update_tpsl(
+    State(state): State<AppState>,
+    Path(position_id): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<TpslRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let (_, wallet) = wallet_of(&state, &headers).await?;
+    let dex = split_coin(&position_id).0;
+    if !dex.is_empty() && !DEXES.iter().any(|(d, _)| *d == dex) {
+        return Err((StatusCode::NOT_FOUND, "no such position".into()));
+    }
+    let position = state
+        .hl
+        .client
+        .account_on(&wallet, dex)
+        .await
+        .map_err(venue)?
+        .positions
+        .into_iter()
+        .find(|p| p.coin == position_id)
+        .ok_or((StatusCode::NOT_FOUND, "no such position".into()))?;
+    let long = position.size > 0.0;
+    check_tpsl(
+        req.take_profit_pct,
+        req.stop_loss_pct,
+        long,
+        position.leverage,
+    )?;
+    let agent = bridge(&state, &headers, "agent", json!({}))
+        .await
+        .map_err(venue)?;
+    let agent = agent["agentAddress"]
+        .as_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !state
+        .hl
+        .client
+        .agents(&wallet)
+        .await
+        .map_err(venue)?
+        .contains(&agent)
+    {
+        return Err(conflict(
+            "Make a trade first: your account needs its one-time approval.",
+        ));
+    }
+    let set = set_tpsl(
+        &state,
+        &headers,
+        &wallet,
+        &position_id,
+        req.take_profit_pct,
+        req.stop_loss_pct,
+    )
+    .await
+    .map_err(|reason| conflict(&reason))?;
+    Ok(Json(tpsl_view(
+        &set,
+        position.entry,
+        long,
+        position.leverage,
+    )))
+}
+
+// A position's take-profit and stop-loss for the app: price, and the gain or loss on margin there.
+fn tpsl_view(triggers: &[PositionTrigger], entry: f64, long: bool, leverage: u32) -> Value {
+    let view = |kind: &str| {
+        triggers.iter().find(|t| t.kind == kind).map(|t| {
+            json!({"price":usd(t.trigger_price),
+                "pct":format!("{:.0}", tpsl_pct(entry, long, leverage, t.trigger_price))})
+        })
+    };
+    json!({"takeProfit":view("tp"),"stopLoss":view("sl")})
 }
 
 // After a close: the money it freed goes back to cash. A cash-out that doesn't happen leaves the
@@ -1558,6 +1924,7 @@ async fn signed_cashout(
                 }
             }
             let _ = state.hl.intents.put(&id, &intent).await;
+            emails::after_status(&state, &headers, &intent.status);
         });
         return Ok(answer);
     }
@@ -1605,6 +1972,7 @@ async fn signed_cashout(
             }
         }
         let _ = state.hl.intents.put(&id, &intent).await;
+        emails::after_status(&state, &headers, &intent.status);
     });
     Ok(answer)
 }
@@ -1712,6 +2080,43 @@ mod tests {
             "approve"
         )
         .is_err());
+    }
+
+    #[test]
+    fn take_profit_and_stop_loss_are_gains_and_losses_on_margin() {
+        // +50% at 5x: a 10% move in the trade's favour; -25%: 5% against.
+        assert!((tpsl_price(100.0, true, 5, 50.0) - 110.0).abs() < 1e-9);
+        assert!((tpsl_price(100.0, true, 5, -25.0) - 95.0).abs() < 1e-9);
+        assert!((tpsl_price(100.0, false, 5, 50.0) - 90.0).abs() < 1e-9);
+        assert!((tpsl_price(100.0, false, 5, -25.0) - 105.0).abs() < 1e-9);
+        assert!((tpsl_pct(100.0, true, 5, 110.0) - 50.0).abs() < 1e-9);
+        assert!((tpsl_pct(100.0, false, 5, 105.0) + 25.0).abs() < 1e-9);
+        assert!(check_tpsl(Some(50.0), Some(25.0), true, 5).is_ok());
+        assert!(check_tpsl(None, None, true, 5).is_ok());
+        assert!(check_tpsl(Some(0.5), None, true, 5).is_err());
+        assert!(check_tpsl(None, Some(95.0), true, 5).is_err());
+        assert!(check_tpsl(Some(f64::NAN), None, true, 5).is_err());
+        // A 1x short can't make more than 99%: the price would have to go below zero.
+        assert!(check_tpsl(Some(100.0), None, false, 1).is_err());
+        assert!(check_tpsl(Some(100.0), None, false, 2).is_ok());
+        assert_eq!(say_usd(120_000.0), "$120,000");
+        assert_eq!(say_usd(0.53214), "$0.53214");
+        assert_eq!(say_usd(4_321.5), "$4,321.5");
+        assert_eq!(say_pct(50.0), "50%");
+        let view = tpsl_view(
+            &[PositionTrigger {
+                coin: "BTC".into(),
+                oid: 1,
+                kind: "sl",
+                trigger_price: 95.0,
+            }],
+            100.0,
+            true,
+            5,
+        );
+        assert_eq!(view["takeProfit"], Value::Null);
+        assert_eq!(view["stopLoss"]["pct"], "-25");
+        assert_eq!(view["stopLoss"]["price"]["amount"], "95");
     }
 
     #[test]

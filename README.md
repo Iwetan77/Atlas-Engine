@@ -67,9 +67,10 @@ network loses money.
 | **Relay** | Base → Solana cash moves (one EIP-3009 signature, the solver pays gas), and Atlas Link payouts. |
 | **Layerswap** | Solana → Base (with refuel), the fallback to Relay. |
 | **CoW Protocol** | The Base gas tank: a USDC permit plus a USDC → ETH order, settled by a solver who pays the gas. |
-| **Hyperliquid** | Perps: ~290 markets (its own crypto perps plus the `xyz` dex's stocks, commodities, indices and currencies), margin moved in from the balance by Relay in the same confirm, open/close with one confirm, money back to cash after a close, candles for charts. The account is the user's own wallet; trades are signed by a per-user agent the user approves once (it can trade, never withdraw). |
+| **Hyperliquid** | Perps: ~290 markets (its own crypto perps plus the `xyz` dex's stocks, commodities, indices and currencies), margin moved in from the balance by Relay in the same confirm, open/close with one confirm, money back to cash after a close, take-profit and stop-loss on the whole position (set when opening or later, as a gain or loss on margin), candles for charts. The account is the user's own wallet; trades are signed by a per-user agent the user approves once (it can trade, never withdraw). |
 | **Morpho, Aave, Jupiter Lend, Jito** | Earn: Morpho's three largest curated USDC vaults on Base (Gauntlet, Spark, Steakhouse), Aave USDC on Base, Jupiter Lend (USDC, USDT, JupUSD, USDS, EURC), SOL staking. Best rate first. |
 | **GeckoTerminal, CoinGecko, DexScreener** | Charts for coins beyond Jupiter; the CoinGecko listing that marks a searched coin verified (exact contract, per chain); Sui search. |
+| **Senviok** | Emails from "Ebube from Atlas" (hello@justatlas.xyz): money in (bank top-ups, deposits, a friend paying you), money out (cash-outs paid, sends, links, withdrawals), trades and predictions, and perps alerts (liquidation, take-profit or stop-loss hit, close to liquidation). Once per event, to the sign-in email, off in Profile. |
 | **Helius** | Solana RPC in production (any keyed RPC works). |
 | **Render + Postgres** | Hosting; intents, trades, handles and photos survive restarts. |
 
@@ -161,7 +162,9 @@ user's display currency.
 | GET | `/v1/intents/{id}/next` | The second step, once cash or gas has landed |
 | GET/POST | `/v1/perps/onboarding` | Perps access for the user's wallet |
 | GET | `/v1/perps/markets`, `/v1/perps/positions` | Hyperliquid markets (crypto, stocks, commodities, indices, currencies) and open positions |
-| POST | `/v1/perps/quotes` → `/execute`, `/v1/perps/positions/{id}/close-quote` → `/v1/perps/close-quotes/{id}/execute` | Open and close |
+| POST | `/v1/perps/quotes` → `/execute`, `/v1/perps/positions/{id}/close-quote` → `/v1/perps/close-quotes/{id}/execute` | Open (optionally with `takeProfitPct` / `stopLossPct`, a gain or loss on margin) and close |
+| POST | `/v1/perps/positions/{id}/tpsl` `{takeProfitPct, stopLossPct}` | Set or clear (null) a position's take-profit and stop-loss; positions carry `takeProfit` / `stopLoss` `{price, pct}` |
+| GET · POST | `/v1/me/emails` · `{enabled}` | Where Atlas emails the user, and turning those emails on or off |
 | GET | `/v1/earn/options`, `/v1/earn/positions` | Savings options and what's earning |
 | POST | `/v1/earn/quotes` → `/v1/earn/quotes/{id}/execute` | Put in / take out |
 | GET/POST | `/v1/me`, `/v1/me/handle`, `/v1/me/avatar`, `/v1/users/resolve` | Profile, @handles, photos |
@@ -199,6 +202,8 @@ cargo run -p engine-service          # http://127.0.0.1:3000
 | `ATLAS_MONAD_MAINNET_RPC_URL`, `ATLAS_NEAR_MAINNET_RPC_URL`, `ATLAS_ARC_RPC_URL`, `SUI_FULLNODE_URL` | RPC overrides (public by default) |
 | `JUPITER_API_KEY`, `NEAR_INTENTS_API_KEY`, `RELAY_API_KEY` | Optional venue keys (higher limits, lower 1Click fees) |
 | `ATLAS_FEE_NEAR_ACCOUNT` | Where Atlas's share of the 1% fee on withdrawals to a wallet goes: a NEAR account (`atlasfees.near`, or a 64-character implicit one) or an EVM address (`0x…`). It builds up as a NEAR Intents balance of that address as each withdrawal settles (a refunded one pays nothing); with the API key, 1Click keeps half of the fee. Withdraw it at near-intents.org by signing in with that wallet. Withdraw to wallet shows Soon until it's set (`/health` → `keys.withdrawFeeAccount`) |
+| `SENVIOK_API_KEY` | Emails about the user's money (Senviok, `svk_live_…`). Without it nothing is sent and Profile hides the switch (`/health` → `keys.emails`) |
+| `ATLAS_EMAIL_FROM`, `ATLAS_EMAIL_FROM_NAME` | The sender (default `hello@justatlas.xyz`, "Ebube from Atlas"). The domain must be verified in Senviok: add the DKIM CNAME and TXT records it shows for justatlas.xyz at your DNS host |
 | `ATLAS_ALLOWED_ORIGINS` | Additional exact CORS origins for the web app; https://justatlas.xyz is always included |
 | `ATLAS_BALANCE_BIND` | Listen address (default `127.0.0.1:3000`) |
 
