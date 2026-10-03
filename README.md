@@ -168,6 +168,7 @@ user's display currency.
 | GET · POST | `/v1/cashlinks/{escrow}` (public) · `/v1/cashlinks/{escrow}/claim` | An Atlas Link, and claiming it |
 | POST | `/v1/sends/quote` → `/v1/sends/quote/{id}/execute` | Send to a friend |
 | GET | `/v1/deposit/networks` · POST `/v1/deposit/quote` · GET `/v1/deposit/status` | Deposits from other networks |
+| GET | `/v1/withdrawals/networks` · POST `/v1/withdrawals/quote` → `/v1/withdrawals/quote/{id}/execute` | Withdraw to a wallet: cash leaves as USDC on Solana or Base, or any deposit coin, sent by 1Click to a pasted address, less a 1% fee |
 
 ---
 
@@ -196,6 +197,7 @@ cargo run -p engine-service          # http://127.0.0.1:3000
 | `ATLAS_BASE_MAINNET_RPC_URL` | A keyed Base RPC (Alchemy, Coinbase Developer Platform…); public by default |
 | `ATLAS_MONAD_MAINNET_RPC_URL`, `ATLAS_NEAR_MAINNET_RPC_URL`, `ATLAS_ARC_RPC_URL`, `SUI_FULLNODE_URL` | RPC overrides (public by default) |
 | `JUPITER_API_KEY`, `NEAR_INTENTS_API_KEY`, `RELAY_API_KEY` | Optional venue keys (higher limits, lower 1Click fees) |
+| `ATLAS_FEE_NEAR_ACCOUNT` | Where Atlas's share of the 1% fee on withdrawals to a wallet goes: a NEAR account (`atlasfees.near`, or a 64-character implicit one) or an EVM address (`0x…`). It builds up as a NEAR Intents balance of that address as each withdrawal settles (a refunded one pays nothing); with the API key, 1Click keeps half of the fee. Withdraw it at near-intents.org by signing in with that wallet. Withdraw to wallet shows Soon until it's set (`/health` → `keys.withdrawFeeAccount`) |
 | `ATLAS_ALLOWED_ORIGINS` | CORS for the web app |
 | `ATLAS_BALANCE_BIND` | Listen address (default `127.0.0.1:3000`) |
 

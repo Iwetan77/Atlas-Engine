@@ -212,6 +212,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/deposit/networks", get(near_intents::deposit_networks))
         .route("/v1/deposit/quote", post(near_intents::deposit_quote))
         .route("/v1/deposit/status", get(near_intents::deposit_status))
+        .route(
+            "/v1/withdrawals/networks",
+            get(near_intents::withdraw_networks),
+        )
+        .route("/v1/withdrawals/quote", post(near_intents::withdraw_quote))
+        .route(
+            "/v1/withdrawals/quote/{quote_id}/execute",
+            post(near_intents::withdraw_execute),
+        )
         .route("/v1/predictions/markets", get(predictions::markets))
         .route("/v1/predictions/markets/{id}", get(predictions::market))
         .route(
@@ -258,6 +267,8 @@ async fn health() -> Json<serde_json::Value> {
         "keys": {
             "nearIntents": env::var("NEAR_INTENTS_API_KEY").is_ok_and(|k| !k.trim().is_empty()),
             "relay": env::var("RELAY_API_KEY").is_ok_and(|k| !k.trim().is_empty()),
+            // Withdrawals to a wallet take Atlas's fee into this NEAR account; off without it.
+            "withdrawFeeAccount": near_intents::fee_account().is_some(),
         },
         // Bank transfers: whether Daya's key and webhook secret are set, and its last no-money check.
         "daya": daya::health(),

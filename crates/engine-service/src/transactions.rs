@@ -206,6 +206,7 @@ pub(super) fn title(kind: &str, symbol: &str) -> String {
         "deposit" => "Deposit",
         "onramp" => "Add money",
         "offramp" => "Cash out",
+        "withdraw" => "Withdraw",
         _ => "Transaction",
     };
     if symbol.is_empty() {
@@ -371,7 +372,9 @@ fn snapshot(owner: &str, v: &Value, source: &str) -> Receipt {
         .filter_map(|v| v.as_str().map(str::to_owned))
         .collect();
     if source == "near" {
-        r.kind = if v["sell_sui"] == true || v["origin_chain"] == "monad" {
+        r.kind = if v["withdraw"].is_object() {
+            "withdraw"
+        } else if v["sell_sui"] == true || v["origin_chain"] == "monad" {
             "sell"
         } else {
             "buy"
@@ -388,7 +391,7 @@ fn snapshot(owner: &str, v: &Value, source: &str) -> Receipt {
             }
         }
         r.asset_id = v["asset_id"].as_str().map(str::to_owned);
-        let amount = if r.kind == "buy" {
+        let amount = if r.kind == "buy" || r.kind == "withdraw" {
             &v["amount"]
         } else {
             &v["minimum_out"]

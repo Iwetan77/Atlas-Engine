@@ -1,6 +1,6 @@
 use super::*;
 use base64::Engine;
-use engine_execution::near_intents::{ChainTx, Client, QuoteRequest, Token};
+use engine_execution::near_intents::{AppFee, ChainTx, Client, QuoteRequest, Token};
 use engine_execution::relay_link::{MonadPay, MonadSwap};
 use engine_execution::swaps::uniswap::BASE_USDC;
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,7 @@ async fn step_guard(id: &str) -> Result<tokio::sync::OwnedMutexGuard<()>, ApiErr
 pub(super) struct NearState {
     client: Client,
     quotes: Arc<Mutex<HashMap<String, StoredQuote>>>,
+    withdrawals: Arc<Mutex<HashMap<String, WithdrawQuote>>>,
     recoveries: Arc<Mutex<HashMap<String, SuiRecovery>>>,
     intents: Arc<Mutex<HashMap<String, StoredIntent>>>,
     tokens: Arc<Mutex<Option<(Instant, Vec<Token>)>>>,
@@ -197,6 +198,31 @@ struct StoredIntent {
     // MON goes through Relay (1Click lists it but quotes no route to or from Monad).
     #[serde(default)]
     relay: Option<RelayLeg>,
+    // Cash leaving Atlas as a coin for someone else's wallet: not a buy, so nothing for the trade book.
+    #[serde(default)]
+    withdraw: Option<Withdrawal>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct Withdrawal {
+    network: String,
+    address: String,
+    fee: u128,
+}
+// A withdrawal quote, kept until its plan is made (once).
+#[derive(Clone)]
+struct WithdrawQuote {
+    owner: String,
+    wallet: String,
+    from_solana: bool,
+    network_fee: u128,
+    option: &'static DepositOption,
+    token: Token,
+    address: String,
+    amount: u128,
+    fee: u128,
+    minimum_out: u128,
+    currency: String,
+    expires: u64,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct RelayLeg {
@@ -282,6 +308,7 @@ impl NearState {
         Ok(Self {
             client: Client::new(env::var("NEAR_INTENTS_API_KEY").ok())?,
             quotes: Arc::new(Mutex::new(HashMap::new())),
+            withdrawals: Arc::new(Mutex::new(HashMap::new())),
             recoveries: Arc::new(Mutex::new(HashMap::new())),
             intents: Arc::new(Mutex::new(HashMap::new())),
             tokens: Arc::new(Mutex::new(None)),
@@ -1646,6 +1673,481 @@ pub(super) async fn deposit_status(
             "payout": details.map(|d| hop(&d.destination_chain_tx_hashes)).unwrap_or_default(),
         }
     })))
+}
+
+// Withdrawing to a wallet outside Atlas: cash leaves the balance as one of these coins, sent by
+// 1Click straight to the address the user pastes. USDC on Solana and Base first, then every coin
+// people can deposit from, the other way round.
+const WITHDRAW_FIRST: &[DepositOption] = &[
+    DepositOption {
+        id: "solana-usdc",
+        label: "USDC on Solana",
+        network: "Solana",
+        asset: "USDC",
+        asset_id: SOLANA_USDC_1CLICK,
+        dollar: true,
+        asset_icon: "https://cdn.layerswap.io/layerswap/currencies/usdc.png",
+        chain_icon: Some("https://cdn.layerswap.io/layerswap/networks/solana_mainnet.png"),
+        featured: true,
+    },
+    DepositOption {
+        id: "base-usdc",
+        label: "USDC on Base",
+        network: "Base",
+        asset: "USDC",
+        asset_id: BASE_USDC_1CLICK,
+        dollar: true,
+        asset_icon: "https://cdn.layerswap.io/layerswap/currencies/usdc.png",
+        chain_icon: Some("https://cdn.layerswap.io/layerswap/networks/base_mainnet.png"),
+        featured: true,
+    },
+];
+fn withdraw_options() -> impl Iterator<Item = &'static DepositOption> {
+    WITHDRAW_FIRST.iter().chain(DEPOSIT_NETWORKS.iter())
+}
+
+// The fee on a withdrawal to a wallet: 1% of what leaves the balance (₦10 of ₦1,000), a 1Click app
+// fee taken as the swap settles, so a refunded withdrawal pays nothing. With Atlas's API key 1Click
+// keeps half of it; the other half builds up as a NEAR Intents balance of ATLAS_FEE_NEAR_ACCOUNT.
+// Until that account is set, withdrawals to a wallet stay off.
+const WITHDRAW_FEE_BPS: u32 = 100;
+pub(super) fn fee_account() -> Option<String> {
+    env::var("ATLAS_FEE_NEAR_ACCOUNT")
+        .ok()
+        .and_then(|a| fee_recipient(&a))
+}
+// Who NEAR Intents can pay: a named account (atlasfees.near), an implicit one (64 hex characters) or
+// an EVM address (0x…), all lowercase.
+fn fee_recipient(raw: &str) -> Option<String> {
+    let a = raw.trim().trim_matches('"').to_ascii_lowercase();
+    let hex = |s: &str| s.bytes().all(|b| b.is_ascii_hexdigit());
+    (near_account(&a) || (a.len() == 64 && hex(&a)) || is_evm(&a)).then_some(a)
+}
+fn withdraw_fee(amount: u128) -> u128 {
+    amount * u128::from(WITHDRAW_FEE_BPS) / 10_000
+}
+
+// A first look at a pasted address, so a typo is caught before asking 1Click (which checks it fully).
+fn address_fits(network: &str, address: &str) -> bool {
+    let hex = |s: &str| s.bytes().all(|b| b.is_ascii_hexdigit());
+    (2..=100).contains(&address.len())
+        && address
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-.:".contains(&b))
+        && match network {
+            "Solana" => is_solana(address),
+            "Base" | "Ethereum" | "Arbitrum" | "BNB Chain" | "Polygon" | "Optimism"
+            | "Avalanche" | "Monad" => is_evm(address),
+            "Sui" => address.len() == 66 && address.starts_with("0x") && hex(&address[2..]),
+            "Tron" => address.len() == 34 && address.starts_with('T') && is_solana(address),
+            "NEAR" => near_account(address) || (address.len() == 64 && hex(address)),
+            _ => address.len() >= 20,
+        }
+}
+
+pub(super) async fn withdraw_networks() -> Json<Value> {
+    Json(json!({
+        "enabled": fee_account().is_some(),
+        "feePercent": format!("{}", f64::from(WITHDRAW_FEE_BPS) / 100.0),
+        "networks": withdraw_options().map(|o| {
+            json!({"id":o.id,"label":o.label,"network":o.network,"asset":o.asset,
+                "assetIcon":o.asset_icon,"chainIcon":o.chain_icon,"featured":o.featured})
+        }).collect::<Vec<_>>(),
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct WithdrawRequest {
+    network_id: String,
+    address: String,
+    amount: markets::Money,
+}
+
+// The smallest amount in 1Click's "too low" refusal (base units of what was offered).
+fn least_units(message: &str) -> Option<u128> {
+    let tail = message.split("try at least ").nth(1)?;
+    let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok().filter(|n| *n > 0)
+}
+
+// What 1Click says about a withdrawal it won't quote, in words for the user.
+fn withdraw_refused(
+    option: &DepositOption,
+    error: engine_execution::near_intents::Error,
+    currency: &str,
+    rate: u128,
+) -> ApiError {
+    let label = option.label;
+    let engine_execution::near_intents::Error::Venue(_, text) = &error else {
+        return venue(error);
+    };
+    if text.contains("recipient is not valid") {
+        return bad(&format!(
+            "That isn't a {label} address. Check it and paste it again."
+        ));
+    }
+    if let Some(min) = venue_minimum_usd(text) {
+        return bad(&format!(
+            "The smallest withdrawal as {label} right now is {} (${min}).",
+            markets::say_money(min * 1_000_000, currency, rate)
+        ));
+    }
+    // "Amount is too low for bridge, try at least 7421581": USDC units, as every withdrawal pays USDC.
+    if let Some(min) = least_units(text) {
+        return bad(&format!(
+            "The smallest withdrawal as {label} right now is about {}.",
+            markets::say_money(min, currency, rate)
+        ));
+    }
+    venue(format!(
+        "Withdrawing as {label} isn't available right now. Try another coin or try again later."
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn withdraw_request<'a>(
+    origin: &'a str,
+    option: &'a DepositOption,
+    units: &'a str,
+    address: &'a str,
+    refund_to: &'a str,
+    deadline: &'a str,
+    fee_to: String,
+    dry: bool,
+) -> QuoteRequest<'a> {
+    QuoteRequest {
+        app_fees: vec![AppFee {
+            recipient: fee_to,
+            fee: WITHDRAW_FEE_BPS,
+        }],
+        ..QuoteRequest::exact_input(
+            origin,
+            option.asset_id,
+            units,
+            address,
+            refund_to,
+            deadline,
+            dry,
+        )
+    }
+}
+
+pub(super) async fn withdraw_quote(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<WithdrawRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let fee_to = fee_account().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Withdrawing to a wallet isn't switched on yet.".into(),
+    ))?;
+    let user = app_balance::verified_wallets(&state, &headers).await?;
+    let option = withdraw_options()
+        .find(|o| o.id == req.network_id)
+        .ok_or((StatusCode::NOT_FOUND, "unknown withdrawal coin".into()))?;
+    let address = req.address.trim().to_owned();
+    if !address_fits(option.network, &address) {
+        return Err(bad(&format!(
+            "That isn't a {} address. Check it and paste it again.",
+            option.label
+        )));
+    }
+    let own = [user.solana_wallet.as_deref(), user.evm_wallet.as_deref()];
+    if own
+        .iter()
+        .flatten()
+        .any(|w| w.eq_ignore_ascii_case(&address))
+    {
+        return Err(bad(
+            "That's your own Atlas wallet. Paste the wallet you're withdrawing to.",
+        ));
+    }
+    let currency = req.amount.currency.clone();
+    markets::checked_currency(&currency)?;
+    let rate = app_balance::fx_rate(&currency).await?;
+    let amount = markets::parse_micros(&req.amount.amount)?
+        .checked_mul(1_000_000)
+        .ok_or_else(|| bad("amount too large"))?
+        / rate;
+    markets::check_limits(amount, &currency, rate)?;
+    let token = state
+        .near
+        .tokens()
+        .await?
+        .into_iter()
+        .find(|t| t.asset_id == option.asset_id)
+        .ok_or_else(|| {
+            venue(format!(
+                "Withdrawing as {} isn't available right now",
+                option.label
+            ))
+        })?;
+    let (wallet, from_solana, network_fee, origin) =
+        pay_from(&state, &user, amount, &currency, rate).await?;
+    let deadline = deadline_utc(180);
+    let units = amount.to_string();
+    let request = withdraw_request(
+        origin, option, &units, &address, &wallet, &deadline, fee_to, true,
+    );
+    let q = state
+        .near
+        .client
+        .quote(&request)
+        .await
+        .map_err(|e| withdraw_refused(option, e, &currency, rate))?;
+    if q.amount_in.parse::<u128>().ok() != Some(amount) {
+        return Err(venue("1Click changed the exact input amount"));
+    }
+    let output: u128 = q.amount_out.parse().map_err(internal)?;
+    let output_usd = usd_micros(&q.amount_out_usd)?;
+    let minimum_out: u128 = q
+        .min_amount_out
+        .as_deref()
+        .unwrap_or(&q.amount_out)
+        .parse()
+        .map_err(internal)?;
+    let fee = withdraw_fee(amount);
+    let quote_id = id("w");
+    let expires = now() + 30_000;
+    state.near.withdrawals.lock().map_err(internal)?.insert(
+        quote_id.clone(),
+        WithdrawQuote {
+            owner: user.user_id,
+            wallet,
+            from_solana,
+            network_fee,
+            option,
+            token: token.clone(),
+            address: address.clone(),
+            amount,
+            fee,
+            minimum_out,
+            currency: currency.clone(),
+            expires,
+        },
+    );
+    Ok(Json(json!({
+        "quoteId": quote_id,
+        "networkId": option.id,
+        "label": option.label,
+        "network": option.network,
+        "asset": option.asset,
+        "address": address,
+        "send": money(amount, &currency, rate),
+        "fee": money(fee, &currency, rate),
+        "networkFee": money(network_fee, &currency, rate),
+        "receive": {"amount": markets::format_units(output, token.decimals), "symbol": option.asset,
+            "value": money(output_usd, &currency, rate)},
+        "timeEstimateSec": q.time_estimate,
+        "expiresAtUnixMs": expires,
+    })))
+}
+
+// "0.062153" for "0.062153587": six decimals are plenty for a summary line.
+fn short_units(amount: &str) -> String {
+    match amount.split_once('.') {
+        Some((whole, fraction)) => {
+            let fraction = fraction[..fraction.len().min(6)].trim_end_matches('0');
+            if fraction.is_empty() {
+                whole.into()
+            } else {
+                format!("{whole}.{fraction}")
+            }
+        }
+        None => amount.into(),
+    }
+}
+
+// "9WzD…AWWM": an address short enough for a summary line.
+fn short_address(address: &str) -> String {
+    if address.len() <= 14 {
+        return address.into();
+    }
+    format!("{}…{}", &address[..6], &address[address.len() - 4..])
+}
+
+pub(super) async fn withdraw_execute(
+    State(state): State<AppState>,
+    Path(quote_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let fee_to = fee_account().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Withdrawing to a wallet isn't switched on yet.".into(),
+    ))?;
+    let user = app_balance::verified_wallets(&state, &headers).await?;
+    let stored = state
+        .near
+        .withdrawals
+        .lock()
+        .map_err(internal)?
+        .get(&quote_id)
+        .cloned()
+        .ok_or((StatusCode::NOT_FOUND, "quote not found".into()))?;
+    if stored.owner != user.user_id {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "quote belongs to another user".into(),
+        ));
+    }
+    if stored.expires < now() {
+        return Err(conflict("quote expired; request a fresh quote"));
+    }
+    let paying = if stored.from_solana {
+        user.solana_wallet.as_deref()
+    } else {
+        user.evm_wallet.as_deref()
+    };
+    if paying != Some(&stored.wallet) {
+        return Err(conflict("Privy wallet changed; request a fresh quote"));
+    }
+    // A quote makes one plan, however often the app retries.
+    if state
+        .near
+        .withdrawals
+        .lock()
+        .map_err(internal)?
+        .remove(&quote_id)
+        .is_none()
+    {
+        return Err(conflict("quote already used; request a fresh quote"));
+    }
+    let rate = app_balance::fx_rate(&stored.currency).await?;
+    let gas_topup = deposit_ready(
+        &state,
+        &stored.wallet,
+        stored.from_solana,
+        stored.amount,
+        &stored.currency,
+    )
+    .await?;
+    let deadline = deadline_utc(if gas_topup { 20 * 60 } else { 240 });
+    let units = stored.amount.to_string();
+    let origin = if stored.from_solana {
+        SOLANA_USDC_1CLICK
+    } else {
+        BASE_USDC_1CLICK
+    };
+    let request = withdraw_request(
+        origin,
+        stored.option,
+        &units,
+        &stored.address,
+        &stored.wallet,
+        &deadline,
+        fee_to,
+        false,
+    );
+    let fresh = state
+        .near
+        .client
+        .quote(&request)
+        .await
+        .map_err(|e| withdraw_refused(stored.option, e, &stored.currency, rate))?;
+    let fresh_minimum = fresh
+        .min_amount_out
+        .as_deref()
+        .unwrap_or(&fresh.amount_out)
+        .parse::<u128>()
+        .unwrap_or_default();
+    if fresh.amount_in.parse::<u128>().ok() != Some(stored.amount)
+        || fresh_minimum < stored.minimum_out.saturating_mul(99) / 100
+    {
+        return Err(conflict("route price changed; request a fresh quote"));
+    }
+    let deposit = fresh
+        .deposit_address
+        .ok_or_else(|| venue("1Click omitted deposit address"))?;
+    let DepositSteps {
+        expected_to,
+        expected_data,
+        transactions: steps,
+        gas_request_id,
+        topup,
+    } = deposit_steps(
+        &state,
+        &stored.wallet,
+        stored.from_solana,
+        gas_topup,
+        &deposit,
+        fresh.deposit_memo.as_deref(),
+        stored.amount,
+    )
+    .await?;
+    let intent_id = id("intent");
+    let expires = now() + 120_000;
+    state
+        .near
+        .insert_intent(
+            &intent_id,
+            StoredIntent {
+                owner: user.user_id.clone(),
+                wallet: stored.wallet.clone(),
+                expected_to,
+                expected_data,
+                deposit_address: deposit,
+                deposit_memo: fresh.deposit_memo,
+                asset: Some(stored.token.clone()),
+                expires,
+                status: markets::IntentStatus {
+                    intent_id: intent_id.clone(),
+                    stage: "validate".into(),
+                    state: "pending".into(),
+                    tx_ids: Vec::new(),
+                    error: None,
+                },
+                then_swap: None,
+                sell_sui: false,
+                sale: None,
+                amount: stored.amount,
+                minimum_out: stored.minimum_out,
+                sui_wallet: None,
+                from_solana: stored.from_solana,
+                gas_request_id,
+                gas_topup,
+                gas_order: None,
+                topup,
+                sale_permission_used: false,
+                ref_wallet: None,
+                asset_id: String::new(),
+                origin_chain: String::new(),
+                expected_value: String::new(),
+                handed_nonce: None,
+                device: None,
+                relay: None,
+                withdraw: Some(Withdrawal {
+                    network: stored.option.label.into(),
+                    address: stored.address.clone(),
+                    fee: stored.fee,
+                }),
+            },
+        )
+        .await?;
+    let get = short_units(&markets::format_units(
+        fresh.amount_out.parse().map_err(internal)?,
+        stored.token.decimals,
+    ));
+    let mut summary = vec![
+        json!({"label":"To","value":short_address(&stored.address)}),
+        json!({"label":"Network","value":stored.option.label}),
+        json!({"label":"You send","value":markets::say_money(stored.amount,&stored.currency,rate)}),
+        json!({"label":"Fee","value":markets::say_money(stored.fee,&stored.currency,rate)}),
+        json!({"label":"They get (about)","value":format!("{get} {}", stored.option.asset)}),
+    ];
+    if stored.network_fee > 0 {
+        summary.push(json!({"label":"Network fee",
+            "value":markets::say_money(stored.network_fee,&stored.currency,rate)}));
+    }
+    let plan = json!({"intentId":intent_id,"kind":"withdraw","summary":summary,
+        "transactions":steps,"expiresAtUnixMs":expires});
+    let mut receipt = transactions::Receipt::plan(&user.user_id, &plan);
+    receipt.symbol = stored.option.asset.into();
+    receipt.icon_url = Some(stored.option.asset_icon.into());
+    receipt.usdc_units = Some(stored.amount.to_string());
+    receipt.title = transactions::title(&receipt.kind, &receipt.symbol);
+    state.history.put(&receipt).await?;
+    Ok(Json(plan))
 }
 
 fn sui_coin_type(value: &str) -> bool {
@@ -4016,6 +4518,7 @@ async fn execute_monad_sale(
                 expected_value: format!("0x{value:x}"),
                 handed_nonce: Some(nonce),
                 device: None,
+                withdraw: None,
                 relay: Some(RelayLeg {
                     request_id: swap.request_id,
                     typed_data: None,
@@ -4145,6 +4648,7 @@ async fn execute_mon_buy(
                 expected_value: String::new(),
                 handed_nonce: None,
                 device: None,
+                withdraw: None,
                 relay: Some(RelayLeg {
                     request_id: swap.request_id,
                     typed_data,
@@ -4256,6 +4760,7 @@ async fn execute_sui_sell(
                 expected_value: String::new(),
                 handed_nonce: None,
                 device: None,
+                withdraw: None,
                 relay: None,
             },
         )
@@ -4280,6 +4785,102 @@ async fn execute_sui_sell(
         "transactions":transactions,"expiresAtUnixMs":expires
     })))
 }
+// Before a deposit to 1Click: the cash is still there, and Base can pay its gas. True when an empty
+// Base tank tops itself up first (a gasless CoW order), which gives the deposit more time.
+async fn deposit_ready(
+    state: &AppState,
+    wallet: &str,
+    from_solana: bool,
+    amount: u128,
+    currency: &str,
+) -> Result<bool, ApiError> {
+    let balance = if from_solana {
+        markets::solana_cash(state, wallet).await
+    } else {
+        state
+            .markets
+            .base
+            .balance_of(BASE_USDC, wallet)
+            .await
+            .map_err(venue)?
+    };
+    if balance < amount {
+        return Err(markets::short_of_cash());
+    }
+    let gas_topup = !from_solana && markets::base_topup_fits(state, wallet, amount).await;
+    if !from_solana && !gas_topup && !markets::wallet_pays_gas(state, wallet).await {
+        let rate = app_balance::fx_rate(currency).await?;
+        return Err(markets::short_of_gas(currency, rate));
+    }
+    Ok(gas_topup)
+}
+
+struct DepositSteps {
+    expected_to: String,
+    expected_data: String,
+    transactions: Vec<Value>,
+    gas_request_id: Option<String>,
+    topup: Option<markets::BaseTopup>,
+}
+
+// What the app signs to pay `amount` of USDC into a 1Click deposit address: from Solana, [gas
+// top-up?, transfer] that the engine lands; from Base, the transfer (nothing yet when the tank tops
+// up first; /next hands it out).
+async fn deposit_steps(
+    state: &AppState,
+    wallet: &str,
+    from_solana: bool,
+    gas_topup: bool,
+    deposit: &str,
+    memo: Option<&str>,
+    amount: u128,
+) -> Result<DepositSteps, ApiError> {
+    let expected_chain = if from_solana {
+        is_solana(deposit)
+    } else {
+        is_evm(deposit)
+    };
+    if !expected_chain || memo.is_some() {
+        return Err(venue("1Click returned an unsupported deposit destination"));
+    }
+    if from_solana {
+        let (gas, transfer) = markets::solana_usdc_transfer(state, wallet, deposit, amount).await?;
+        let mut transactions = Vec::new();
+        if let Some((_, gas_tx)) = &gas {
+            transactions.push(json!({"chain":"solana","transaction":gas_tx,"submit":"engine"}));
+        }
+        transactions.push(json!({"chain":"solana","transaction":transfer,"submit":"engine"}));
+        return Ok(DepositSteps {
+            expected_to: deposit.into(),
+            expected_data: String::new(),
+            transactions,
+            gas_request_id: gas.map(|(id, _)| id),
+            topup: None,
+        });
+    }
+    let tx = state
+        .markets
+        .base
+        .transfer_transaction(BASE_USDC, wallet, deposit, amount)
+        .map_err(venue)?;
+    let topup = if gas_topup {
+        Some(markets::prepare_base_topup(state, wallet).await?)
+    } else {
+        None
+    };
+    let transactions = match &topup {
+        Some(t) => markets::topup_steps(t),
+        None => vec![json!({"chain":"base","chainId":8453,"to":tx.to,"data":tx.data,"value":"0"})],
+    };
+    Ok(DepositSteps {
+        expected_to: tx.to.to_ascii_lowercase(),
+        expected_data: tx.data.to_ascii_lowercase(),
+        transactions,
+        gas_request_id: None,
+        topup,
+    })
+}
+
 pub(super) async fn execute(
     state: AppState,
     headers: HeaderMap,
@@ -4393,27 +4994,14 @@ pub(super) async fn execute(
     if stored.asset.blockchain == "monad" {
         return execute_mon_buy(&state, &user, stored).await;
     }
-    let balance = if stored.from_solana {
-        markets::solana_cash(&state, &stored.wallet).await
-    } else {
-        state
-            .markets
-            .base
-            .balance_of(BASE_USDC, &stored.wallet)
-            .await
-            .map_err(venue)?
-    };
-    if balance < stored.amount {
-        return Err(markets::short_of_cash());
-    }
-    // No ETH on Base: a gasless CoW top-up goes first, so the deposit gets more time.
-    let gas_topup = !stored.from_solana
-        && markets::base_topup_fits(&state, &stored.wallet, stored.amount).await;
-    if !stored.from_solana && !gas_topup && !markets::wallet_pays_gas(&state, &stored.wallet).await
-    {
-        let rate = app_balance::fx_rate(&stored.currency).await?;
-        return Err(markets::short_of_gas(&stored.currency, rate));
-    }
+    let gas_topup = deposit_ready(
+        &state,
+        &stored.wallet,
+        stored.from_solana,
+        stored.amount,
+        &stored.currency,
+    )
+    .await?;
     let deadline = deadline_utc(if gas_topup { 20 * 60 } else { 240 });
     let amount = stored.amount.to_string();
     let req = QuoteRequest::exact_input(
@@ -4444,53 +5032,22 @@ pub(super) async fn execute(
     let deposit = fresh
         .deposit_address
         .ok_or_else(|| venue("1Click omitted deposit address"))?;
-    let expected_chain = if stored.from_solana {
-        is_solana(&deposit)
-    } else {
-        is_evm(&deposit)
-    };
-    if !expected_chain || fresh.deposit_memo.is_some() {
-        return Err(venue("1Click returned an unsupported deposit destination"));
-    }
-    // What the app signs now: from Solana, [gas top-up?, transfer] that the engine lands; from Base,
-    // the transfer (nothing yet when the tank tops up first; /next hands it out).
-    let (expected_to, expected_data, transactions, gas_request_id) = if stored.from_solana {
-        let (gas, transfer) =
-            markets::solana_usdc_transfer(&state, &stored.wallet, &deposit, stored.amount).await?;
-        let mut txs = Vec::new();
-        if let Some((_, gas_tx)) = &gas {
-            txs.push(json!({"chain":"solana","transaction":gas_tx,"submit":"engine"}));
-        }
-        txs.push(json!({"chain":"solana","transaction":transfer,"submit":"engine"}));
-        (deposit.clone(), String::new(), txs, gas.map(|(id, _)| id))
-    } else {
-        let tx = state
-            .markets
-            .base
-            .transfer_transaction(BASE_USDC, &stored.wallet, &deposit, stored.amount)
-            .map_err(venue)?;
-        let txs = if gas_topup {
-            Vec::new()
-        } else {
-            vec![json!({"chain":"base","chainId":8453,"to":tx.to,"data":tx.data,"value":"0"})]
-        };
-        (
-            tx.to.to_ascii_lowercase(),
-            tx.data.to_ascii_lowercase(),
-            txs,
-            None,
-        )
-    };
-    let prepared_topup = if gas_topup {
-        Some(markets::prepare_base_topup(&state, &stored.wallet).await?)
-    } else {
-        None
-    };
-    let transactions = if let Some(t) = &prepared_topup {
-        markets::topup_steps(t)
-    } else {
-        transactions
-    };
+    let DepositSteps {
+        expected_to,
+        expected_data,
+        transactions,
+        gas_request_id,
+        topup: prepared_topup,
+    } = deposit_steps(
+        &state,
+        &stored.wallet,
+        stored.from_solana,
+        gas_topup,
+        &deposit,
+        fresh.deposit_memo.as_deref(),
+        stored.amount,
+    )
+    .await?;
     let intent_id = id("intent");
     let status = markets::IntentStatus {
         intent_id: intent_id.clone(),
@@ -4532,6 +5089,7 @@ pub(super) async fn execute(
                 expected_value: String::new(),
                 handed_nonce: None,
                 device: None,
+                withdraw: None,
                 relay: None,
             },
         )
@@ -5216,7 +5774,9 @@ pub(super) async fn status(
                     } else {
                         result.state = "filled".into();
                         let tx = result.tx_ids.first().cloned();
-                        if current.origin_chain == "monad" {
+                        if current.withdraw.is_some() {
+                            // It left Atlas: nothing bought, nothing for the trade book.
+                        } else if current.origin_chain == "monad" {
                             record_fill(&state, &id, &current, "sell", current.amount, got, tx)
                                 .await;
                         } else {
@@ -5227,7 +5787,11 @@ pub(super) async fn status(
                 }
                 "FAILED" | "REFUNDED" => {
                     result.state = "failed".into();
-                    result.error = Some(format!("1Click {}", venue_status.status));
+                    result.error = Some(if current.withdraw.is_some() {
+                        "The withdrawal didn't go through, so the cash went back to your balance. No fee was taken.".into()
+                    } else {
+                        format!("1Click {}", venue_status.status)
+                    });
                 }
                 "PENDING_DEPOSIT" | "KNOWN_DEPOSIT_TX" | "PROCESSING" | "INCOMPLETE_DEPOSIT" => {}
                 _ => {
@@ -5587,7 +6151,7 @@ pub(super) async fn pending_rows(
             .or_else(|| intent.asset.as_ref().map(|a| a.symbol.as_str()))
             .unwrap_or("Coin");
         rows.push(json!({"intentId":intent.status.intent_id,"assetId":intent.asset_id,"symbol":symbol,
-            "kind":if intent.sell_sui{"sell"}else{"buy"},"stage":intent.status.stage,"error":intent.status.error}));
+            "kind":if intent.sell_sui{"sell"}else if intent.withdraw.is_some(){"withdraw"}else{"buy"},"stage":intent.status.stage,"error":intent.status.error}));
     }
     Ok(rows)
 }
@@ -5679,8 +6243,20 @@ pub(super) async fn resume(
     } else {
         drop(_step);
         let next = next(state.clone(), headers.clone(), id.clone()).await?.0;
+        let (kind, finish, value) = match &intent.withdraw {
+            Some(w) => (
+                "withdraw",
+                "Finish withdrawal",
+                format!("To {}", short_address(&w.address)),
+            ),
+            None => (
+                "buy",
+                "Finish purchase",
+                "No new purchase payment".to_string(),
+            ),
+        };
         return Ok(Json(
-            json!({"intentId":id,"stage":"sign","kind":"buy","summary":[{"label":"Finish purchase","value":"No new purchase payment"}],
+            json!({"intentId":id,"stage":"sign","kind":kind,"summary":[{"label":finish,"value":value}],
             "transactions":next["transactions"],"expiresAtUnixMs":now()+120000}),
         ));
     }
@@ -5704,6 +6280,102 @@ pub(super) async fn resume(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn withdrawals_take_one_percent_and_check_the_address_first() {
+        // ₦1,000 at ₦1,500 a dollar is about $0.67: Atlas keeps 1% of it.
+        assert_eq!(super::withdraw_fee(666_666), 6_666);
+        assert_eq!(super::withdraw_fee(10_000_000), 100_000);
+        let fits = super::address_fits;
+        assert!(fits(
+            "Solana",
+            "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM"
+        ));
+        assert!(!fits(
+            "Solana",
+            "0x4838b106fce9647bdf1e7877bf73ce8b0bad5f97"
+        ));
+        assert!(fits(
+            "BNB Chain",
+            "0x4838b106fce9647bdf1e7877bf73ce8b0bad5f97"
+        ));
+        assert!(!fits(
+            "Base",
+            "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM"
+        ));
+        assert!(fits("Tron", "TN3W4H6rK2ce4vX9YnFQHwKENnHjoxb3m9"));
+        assert!(!fits("Tron", "0x4838b106fce9647bdf1e7877bf73ce8b0bad5f97"));
+        assert!(fits("NEAR", "bob.near"));
+        assert!(fits(
+            "Bitcoin",
+            "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq"
+        ));
+        assert!(!fits("Bitcoin", "bc1 q"));
+        assert!(!fits("Solana", ""));
+        assert_eq!(
+            super::least_units("Amount is too low for bridge, try at least 7421581"),
+            Some(7_421_581)
+        );
+        assert_eq!(super::least_units("recipient is not valid"), None);
+        // Where Atlas's share of the fee may go.
+        assert_eq!(
+            super::fee_recipient(" AtlasFees.near "),
+            Some("atlasfees.near".into())
+        );
+        assert_eq!(
+            super::fee_recipient("0x4838B106FCe9647Bdf1E7877BF73cE8B0BAD5f97").as_deref(),
+            Some("0x4838b106fce9647bdf1e7877bf73ce8b0bad5f97")
+        );
+        assert!(super::fee_recipient(&"ab".repeat(32)).is_some());
+        assert!(super::fee_recipient("atlas.tg").is_none());
+        assert!(super::fee_recipient("").is_none());
+    }
+
+    #[test]
+    fn every_withdrawal_coin_is_listed_once_and_carries_atlas_fee() {
+        let ids: Vec<_> = super::withdraw_options().map(|o| o.id).collect();
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(ids.len(), unique.len());
+        assert_eq!(&ids[..2], ["solana-usdc", "base-usdc"]);
+        let option = super::withdraw_options()
+            .find(|o| o.id == "tron-usdt")
+            .unwrap();
+        let request = super::withdraw_request(
+            super::SOLANA_USDC_1CLICK,
+            option,
+            "10000000",
+            "TN3W4H6rK2ce4vX9YnFQHwKENnHjoxb3m9",
+            "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM",
+            "2026-10-03T12:00:00Z",
+            "atlasfees.near".into(),
+            true,
+        );
+        let body = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            body["appFees"],
+            serde_json::json!([{"recipient":"atlasfees.near","fee":100}])
+        );
+        assert_eq!(body["recipient"], "TN3W4H6rK2ce4vX9YnFQHwKENnHjoxb3m9");
+        assert_eq!(body["destinationAsset"], option.asset_id);
+        assert_eq!(body["refundType"], "ORIGIN_CHAIN");
+        // A buy carries no app fee at all.
+        let buy = engine_execution::near_intents::QuoteRequest::exact_input(
+            "a", "b", "1", "r", "f", "d", true,
+        );
+        assert!(serde_json::to_value(&buy).unwrap().get("appFees").is_none());
+    }
+
+    #[test]
+    fn a_summary_shows_the_start_and_end_of_an_address() {
+        assert_eq!(
+            super::short_address("9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM"),
+            "9WzDXw…AWWM"
+        );
+        assert_eq!(super::short_address("bob.near"), "bob.near");
+        assert_eq!(super::short_units("0.062153587"), "0.062153");
+        assert_eq!(super::short_units("6.500000"), "6.5");
+        assert_eq!(super::short_units("12"), "12");
+    }
 
     #[tokio::test]
     async fn a_slow_provider_keeps_the_deep_result_from_another_provider() {
