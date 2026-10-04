@@ -105,6 +105,29 @@ impl<'a> QuoteRequest<'a> {
             app_fees: Vec::new(),
         }
     }
+    /// Fix what the recipient gets; 1Click adds fees and the input-side price buffer to amount_in.
+    pub fn exact_output(
+        origin_asset: &'a str,
+        destination_asset: &'a str,
+        amount: &'a str,
+        recipient: &'a str,
+        refund_to: &'a str,
+        deadline: &'a str,
+        dry: bool,
+    ) -> Self {
+        Self {
+            swap_type: "EXACT_OUTPUT",
+            ..Self::exact_input(
+                origin_asset,
+                destination_asset,
+                amount,
+                recipient,
+                refund_to,
+                deadline,
+                dry,
+            )
+        }
+    }
 }
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

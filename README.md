@@ -172,7 +172,16 @@ user's display currency.
 | POST | `/v1/sends/quote` → `/v1/sends/quote/{id}/execute` | Send to a friend |
 | GET | `/v1/deposit/networks` · POST `/v1/deposit/quote` · GET `/v1/deposit/status` | Deposits from other networks |
 | GET · POST | `/v1/predictions/markets/{id}/comments` · POST `/v1/predictions/comments/{id}/delete` | A market's comments (newest first, 30 a page) signed with @handles; posting needs a handle, one line up to 280 characters, no links, one every 15 seconds and 30 an hour; only your own can be deleted |
-| GET | `/v1/withdrawals/networks` · POST `/v1/withdrawals/quote` → `/v1/withdrawals/quote/{id}/execute` | Withdraw to a wallet: cash leaves as USDC on Solana or Base, or any deposit coin, sent by 1Click to a pasted address, less a 1% fee |
+| GET | `/v1/withdrawals/networks` · POST `/v1/withdrawals/quote` → `/v1/withdrawals/quote/{id}/execute` | Withdraw to a wallet: cash leaves as USDC on Solana or Base, or any deposit coin, sent by 1Click to a pasted address; the amount entered is what the recipient gets, and fees go on top |
+
+Wallet withdrawals use an exact-output quote. POST /v1/withdrawals/quote takes
+{ networkId, address, amount: { amount, currency } }, where amount is the recipient's payout value.
+The response keeps the same shape: receive.value is that entered value, receive.amount is the fixed
+coin amount, send is the full cash debit, and fee is send minus the payout (1Click app/route costs
+and its input price buffer). The input buffer can be refunded after settlement. networkFee separately
+estimates the wallet transfer's native-coin cost. The review and confirmation show the payout, fee
+and total cash debit; execution refuses a higher debit or a smaller coin payout. For coins whose
+price moves, the fixed coin amount is valued at the price used to quote it.
 
 ---
 

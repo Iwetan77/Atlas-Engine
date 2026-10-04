@@ -221,6 +221,7 @@ struct WithdrawQuote {
     amount: u128,
     fee: u128,
     minimum_out: u128,
+    receive: u128,
     currency: String,
     expires: u64,
 }
@@ -1707,9 +1708,9 @@ fn withdraw_options() -> impl Iterator<Item = &'static DepositOption> {
     WITHDRAW_FIRST.iter().chain(DEPOSIT_NETWORKS.iter())
 }
 
-// The fee on a withdrawal to a wallet: 1% of what leaves the balance (₦10 of ₦1,000), a 1Click app
-// fee taken as the swap settles, so a refunded withdrawal pays nothing. With Atlas's API key 1Click
-// keeps half of it; the other half builds up as a NEAR Intents balance of ATLAS_FEE_NEAR_ACCOUNT.
+// The 1Click app fee is added to the deposit needed for an exact payout, never taken from the
+// recipient's amount. It is collected as the swap settles, so a refunded withdrawal pays nothing.
+// With Atlas's API key 1Click keeps half of it; the other half builds up as a NEAR Intents balance of ATLAS_FEE_NEAR_ACCOUNT.
 // Until that account is set, withdrawals to a wallet stay off.
 const WITHDRAW_FEE_BPS: u32 = 100;
 pub(super) fn fee_account() -> Option<String> {
@@ -1822,7 +1823,7 @@ fn withdraw_request<'a>(
             recipient: fee_to,
             fee: WITHDRAW_FEE_BPS,
         }],
-        ..QuoteRequest::exact_input(
+        ..QuoteRequest::exact_output(
             origin,
             option.asset_id,
             units,
@@ -1832,6 +1833,121 @@ fn withdraw_request<'a>(
             dry,
         )
     }
+}
+
+fn withdraw_units(amount: u128, token: &Token, dollar: bool) -> Result<u128, ApiError> {
+    let price = if dollar {
+        1_000_000
+    } else {
+        let value = token
+            .price
+            .as_ref()
+            .ok_or_else(|| venue("No price for this coin right now"))?;
+        let text = value
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| value.to_string());
+        let price = usd_micros(&text)?;
+        if price == 0 {
+            return Err(venue("No price for this coin right now"));
+        }
+        price
+    };
+    let scale = 10u128
+        .checked_pow(token.decimals)
+        .ok_or_else(|| bad("amount too large"))?;
+    amount
+        .checked_mul(scale)
+        .map(|n| n.div_ceil(price))
+        .filter(|n| *n > 0)
+        .ok_or_else(|| bad("amount too large"))
+}
+
+// EXACT_OUTPUT fixes both the expected and minimum payout. Never accept a smaller recipient amount.
+fn withdraw_input(
+    q: &engine_execution::near_intents::Quote,
+    output: u128,
+    maximum: Option<u128>,
+) -> Result<u128, ApiError> {
+    if q.amount_out.parse::<u128>().ok() != Some(output)
+        || q.min_amount_out
+            .as_deref()
+            .is_some_and(|n| n.parse::<u128>().ok() != Some(output))
+    {
+        return Err(venue("The withdrawal quote changed the recipient's amount"));
+    }
+    let input = q
+        .amount_in
+        .parse::<u128>()
+        .ok()
+        .filter(|n| *n > 0)
+        .ok_or_else(|| venue("The withdrawal quote omitted its full cost"))?;
+    if maximum.is_some_and(|cap| input > cap) {
+        return Err(conflict(
+            "The withdrawal cost increased. Request a fresh quote.",
+        ));
+    }
+    Ok(input)
+}
+
+fn withdraw_cost(input: u128, receive: u128) -> Result<u128, ApiError> {
+    input
+        .checked_sub(receive)
+        .ok_or_else(|| venue("The withdrawal quote returned an invalid total"))
+}
+
+// Pick cash against the full quoted debit, not just the payout. If that changes the origin, re-quote it.
+#[allow(clippy::too_many_arguments)]
+async fn withdraw_route(
+    state: &AppState,
+    user: &app_balance::VerifiedWallets,
+    option: &DepositOption,
+    output: u128,
+    receive: u128,
+    address: &str,
+    fee_to: &str,
+    currency: &str,
+    rate: u128,
+) -> Result<(String, bool, u128, engine_execution::near_intents::Quote), ApiError> {
+    let mut funding = pay_from(
+        state,
+        user,
+        receive.saturating_add(withdraw_fee(receive)),
+        currency,
+        rate,
+    )
+    .await?;
+    let units = output.to_string();
+    let deadline = deadline_utc(180);
+    for _ in 0..2 {
+        let request = withdraw_request(
+            funding.3,
+            option,
+            &units,
+            address,
+            &funding.0,
+            &deadline,
+            fee_to.into(),
+            true,
+        );
+        let q = state
+            .near
+            .client
+            .quote(&request)
+            .await
+            .map_err(|e| withdraw_refused(option, e, currency, rate))?;
+        let input = withdraw_input(&q, output, None)?;
+        withdraw_cost(input, receive)?;
+        markets::check_limits(input, currency, rate)?;
+        let checked = pay_from(state, user, input, currency, rate).await?;
+        if checked.0 == funding.0 && checked.1 == funding.1 {
+            return Ok((checked.0, checked.1, checked.2, q));
+        }
+        funding = checked;
+    }
+    Err(conflict(
+        "The withdrawal cost changed. Request a fresh quote.",
+    ))
 }
 
 pub(super) async fn withdraw_quote(
@@ -1870,7 +1986,7 @@ pub(super) async fn withdraw_quote(
     let amount = markets::parse_micros(&req.amount.amount)?
         .checked_mul(1_000_000)
         .ok_or_else(|| bad("amount too large"))?
-        / rate;
+        .div_ceil(rate);
     markets::check_limits(amount, &currency, rate)?;
     let token = state
         .near
@@ -1884,31 +2000,15 @@ pub(super) async fn withdraw_quote(
                 option.label
             ))
         })?;
-    let (wallet, from_solana, network_fee, origin) =
-        pay_from(&state, &user, amount, &currency, rate).await?;
-    let deadline = deadline_utc(180);
-    let units = amount.to_string();
-    let request = withdraw_request(
-        origin, option, &units, &address, &wallet, &deadline, fee_to, true,
-    );
-    let q = state
-        .near
-        .client
-        .quote(&request)
-        .await
-        .map_err(|e| withdraw_refused(option, e, &currency, rate))?;
-    if q.amount_in.parse::<u128>().ok() != Some(amount) {
-        return Err(venue("1Click changed the exact input amount"));
-    }
-    let output: u128 = q.amount_out.parse().map_err(internal)?;
-    let output_usd = usd_micros(&q.amount_out_usd)?;
-    let minimum_out: u128 = q
-        .min_amount_out
-        .as_deref()
-        .unwrap_or(&q.amount_out)
-        .parse()
-        .map_err(internal)?;
-    let fee = withdraw_fee(amount);
+    let output = withdraw_units(amount, &token, option.dollar)?;
+    let (wallet, from_solana, network_fee, q) = withdraw_route(
+        &state, &user, option, output, amount, &address, &fee_to, &currency, rate,
+    )
+    .await?;
+    let input = withdraw_input(&q, output, None)?;
+    // Includes 1Click's app fee, route cost and input buffer. Unused input is refunded.
+    let fee = withdraw_cost(input, amount)?;
+    let receive = req.amount;
     let quote_id = id("w");
     let expires = now() + 30_000;
     state.near.withdrawals.lock().map_err(internal)?.insert(
@@ -1921,9 +2021,10 @@ pub(super) async fn withdraw_quote(
             option,
             token: token.clone(),
             address: address.clone(),
-            amount,
+            amount: input,
             fee,
-            minimum_out,
+            minimum_out: output,
+            receive: amount,
             currency: currency.clone(),
             expires,
         },
@@ -1935,11 +2036,11 @@ pub(super) async fn withdraw_quote(
         "network": option.network,
         "asset": option.asset,
         "address": address,
-        "send": money(amount, &currency, rate),
+        "send": money(input, &currency, rate),
         "fee": money(fee, &currency, rate),
         "networkFee": money(network_fee, &currency, rate),
         "receive": {"amount": markets::format_units(output, token.decimals), "symbol": option.asset,
-            "value": money(output_usd, &currency, rate)},
+            "value": receive},
         "timeEstimateSec": q.time_estimate,
         "expiresAtUnixMs": expires,
     })))
@@ -2024,7 +2125,7 @@ pub(super) async fn withdraw_execute(
     )
     .await?;
     let deadline = deadline_utc(if gas_topup { 20 * 60 } else { 240 });
-    let units = stored.amount.to_string();
+    let units = stored.minimum_out.to_string();
     let origin = if stored.from_solana {
         SOLANA_USDC_1CLICK
     } else {
@@ -2046,17 +2147,8 @@ pub(super) async fn withdraw_execute(
         .quote(&request)
         .await
         .map_err(|e| withdraw_refused(stored.option, e, &stored.currency, rate))?;
-    let fresh_minimum = fresh
-        .min_amount_out
-        .as_deref()
-        .unwrap_or(&fresh.amount_out)
-        .parse::<u128>()
-        .unwrap_or_default();
-    if fresh.amount_in.parse::<u128>().ok() != Some(stored.amount)
-        || fresh_minimum < stored.minimum_out.saturating_mul(99) / 100
-    {
-        return Err(conflict("route price changed; request a fresh quote"));
-    }
+    withdraw_input(&fresh, stored.minimum_out, Some(stored.amount))?;
+    // The confirmed debit is the cap. Any spare input returns to the same wallet.
     let deposit = fresh
         .deposit_address
         .ok_or_else(|| venue("1Click omitted deposit address"))?;
@@ -2132,9 +2224,10 @@ pub(super) async fn withdraw_execute(
     let mut summary = vec![
         json!({"label":"To","value":short_address(&stored.address)}),
         json!({"label":"Network","value":stored.option.label}),
-        json!({"label":"You send","value":markets::say_money(stored.amount,&stored.currency,rate)}),
+        json!({"label":"They receive","value":markets::say_money(stored.receive, &stored.currency, rate)}),
+        json!({"label":"In coins","value":format!("{get} {}", stored.option.asset)}),
         json!({"label":"Fee","value":markets::say_money(stored.fee,&stored.currency,rate)}),
-        json!({"label":"They get (about)","value":format!("{get} {}", stored.option.asset)}),
+        json!({"label":"Total from cash","value":markets::say_money(stored.amount,&stored.currency,rate)}),
     ];
     if stored.network_fee > 0 {
         summary.push(json!({"label":"Network fee",
@@ -6283,6 +6376,102 @@ pub(super) async fn resume(
 mod tests {
 
     #[test]
+    fn wallet_withdrawal_fees_go_on_top_of_the_requested_payout() {
+        // At 1,000 naira per dollar: 5,000 for them, 350 in fees, 5,350 from cash.
+        let payout = 5_000_000;
+        let input = 5_350_000;
+        let fee = super::withdraw_cost(input, payout).unwrap();
+        assert_eq!(super::money(payout, "NGN", 1_000_000_000)["amount"], "5000");
+        assert_eq!(super::money(fee, "NGN", 1_000_000_000)["amount"], "350");
+        assert_eq!(super::money(input, "NGN", 1_000_000_000)["amount"], "5350");
+        assert!(super::withdraw_cost(payout - 1, payout).is_err());
+    }
+
+    #[test]
+    fn withdrawal_payout_rounds_up_to_a_whole_coin_unit() {
+        let mut token: engine_execution::near_intents::Token = serde_json::from_value(
+            serde_json::json!({"assetId":"cash","blockchain":"base","symbol":"USDC",
+                "decimals":6,"contractAddress":null,"price":0.999993,"coingeckoId":null}),
+        )
+        .unwrap();
+        assert_eq!(
+            super::withdraw_units(3_333_334, &token, true).unwrap(),
+            3_333_334
+        );
+        token.decimals = 2;
+        assert_eq!(super::withdraw_units(3_333_334, &token, true).unwrap(), 334);
+        token.decimals = 9;
+        token.price = Some(serde_json::json!("1.18"));
+        assert_eq!(
+            super::withdraw_units(3_333_334, &token, false).unwrap(),
+            2_824_859_323
+        );
+        token.price = Some(serde_json::json!(0));
+        assert!(super::withdraw_units(1_000_000, &token, false).is_err());
+        token.decimals = 255;
+        assert!(super::withdraw_units(1_000_000, &token, true).is_err());
+    }
+
+    #[test]
+    fn exact_payout_quotes_include_fees_without_reducing_the_recipient_amount() {
+        // Captured from 1Click EXACT_OUTPUT Base USDC -> Solana USDC, 2026-10-04 (dry).
+        let mut q: engine_execution::near_intents::Quote = serde_json::from_value(
+            serde_json::json!({"amountIn":"3411397","minAmountIn":"3377283",
+                "amountOut":"3333334","minAmountOut":"3333334","amountOutUsd":"3.333334000000",
+                "timeEstimate":32}),
+        )
+        .unwrap();
+        assert_eq!(
+            super::withdraw_input(&q, 3_333_334, None).unwrap(),
+            3_411_397
+        );
+        assert_eq!(super::withdraw_cost(3_411_397, 3_333_334).unwrap(), 78_063);
+        assert!(super::withdraw_input(&q, 3_333_334, Some(3_411_396)).is_err());
+        assert!(super::withdraw_input(&q, 3_333_334, Some(3_411_397)).is_ok());
+        assert!(super::withdraw_input(&q, 3_333_334, Some(3_500_000)).is_ok());
+        q.min_amount_out = Some("3300000".into());
+        assert!(super::withdraw_input(&q, 3_333_334, None).is_err());
+        q.min_amount_out = Some("3333334".into());
+        q.amount_out = "3300000".into();
+        assert!(super::withdraw_input(&q, 3_333_334, None).is_err());
+        q.amount_out = "3333334".into();
+        q.amount_in = "0".into();
+        assert!(super::withdraw_input(&q, 3_333_334, None).is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "live mainnet 1Click dry quotes; no transaction is signed or sent"]
+    async fn wallet_withdrawal_dry_quotes_keep_exact_payout() {
+        let client = engine_execution::near_intents::Client::new(None).unwrap();
+        let deadline = super::deadline_utc(180);
+        let solana = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM";
+        let base = "0xEe8646AF9e1DDA672716389aB64a7bD0Fd202ba7";
+        for (origin, network, recipient, refund) in [
+            (super::BASE_USDC_1CLICK, "solana-usdc", solana, base),
+            (super::SOLANA_USDC_1CLICK, "base-usdc", base, solana),
+        ] {
+            let option = super::withdraw_options().find(|o| o.id == network).unwrap();
+            let request = super::withdraw_request(
+                origin,
+                option,
+                "3333334",
+                recipient,
+                refund,
+                &deadline,
+                "atlasfees.near".into(),
+                true,
+            );
+            let q = client
+                .quote(&request)
+                .await
+                .expect("live exact-output quote");
+            let input = super::withdraw_input(&q, 3_333_334, None).unwrap();
+            let fee = super::withdraw_cost(input, 3_333_334).unwrap();
+            println!("dry {network}: recipient=3333334, cash_debit={input}, fee_and_buffer={fee}; no funds moved");
+        }
+    }
+
+    #[test]
     fn withdrawals_take_one_percent_and_check_the_address_first() {
         // ₦1,000 at ₦1,500 a dollar is about $0.67: Atlas keeps 1% of it.
         assert_eq!(super::withdraw_fee(666_666), 6_666);
@@ -6356,6 +6545,9 @@ mod tests {
             body["appFees"],
             serde_json::json!([{"recipient":"atlasfees.near","fee":100}])
         );
+        assert_eq!(body["swapType"], "EXACT_OUTPUT");
+        assert_eq!(body["amount"], "10000000");
+        assert_eq!(body["slippageTolerance"], 100);
         assert_eq!(body["recipient"], "TN3W4H6rK2ce4vX9YnFQHwKENnHjoxb3m9");
         assert_eq!(body["destinationAsset"], option.asset_id);
         assert_eq!(body["refundType"], "ORIGIN_CHAIN");
