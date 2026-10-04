@@ -48,6 +48,7 @@ fn page_file(path: &str) -> Option<&'static str> {
         "/deposit" => Some("deposit.html"),
         "/add-bank" => Some("add-bank.html"),
         "/profile" => Some("profile.html"),
+        "/payment-pin" => Some("payment-pin.html"),
         "/handle" => Some("handle.html"),
         "/browse" => Some("browse.html"),
         "/send/friend" => Some("send/friend.html"),
@@ -124,6 +125,11 @@ mod tests {
 
     #[test]
     fn direct_links_resolve_only_exported_pages() {
+        assert_eq!(page_file("/payment-pin"), Some("payment-pin.html"));
+        assert_eq!(page_file("/payment-pin/"), Some("payment-pin.html"));
+        assert!(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("web/payment-pin.html")
+            .is_file());
         assert_eq!(page_file("/install"), Some("install.html"));
         assert_eq!(page_file("/install/"), Some("install.html"));
         assert_eq!(page_file("/send/wallet"), Some("send/wallet.html"));
