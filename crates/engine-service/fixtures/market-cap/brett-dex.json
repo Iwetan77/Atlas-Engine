@@ -1,0 +1,22 @@
+[
+  {
+    "chainId": "base",
+    "baseToken": {
+      "address": "0x532f27101965dd16442E59d40670FaF5eBB142E4",
+      "name": "Brett",
+      "symbol": "BRETT"
+    },
+    "quoteToken": {
+      "address": "0x4200000000000000000000000000000000000006",
+      "name": "Wrapped Ether",
+      "symbol": "WETH"
+    },
+    "liquidity": {
+      "usd": 866505.42,
+      "base": 79845318,
+      "quote": 150.1775
+    },
+    "marketCap": 57196507,
+    "fdv": 57196507
+  }
+]

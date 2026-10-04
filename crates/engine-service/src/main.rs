@@ -2,6 +2,7 @@
 //! account is available only when the operator explicitly enables local demo mode.
 
 mod app_balance;
+mod asset_stats;
 mod cashlinks;
 mod comments;
 mod daya;
@@ -185,6 +186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/transactions/{id}", get(transactions::detail))
         .route("/v1/assets", get(markets::assets))
         .route("/v1/assets/{asset_id}/chart", get(markets::chart))
+        .route("/v1/assets/{asset_id}/stats", get(asset_stats::stats))
         .route("/v1/positions/spot", get(positions::spot))
         .route("/v1/me", get(social::me))
         .route("/v1/me/pin", get(pin::status).post(pin::set))

@@ -765,6 +765,23 @@ pub(super) async fn find_asset(state: &MarketState, id: &str) -> Result<Asset, A
     Err((StatusCode::NOT_FOUND, "unsupported asset".into()))
 }
 
+// Display statistics resolve a coin without warming the trading catalog first.
+pub(super) fn stats_token(id: &str) -> Option<(&'static str, String)> {
+    if looks_like_mint(id) {
+        return Some(("solana", id.into()));
+    }
+    if let Some(address) = id
+        .strip_prefix("base:")
+        .filter(|a| looks_like_evm_address(a))
+    {
+        return Some(("base", address.into()));
+    }
+    base_assets()
+        .into_iter()
+        .find(|a| a.id == id)
+        .map(|a| ("base", a.token))
+}
+
 // Live USD price and 24h change for Solana mints, from Jupiter, 50 at a time, shared for 15 seconds.
 pub(super) async fn usd_prices(
     state: &MarketState,
@@ -5175,6 +5192,19 @@ fn received_units(receipt: &Value, token: &str, wallet: &str) -> Option<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stats_resolve_mints_and_base_coins_without_a_catalog_request() {
+        let bonk = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263";
+        assert_eq!(stats_token(bonk), Some(("solana", bonk.into())));
+        assert_eq!(stats_token("brett-base"), Some(("base", BRETT.into())));
+        assert_eq!(
+            stats_token(&format!("base:{BRETT}")),
+            Some(("base", BRETT.into()))
+        );
+        assert_eq!(stats_token("base:https://example.com"), None);
+        assert_eq!(stats_token("unknown"), None);
+    }
+
     #[test]
     fn charts_have_a_coingecko_twin() {
         let deep = "0xdeeb7a4662eec9f2f3def03fb937a663dddaa2e215b8078a284d026b7946c270::deep::DEEP";
