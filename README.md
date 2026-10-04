@@ -2,11 +2,11 @@
 
 **One balance, every chain, one tap.** Atlas gives people in Nigeria (and anywhere they're paid in a
 currency that loses value) one balance in their own money that can buy memes, tokenized stocks and crypto,
-open perps, earn yield and pay friends, across Solana, Base, Sui, Monad, NEAR and Arc. This repo is the
+open perps, trade predictions, earn yield and pay friends, across Solana, Base, Sui, Monad, NEAR and Arc. This repo is the
 engine behind the [Atlas app](https://github.com/Iwetan77/Atlas): it prices everything, plans every action
-as plain transactions for the user's **own** wallets, and settles them.
+as bounded transactions and device signatures for the user's **own** wallets, and settles them.
 
-- **API:** https://atlas-engine-djed.onrender.com (`GET /health` shows the deployed commit and RPC hosts)
+- **API and website:** https://justatlas.xyz (`GET /health` shows the deployed commit and RPC hosts)
 - **App:** [Iwetan77/Atlas](https://github.com/Iwetan77/Atlas) (Expo: iOS, Android, web)
 
 Money is always shown in the user's currency (₦ first). Under the hood the cash is USDC on Solana and Base.
@@ -22,13 +22,17 @@ network loses money.
 2. **Add money.**
    - USDC on Solana or Base goes straight into the user's own wallet.
    - 23 more options (USDT on Tron and BNB Chain, USDC on Sui, SOL, BTC, ETH…) get a one-off deposit address
-     from NEAR Intents 1Click; whatever arrives becomes USDC on Solana. The most used are flagged `featured`.
+     from NEAR Intents 1Click; the quote fixes the USDC output on Solana. Type what should land in the balance;
+     fees are added on top, and the app shows the total to send. The most used are flagged `featured`.
+   - Bank top-ups create a one-time Nigerian bank account. The requested balance amount is preserved;
+     Fee and delivery charges go on top of the transfer total.
 3. **One balance.** `GET /v1/balance` adds up cash on every chain, savings, perps margin and every coin held,
    valued live in the user's currency.
 4. **Every action is a quote, then one confirm.**
    - The app asks for a quote; the engine prices it and checks limits and cash, in the user's currency.
    - On confirm it returns an **execution plan**: the exact transactions for the user's wallets, in order.
-   - The app signs them after the one confirmation; the engine lands them and reports each stage:
+   - The app signs transactions, checked typed data and one-use device approvals after the one confirmation;
+     the engine lands them and reports each stage:
      `validate → fund → sign → execute → settle`.
 5. **Unified cash.** If the cash is on the other chain, the plan moves the shortfall first and finishes
    the action once it lands, still behind that one confirm:
@@ -50,7 +54,12 @@ network loses money.
    the link, signs in, and the bridge (given the secret they hold) signs one payout through Relay to their
    Solana wallet, with no gas. The sender can take it back the same way; after 30 days only the sender can.
 8. **Track records.** Every spot fill is kept, so each holding shows its average entry and gain or loss;
-   meme cards on Home are made from it.
+   meme cards on Home are made from it. Activity includes deposits, sends, withdrawals, trades and predictions,
+   with pending states and transaction IDs. Home shows six recent actions and links to the full history.
+   Bank recipient suggestions filter saved recents as the user types an account number.
+9. **Predictions.** Polymarket events and outcome shares, paid from the balance. The user's device signs
+   and submits venue requests; cash returned to Atlas lands the amount entered, with fees added on top.
+10. **Money emails.** Senviok sends event updates to the user's sign-in address, with an opt-out in Profile.
 
 ---
 
@@ -62,8 +71,12 @@ network loses money.
 | **Jupiter** | Solana spot: ~350 verified assets (memes, xStocks, crypto), gasless orders, price charts, Jupiter Lend savings. |
 | **KyberSwap** | Base swaps: searches every exchange for the best route (router pinned, every built swap decoded and checked: amount in, no fees, pays the user). Any Base token by pasting its address; trending Base coins (GeckoTerminal, CoinGecko-listed only) in Trade. |
 | **Uniswap v3** | Base swaps when Kyber can't answer (one direct pool). |
-| **NEAR Intents 1Click** | Buys on other chains (Sui, NEAR, Monad…), paid from Base cash or, when Base can't cover it, Solana cash; deposits from 23 networks and coins; SUI cashouts. |
-| **Cetus** | Sui coins 1Click doesn't list (DEEP…): 1Click delivers SUI, then Cetus swaps it in the user's own Sui wallet. |
+| **NEAR Intents 1Click** | Buys on other chains (Sui, NEAR, Monad…), paid from Base cash or, when Base can't cover it, Solana cash; deposits from supported networks and coins; listed-asset sells and SUI cashouts. |
+| **Cetus** | Sui coins 1Click doesn't list (DEEP, WAL…): 1Click delivers SUI, then a device-approved Cetus swap buys the coin. Selling swaps back to SUI before cash-out. |
+| **Ref Finance** | NEAR tokens beyond 1Click's list: search, holdings and swaps through Ref pools, signed with one-use device approvals. Pool discovery depends on Ref's indexer. |
+| **Polymarket** | Live events, outcome-share buy/sell, resolved claims and exact-output cash return; the phone signs and submits authentication, orders and wallet actions. |
+| **Kora** | User-paid USDC transfers for the Solana gas-reserve fallback; Atlas does not sponsor gas. |
+| **Bank transfers** | One-time Nigerian bank accounts for top-ups and Nigerian bank payouts; the user sees Fee and Rate. |
 | **Relay** | Base → Solana cash moves (one EIP-3009 signature, the solver pays gas), and Atlas Link payouts. |
 | **Layerswap** | Solana → Base (with refuel), the fallback to Relay. |
 | **CoW Protocol** | The Base gas tank: a USDC permit plus a USDC → ETH order, settled by a solver who pays the gas. |
@@ -80,17 +93,17 @@ network loses money.
 
 Atlas never holds user funds, and the engine can't move a user's money anywhere they didn't confirm.
 
-- **The user signs.** Plans are plain transactions for the user's own wallets; nothing leaves before their
-  one confirmation, and the app never signs typed data itself.
-- **Server-side signing is narrow and uses the user's own login.** The Privy bridge signs with the user's
-  JWT, never an unrestricted server key, and only these shapes (`privy-bridge/base-authorization.mjs`), each
-  rebuilt from checked fields and verified by recovering the signer:
+- **The user signs.** After one confirmation, the device signs bounded transactions, typed data and
+  exact Privy authorization requests. Sui and NEAR requests are prepared once, expire within minutes,
+  and can be committed only once. The bridge verifies the owner and confirmed bounds before forwarding
+  the device's approval to Privy; no `user_jwts` wallet-signing path remains.
+- **Every signed shape stays narrow** (`privy-bridge/base-authorization.mjs`):
   - a USDC `ReceiveWithAuthorization` from the user's wallet to a **pinned** receiver (Relay),
     for exactly the planned amount;
   - a USDC permit to CoW's vault relayer and a CoW order selling USDC for ETH **to the wallet itself**,
     both capped at $2 and two hours;
-  - for an Atlas Link, a payout from the link's own escrow to Relay's pinned receiver, signed with the secret
-    the claimer holds (the engine never stores it).
+  - for an Atlas Link, a payout from the link's own escrow to Relay's pinned receiver, signed with the
+    secret the claimer holds (the engine never stores it).
 - **Venue answers are checked before anything is planned:** deposit contracts, receivers, amounts, chain IDs
   and minimum outputs. A quote that differs from what the user saw is refused.
 - **Exact approvals**, never unlimited ones.
@@ -114,12 +127,12 @@ Atlas never holds user funds, and the engine can't move a user's money anywhere 
 flowchart LR
   APP[Atlas app<br/>Expo] -->|quote, execute, signed, status| API[engine-service<br/>Rust / axum on Render]
   APP -->|signs plans| PRIVYW[(User's Privy wallets)]
-  API -->|user's JWT only| BRIDGE[privy-bridge<br/>Node, loopback]
+  API -->|checked device approvals| BRIDGE[privy-bridge<br/>Node, loopback]
   BRIDGE --> PRIVY[Privy]
   API --> JUP[Jupiter] & KYBER[KyberSwap] & UNI[Uniswap v3] & ONECLICK[NEAR Intents 1Click]
   API --> RELAY[Relay] & LS[Layerswap] & COW[CoW Protocol]
   API --> HL[Hyperliquid] & EARN[Morpho · Aave · Jupiter Lend · Jito]
-  BRIDGE --> CETUS[Cetus / Sui]
+  BRIDGE --> CETUS[Cetus / Sui] & REF[Ref / NEAR] & PM[Polymarket / Polygon]
   API --> RPC[(Solana · Base · Sui · NEAR · Monad · Arc RPCs)]
   API --> PG[(Postgres)]
 ```
@@ -130,8 +143,8 @@ crates/engine-service      The HTTP API: balance, markets, trades, perps, earn, 
   src/near_intents.rs      1Click buys, deposits, Sui/NEAR/Monad holdings, charts and verification.
   src/earn.rs              Morpho, Aave, Jupiter Lend, Jito.
   src/hl.rs                Hyperliquid perps: markets, positions, quotes, margin, orders, cash-out.
-  src/gasless.rs           The user's session signs a checked authorization via the bridge.
-  privy-bridge/            Node sidecar: Privy token checks and user-JWT signing (see Safety).
+  src/gasless.rs           Prepares checked device typed-data authorizations and verifies the result.
+  privy-bridge/            Node sidecar: token checks, one-use device approvals, signature verification.
 crates/engine-execution    Venue clients: jupiter, uniswap, near_intents, relay_link, layerswap, cow,
                            hyperliquid, solana, gateway.
 crates/engine-core, engine-types, engine-discovery   Shared types and routing primitives.
@@ -146,8 +159,9 @@ the user signed; the status poll walks the intent through its stages, handing ou
 
 ## API
 
-All routes except `/health` need `Authorization: Bearer <Privy access token>`. Money in and out is in the
-user's display currency.
+Account and money-action routes need `Authorization: Bearer <Privy access token>`. Public exceptions
+include `/health`, cash-link previews, Predictions availability and the served website. Money in and
+out is in the user's display currency.
 
 | Method | Route | Purpose |
 |---|---|---|
@@ -160,6 +174,12 @@ user's display currency.
 | POST | `/v1/intents/{id}/signed` | What the app signed or sent for a plan |
 | GET | `/v1/intents/{id}` | Where an intent stands |
 | GET | `/v1/intents/{id}/next` | The second step, once cash or gas has landed |
+| GET | `/v1/intents/pending` | Purchases awaiting a device signature or recoverable completion |
+| GET | `/v1/transactions` · `/v1/transactions/{id}` | Activity history, receipts and transaction IDs |
+| POST | `/v1/onramp/bank/quote` · `/v1/onramp/bank` | Exact balance amount and the fee-inclusive bank transfer total |
+| GET | `/v1/onramp/bank/{id}` | Bank top-up status |
+| GET | `/v1/predictions/markets` · `/v1/predictions/account` | Events, outcome shares and Predictions cash |
+| POST | `/v1/predictions/quotes` → `/v1/predictions/quotes/{id}/execute` | Buy, sell, claim or return cash with one confirmation |
 | GET/POST | `/v1/perps/onboarding` | Perps access for the user's wallet |
 | GET | `/v1/perps/markets`, `/v1/perps/positions` | Hyperliquid markets (crypto, stocks, commodities, indices, currencies) and open positions |
 | POST | `/v1/perps/quotes` → `/execute`, `/v1/perps/positions/{id}/close-quote` → `/v1/perps/close-quotes/{id}/execute` | Open (optionally with `takeProfitPct` / `stopLossPct`, a gain or loss on margin) and close |
@@ -173,6 +193,17 @@ user's display currency.
 | GET | `/v1/deposit/networks` · POST `/v1/deposit/quote` · GET `/v1/deposit/status` | Deposits from other networks |
 | GET · POST | `/v1/predictions/markets/{id}/comments` · POST `/v1/predictions/comments/{id}/delete` | A market's comments (newest first, 30 a page) signed with @handles; posting needs a handle, one line up to 280 characters, no links, one every 15 seconds and 30 an hour; only your own can be deleted |
 | GET | `/v1/withdrawals/networks` · POST `/v1/withdrawals/quote` → `/v1/withdrawals/quote/{id}/execute` | Withdraw to a wallet: cash leaves as USDC on Solana or Base, or any deposit coin, sent by 1Click to a pasted address; the amount entered is what the recipient gets, and fees go on top |
+
+Deposits from a wallet/exchange and bank top-ups use the entered amount as the target balance credit.
+Their quotes show the extra route/delivery fees and the full amount to send. Predictions cash return
+also uses exact output: the quote's receive value is the entered amount and the debit includes fees.
+Availability and minimums are checked against the live provider; no quote promises an unavailable route.
+
+A deposit does not itself collect a Solana gas reserve on every arrival. Ordinary swaps first inspect
+existing SOL and simulate the unsigned transaction, including account rent; top-ups are conditional.
+The gas tank is kept outside spendable cash and valued at live SOL/USD and currency exchange rates,
+so its naira value can change even when the SOL quantity stays the same. Compare `gas[].amount`
+and the on-chain transfer to establish whether SOL was actually added.
 
 Wallet withdrawals use an exact-output quote. POST /v1/withdrawals/quote takes
 { networkId, address, amount: { amount, currency } }, where amount is the recipient's payout value.
@@ -430,15 +461,16 @@ Sources: [Kora fee abstraction](https://solana.com/docs/payments/send-payments/p
 
 ## Atlas website on Render
 
-The Docker image serves the app's production Expo web export from `crates/engine-service/web/`. The app source lives in `Iwetan77/Atlas` (desktop-web/mainnet); rebuild there with both `EXPO_PUBLIC_ENGINE_URL` and `EXPO_PUBLIC_WEB_URL` set to `https://atlas-engine-djed.onrender.com`, then replace this directory with the export. Run `python3 scripts/normalize-web-export.py crates/engine-service/web` before the diff gate: it packages public font/icon files under `assets/vendor` instead of ignored `node_modules` paths, updates their URLs, clears whitespace-only license-comment lines retained by Expo, and rehashes the entry URL. Signing code and license text are preserved. No local QA previews belong in the build. All runtime static files are copied by the existing Dockerfile.
+The Docker image serves the app's production Expo web export from `crates/engine-service/web/`. The app source lives in `Iwetan77/Atlas` (main); rebuild there with both `EXPO_PUBLIC_ENGINE_URL` and `EXPO_PUBLIC_WEB_URL` set to `https://justatlas.xyz`, then replace this directory with the export. Run `python3 scripts/normalize-web-export.py crates/engine-service/web` before the diff gate: it packages public font/icon files under `assets/vendor` instead of ignored `node_modules` paths, updates their URLs, clears whitespace-only license-comment lines retained by Expo, and rehashes the entry URL. Signing code and license text are preserved. No local QA previews belong in the build. All runtime static files are copied by the existing Dockerfile.
 
-Desktop browsers get the Atlas website and dashboard; phone browsers keep the phone layout. `/install` is public: Android says Coming soon until the app's public `EXPO_PUBLIC_ANDROID_APK_URL` is set and rebuilt. iPhone shows Safari Add to Home Screen instructions for the website. The manifest and existing Atlas icon are served without authentication; account APIs still require their normal Privy token. Only exported page routes are resolved by the GET fallback; unknown API paths and arbitrary files remain 404.
+Desktop browsers get the Atlas website and dashboard, including Predictions in the sidebar, Home shortcuts and welcome orbit; phone browsers keep the phone layout. `/install` is public: Android downloads the latest full release's `atlas.apk` from `https://github.com/Iwetan77/Atlas/releases/latest/download/atlas.apk`. The app's public `EXPO_PUBLIC_ANDROID_APK_URL` can override it. iPhone shows Safari Add to Home Screen instructions for the website. The manifest and existing Atlas icon are served without authentication; account APIs still require their normal Privy token. Only exported page routes are resolved by the GET fallback; unknown API paths and arbitrary files remain 404.
 
 
 ## Atlas Predictions (Polymarket)
 
-Open **More → Predictions**. Explore live events, choose an outcome, buy in your display currency,
-sell shares, claim resolved winnings, and return unused Predictions cash to Atlas.
+Open **Predictions** from the bottom bar, More, or the desktop sidebar and Home dashboard. Explore live events, choose an outcome, buy in your display currency,
+sell shares, claim resolved winnings, and return unused Predictions cash to Atlas. Cash return fixes
+the amount that lands in Atlas; the quote adds fees on top and shows the full Predictions debit.
 Atlas uses Polymarket's current Polygon pUSD Deposit Wallet and direct Base/Solana USDC bridge,
 without an extra NEAR Intents hop.
 
@@ -539,8 +571,7 @@ these paths have settled.
    `{configured, serverAllowed, serviceCountry, blockedBy, reason, deviceSubmission}`. It never returns IP addresses or secret values.
    `blockedBy` is `service_region`, `builder_setup`, or null. User eligibility is independently checked on the device.
 
-The existing Render service is in Oregon, USA. Its diagnostic check still reports its own region,
-but updated clients do not submit trades from that server. They check Polymarket's geoblock directly
+The service diagnostic reports the hosting region; updated clients do not submit trades from that server. They check Polymarket's geoblock directly
 and submit authentication, orders and signed wallet batches directly to Polymarket. No proxy,
 invented IP header or GPS location is used. Restricted device connections still cannot trade.
 
