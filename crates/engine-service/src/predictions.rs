@@ -213,8 +213,29 @@ async fn bridge(
     state: &AppState,
     headers: &HeaderMap,
     route: &str,
-    mut data: Value,
+    data: Value,
 ) -> Result<Value, ApiError> {
+    match bridge_or_minimum(state, headers, route, data.clone()).await? {
+        Ok(body) => Ok(body),
+        Err(minimum) => {
+            let currency = text(&data, "currency");
+            let currency = if currency.is_empty() { "NGN" } else { currency };
+            let rate = app_balance::fx_rate(currency).await?;
+            Err(conflict(format!(
+                "This needs at least {}.",
+                markets::say_money(minimum, currency, rate)
+            )))
+        }
+    }
+}
+// The bridge's answer, or the smallest amount it asked for when what was offered was too small
+// (an order's budget, or a cash transfer's minimum), in USDC units.
+async fn bridge_or_minimum(
+    state: &AppState,
+    headers: &HeaderMap,
+    route: &str,
+    mut data: Value,
+) -> Result<Result<Value, u128>, ApiError> {
     let AuthMode::Privy { bridge_url, http } = &state.auth else {
         return Err(conflict("Predictions needs your Atlas wallet"));
     };
@@ -246,13 +267,7 @@ async fn bridge(
             .as_str()
             .and_then(|v| v.parse::<u128>().ok())
         {
-            let currency = text(&data, "currency");
-            let currency = if currency.is_empty() { "NGN" } else { currency };
-            let rate = app_balance::fx_rate(currency).await?;
-            return Err(conflict(format!(
-                "This needs at least {}.",
-                markets::say_money(minimum, currency, rate)
-            )));
+            return Ok(Err(minimum));
         }
         return Err((
             if response_status.is_server_error() {
@@ -266,7 +281,7 @@ async fn bridge(
                 .into(),
         ));
     }
-    Ok(body)
+    Ok(Ok(body))
 }
 #[derive(Deserialize)]
 pub(super) struct Browse {
@@ -433,14 +448,18 @@ pub(super) async fn quote(
         } else {
             requested
         };
-        bridge(
-            &state,
-            &headers,
-            "preview",
-            json!({"marketId":input.market_id,"tokenId":input.token_id,
-            "side":input.side,"units":units.to_string(),"currency":currency,"deviceSubmission":true}),
-        )
-        .await?
+        let preview = json!({"marketId":input.market_id,"tokenId":input.token_id,
+            "side":input.side,"units":units.to_string(),"currency":currency,"deviceSubmission":true});
+        if input.side == "sell" {
+            bridge(&state, &headers, "preview", preview).await?
+        } else {
+            match bridge_or_minimum(&state, &headers, "preview", preview).await? {
+                Ok(q) => q,
+                Err(budget) => {
+                    return Err(too_small(&state, &user, cash, budget, 0, currency, rate).await?)
+                }
+            }
+        }
     };
     if input.side == "sell" {
         markets::check_limits(number(&q, "notional")?, currency, rate)?;
@@ -477,27 +496,45 @@ pub(super) async fn quote(
             return Err(markets::not_enough_cash(base + sol + cash, currency, rate));
         };
         let reserve = funding_reserve(&state, &user, from).await?;
+        // What the order alone needs, for when the cash that's left after the move falls short.
+        let order_budget = number(&q, "maximumSpend")?;
         let amount = shortfall
             .checked_sub(reserve)
             .filter(|v| *v > 0)
             .ok_or_else(|| markets::short_of_gas(currency, rate))?;
-        let mut funding = bridge(
+        let mut funding = match bridge_or_minimum(
             &state,
             &headers,
             "bridge-quote",
             json!({"units":amount.to_string(),"from":from,"currency":currency}),
         )
-        .await?;
+        .await?
+        {
+            Ok(funding) => funding,
+            // Below the smallest cash move: that much moved, plus the network-fee reserve.
+            Err(least) => {
+                return Err(
+                    too_small(&state, &user, cash, order_budget, least, currency, rate).await?,
+                )
+            }
+        };
         funding["gasReserve"] = json!(reserve.to_string());
         let effective = cash + number(&funding, "receiveUnits")?;
-        q = bridge(
+        q = match bridge_or_minimum(
             &state,
             &headers,
             "preview",
             json!({"marketId":input.market_id,"tokenId":input.token_id,
             "side":"buy","units":effective.to_string(),"currency":currency,"deviceSubmission":true}),
         )
-        .await?;
+        .await?
+        {
+            Ok(q) => q,
+            // What reached the order after the move's fee and the network-fee reserve fell short.
+            Err(budget) => {
+                return Err(too_small(&state, &user, cash, budget, 0, currency, rate).await?)
+            }
+        };
         q["owner"] = json!(user.user_id);
         q["currency"] = json!(currency);
         q["rate"] = json!(rate.to_string());
@@ -923,6 +960,57 @@ async fn funding_reserve(
         markets::BASE_GAS_REFILL_USDC
     })
 }
+// The cash move to Polymarket: about 0.02% (measured 2026-10-04: $5 → 0.12¢, $20 → 0.47¢). Allowed
+// for as 0.1% and a cent, so the minimum shown is never short.
+fn with_move_fee(units: u128) -> u128 {
+    units + units / 1000 + 10_000
+}
+
+// A buy too small to place: the least to spend for it to go through, in words. That's the order's
+// own smallest budget (from the market), and when Predictions cash doesn't cover it, the rest moved
+// in (its fee, and at least the smallest move) plus the network-fee reserve kept from the spend.
+async fn too_small(
+    state: &AppState,
+    user: &app_balance::VerifiedWallets,
+    cash: u128,
+    order_budget: u128,
+    least_move: u128,
+    currency: &str,
+    rate: u128,
+) -> Result<ApiError, ApiError> {
+    // A price can tick up between this answer and the next try: 1% of room on the order.
+    let order_budget = order_budget + order_budget / 100;
+    let (spend, reserve) = if cash >= order_budget && least_move == 0 {
+        (order_budget, 0)
+    } else {
+        let from = if user.solana_wallet.is_some() {
+            let sol =
+                markets::solana_cash(state, user.solana_wallet.as_deref().unwrap_or("")).await;
+            if sol >= order_budget.saturating_sub(cash) {
+                "solana"
+            } else {
+                "base"
+            }
+        } else {
+            "base"
+        };
+        let reserve = funding_reserve(state, user, from).await?;
+        let moved = with_move_fee(order_budget.saturating_sub(cash)).max(least_move);
+        (cash + moved + reserve, reserve)
+    };
+    // Rounded up to a whole unit of their currency.
+    let micros = (spend * rate).div_ceil(1_000_000).div_ceil(1_000_000) * 1_000_000;
+    let shown = markets::say_micros(micros, currency);
+    Ok(conflict(if reserve > 0 {
+        format!(
+            "This needs at least {shown}, including {} kept for network fees.",
+            markets::say_money(reserve, currency, rate)
+        )
+    } else {
+        format!("This needs at least {shown}.")
+    }))
+}
+
 async fn funding(
     state: &AppState,
     headers: &HeaderMap,
@@ -1330,6 +1418,17 @@ pub(super) async fn portfolio(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cash_move_fee_is_never_under_allowed() {
+        // Measured on Polymarket's bridge (2026-10-04): $5 arrives as $4.998844, $20 as $19.995278.
+        assert!(with_move_fee(5_000_000) - 5_000_000 >= 1_156);
+        assert!(with_move_fee(20_000_000) - 20_000_000 >= 4_722);
+        // The ₦7,000 that failed: $5 for the order, $0.50 kept for network fees and the move's fee
+        // need more than that at ₦1,329/$ (about ₦7,400).
+        let spend = with_move_fee(5_050_000) + 500_000;
+        assert!(spend * 1_329_370_000 / 1_000_000 > 7_000_000_000);
+    }
 
     #[test]
     fn an_abandoned_auth_releases_the_action_before_funding_but_never_a_sent_order() {

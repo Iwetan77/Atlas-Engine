@@ -31,6 +31,12 @@ test('captured live book includes fees without exceeding the approved budget',()
 });
 test('limits, liquidity, unknown fees and changed values are refused',()=>{
  assert.throws(()=>orderQuote(captured.market,captured.book,'buy',1000n),/larger/);
+ // The minimum it reports is a budget that really buys an order the market takes.
+ let short;try{orderQuote(captured.market,captured.book,'buy',1000n);}catch(e){short=e;}
+ const smallest=BigInt(short.minimumUnits),bought=orderQuote(captured.market,captured.book,'buy',smallest);
+ assert.ok(BigInt(bought.notional)>=units(String(captured.book.min_order_size)));
+ assert.ok(BigInt(bought.shares)>=units(String(captured.book.min_order_size)));
+ assert.throws(()=>orderQuote(captured.market,captured.book,'buy',smallest-1000n),/larger/);
  assert.throws(()=>orderQuote(captured.market,{...captured.book,asks:[]},'buy',10000000n),/offers/);
  assert.throws(()=>orderQuote({...captured.market,feeSchedule:null},captured.book,'buy',10000000n),/fee/);
  assert.throws(()=>units('1e4'),/Invalid/);

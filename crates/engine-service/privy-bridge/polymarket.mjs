@@ -173,7 +173,16 @@ export function orderQuote(raw,book,side,budget){
  const available=levels.filter(l=>side==='buy'?l.price<=limit:l.price>=limit).reduce((n,l)=>n+l.size,0n);
  if(shares>available)throw new Error('Not enough offers at this price. Try a smaller amount.');
  const notional=shares*limit/1000000n;
- if(shares<minimum||notional<minimum){const e=new Error('This market needs a larger order.');e.minimumUnits=minimum.toString();throw e;}
+ if(shares<minimum||notional<minimum){
+  const e=new Error('This market needs a larger order.');
+  // A buy's smallest budget, not the bare minimum: enough shares for the market's share and dollar
+  // minimums at this limit, in 0.01-share steps, with the fee and the 10-unit margin on top.
+  if(side==='buy'){
+   let need=(minimum*1000000n+limit-1n)/limit;if(need<minimum)need=minimum;need=(need+9999n)/10000n*10000n;
+   e.minimumUnits=((need*(limit+fee)+999999n)/1000000n+10n).toString();
+  }else e.minimumUnits=minimum.toString();
+  throw e;
+ }
  const feeUnits=(shares*fee/1000000n+9n)/10n*10n;
  return {shares:shares.toString(),limit:limit.toString(),notional:notional.toString(),feeUnits:feeUnits.toString(),
   maximumSpend:(notional+feeUnits).toString(),minimumReceive:(notional>feeUnits?notional-feeUnits:0n).toString(),
