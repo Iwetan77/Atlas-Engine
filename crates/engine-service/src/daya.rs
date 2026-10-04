@@ -1175,8 +1175,12 @@ async fn account_closed(state: &AppState, account: &Value) -> Result<(), ApiErro
 
 #[derive(Deserialize)]
 pub(super) struct OnrampBody {
-    // Whole naira to pay in.
+    // Whole naira: to pay in, or (with `receive`) to land in the balance.
     amount: String,
+    // The amount is what should land: the fees go on top of it, into what's transferred. Older apps
+    // leave it out and get the old meaning (what they transfer, fees taken out of it).
+    #[serde(default)]
+    receive: bool,
     // The currency to show what lands in.
     currency: Option<String>,
 }
@@ -1186,20 +1190,60 @@ pub(super) struct OnrampQuery {
 }
 
 // What paying in `amount` naira gets: (naira paid, Daya's deposit fee, USDC that lands, the rate).
+// The USDC (units) that paying `pay` naira micros lands: the deposit fee comes off the naira, the
+// rest converts at Daya's rate, and the delivery fee comes off the USDC.
+fn lands(pay: u128, rate: &Rate, fees: &Fees) -> u128 {
+    ((pay - fees.deposit(pay)) * 1_000_000 / rate.ngn_per_usdc).saturating_sub(fees.usdc_payout_fee)
+}
+
+// The whole naira to transfer so that `target` naira (micros, at the balance's own naira rate
+// `ngn_fx`) lands: the delivery fee, Daya's conversion and the deposit fee all go on top.
+fn pay_for(target: u128, rate: &Rate, fees: &Fees, ngn_fx: u128) -> u128 {
+    let usdc = (target * 1_000_000).div_ceil(ngn_fx.max(1));
+    let after_fee = ((usdc + fees.usdc_payout_fee) * rate.ngn_per_usdc).div_ceil(1_000_000);
+    // The deposit fee is a share up to a cap: whichever needs less.
+    let by_share = if fees.deposit_pct < 100_000_000 {
+        (after_fee * 100_000_000).div_ceil(100_000_000 - fees.deposit_pct)
+    } else {
+        u128::MAX
+    };
+    let mut pay = by_share
+        .min(after_fee + fees.deposit_cap)
+        .div_ceil(1_000_000)
+        * 1_000_000;
+    // Checked with the very arithmetic the account uses; a naira more if rounding fell short.
+    for _ in 0..5 {
+        if lands(pay, rate, fees) >= usdc {
+            break;
+        }
+        pay += 1_000_000;
+    }
+    pay
+}
+
 async fn onramp_amounts(
     daya: &DayaState,
     amount: &str,
+    receive: bool,
 ) -> Result<(u128, u128, u128, Rate, Fees), ApiError> {
     let naira: u128 = amount
         .trim()
         .parse()
         .map_err(|_| bad("Enter a whole naira amount"))?;
-    let pay = naira
+    let entered = naira
         .checked_mul(1_000_000)
         .ok_or_else(|| bad("amount too large"))?;
+    if entered > 1_000_000_000_000_000 {
+        return Err(bad("amount too large"));
+    }
     let (rate, fees) = tokio::try_join!(daya.rate("BUY"), daya.fees())?;
+    let pay = if receive {
+        pay_for(entered, &rate, &fees, app_balance::fx_rate("NGN").await?)
+    } else {
+        entered
+    };
     let fee = fees.deposit(pay);
-    let usdc = ((pay - fee) * 1_000_000 / rate.ngn_per_usdc).saturating_sub(fees.usdc_payout_fee);
+    let usdc = lands(pay, &rate, &fees);
     if pay < rate.min_ngn || usdc < markets::MIN_USDC {
         return Err(bad(&format!(
             "The smallest bank transfer is {}",
@@ -1227,7 +1271,7 @@ pub(super) async fn onramp_quote(
     let currency = body.currency.as_deref().unwrap_or("NGN");
     markets::checked_currency(currency)?;
     let ((pay, fee, usdc, rate, fees), fx) = tokio::try_join!(
-        onramp_amounts(&state.daya, &body.amount),
+        onramp_amounts(&state.daya, &body.amount, body.receive),
         app_balance::fx_rate(currency)
     )?;
     Ok(Json(json!({
@@ -1261,7 +1305,7 @@ pub(super) async fn onramp_open(
             "Your wallet isn't ready yet. Try again in a moment.".into(),
         ))?;
     let ((pay, fee, usdc, rate, _), customer) = tokio::try_join!(
-        onramp_amounts(&state.daya, &body.amount),
+        onramp_amounts(&state.daya, &body.amount, body.receive),
         state.daya.customer(&user)
     )?;
     if rate.expires_ms < now_ms() + RATE_MARGIN_MS {
@@ -1813,6 +1857,40 @@ mod tests {
         assert_eq!(micros_of(&json!("100")), Some(100_000_000));
         assert_eq!(micros_of(&json!("-1")), None);
         assert_eq!(micros_of(&json!("1e3")), None);
+    }
+
+    #[test]
+    fn adding_money_puts_the_fees_on_top() {
+        let fees = Fees {
+            deposit_pct: 1_000_000,
+            deposit_cap: 100_000_000,
+            payout_pct: 1_000_000,
+            payout_cap: 100_000_000,
+            low_payout_fee: 20_000_000,
+            low_payout_below: 1_000_000_000,
+            payout_min: 100_000_000,
+            usdc_payout_fee: 200_000,
+        };
+        let rate = Rate {
+            id: "r".into(),
+            ngn_per_usdc: 1_560_000_000,
+            expires_ms: 0,
+            min_ngn: 1_000_000_000,
+            fetched: Instant::now(),
+        };
+        // ₦5,500 to land at ₦1,530/$ (the balance's rate): $3.594771 plus the $0.20 delivery fee at
+        // ₦1,560/$, plus 1%, in whole naira: ₦5,980.
+        let fx = 1_530_000_000;
+        let pay = pay_for(5_500_000_000, &rate, &fees, fx);
+        assert_eq!(pay, 5_980_000_000);
+        assert!(lands(pay, &rate, &fees) * fx / 1_000_000 >= 5_500_000_000);
+        // And never more than a naira over what's needed.
+        assert!(lands(pay - 1_000_000, &rate, &fees) * fx / 1_000_000 < 5_500_000_000);
+        // Big amounts hit the ₦100 cap instead of 1%.
+        let big = pay_for(500_000_000_000, &rate, &fees, fx);
+        assert!(lands(big, &rate, &fees) * fx / 1_000_000 >= 500_000_000_000);
+        assert_eq!(fees.deposit(big), 100_000_000);
+        assert!(lands(big - 1_000_000, &rate, &fees) * fx / 1_000_000 < 500_000_000_000);
     }
 
     #[test]
