@@ -592,3 +592,28 @@ No further confirm sheet is shown for subsequent steps of the same action.
 Sources: [Polymarket account setup](https://docs.polymarket.com/trading/wallets-auth),
 [geographic restrictions](https://docs.polymarket.com/api-reference/geoblock),
 [Render regions](https://render.com/docs/regions).
+
+## Payment PIN
+
+GET /v1/me/pin returns {configured, lockedUntilUnixMs}. POST /v1/me/pin sets a
+four-digit PIN with {pin, confirmation}; changing an existing PIN also requires currentPin.
+POST /v1/me/pin/authorize checks {pin, action} and returns
+{authorization, expiresAtUnixMs}. Send that authorization in x-atlas-pin-authorization on
+/signed, /next and device order submissions. It applies only to the owner's saved, unexpired
+intent; later steps and idempotent reports keep the same approval. Direct TP/SL edits, cash-link
+claims and embedded mini-app wallet requests are bound to all request fields and consumed once.
+Wallet requests consume via POST /v1/me/pin/consume. Clients also send
+x-atlas-payment-pin: 1; older clients are refused before receiving a money-moving plan.
+
+PINs use salted Argon2id after a domain-separated HMAC with a server-only pepper. The four-digit PIN
+is never persisted or logged. DATABASE_URL is required: PINs, attempts, lockouts and hashed
+authorization grants live in Postgres, with row locks to serialize concurrent guesses across
+instances. Five wrong attempts lock verification for 15 minutes; repeated lockouts rise to an hour,
+then a day. Successful verification resets that counter.
+
+ATLAS_PIN_PEPPER is an optional stable secret of at least 24 characters, kept outside the database.
+If absent, the existing PRIVY_APP_SECRET is used. Choose the pepper before users create PINs;
+changing it (or rotating the fallback Privy secret) requires a controlled recovery/migration process.
+Do not replace it without that process. /health exposes only keys.paymentPin, never its value.
+PIN changes require the current PIN and revoke earlier approvals. There is no login-only forgotten
+PIN reset endpoint. Signing remains on the user's device; the PIN does not give the server a wallet key.

@@ -1537,6 +1537,17 @@ pub(super) async fn update_tpsl(
     headers: HeaderMap,
     Json(req): Json<TpslRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    pin::require_action(
+        &state,
+        &headers,
+        pin::Action::Tpsl {
+            position_id: position_id.clone(),
+            take_profit_pct: req.take_profit_pct,
+            stop_loss_pct: req.stop_loss_pct,
+        },
+        true,
+    )
+    .await?;
     let (_, wallet) = wallet_of(&state, &headers).await?;
     let dex = split_coin(&position_id).0;
     if !dex.is_empty() && !DEXES.iter().any(|(d, _)| *d == dex) {

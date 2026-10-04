@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+argon2 = "0.5"
+rand = "0.8"
 axum = "0.8"
 base64 = "0.22"
 engine-core = { path = "../engine-core" }

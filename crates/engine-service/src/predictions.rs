@@ -749,6 +749,7 @@ pub(super) async fn device_request(
     Path(id): Path<String>,
     Json(input): Json<DeviceRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    pin::require_intent(&state, &headers, &id).await?;
     if !input.geo_allowed {
         return Err((
             StatusCode::FORBIDDEN,

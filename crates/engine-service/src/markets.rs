@@ -4766,6 +4766,7 @@ pub(super) async fn next_transactions(
     Path(intent_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
+    pin::require_intent(&state, &headers, &intent_id).await?;
     if intent_id.starts_with("prediction-") {
         return predictions::next(state, headers, intent_id).await;
     }

@@ -12,6 +12,7 @@ mod hl;
 mod markets;
 mod near_intents;
 mod pending;
+mod pin;
 mod positions;
 mod predictions;
 mod social;
@@ -61,6 +62,7 @@ struct AppState {
     history: transactions::HistoryStore,
     daya: daya::DayaState,
     predictions: predictions::PredictionState,
+    pin: pin::PinState,
 }
 
 #[derive(Clone)]
@@ -130,6 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         history: transactions::HistoryStore::new().await?,
         daya: daya::DayaState::new().await?,
         predictions: predictions::PredictionState::new().await?,
+        pin: pin::PinState::new().await?,
     };
     let bind: SocketAddr = env::var("ATLAS_BALANCE_BIND")
         .unwrap_or_else(|_| "127.0.0.1:3000".into())
@@ -184,6 +187,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/assets/{asset_id}/chart", get(markets::chart))
         .route("/v1/positions/spot", get(positions::spot))
         .route("/v1/me", get(social::me))
+        .route("/v1/me/pin", get(pin::status).post(pin::set))
+        .route("/v1/me/pin/authorize", post(pin::authorize))
+        .route("/v1/me/pin/consume", post(pin::consume))
         .route(
             "/v1/me/emails",
             get(emails::settings).post(emails::update_settings),
@@ -266,6 +272,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/earn/quotes", post(earn::quote))
         .route("/v1/earn/quotes/{quote_id}/execute", post(earn::execute))
         .route("/v1/intents/{intent_id}", get(emails::intent_status))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            pin::plan_gate,
+        ))
         .with_state(state);
     if let Some(cors) = configured_cors()? {
         app = app.layer(cors);
@@ -278,7 +288,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 // Public and secret-free: which commit Render is serving, and which RPC hosts it reads (hosts only;
 // a key in the URL never shows).
-async fn health() -> Json<serde_json::Value> {
+async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
     let host = |var: &str, default: &str| {
         reqwest::Url::parse(&env_url(var, default))
             .ok()
@@ -293,6 +303,7 @@ async fn health() -> Json<serde_json::Value> {
         },
         // Which optional partner keys are set (never the keys themselves).
         "keys": {
+            "paymentPin": state.pin.configured(),
             "nearIntents": env::var("NEAR_INTENTS_API_KEY").is_ok_and(|k| !k.trim().is_empty()),
             "relay": env::var("RELAY_API_KEY").is_ok_and(|k| !k.trim().is_empty()),
             // Withdrawals to a wallet take Atlas's fee into this NEAR account; off without it.
@@ -377,6 +388,8 @@ fn configured_cors() -> Result<Option<CorsLayer>, Box<dyn std::error::Error>> {
                 header::AUTHORIZATION,
                 header::CONTENT_TYPE,
                 header::HeaderName::from_static("privy-id-token"),
+                header::HeaderName::from_static("x-atlas-pin-authorization"),
+                header::HeaderName::from_static("x-atlas-payment-pin"),
             ]),
     ))
 }

@@ -207,6 +207,16 @@ pub(super) async fn claim(
     headers: HeaderMap,
     Json(body): Json<ClaimBody>,
 ) -> Result<Json<markets::IntentStatus>, ApiError> {
+    pin::require_action(
+        &state,
+        &headers,
+        pin::Action::Cashlink {
+            link_id: id.clone(),
+            secret: body.secret.clone(),
+        },
+        true,
+    )
+    .await?;
     let user = app_balance::verified_wallets(&state, &headers).await?;
     let to = user
         .solana_wallet

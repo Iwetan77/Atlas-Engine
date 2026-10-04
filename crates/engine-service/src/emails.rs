@@ -860,6 +860,7 @@ pub(super) async fn signed(
     headers: HeaderMap,
     body: Json<markets::Submission>,
 ) -> Result<Json<markets::IntentStatus>, ApiError> {
+    pin::require_intent(&state, &headers, &intent_id).await?;
     let answer =
         markets::signed(State(state.clone()), Path(intent_id), headers.clone(), body).await?;
     after_status(&state, &headers, &answer.0);
