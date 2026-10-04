@@ -53,6 +53,7 @@ fn page_file(path: &str) -> Option<&'static str> {
         "/send/friend" => Some("send/friend.html"),
         "/send/bank" => Some("send/bank.html"),
         "/send/link" => Some("send/link.html"),
+        "/send/wallet" => Some("send/wallet.html"),
         _ => {
             let parts: Vec<_> = path.strip_prefix('/')?.split('/').collect();
             match parts.as_slice() {
@@ -125,6 +126,8 @@ mod tests {
     fn direct_links_resolve_only_exported_pages() {
         assert_eq!(page_file("/install"), Some("install.html"));
         assert_eq!(page_file("/install/"), Some("install.html"));
+        assert_eq!(page_file("/send/wallet"), Some("send/wallet.html"));
+        assert_eq!(page_file("/send/wallet/"), Some("send/wallet.html"));
         assert_eq!(page_file("/sign-in-email"), Some("sign-in-email.html"));
         assert_eq!(
             page_file("/trade/near%3Acoin"),
