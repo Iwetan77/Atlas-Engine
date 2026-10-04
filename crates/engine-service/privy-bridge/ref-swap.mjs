@@ -46,7 +46,7 @@ async function fetchPools() {
   try {
     const r=await fetch('https://indexer.ref.finance/fetchAllPools',{signal:AbortSignal.timeout(10000)});
     const body=await r.json();
-    if(Array.isArray(body.simplePools))value=body.simplePools;
+    if(Array.isArray(body.simplePools))value=body.simplePools.map(indexedPool);
   } catch {}
   if(!value){
     const total=Number(await view(REF,'get_number_of_pools'));
@@ -62,6 +62,16 @@ async function fetchPools() {
     }
   }
   poolCache={at:Date.now(),value};return value;
+}
+// The indexer lists pools as {id, tokenIds, supplies:{token: amount}, fee, shareSupply}; the contract
+// as {token_account_ids, amounts, total_fee, shares_total_supply}. Everything here reads the
+// contract's shape: read as-is, every pool looked empty and every NEAR coin "had no liquidity"
+// whenever the indexer was up (live, 2026-10-04).
+export function indexedPool(p){
+  if(Array.isArray(p?.token_account_ids))return p;
+  const ids=Array.isArray(p?.tokenIds)?p.tokenIds:[];
+  return {id:Number(p?.id),pool_kind:p?.pool_kind??'SIMPLE_POOL',token_account_ids:ids,
+    amounts:ids.map(t=>String(p?.supplies?.[t]??'0')),total_fee:p?.fee,shares_total_supply:p?.shareSupply};
 }
 export function directPools(list,token,nearPrice){
   account(token);

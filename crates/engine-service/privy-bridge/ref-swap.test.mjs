@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
-import {transaction,swapCall,directPools,receivedToken,account,nextNonce,checkCashoutQuote,sentToken,cashDestination,available,wrapFirst,depositActions,GAS_RESERVE} from './ref-swap.mjs';
+import {transaction,swapCall,directPools,indexedPool,receivedToken,account,nextNonce,checkCashoutQuote,sentToken,cashDestination,available,wrapFirst,depositActions,GAS_RESERVE} from './ref-swap.mjs';
 import {PreparedSales} from './prepared-sale.mjs';
 const fixture=name=>JSON.parse(readFileSync(new URL('./fixtures/'+name,import.meta.url)));
 test('NEAR encoding matches the official near-api-js 7.3.1 vector',()=>{
@@ -25,6 +25,12 @@ test('thin or unrelated Ref pools cannot make an asset tradeable',()=>{
   assert.equal(directPools([p],'token.v2.ref-finance.near',3).length,1);
   assert.equal(directPools([p],'token.v2.ref-finance.near',1).length,0);
   assert.equal(directPools([p],'another.near',3).length,0);
+  // The same pool as Ref's indexer lists it (shape captured live, 2026-10-04) is found the same way.
+  const indexed=indexedPool({id:7,tokenIds:p.token_account_ids,fee:30,shareSupply:'1',pool_kind:'SIMPLE_POOL',
+    supplies:Object.fromEntries(p.token_account_ids.map((t,i)=>[t,p.amounts[i]]))});
+  assert.equal(directPools([indexed],'token.v2.ref-finance.near',3).length,1);
+  assert.equal(indexed.id,7);
+  assert.equal(indexedPool(p),p);
   assert.throws(()=>account('bad/token'));
 });
 test('Ref settlement counts only venue transfers of the output into this wallet',()=>{
