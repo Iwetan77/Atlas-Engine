@@ -421,15 +421,29 @@ pub(super) async fn quote(
         if requested > cash {
             return Err(markets::not_enough_cash(cash, currency, rate));
         }
-        let mut q = bridge(
-            &state,
-            &headers,
-            "bridge-quote",
-            json!({"units":requested.to_string(),"from":from,"withdraw":true,"currency":currency}),
-        )
-        .await?;
+        let ask = |units: u128| {
+            bridge(
+                &state,
+                &headers,
+                "bridge-quote",
+                json!({"units":units.to_string(),"from":from,"withdraw":true,"currency":currency}),
+            )
+        };
+        let mut q = ask(requested).await?;
+        // What's typed is what lands: the move's few cents go on top, from Predictions cash, when
+        // there's room for them (returning all of it, they come out of what lands).
+        let missing = requested.saturating_sub(number(&q, "receiveUnits")?);
+        let with_fee = requested + missing + missing / 5;
+        if missing > 0 && with_fee <= cash {
+            if let Ok(topped) = ask(with_fee).await {
+                if number(&topped, "receiveUnits")? >= requested {
+                    q = topped;
+                }
+            }
+        }
+        let leaves = number(&q, "units").unwrap_or(requested);
         q["side"] = json!("withdraw");
-        q["maximumSpend"] = json!(requested.to_string());
+        q["maximumSpend"] = json!(leaves.to_string());
         q["minimumReceive"] = q["receiveUnits"].clone();
         q["question"] = json!("Return Predictions cash");
         q["expiresAtUnixMs"] = json!(now() + 60_000);

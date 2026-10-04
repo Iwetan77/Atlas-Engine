@@ -1479,6 +1479,20 @@ pub(super) async fn deposit_networks() -> Json<Value> {
 pub(super) struct DepositRequest {
     network_id: String,
     amount: markets::Money,
+    // The amount is what should land in the balance: the coin to send carries the fees on top.
+    // Older apps leave it out and get the old meaning (the value sent, fees taken out of it).
+    #[serde(default)]
+    receive: bool,
+}
+
+// The coin units to send so about `target` USDC units land, from a first quote: `units` sent gave
+// `out`. Scaled up by what went missing, with 0.3% of room for the price moving, never down.
+fn units_for(units: u128, out: u128, target: u128) -> u128 {
+    if out == 0 || out >= target {
+        return units;
+    }
+    let scaled = (units * target).div_ceil(out);
+    scaled + scaled.div_ceil(333)
 }
 
 // "Temporary swap limits: minimum swap amount is $100" → 100.
@@ -1548,6 +1562,29 @@ pub(super) async fn deposit_quote(
     }
     .ok_or_else(|| bad("amount too large"))?;
     let deadline = deadline_utc(DEPOSIT_WINDOW_SECS);
+    // What lands is what was typed: a first look at what this many coins would bring, then the
+    // fees and route cost go on top of what to send. A failed first look leaves the amount as typed.
+    let typed_units = units;
+    let units = if req.receive {
+        let units_text = units.to_string();
+        let look = QuoteRequest {
+            dry: true,
+            ..QuoteRequest::flex_deposit(
+                asset_id,
+                SOLANA_USDC_1CLICK,
+                &units_text,
+                &wallet,
+                &refund_to,
+                &deadline,
+            )
+        };
+        match state.near.client.quote(&look).await {
+            Ok(first) => units_for(units, first.amount_out.parse().unwrap_or(0), usd),
+            Err(_) => units,
+        }
+    } else {
+        units
+    };
     let amount = units.to_string();
     let request = QuoteRequest::flex_deposit(
         asset_id,
@@ -1599,6 +1636,8 @@ pub(super) async fn deposit_quote(
         "label": label,
         "asset": asset,
         "sendAmount": markets::format_units(units, origin.decimals),
+        // What the coin sent is worth, so the fees (it less what lands) can be shown.
+        "sendValue": money(usd * units / typed_units.max(1), &currency, rate),
         "minAmount": markets::format_units(minimum, origin.decimals),
         "receive": money(receive, &currency, rate),
         "timeEstimateSec": q.time_estimate,
@@ -6556,6 +6595,20 @@ mod tests {
             "a", "b", "1", "r", "f", "d", true,
         );
         assert!(serde_json::to_value(&buy).unwrap().get("appFees").is_none());
+    }
+
+    #[test]
+    fn a_deposit_sends_enough_for_what_was_typed_to_land() {
+        // 32 USDT that brought $31.80 (fees and route cost) for $32 typed: send a little more.
+        let units = super::units_for(32_000_000, 31_800_000, 32_000_000);
+        assert!(units * 31_800_000 / 32_000_000 >= 32_000_000);
+        assert!(units < 32_400_000);
+        // Already enough, or no answer to go by: unchanged.
+        assert_eq!(
+            super::units_for(32_000_000, 32_100_000, 32_000_000),
+            32_000_000
+        );
+        assert_eq!(super::units_for(32_000_000, 0, 32_000_000), 32_000_000);
     }
 
     #[test]
