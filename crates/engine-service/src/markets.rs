@@ -18,9 +18,31 @@ pub(super) const SOL_USDC_MINT: &str = SOL_USDC;
 pub(super) const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const BRETT: &str = "0x532f27101965dd16442E59d40670FaF5eBB142E4";
 const AAPLC: &str = "0xb200000000000000000000C2e324d24d7eEcd1fb";
+#[cfg(test)]
 const JUPITER_VERIFIED: &str = "https://lite-api.jup.ag/tokens/v2/tag?query=verified";
-const JUPITER_PRICES: &str = "https://lite-api.jup.ag/price/v3";
-const JUPITER_SEARCH: &str = "https://lite-api.jup.ag/tokens/v2/search";
+
+// Jupiter's keyless API (lite-api) is limited per address, and shared hosting shares addresses.
+// With JUPITER_API_KEY (the key swaps already use) every data call goes to api.jup.ag under the
+// key's own limit; the paths are the same.
+static JUPITER_KEY: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| {
+    env::var("JUPITER_API_KEY")
+        .ok()
+        .map(|k| k.trim().to_owned())
+        .filter(|k| !k.is_empty())
+});
+pub(super) fn jupiter_keyed() -> bool {
+    JUPITER_KEY.is_some()
+}
+pub(super) fn jupiter_get(http: &reqwest::Client, path: &str) -> reqwest::RequestBuilder {
+    match JUPITER_KEY.as_deref() {
+        Some(key) => http
+            .get(format!("https://api.jup.ag{path}"))
+            .header("x-api-key", key),
+        None => http.get(format!("https://lite-api.jup.ag{path}")),
+    }
+}
+// Prices this old still stand in when Jupiter refuses a refresh.
+const PRICE_STALE_OK: Duration = Duration::from_secs(10 * 60);
 // Liquid enough that an order of up to $10,000 (the quote cap) routes without wrecking the price.
 const MIN_LIQUIDITY_USD: f64 = 100_000.0;
 const CATALOG_TTL: Duration = Duration::from_secs(30 * 60);
@@ -270,9 +292,7 @@ pub(super) async fn pasted_token(
         }
     }
     let fetched: Result<Vec<Value>, ApiError> = async {
-        state
-            .http
-            .get(JUPITER_SEARCH)
+        jupiter_get(&state.http, "/tokens/v2/search")
             .query(&[("query", mint)])
             .send()
             .await
@@ -649,9 +669,7 @@ pub(super) async fn catalog(state: &MarketState) -> Result<Arc<Vec<Asset>>, ApiE
         }
     }
     let fetched: Result<Vec<Value>, reqwest::Error> = async {
-        state
-            .http
-            .get(JUPITER_VERIFIED)
+        jupiter_get(&state.http, "/tokens/v2/tag?query=verified")
             .send()
             .await?
             .error_for_status()?
@@ -800,19 +818,37 @@ pub(super) async fn usd_prices(
             }
         }
     }
+    let mut refused = None;
     for chunk in missing.chunks(50) {
-        let body: Value = state
-            .http
-            .get(JUPITER_PRICES)
-            .query(&[("ids", chunk.join(","))])
-            .send()
-            .await
-            .map_err(unavailable)?
-            .error_for_status()
-            .map_err(unavailable)?
-            .json()
-            .await
-            .map_err(unavailable)?;
+        let fetched: Result<Value, ApiError> = async {
+            jupiter_get(&state.http, "/price/v3")
+                .query(&[("ids", chunk.join(","))])
+                .send()
+                .await
+                .map_err(unavailable)?
+                .error_for_status()
+                .map_err(unavailable)?
+                .json()
+                .await
+                .map_err(unavailable)
+        }
+        .await;
+        let body = match fetched {
+            Ok(body) => body,
+            // Refused or down: the last prices from the past few minutes stand in.
+            Err(error) => {
+                let cache = state.prices.lock().map_err(internal)?;
+                for mint in chunk {
+                    if let Some((at, price, change)) = cache.get(mint) {
+                        if at.elapsed() < PRICE_STALE_OK {
+                            result.insert(mint.clone(), (*price, *change));
+                        }
+                    }
+                }
+                refused = Some(error);
+                continue;
+            }
+        };
         let mut cache = state.prices.lock().map_err(internal)?;
         for mint in chunk {
             let Some(price) = body[mint]["usdPrice"].as_f64().filter(|p| *p > 0.0) else {
@@ -823,7 +859,10 @@ pub(super) async fn usd_prices(
             result.insert(mint.clone(), (price, change));
         }
     }
-    Ok(result)
+    match refused {
+        Some(error) if result.is_empty() && !mints.is_empty() => Err(error),
+        _ => Ok(result),
+    }
 }
 
 #[derive(Clone)]

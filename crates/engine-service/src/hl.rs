@@ -14,7 +14,11 @@ use serde_json::{json, Value};
 const QUOTE_MS: u64 = 45_000;
 // Every market's list in one call; refreshed in the background, fetched on the spot when older.
 const MARKETS_TTL: Duration = Duration::from_secs(30);
-const REFRESH_EVERY: Duration = Duration::from_secs(10);
+const REFRESH_EVERY: Duration = Duration::from_secs(20);
+// Hyperliquid limits requests per address and shared hosting shares addresses: when it says "too
+// many", the last good list keeps serving for a while, and refreshes slow down instead of piling on.
+const STALE_OK: Duration = Duration::from_secs(5 * 60);
+const BACKOFF_MAX: Duration = Duration::from_secs(5 * 60);
 // Hyperliquid's base taker fee (0.045%), and the price room a market order allows (3%).
 const TAKER_FEE: f64 = 0.00045;
 const SLIPPAGE: f64 = 0.03;
@@ -449,16 +453,29 @@ fn shortfall(needed: f64, have: f64) -> u128 {
     }
 }
 
-async fn markets_now(state: &AppState) -> Result<Arc<Vec<Market>>, ApiError> {
-    if let Some((at, markets)) = state.hl.markets.lock().map_err(internal)?.clone() {
-        if at.elapsed() < MARKETS_TTL {
-            return Ok(markets);
-        }
-    }
-    refresh_markets(state).await
+fn held_markets(state: &AppState, fresh_for: Duration) -> Option<Arc<Vec<Market>>> {
+    let held = state.hl.markets.lock().ok()?.clone()?;
+    (held.0.elapsed() < fresh_for).then_some(held.1)
 }
 
+async fn markets_now(state: &AppState) -> Result<Arc<Vec<Market>>, ApiError> {
+    if let Some(markets) = held_markets(state, MARKETS_TTL) {
+        return Ok(markets);
+    }
+    match refresh_markets(state).await {
+        Ok(markets) => Ok(markets),
+        Err(error) => held_markets(state, STALE_OK).ok_or(error),
+    }
+}
+
+// One refresh at a time: requests that arrive while one runs share its answer.
+static REFRESHING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn refresh_markets(state: &AppState) -> Result<Arc<Vec<Market>>, ApiError> {
+    let _turn = REFRESHING.lock().await;
+    if let Some(markets) = held_markets(state, Duration::from_secs(5)) {
+        return Ok(markets);
+    }
     let markets = Arc::new(state.hl.client.markets().await.map_err(venue)?);
     if markets.is_empty() {
         return Err(venue("Hyperliquid listed no markets"));
@@ -467,14 +484,24 @@ async fn refresh_markets(state: &AppState) -> Result<Arc<Vec<Market>>, ApiError>
     Ok(markets)
 }
 
-// The market list stays warm, so opening Perps never waits.
+// The market list stays warm, so opening Perps never waits. A refused refresh waits twice as long
+// before the next (up to five minutes); a good one goes back to the usual pace.
 pub(super) fn keep_warm(state: AppState) {
     tokio::spawn(async move {
+        let mut wait = REFRESH_EVERY;
         loop {
-            if let Err(error) = refresh_markets(&state).await {
-                eprintln!("hyperliquid markets not refreshed: {}", error.1);
+            match refresh_markets(&state).await {
+                Ok(_) => wait = REFRESH_EVERY,
+                Err(error) => {
+                    wait = (wait * 2).min(BACKOFF_MAX);
+                    eprintln!(
+                        "hyperliquid markets not refreshed (next try in {}s): {}",
+                        wait.as_secs(),
+                        error.1
+                    );
+                }
             }
-            tokio::time::sleep(REFRESH_EVERY).await;
+            tokio::time::sleep(wait).await;
         }
     });
 }

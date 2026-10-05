@@ -39,6 +39,7 @@ const LEND_MARKETS: &[(&str, &str)] = &[
         "jupiter-eurc-solana",
     ),
 ];
+#[cfg(test)]
 const JUPITER_LEND_TOKENS: &str = "https://lite-api.jup.ag/lend/v1/earn/tokens";
 // Logos the app shows for each venue.
 const JUPITER_ICON: &str = "https://static.jup.ag/jup/icon.png";
@@ -387,10 +388,7 @@ async fn jupiter_lend(state: &AppState) -> Result<Vec<Lend>, ApiError> {
             return Ok(markets.clone());
         }
     }
-    let tokens: Value = state
-        .earn
-        .http
-        .get(JUPITER_LEND_TOKENS)
+    let tokens: Value = markets::jupiter_get(&state.earn.http, "/lend/v1/earn/tokens")
         .timeout(Duration::from_secs(10))
         .send()
         .await

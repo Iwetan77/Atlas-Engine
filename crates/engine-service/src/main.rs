@@ -316,6 +316,8 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
             "withdrawFeeAccount": near_intents::fee_account().is_some(),
             // Emails about money in and out, trades and perps alerts (Senviok); off without it.
             "emails": emails::configured(),
+            // Jupiter data under Atlas's own key instead of the shared keyless limit.
+            "jupiter": markets::jupiter_keyed(),
         },
         // Bank transfers: whether Daya's key and webhook secret are set, and its last no-money check.
         "daya": daya::health(),
