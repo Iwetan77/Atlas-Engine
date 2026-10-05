@@ -176,21 +176,23 @@ async fn latest_android() -> Option<String> {
             return Some(version.clone());
         }
     }
+    // The release page's redirect names the newest tag; unlike GitHub's API it isn't limited per
+    // address, which matters on shared hosting.
     let fetched: Option<String> = async {
-        let body: serde_json::Value = reqwest::Client::new()
-            .get("https://api.github.com/repos/Iwetan77/Atlas/releases/latest")
-            .header("User-Agent", "atlas-engine")
-            .header("Accept", "application/vnd.github+json")
+        let response = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(8))
+            .build()
+            .ok()?
+            .get("https://github.com/Iwetan77/Atlas/releases/latest")
+            .header("User-Agent", "atlas-engine")
             .send()
             .await
-            .ok()?
-            .error_for_status()
-            .ok()?
-            .json()
-            .await
             .ok()?;
-        let tag = body["tag_name"].as_str()?.trim_start_matches('v');
+        let location = response.headers().get("location")?.to_str().ok()?;
+        let tag = location
+            .strip_prefix("https://github.com/Iwetan77/Atlas/releases/tag/")?
+            .trim_start_matches('v');
         is_version(tag).then(|| tag.to_owned())
     }
     .await;
