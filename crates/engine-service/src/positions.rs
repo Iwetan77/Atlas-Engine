@@ -183,20 +183,15 @@ fn signed_money(usdc: i128, currency: &str, rate: u128) -> Value {
     json!({"amount": format!("{sign}{}", markets::format_units(scaled, 6)), "currency": currency})
 }
 
-// An unavailable asset is not a sold asset. Other positions can still refresh.
-#[derive(Default)]
-struct Refresh {
-    positions: Vec<Value>,
-    unavailable: Vec<String>,
-}
-
 #[derive(Deserialize)]
 pub(super) struct SpotQuery {
     currency: Option<String>,
 }
 
-// Open spot positions with live value. What the wallet still holds caps each one: tokens sent
-// away outside Atlas leave the position (with their share of the cost).
+// Open spot positions with live value, from the same read as the balance (`app_balance::portfolio`):
+// a coin on Home always has its gain or loss, and the two can't disagree. What the wallet still
+// holds caps each one: tokens sent away outside Atlas leave the position (with their share of the
+// cost).
 pub(super) async fn spot(
     State(state): State<AppState>,
     Query(q): Query<SpotQuery>,
@@ -206,289 +201,120 @@ pub(super) async fn spot(
     let currency = q.currency.unwrap_or_else(|| "NGN".into());
     markets::checked_currency(&currency)?;
     let rate = app_balance::fx_rate(&currency).await?;
-    let trades = state.trades.for_user(&user.user_id).await?;
-    let wallets = Wallets {
-        solana: user.solana_wallet.as_deref().filter(|w| !w.is_empty()),
-        evm: user.evm_wallet.as_deref().filter(|w| !w.is_empty()),
-    };
-    // A slow Solana venue must not delay the Sui/NEAR cards, or vice versa.
-    let (other, near) = tokio::join!(
-        tokio::time::timeout(
-            Duration::from_secs(15),
-            valued(
-                &state.markets,
-                &state.solana_mainnet,
-                wallets,
-                &trades,
-                &currency,
-                rate
-            ),
-        ),
-        near_valued(&state, &headers, &user, &trades, &currency, rate),
-    );
-    let mut refreshed = match other {
-        Ok(Ok(refreshed)) => refreshed,
-        _ => Refresh {
-            positions: vec![],
-            unavailable: fold(&trades)
-                .into_iter()
-                .filter(|(id, p)| p.units > 0 && !id.starts_with("near:"))
-                .map(|(id, _)| id)
-                .collect(),
-        },
-    };
-    let near = near?;
-    refreshed.unavailable.extend(near.unavailable);
-    let mut positions = refreshed.positions;
-    positions.extend(near.positions);
-    positions.sort_by(|a, b| {
-        let v = |x: &Value| {
-            x["value"]["amount"]
-                .as_str()
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(0.0)
-        };
-        v(b).total_cmp(&v(a))
-    });
+    let portfolio = app_balance::portfolio(&state, &headers, &user).await?;
+    let positions = rows(&portfolio.holdings, &portfolio.trades, &currency, rate)?;
     let as_of = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(internal)?
         .as_millis() as u64;
+    // Every holding is in the read (a failed lookup keeps its last confirmed amount), so none is
+    // ever reported unavailable; the field stays for apps that look for it.
     Ok(Json(
-        json!({"positions": positions, "unavailableAssetIds": refreshed.unavailable, "asOfUnixMs": as_of}),
+        json!({"positions": positions, "unavailableAssetIds": [], "asOfUnixMs": as_of}),
     ))
 }
 
-#[derive(Clone, Copy)]
-struct Wallets<'a> {
-    solana: Option<&'a str>,
-    evm: Option<&'a str>,
+// One asset, however its id was written: Base addresses in either case, Sui coin types with or
+// without leading zeros.
+fn asset_key(id: &str) -> String {
+    if id.starts_with("base:") {
+        return id.to_ascii_lowercase();
+    }
+    if let Some(coin) = id.strip_prefix("near:sui:") {
+        return format!("near:sui:{}", near_intents::sui_coin_key(coin));
+    }
+    id.to_owned()
 }
 
-async fn valued(
-    markets: &markets::MarketState,
-    solana: &SolanaAtaPreflight,
-    wallets: Wallets<'_>,
-    trades: &[Trade],
-    currency: &str,
-    rate: u128,
-) -> Result<Refresh, ApiError> {
-    let open: Vec<(String, Position)> = fold(trades)
-        .into_iter()
-        .filter(|(id, p)| p.units > 0 && !id.starts_with("near:"))
-        .collect();
-    let mut assets = Vec::new();
-    let mut unavailable = Vec::new();
-    for (asset_id, position) in open {
-        // A token Atlas can no longer find or price has no live value to show.
-        if let Ok(asset) = markets::find_asset(markets, &asset_id).await {
-            assets.push((asset, position));
-        } else {
-            unavailable.push(asset_id);
-        }
-    }
-    // One read of the Solana wallet covers every Solana position; if it fails the tracked units stand.
-    let solana_held = match wallets.solana {
-        Some(owner) if assets.iter().any(|(a, _)| a.chain == "solana") => {
-            let (tokens, native) = tokio::join!(
-                solana.owner_token_balances(owner),
-                solana.owner_sol_balance(owner),
-            );
-            tokens.ok().map(|mut held| {
-                if let Ok(native) = native {
-                    match held.iter_mut().find(|(m, _, _)| m == markets::SOL_MINT) {
-                        Some(entry) => entry.1 = entry.1.saturating_add(native),
-                        None => held.push((markets::SOL_MINT.into(), native, 9)),
-                    }
-                }
-                held
-            })
-        }
-        _ => None,
-    };
-    let mints: Vec<String> = assets
+// What Atlas bought and still tracks of each asset, by `asset_key`.
+pub(super) fn open_positions(trades: &[Trade]) -> HashMap<String, Position> {
+    let keyed: Vec<Trade> = trades
         .iter()
-        .filter(|(a, _)| a.chain == "solana")
-        .map(|(a, _)| a.token.clone())
+        .map(|t| Trade {
+            asset_id: asset_key(&t.asset_id),
+            ..t.clone()
+        })
         .collect();
-    let prices = markets::usd_prices(markets, &mints).await?;
-    let mut result = Vec::new();
-    for (asset, p) in &assets {
-        let on_chain = if asset.chain == "solana" {
-            solana_held.as_ref().map(|held| {
-                held.iter()
-                    .filter(|(m, _, _)| *m == asset.token)
-                    .map(|(_, units, _)| *units)
-                    .sum::<u128>()
-            })
-        } else {
-            match wallets.evm {
-                Some(wallet) => markets.base.balance_of(&asset.token, wallet).await.ok(),
-                None => None,
-            }
-        };
-        let held = on_chain.map_or(p.units, |units| units.min(p.units));
-        if held == 0 {
-            continue;
-        }
-        let invested = mul_div(p.cost, held, p.units);
-        let (price, value) = if asset.chain == "solana" {
-            let Some((usd, _)) = prices.get(&asset.token) else {
-                unavailable.push(asset.id.clone());
-                continue;
-            };
-            (
-                markets::money_from_usd(*usd, currency, rate)?,
-                (held as f64 / 10f64.powi(asset.decimals as i32) * usd * 1_000_000.0) as u128,
-            )
-        } else {
-            let Some(per_dollar) = markets::base_rate(markets, asset).await else {
-                unavailable.push(asset.id.clone());
-                continue;
-            };
-            (
-                json!(markets::unit_price(
-                    1_000_000,
-                    per_dollar,
-                    asset.decimals,
-                    currency,
-                    rate
-                )?),
-                mul_div(held, 1_000_000, per_dollar),
-            )
-        };
-        let pnl = value as i128 - invested as i128;
-        let pnl_pct = if invested > 0 {
-            Some(format!("{:.2}", pnl as f64 / invested as f64 * 100.0))
-        } else {
-            None
-        };
-        let entry = if held > 0 && invested > 0 {
-            Some(json!(markets::unit_price(
-                invested,
-                held,
-                asset.decimals,
-                currency,
-                rate
-            )?))
-        } else {
-            None
-        };
-        result.push(json!({
-            "assetId": asset.id,
-            "symbol": asset.symbol,
-            "name": asset.name,
-            "kind": asset.kind,
-            "chain": asset.chain,
-            "iconUrl": asset.icon_url,
-            "amount": markets::format_units(held, asset.decimals),
-            "invested": signed_money(invested as i128, currency, rate),
-            "value": signed_money(value as i128, currency, rate),
-            "pnl": signed_money(pnl, currency, rate),
-            "pnlPct": pnl_pct,
-            "entryPrice": entry,
-            "price": price,
-            "realizedPnl": signed_money(p.realized, currency, rate),
-            "openedAtUnixMs": p.opened_at_ms,
-        }));
+    fold(&keyed)
+        .into_iter()
+        .filter(|(_, p)| p.units > 0)
+        .collect()
+}
+
+// A coin in the wallet that Atlas bought: (tracked units held, what went into them, what they're worth).
+fn bought_part(
+    h: &app_balance::Held,
+    open: &HashMap<String, Position>,
+) -> Option<(u128, u128, u128)> {
+    if h.location != "wallet" || h.kind == "cash" || h.units == 0 {
+        return None;
     }
-    // Biggest first.
-    result.sort_by(|a, b| {
-        let v = |x: &Value| {
-            x["value"]["amount"]
-                .as_str()
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(0.0)
-        };
-        v(b).total_cmp(&v(a))
-    });
-    Ok(Refresh {
-        positions: result,
-        unavailable,
+    let p = open.get(&asset_key(&h.asset_id))?;
+    let held = h.units.min(p.units);
+    Some((
+        held,
+        mul_div(p.cost, held, p.units),
+        mul_div(h.value_usdc, held, h.units),
+    ))
+}
+
+fn percent(invested: u128, value: u128) -> Option<String> {
+    (invested > 0).then(|| {
+        format!(
+            "{:.2}",
+            (value as f64 - invested as f64) / invested as f64 * 100.0
+        )
     })
 }
 
-// Positions in NEAR Intents coins (NEAR and Monad coins, Ref coins): priced from 1Click's list or
-// Ref, capped by what the wallet holds now, in the same shape as the rest.
-async fn near_valued(
-    state: &AppState,
-    headers: &HeaderMap,
-    user: &app_balance::VerifiedWallets,
+// The gain or loss shown on a holding's card on Home.
+pub(super) fn pnl_pct(h: &app_balance::Held, open: &HashMap<String, Position>) -> Option<String> {
+    let (_, invested, value) = bought_part(h, open)?;
+    percent(invested, value)
+}
+
+fn rows(
+    holdings: &[app_balance::Held],
     trades: &[Trade],
     currency: &str,
     rate: u128,
-) -> Result<Refresh, ApiError> {
-    let mut reads = tokio::task::JoinSet::new();
-    for (asset_id, p) in fold(trades) {
-        if p.units == 0 || !asset_id.starts_with("near:") {
+) -> Result<Vec<Value>, ApiError> {
+    let open = open_positions(trades);
+    let mut rows = Vec::new();
+    for h in holdings {
+        let Some((held, invested, value)) = bought_part(h, &open) else {
             continue;
-        }
-        let (state, headers, user) = (state.clone(), headers.clone(), user.clone());
-        reads.spawn(async move {
-            let coin = tokio::time::timeout(
-                Duration::from_secs(15),
-                near_intents::position_coin(&state, &headers, &user, &asset_id),
-            )
-            .await
-            .ok()
-            .flatten();
-            (asset_id, p, coin)
-        });
+        };
+        let p = &open[&asset_key(&h.asset_id)];
+        let entry = (invested > 0)
+            .then(|| markets::unit_price(invested, held, h.decimals, currency, rate))
+            .transpose()?;
+        // Per whole token, from what the holding is worth now (`bought_part` saw units > 0).
+        let price = markets::unit_price(h.value_usdc, h.units, h.decimals, currency, rate)?;
+        rows.push((
+            value,
+            json!({
+                "assetId": h.asset_id,
+                "symbol": h.symbol,
+                "name": h.name,
+                "kind": h.kind,
+                "chain": h.chain,
+                "iconUrl": h.icon_url,
+                "amount": markets::format_units(held, h.decimals),
+                "invested": signed_money(invested as i128, currency, rate),
+                "value": signed_money(value as i128, currency, rate),
+                "pnl": signed_money(value as i128 - invested as i128, currency, rate),
+                "pnlPct": percent(invested, value),
+                "entryPrice": entry,
+                "price": price,
+                "realizedPnl": signed_money(p.realized, currency, rate),
+                "openedAtUnixMs": p.opened_at_ms,
+            }),
+        ));
     }
-    let mut refreshed = Refresh::default();
-    while let Some(read) = reads.join_next().await {
-        let (asset_id, p, coin) = read.map_err(internal)?;
-        append_near_position(&mut refreshed, asset_id, p, coin, currency, rate)?;
-    }
-    Ok(refreshed)
-}
-
-fn append_near_position(
-    refreshed: &mut Refresh,
-    asset_id: String,
-    p: Position,
-    coin: Option<near_intents::NearCoin>,
-    currency: &str,
-    rate: u128,
-) -> Result<(), ApiError> {
-    let Some(coin) = coin else {
-        refreshed.unavailable.push(asset_id);
-        return Ok(());
-    };
-    let held = coin.held.min(p.units);
-    if held == 0 {
-        return Ok(());
-    }
-    if !coin.price.is_finite() || coin.price <= 0.0 {
-        refreshed.unavailable.push(asset_id);
-        return Ok(());
-    }
-    let invested = mul_div(p.cost, held, p.units);
-    let value = (held as f64 / 10f64.powi(coin.decimals as i32) * coin.price * 1e6) as u128;
-    let pnl = value as i128 - invested as i128;
-    let pnl_pct = (invested > 0).then(|| format!("{:.2}", pnl as f64 / invested as f64 * 100.0));
-    let entry = (invested > 0)
-        .then(|| markets::unit_price(invested, held, coin.decimals, currency, rate))
-        .transpose()?;
-    refreshed.positions.push(json!({
-        "assetId": asset_id,
-        "symbol": coin.symbol,
-        "name": coin.name,
-        "kind": "crypto",
-        "chain": coin.chain,
-        "iconUrl": coin.icon,
-        "amount": markets::format_units(held, coin.decimals),
-        "invested": signed_money(invested as i128, currency, rate),
-        "value": signed_money(value as i128, currency, rate),
-        "pnl": signed_money(pnl, currency, rate),
-        "pnlPct": pnl_pct,
-        "entryPrice": entry,
-        "price": markets::money_from_usd(coin.price, currency, rate)?,
-        "realizedPnl": signed_money(p.realized, currency, rate),
-        "openedAtUnixMs": p.opened_at_ms,
-    }));
-
-    Ok(())
+    // Biggest first.
+    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    Ok(rows.into_iter().map(|(_, row)| row).collect())
 }
 
 #[cfg(test)]
@@ -508,72 +334,64 @@ mod tests {
         }
     }
 
-    #[test]
-    fn one_failed_coin_keeps_other_pnl_and_a_zero_balance_removes_only_that_coin() {
-        let mut refreshed = Refresh::default();
-        let position = Position {
-            units: 10_000_000,
-            cost: 1_000_000,
-            opened_at_ms: 1,
-            ..Position::default()
-        };
-        let coin = |held, price| near_intents::NearCoin {
-            symbol: "DEEP".into(),
-            name: "DeepBook Token".into(),
-            chain: "sui".into(),
-            icon: None,
-            decimals: 6,
-            price,
-            held,
-        };
-        append_near_position(
-            &mut refreshed,
-            "near:unavailable".into(),
-            position.clone(),
-            None,
-            "USD",
-            1_000_000,
-        )
-        .unwrap();
-        append_near_position(
-            &mut refreshed,
-            "near:deep".into(),
-            position.clone(),
-            Some(coin(5_000_000, 0.12)),
-            "USD",
-            1_000_000,
-        )
-        .unwrap();
-        assert_eq!(refreshed.positions.len(), 1);
-        let row = &refreshed.positions[0];
-        assert_eq!(row["amount"], "5");
-        assert_eq!(row["invested"]["amount"], "0.5");
-        assert_eq!(row["value"]["amount"], "0.6");
-        assert_eq!(row["pnlPct"], "20.00");
-        assert_eq!(refreshed.unavailable, ["near:unavailable"]);
-        append_near_position(
-            &mut refreshed,
-            "near:sold".into(),
-            position.clone(),
-            Some(coin(0, 0.0)),
-            "USD",
-            1_000_000,
-        )
-        .unwrap();
-        assert_eq!(refreshed.unavailable, ["near:unavailable"]);
-        for price in [0.0, f64::NAN, f64::INFINITY] {
-            append_near_position(
-                &mut refreshed,
-                "near:no-price".into(),
-                position.clone(),
-                Some(coin(10, price)),
-                "USD",
-                1_000_000,
-            )
-            .unwrap();
-            assert_eq!(refreshed.positions.len(), 1);
-            assert_eq!(refreshed.unavailable.last().unwrap(), "near:no-price");
+    fn held(asset_id: &str, units: u128, decimals: u32, value_usdc: u128) -> app_balance::Held {
+        app_balance::Held {
+            asset_id: asset_id.into(),
+            symbol: "X".into(),
+            name: "X".into(),
+            kind: "crypto".into(),
+            chain: "near".into(),
+            location: "wallet".into(),
+            icon_url: None,
+            amount: markets::format_units(units, decimals),
+            units,
+            decimals,
+            value_usdc,
+            seen_ms: 0,
         }
+    }
+
+    #[test]
+    fn positions_come_from_the_balance_read_and_near_prices_in_naira() {
+        // The holdings that lost their P&L: 0.452112 wNEAR bought for $2 (24 decimals), DEEP and SUI.
+        let mut near = trade(1, "buy", 452_112_000_000_000_000_000_000, 2_000_000);
+        near.asset_id = "near:nep141:wrap.near".into();
+        let mut deep = trade(2, "buy", 63_146_677, 1_500_000);
+        deep.asset_id = "near:sui:0x0deeb::deep::DEEP".into();
+        let holdings = [
+            held(
+                "near:nep141:wrap.near",
+                452_112_000_000_000_000_000_000,
+                24,
+                2_200_000,
+            ),
+            // The balance spells the coin type without the leading zero; it's the same coin.
+            held("near:sui:0xdeeb::deep::DEEP", 63_146_677, 6, 1_485_000),
+            // Bought elsewhere: no position, no percentage.
+            held("near:nep141:sui.omft.near", 953_939_794, 9, 1_100_000),
+        ];
+        let rows = rows(&holdings, &[near, deep], "NGN", 1_328_440_000).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["assetId"], "near:nep141:wrap.near");
+        assert_eq!(rows[0]["pnlPct"], "10.00");
+        assert_eq!(rows[0]["amount"], "0.452112");
+        assert!(rows[0]["entryPrice"]["amount"]
+            .as_str()
+            .unwrap()
+            .starts_with("5876.59"));
+        assert_eq!(rows[1]["pnlPct"], "-1.00");
+        let open = open_positions(&[]);
+        assert_eq!(pnl_pct(&holdings[2], &open), None);
+    }
+
+    #[test]
+    fn a_partly_sent_away_holding_counts_only_what_is_left() {
+        let mut t = trade(1, "buy", 1_000, 10_000_000);
+        t.asset_id = "base:0xABC".into();
+        // Half left in the wallet, worth $6: half the cost ($5) went into it.
+        let h = held("base:0xabc", 500, 0, 6_000_000);
+        let open = open_positions(&[t]);
+        assert_eq!(pnl_pct(&h, &open).as_deref(), Some("20.00"));
     }
 
     #[test]
@@ -640,165 +458,6 @@ mod tests {
             signed_money(0, "USD", 1_000_000),
             json!({"amount":"0","currency":"USD"})
         );
-    }
-
-    // Real catalog, prices and Base route: a BONK and a BRETT position value without errors.
-    #[tokio::test]
-    #[ignore]
-    async fn live_spot_positions() {
-        let markets = markets::MarketState::new().unwrap();
-        let solana = SolanaAtaPreflight::new(
-            SolanaNetwork::Mainnet,
-            "https://api.mainnet-beta.solana.com",
-            "",
-        )
-        .unwrap();
-        let catalog = markets::catalog(&markets).await.unwrap();
-        let bonk = catalog
-            .iter()
-            .find(|a| a.symbol == "Bonk" || a.symbol == "BONK")
-            .unwrap();
-        let brett = catalog.iter().find(|a| a.symbol == "BRETT").unwrap();
-        let mut trades = vec![
-            trade(1, "buy", 10u128.pow(bonk.decimals) * 1_000_000, 20_000_000),
-            trade(2, "sell", 10u128.pow(bonk.decimals) * 250_000, 6_000_000),
-        ];
-        let mut b = trade(3, "buy", 10u128.pow(brett.decimals) * 100, 3_000_000);
-        b.asset_id = brett.id.clone();
-        trades.push(b);
-        for t in trades.iter_mut().take(2) {
-            t.asset_id = bonk.id.clone();
-        }
-        let wallets = Wallets {
-            solana: None,
-            evm: None,
-        };
-        let rows = valued(&markets, &solana, wallets, &trades, "NGN", 1_500_000_000)
-            .await
-            .unwrap()
-            .positions;
-        println!("{}", serde_json::to_string_pretty(&rows).unwrap());
-        assert_eq!(rows.len(), 2);
-        let bonk_row = rows
-            .iter()
-            .find(|r| r["assetId"] == bonk.id.as_str())
-            .unwrap();
-        assert_eq!(bonk_row["amount"], "750000");
-        assert_eq!(bonk_row["invested"]["amount"], "22500");
-        assert_eq!(bonk_row["realizedPnl"]["amount"], "1500");
-        assert!(bonk_row["pnlPct"].as_str().is_some());
-    }
-
-    // Read-only mainnet check. The loopback bridge supplies fixture authentication and verified
-    // addresses, but /sui/balance still uses the production SDK. No transaction is built or sent.
-    // Trades below are test cost bases, never records from the user's database.
-    #[tokio::test]
-    #[ignore]
-    async fn live_sui_and_near_pnl_survives_an_unavailable_ref_coin() {
-        let bridge_url =
-            env::var("ATLAS_PNL_READONLY_BRIDGE").expect("read-only loopback bridge required");
-        let user_id = env::var("ATLAS_PNL_READONLY_USER").expect("fixture user required");
-        let url = reqwest::Url::parse(&bridge_url).unwrap();
-        assert_eq!(url.host_str(), Some("127.0.0.1"));
-        assert_eq!(url.scheme(), "http");
-        let state = AppState {
-            user_id: user_id.clone(),
-            base_wallet: String::new(),
-            solana_owner: String::new(),
-            solana_mainnet: SolanaAtaPreflight::new(
-                SolanaNetwork::Mainnet,
-                "https://api.mainnet-beta.solana.com",
-                "",
-            )
-            .unwrap(),
-            auth: AuthMode::Privy {
-                bridge_url,
-                http: reqwest::Client::builder()
-                    .timeout(Duration::from_secs(20))
-                    .build()
-                    .unwrap(),
-            },
-            markets: markets::MarketState::new().unwrap(),
-            near: near_intents::NearState::new().await.unwrap(),
-            layerswap: engine_execution::layerswap::LayerswapClient::new().unwrap(),
-            relay_link: engine_execution::relay_link::RelayClient::new(None).unwrap(),
-            cow: engine_execution::cow::CowClient::new().unwrap(),
-            links: cashlinks::LinkStore::new().await.unwrap(),
-            comments: comments::CommentStore::new().await.unwrap(),
-            emails: emails::EmailState::new().await.unwrap(),
-            hl: hl::HlState::new().await.unwrap(),
-            earn: earn::EarnState::default(),
-            social: social::SocialState::new().await.unwrap(),
-            trades: TradeBook::default(),
-            history: transactions::HistoryStore::new().await.unwrap(),
-            daya: daya::DayaState::new().await.unwrap(),
-            predictions: predictions::PredictionState::new().await.unwrap(),
-            pin: pin::PinState::new().await.unwrap(),
-        };
-        for (n, id, units, cost) in [
-            (1, "near:sui:0xdeeb7a4662eec9f2f3def03fb937a663dddaa2e215b8078a284d026b7946c270::deep::DEEP", 63_146_677, 1_000_000),
-            (2, "near:nep141:sui.omft.near", 953_939_794, 1_000_000),
-            (3, "near:nep141:wrap.near", 452_112_000_000_000_000_000_000, 2_000_000),
-            (4, "near:ref:unavailable.near", 1, 1),
-        ] {
-            let mut t = trade(n, "buy", units, cost);
-            t.asset_id = id.into(); t.user_id = user_id.clone();
-            state.trades.record(&t).await.unwrap();
-        }
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let router = axum::Router::new()
-            .route("/v1/positions/spot", axum::routing::get(spot))
-            .with_state(state);
-        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let started = std::time::Instant::now();
-        let response = reqwest::Client::new()
-            .get(format!("http://{address}/v1/positions/spot?currency=USD"))
-            .bearer_auth("pnl-read-only")
-            .timeout(Duration::from_secs(22))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body: Value = response.json().await.unwrap();
-        server.abort();
-        let rows = body["positions"].as_array().unwrap();
-        println!(
-            "mainnet P&L HTTP 200 in {}ms (fixture cost bases): {}",
-            started.elapsed().as_millis(),
-            body
-        );
-        assert_eq!(
-            rows.len(),
-            3,
-            "A failed Ref lookup must not hide the three healthy mainnet positions"
-        );
-        assert_eq!(
-            body["unavailableAssetIds"],
-            json!(["near:ref:unavailable.near"])
-        );
-        for (symbol, amount) in [
-            ("DEEP", "63.146677"),
-            ("SUI", "0.953939794"),
-            ("wNEAR", "0.452112"),
-        ] {
-            let row = rows.iter().find(|row| row["symbol"] == symbol).unwrap();
-            assert_eq!(row["amount"], amount);
-            assert!(row["pnlPct"]
-                .as_str()
-                .unwrap()
-                .parse::<f64>()
-                .unwrap()
-                .is_finite());
-            assert!(
-                row["price"]["amount"]
-                    .as_str()
-                    .unwrap()
-                    .parse::<f64>()
-                    .unwrap()
-                    > 0.0
-            );
-        }
     }
 
     #[test]

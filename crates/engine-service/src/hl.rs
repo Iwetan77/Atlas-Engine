@@ -645,13 +645,18 @@ pub(super) async fn positions(
 
 // The user's Hyperliquid account value in USDC units (6 decimals), for the Atlas balance: their own
 // perps and the `xyz` dex together.
-pub(super) async fn account_value(state: &AppState, wallet: &str) -> Option<u128> {
+// What the account is worth in USDC units: zero with nothing there, an error when it can't be read.
+pub(super) async fn account_value(state: &AppState, wallet: &str) -> Result<u128, ApiError> {
     let (main, on_dex) = tokio::join!(
         state.hl.client.account(wallet),
         state.hl.client.account_on(wallet, DEXES[0].0)
     );
-    let value = main.ok()?.value + on_dex.map_or(0.0, |a| a.value);
-    (value > 0.0).then(|| (value * 1_000_000.0).floor() as u128)
+    let value = main.map_err(internal)?.value + on_dex.map_or(0.0, |a| a.value);
+    Ok(if value.is_finite() && value > 0.0 {
+        (value * 1_000_000.0).floor() as u128
+    } else {
+        0
+    })
 }
 
 #[derive(Deserialize)]

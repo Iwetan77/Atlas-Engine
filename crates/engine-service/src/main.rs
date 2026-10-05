@@ -64,6 +64,7 @@ struct AppState {
     daya: daya::DayaState,
     predictions: predictions::PredictionState,
     pin: pin::PinState,
+    balances: app_balance::BalanceMemory,
 }
 
 #[derive(Clone)]
@@ -134,6 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         daya: daya::DayaState::new().await?,
         predictions: predictions::PredictionState::new().await?,
         pin: pin::PinState::new().await?,
+        balances: app_balance::BalanceMemory::new().await?,
     };
     let bind: SocketAddr = env::var("ATLAS_BALANCE_BIND")
         .unwrap_or_else(|_| "127.0.0.1:3000".into())

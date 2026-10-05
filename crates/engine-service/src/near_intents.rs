@@ -821,11 +821,13 @@ async fn destination(
 
 // A settled 1Click buy lands in the user's own NEAR account. Read the NEP-141 contract,
 // not an inferred 1Click amount: later sends and partial sells must change Home immediately.
+// Also returns the coins it couldn't price or read right now, by asset id, for the balance to keep at
+// their last confirmed value.
 pub(super) async fn near_holdings(
     state: &AppState,
     headers: &HeaderMap,
     user: &app_balance::VerifiedWallets,
-) -> Result<Vec<(Token, u128)>, ApiError> {
+) -> Result<(Vec<(Token, u128)>, Vec<String>), ApiError> {
     let intents: Vec<StoredIntent> = if let Some(pg) = &state.near.postgres {
         pg.query(
             "SELECT payload FROM atlas_near_intents WHERE owner=$1",
@@ -883,33 +885,39 @@ pub(super) async fn near_holdings(
         }
     }
     if tracked.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let catalog = state.near.tokens().await.unwrap_or_default();
     let mut priced = HashMap::new();
+    let mut unread = Vec::new();
     for (id, mut asset) in tracked {
         if let Some(contract) = asset.asset_id.strip_prefix("ref:") {
-            // A Ref coin nobody can price right now is left out, not the whole balance.
+            // A Ref coin nobody can price right now keeps its last value, not the whole balance.
             let Some(fresh) = ref_assets(state, contract)
                 .await
                 .ok()
                 .and_then(|list| list.into_iter().find(|a| a["token"] == contract))
             else {
+                unread.push(format!("near:{}", asset.asset_id));
                 continue;
             };
             asset.price = Some(fresh["price"].clone());
             priced.insert(id, asset);
             continue;
         }
-        let fresh = catalog
+        match catalog
             .iter()
             .find(|token| token.asset_id == asset.asset_id)
-            .ok_or_else(|| venue("An asset price is temporarily unavailable"))?;
-        priced.insert(id, fresh.clone());
+        {
+            Some(fresh) => {
+                priced.insert(id, fresh.clone());
+            }
+            None => unread.push(format!("near:{}", asset.asset_id)),
+        }
     }
     let tracked = priced;
     if tracked.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), unread));
     }
     let wallet = destination(state, headers, tracked.values().next().unwrap(), user).await?;
     let mut held = Vec::new();
@@ -926,12 +934,13 @@ pub(super) async fn near_holdings(
         {
             return Err(venue("An asset balance is temporarily unavailable"));
         }
-        let units = near_coin_held(state, contract, &wallet).await?;
-        if units > 0 {
-            held.push((asset, units));
+        match near_coin_held(state, contract, &wallet).await {
+            Ok(0) => {}
+            Ok(units) => held.push((asset, units)),
+            Err(_) => unread.push(format!("near:{}", asset.asset_id)),
         }
     }
-    Ok(held)
+    Ok((held, unread))
 }
 
 // NEAR RPC: one `query`, answered as the RPC sends it (errors included, for the caller to read).
@@ -1007,7 +1016,7 @@ async fn near_coin_held(state: &AppState, contract: &str, account: &str) -> Resu
 const WRAP_NEAR: &str = "wrap.near";
 // What the user holds on Sui from Atlas buys (SUI left for gas included), valued in USD:
 // (asset id, symbol, name, decimals, units, USDC units, icon). Nothing to read, nothing asked.
-fn sui_coin_key(value: &str) -> String {
+pub(super) fn sui_coin_key(value: &str) -> String {
     match value.split_once("::") {
         Some((address, rest)) => format!(
             "{}::{rest}",
@@ -1038,30 +1047,14 @@ fn best_sui_price(pairs: &Value, coin: &str) -> Option<f64> {
         .filter(|p| p.is_finite() && *p > 0.0)
 }
 type SuiHolding = (String, String, String, u32, u128, u128, Option<String>);
-// The user's Sui coins for the balance. A failed read of the Sui wallet shows the last one from the
-// past ten minutes, so SUI and DEEP don't flicker out of the total when one lookup fails.
+// The user's Sui coins for the balance, and the ones held but unpriced right now (the balance keeps
+// those at their last confirmed value instead of dropping them).
 pub(super) async fn sui_holdings(
     state: &AppState,
     headers: &HeaderMap,
     user: &app_balance::VerifiedWallets,
-) -> Result<Vec<SuiHolding>, ApiError> {
-    static LAST: std::sync::LazyLock<Mutex<HashMap<String, (Instant, Vec<SuiHolding>)>>> =
-        std::sync::LazyLock::new(Default::default);
-    match sui_holdings_now(state, headers, user).await {
-        Ok(held) => {
-            if let Ok(mut last) = LAST.lock() {
-                last.insert(user.user_id.clone(), (Instant::now(), held.clone()));
-            }
-            Ok(held)
-        }
-        Err(error) => LAST
-            .lock()
-            .ok()
-            .and_then(|last| last.get(&user.user_id).cloned())
-            .filter(|(at, _)| at.elapsed() < Duration::from_secs(600))
-            .map(|(_, held)| held)
-            .ok_or(error),
-    }
+) -> Result<(Vec<SuiHolding>, Vec<String>), ApiError> {
+    sui_holdings_now(state, headers, user).await
 }
 // A Sui coin's dollar price from its most liquid DexScreener pair, shared for 30 seconds. When
 // DexScreener is slow or refuses, the last price from the past half hour stands: a held coin never
@@ -1104,14 +1097,14 @@ async fn sui_holdings_now(
     state: &AppState,
     headers: &HeaderMap,
     user: &app_balance::VerifiedWallets,
-) -> Result<Vec<SuiHolding>, ApiError> {
+) -> Result<(Vec<SuiHolding>, Vec<String>), ApiError> {
     let coins = state.near.sui_coins(&user.user_id).await?;
     let tokens = state.near.tokens().await?;
     let Some(sui) = tokens
         .iter()
         .find(|t| t.blockchain == "sui" && t.symbol == "SUI")
     else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     };
     let owner = destination(state, headers, sui, user).await?;
     let balances = bridge(state, headers, "/sui/balances", json!({})).await?;
@@ -1137,19 +1130,23 @@ async fn sui_holdings_now(
             .filter(|p: &f64| p.is_finite() && *p > 0.0)
     };
     let mut out = Vec::new();
+    let mut unpriced = Vec::new();
     let sui_units = held("0x2::sui::SUI");
-    if let (true, Some(price)) = (sui_units > 0, price_of(&sui.price)) {
-        let value = (sui_units as f64 / 1e9 * price * 1e6) as u128;
-        out.push((
-            // The same id search and buys use, so SUI's position card lines up with the holding.
-            format!("near:{}", sui.asset_id),
-            "SUI".into(),
-            "Sui".into(),
-            9,
-            sui_units,
-            value,
-            state.near.icon_for(sui),
-        ));
+    // The same id search and buys use, so SUI's position card lines up with the holding.
+    let sui_id = format!("near:{}", sui.asset_id);
+    if sui_units > 0 {
+        match price_of(&sui.price) {
+            Some(price) => out.push((
+                sui_id,
+                "SUI".into(),
+                "Sui".into(),
+                9,
+                sui_units,
+                (sui_units as f64 / 1e9 * price * 1e6) as u128,
+                state.near.icon_for(sui),
+            )),
+            None => unpriced.push(sui_id),
+        }
     }
     // Every held coin's price at once.
     let held_coins: Vec<_> = coins
@@ -1172,6 +1169,7 @@ async fn sui_holdings_now(
     }
     for ((units, coin), price) in held_coins.into_iter().zip(prices) {
         let Some(price) = price else {
+            unpriced.push(format!("near:sui:{}", coin.coin_type));
             continue;
         };
         let value = (units as f64 / 10f64.powi(coin.decimals as i32) * price * 1e6) as u128;
@@ -1185,7 +1183,7 @@ async fn sui_holdings_now(
             coin.icon_url,
         ));
     }
-    Ok(out)
+    Ok((out, unpriced))
 }
 
 // What people can deposit besides USDC to their own Base or Solana address: each is a 1Click asset
@@ -3269,129 +3267,6 @@ fn display_symbol(t: &Token) -> String {
     } else {
         t.symbol.clone()
     }
-}
-// A NEAR Intents coin's live price and what the user holds of it, for its position card: NEAR and
-// Monad coins from 1Click's list, and NEAR coins found on Ref.
-pub(super) struct NearCoin {
-    pub(super) symbol: String,
-    pub(super) name: String,
-    pub(super) chain: String,
-    pub(super) icon: Option<String>,
-    pub(super) decimals: u32,
-    pub(super) price: f64,
-    pub(super) held: u128,
-}
-pub(super) async fn position_coin(
-    state: &AppState,
-    headers: &HeaderMap,
-    user: &app_balance::VerifiedWallets,
-    asset_id: &str,
-) -> Option<NearCoin> {
-    let id = asset_id.strip_prefix("near:")?;
-    let near_wallet = |contract: &str| Token {
-        asset_id: format!("nep141:{contract}"),
-        blockchain: "near".into(),
-        symbol: String::new(),
-        decimals: 0,
-        contract_address: Some(contract.into()),
-        price: None,
-        coingecko_id: None,
-    };
-    if let Some(contract) = id.strip_prefix("ref:") {
-        let found = ref_assets(state, contract)
-            .await
-            .ok()?
-            .into_iter()
-            .find(|a| a["token"] == contract)?;
-        let wallet = destination(state, headers, &near_wallet(contract), user)
-            .await
-            .ok()?;
-        let symbol = found["symbol"].as_str()?.to_owned();
-        return Some(NearCoin {
-            name: found["name"].as_str().unwrap_or(&symbol).to_owned(),
-            symbol,
-            chain: "near".into(),
-            icon: found["icon"]
-                .as_str()
-                .filter(|v| v.starts_with("https://"))
-                .map(str::to_owned),
-            decimals: u32::try_from(found["decimals"].as_u64()?).ok()?,
-            price: found["price"].as_str()?.parse().ok()?,
-            held: ft_balance(state, contract, &wallet).await.ok()?,
-        });
-    }
-    // A Sui coin bought on Sui (DEEP and the like): its details, held amount and DexScreener price.
-    if let Some(coin) = id.strip_prefix("sui:") {
-        let (symbol, name, decimals, icon) = sui_meta(state, coin).await?;
-        let (held, price) = tokio::join!(
-            sui_held(state, headers, user, coin),
-            sui_coin_price(state.near.icon_http.clone(), coin.to_owned()),
-        );
-        return Some(NearCoin {
-            symbol,
-            name,
-            chain: "sui".into(),
-            icon,
-            decimals,
-            price: price?,
-            held: held?,
-        });
-    }
-    let token = state
-        .near
-        .tokens()
-        .await
-        .ok()?
-        .into_iter()
-        .find(|t| t.asset_id == id && supported(t))?;
-    let held = match token.blockchain.as_str() {
-        // SUI itself, bought through 1Click.
-        "sui" => sui_held(state, headers, user, "0x2::sui::SUI").await?,
-        "near" => {
-            let contract = token.contract_address.clone()?;
-            let wallet = destination(state, headers, &token, user).await.ok()?;
-            near_coin_held(state, &contract, &wallet).await.ok()?
-        }
-        "monad" => {
-            let wallet = user.evm_wallet.as_deref()?;
-            state.near.monad_balance(&token, wallet).await.ok()?
-        }
-        _ => return None,
-    };
-    Some(NearCoin {
-        name: format!("{} on {}", token.symbol, token.blockchain),
-        icon: state.near.icon_for(&token),
-        chain: token.blockchain.clone(),
-        decimals: token.decimals,
-        price: token_usd(&token),
-        symbol: token.symbol,
-        held,
-    })
-}
-// How much of a Sui coin the user's own Sui wallet holds, checked against that wallet's address.
-async fn sui_held(
-    state: &AppState,
-    headers: &HeaderMap,
-    user: &app_balance::VerifiedWallets,
-    coin: &str,
-) -> Option<u128> {
-    let wallet = Token {
-        asset_id: String::new(),
-        blockchain: "sui".into(),
-        symbol: "SUI".into(),
-        decimals: 9,
-        contract_address: None,
-        price: None,
-        coingecko_id: None,
-    };
-    let owner = destination(state, headers, &wallet, user).await.ok()?;
-    let body = bridge(state, headers, "/sui/balance", json!({"coinType": coin}))
-        .await
-        .ok()?;
-    if body["address"].as_str() != Some(owner.as_str()) {
-        return None;
-    }
-    body["result"]["totalBalance"].as_str()?.parse().ok()
 }
 // Where every sale's cash lands: USDC in the user's own Solana wallet, or Base without one. Kept in
 // this one place (and its twin `cashDestination` in the bridge) so naira payouts can follow on later.
