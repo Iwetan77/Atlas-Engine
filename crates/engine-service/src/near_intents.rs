@@ -3375,11 +3375,16 @@ async fn sui_held(
     user: &app_balance::VerifiedWallets,
     coin: &str,
 ) -> Option<u128> {
-    let tokens = state.near.tokens().await.ok()?;
-    let sui = tokens
-        .iter()
-        .find(|t| t.blockchain == "sui" && t.symbol == "SUI")?;
-    let owner = destination(state, headers, sui, user).await.ok()?;
+    let wallet = Token {
+        asset_id: String::new(),
+        blockchain: "sui".into(),
+        symbol: "SUI".into(),
+        decimals: 9,
+        contract_address: None,
+        price: None,
+        coingecko_id: None,
+    };
+    let owner = destination(state, headers, &wallet, user).await.ok()?;
     let body = bridge(state, headers, "/sui/balance", json!({"coinType": coin}))
         .await
         .ok()?;

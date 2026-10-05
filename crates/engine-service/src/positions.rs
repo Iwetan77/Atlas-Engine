@@ -386,11 +386,11 @@ async fn near_valued(
         if p.units == 0 || !asset_id.starts_with("near:") {
             continue;
         }
-        let Some(coin) = near_intents::position_coin(state, headers, user, &asset_id).await else {
-            continue;
-        };
+        let coin = checked_position_coin(
+            near_intents::position_coin(state, headers, user, &asset_id).await,
+        )?;
         let held = coin.held.min(p.units);
-        if held == 0 || coin.price <= 0.0 {
+        if held == 0 {
             continue;
         }
         let invested = mul_div(p.cost, held, p.units);
@@ -422,6 +422,17 @@ async fn near_valued(
     Ok(result)
 }
 
+// Missing data is a failed refresh, not proof that a position was sold.
+fn checked_position_coin(
+    coin: Option<near_intents::NearCoin>,
+) -> Result<near_intents::NearCoin, ApiError> {
+    coin.filter(|c| c.price.is_finite() && c.price > 0.0)
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Your profit and loss couldn't be updated. Try again in a moment.".into(),
+        ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,6 +447,27 @@ mod tests {
             usdc_units: usdc,
             tx_id: None,
             filled_at_ms: n,
+        }
+    }
+
+    #[test]
+    fn an_unavailable_position_is_not_reported_as_sold() {
+        assert_eq!(
+            checked_position_coin(None).err().unwrap().0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let coin = |held, price| near_intents::NearCoin {
+            symbol: "DEEP".into(),
+            name: "DeepBook Token".into(),
+            chain: "sui".into(),
+            icon: None,
+            decimals: 6,
+            price,
+            held,
+        };
+        assert_eq!(checked_position_coin(Some(coin(0, 0.03))).unwrap().held, 0);
+        for price in [0.0, f64::NAN, f64::INFINITY] {
+            assert!(checked_position_coin(Some(coin(10, price))).is_err());
         }
     }
 
