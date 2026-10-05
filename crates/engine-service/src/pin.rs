@@ -61,6 +61,11 @@ pub(super) struct Authorize {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct Unlock {
+    pin: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct Consume {
     authorization: String,
     action: Action,
@@ -149,6 +154,22 @@ impl PinState {
         .map_err(db_error)?;
         tx.commit().await.map_err(db_error)?;
         Ok(Json(json!({"configured":true,"lockedUntilUnixMs":null})))
+    }
+    // Opening the app: the same PIN, the same five tries and lockouts, but it approves nothing.
+    async fn check(&self, user: &str, pin: String) -> Result<(), ApiError> {
+        let pg = self.storage()?;
+        let mut client = pg.lock().await;
+        let tx = client.transaction().await.map_err(db_error)?;
+        let row = tx.query_opt("SELECT pin_hash,failures,lock_level,locked_until_ms FROM atlas_transaction_pins WHERE user_id=$1 FOR UPDATE", &[&user])
+            .await.map_err(db_error)?.ok_or_else(setup_required)?;
+        if let Err(error) = verify_attempt(&self.pepper, &row, pin).await {
+            save_failure(&tx, user, &row, &error).await?;
+            tx.commit().await.map_err(db_error)?;
+            return Err(error);
+        }
+        tx.execute("UPDATE atlas_transaction_pins SET failures=0,lock_level=0,locked_until_ms=0 WHERE user_id=$1", &[&user]).await.map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
+        Ok(())
     }
     async fn approve(&self, user: &str, pin: String, action: &Action) -> Result<String, ApiError> {
         let pg = self.storage()?;
@@ -539,6 +560,16 @@ pub(super) async fn authorize(
     Ok(Json(
         json!({"authorization":token,"expiresAtUnixMs":now()+GRANT_MS}),
     ))
+}
+// The app's lock screen. No grant is issued: money still needs its own PIN entry per action.
+pub(super) async fn verify(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Unlock>,
+) -> Result<Json<Value>, ApiError> {
+    let user = app_balance::verified_wallets(&state, &headers).await?;
+    state.pin.check(&user.user_id, body.pin).await?;
+    Ok(Json(json!({"unlocked":true})))
 }
 pub(super) async fn consume(
     State(state): State<AppState>,

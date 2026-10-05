@@ -194,6 +194,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/me/pin", get(pin::status).post(pin::set))
         .route("/v1/me/pin/authorize", post(pin::authorize))
         .route("/v1/me/pin/consume", post(pin::consume))
+        .route("/v1/me/pin/verify", post(pin::verify))
         .route(
             "/v1/me/emails",
             get(emails::settings).post(emails::update_settings),

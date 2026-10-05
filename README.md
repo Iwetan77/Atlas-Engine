@@ -604,6 +604,9 @@ intent; later steps and idempotent reports keep the same approval. Direct TP/SL 
 claims and embedded mini-app wallet requests are bound to all request fields and consumed once.
 Wallet requests consume via POST /v1/me/pin/consume. Clients also send
 x-atlas-payment-pin: 1; older clients are refused before receiving a money-moving plan.
+POST /v1/me/pin/verify checks {pin} for the app's lock screen and returns {unlocked: true}. It
+counts toward the same attempts and lockouts but issues no authorization: money still needs a PIN
+per action.
 
 PINs use salted Argon2id after a domain-separated HMAC with a server-only pepper. The four-digit PIN
 is never persisted or logged. DATABASE_URL is required: PINs, attempts, lockouts and hashed
