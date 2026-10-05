@@ -1,0 +1,28 @@
+[
+  {
+    "chainId": "sui",
+    "pairAddress": "0xd978d331772a5b90d5a4781e1232d18afd12019d0c35db79e3674beeda8f9126",
+    "baseToken": {
+      "address": "0xdeeb7a4662eec9f2f3def03fb937a663dddaa2e215b8078a284d026b7946c270::deep::DEEP",
+      "name": "DeepBook Token",
+      "symbol": "DEEP"
+    },
+    "quoteToken": {
+      "address": "0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI",
+      "name": "SUI Token",
+      "symbol": "SUI"
+    },
+    "liquidity": {
+      "usd": 108990.39,
+      "base": 2023920,
+      "quote": 49282
+    },
+    "volume": {
+      "h24": 256992.91,
+      "h6": 67805,
+      "h1": 6258.6,
+      "m5": 187.71
+    },
+    "marketCap": 60901571
+  }
+]

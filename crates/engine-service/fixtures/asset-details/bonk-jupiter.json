@@ -1,0 +1,22 @@
+[
+  {
+    "id": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+    "mcap": 346581395.22813016,
+    "liquidity": 6223767.590438207,
+    "stats24h": {
+      "priceChange": 3.245632008079176,
+      "holderChange": -0.0038984340964842946,
+      "liquidityChange": 5.818587040858401,
+      "volumeChange": -23.821709961228972,
+      "buyVolume": 662839.5803848626,
+      "sellVolume": 684334.1063868757,
+      "buyOrganicVolume": 31731.820356646636,
+      "sellOrganicVolume": 40728.146932070274,
+      "numBuys": 23400,
+      "numSells": 25399,
+      "numTraders": 5341,
+      "numOrganicBuyers": 137,
+      "numNetBuyers": 1217
+    }
+  }
+]
