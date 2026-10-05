@@ -937,19 +937,26 @@ async fn bank_plan(
             .await?
         }
     };
+    // Moving cash between networks first costs a little more; "You pay" is everything that leaves
+    // the balance, that included.
+    let network_ngn = match network_fee {
+        Some(usdc) => usdc.saturating_mul(app_balance::fx_rate("NGN").await?) / 1_000_000,
+        None => 0,
+    };
     let mut summary = vec![
         json!({"label":"Send to","value":quote.label}),
         json!({"label":"Bank gets","value":markets::say_micros(get, "NGN")}),
         json!({"label":"Fee","value":markets::say_micros(fee, "NGN")}),
-        json!({"label":"You pay","value":markets::say_micros(get + fee, "NGN")}),
+    ];
+    if network_ngn > 0 {
+        summary
+            .push(json!({"label":"Network fee","value":markets::say_micros(network_ngn, "NGN")}));
+    }
+    summary.extend([
+        json!({"label":"You pay","value":markets::say_micros(get + fee + network_ngn, "NGN")}),
         json!({"label":"Rate","value":payout.rate_line()}),
         json!({"label":"Bank payout","value":"Waiting for your USDC"}),
-    ];
-    if let Some(fee) = network_fee {
-        summary.push(
-            json!({"label":"Network fee","value":markets::say_money(fee,&quote.currency,rate)}),
-        );
-    }
+    ]);
     let plan = json!({"intentId":intent_id,"kind":"send","summary":summary,"transactions":transactions,"expiresAtUnixMs":now()+120_000});
     Ok((plan, funding_account, expires))
 }
