@@ -160,3 +160,84 @@ mod tests {
         }
     }
 }
+
+// The newest Android release, so an installed app can offer the update (the APK has no
+// over-the-air updates). Read from the repo's latest full GitHub release, kept for half an hour;
+// ATLAS_ANDROID_MIN_VERSION (optional) is the oldest app that still works with this engine.
+const ANDROID_DOWNLOAD: &str =
+    "https://github.com/Iwetan77/Atlas/releases/latest/download/atlas.apk";
+static ANDROID_LATEST: std::sync::LazyLock<Mutex<Option<(Instant, String)>>> =
+    std::sync::LazyLock::new(Default::default);
+
+async fn latest_android() -> Option<String> {
+    let held = ANDROID_LATEST.lock().ok()?.clone();
+    if let Some((at, version)) = &held {
+        if at.elapsed() < Duration::from_secs(30 * 60) {
+            return Some(version.clone());
+        }
+    }
+    let fetched: Option<String> = async {
+        let body: serde_json::Value = reqwest::Client::new()
+            .get("https://api.github.com/repos/Iwetan77/Atlas/releases/latest")
+            .header("User-Agent", "atlas-engine")
+            .header("Accept", "application/vnd.github+json")
+            .timeout(Duration::from_secs(8))
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let tag = body["tag_name"].as_str()?.trim_start_matches('v');
+        is_version(tag).then(|| tag.to_owned())
+    }
+    .await;
+    match fetched {
+        Some(version) => {
+            if let Ok(mut latest) = ANDROID_LATEST.lock() {
+                *latest = Some((Instant::now(), version.clone()));
+            }
+            Some(version)
+        }
+        None => held.map(|(_, version)| version),
+    }
+}
+
+// "1.0.11", or "1.0.1-beta.2": digits and dots, then an optional pre-release tag.
+fn is_version(text: &str) -> bool {
+    let core = text.split('-').next().unwrap_or("");
+    !core.is_empty()
+        && core
+            .split('.')
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        && text.len() <= 32
+}
+
+// GET /v1/app/android → { latestVersion, minimumVersion, downloadUrl }. Public: it only says
+// which app version is newest.
+pub(super) async fn android_release() -> Json<serde_json::Value> {
+    let minimum = env::var("ATLAS_ANDROID_MIN_VERSION")
+        .ok()
+        .filter(|v| is_version(v));
+    Json(serde_json::json!({
+        "latestVersion": latest_android().await,
+        "minimumVersion": minimum,
+        "downloadUrl": ANDROID_DOWNLOAD,
+    }))
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+    #[test]
+    fn only_plain_versions_are_offered() {
+        assert!(is_version("1.0.11"));
+        assert!(is_version("1.0.1-beta.2"));
+        assert!(!is_version(""));
+        assert!(!is_version("1..2"));
+        assert!(!is_version("latest"));
+        assert!(!is_version("<script>"));
+    }
+}

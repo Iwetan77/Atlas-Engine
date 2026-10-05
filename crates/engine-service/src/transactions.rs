@@ -125,9 +125,44 @@ impl Receipt {
             self.tx_ids.push(tx);
         }
     }
+    fn line(&self, label: &str) -> Option<&str> {
+        self.summary
+            .iter()
+            .find(|l| l["label"] == label)
+            .and_then(|l| l["value"].as_str())
+    }
+    // A cash out to a bank, as the person sees it: the naira the bank was paid (or will be), and
+    // done only once the bank is paid, not when the USDC left the wallet.
+    fn bank_payout(&self) -> Option<(Option<u128>, Option<(&'static str, &'static str)>)> {
+        if self.kind != "offramp" {
+            return None;
+        }
+        let payout = self.line("Bank payout");
+        let naira = payout
+            .and_then(|v| v.strip_prefix("Paid "))
+            .or(self.line("Bank gets"))
+            .and_then(|v| v.trim().strip_prefix('₦'))
+            .and_then(|v| markets::parse_micros(&v.replace(',', "")).ok());
+        let state = match payout {
+            Some(v) if v.starts_with("Failed") => Some(("failed", "settle")),
+            Some(v) if !v.starts_with("Paid") && self.state != "failed" => {
+                Some(("pending", "settle"))
+            }
+            _ => None,
+        };
+        Some((naira, state))
+    }
     fn public(&self, currency: &str, rate: u128) -> Value {
-        let amount = self.usdc_units.as_deref().and_then(|u| u.parse::<u128>().ok())
-            .and_then(|u| u.checked_mul(rate)).map(|u| json!({"amount": markets::format_units(u / 1_000_000, 6), "currency": currency}));
+        let payout = self.bank_payout();
+        let naira = payout
+            .and_then(|(naira, _)| naira)
+            .filter(|_| currency == "NGN")
+            .map(|n| json!({"amount": markets::format_units(n, 6), "currency": "NGN"}));
+        let amount = naira.or_else(|| self.usdc_units.as_deref().and_then(|u| u.parse::<u128>().ok())
+            .and_then(|u| u.checked_mul(rate)).map(|u| json!({"amount": markets::format_units(u / 1_000_000, 6), "currency": currency})));
+        let (state, stage) = payout
+            .and_then(|(_, state)| state)
+            .unwrap_or((self.state.as_str(), self.stage.as_str()));
         // Older perps plans wrote their moved margin in dollars; receipts use the chosen currency.
         let summary: Vec<_> = self
             .summary
@@ -152,7 +187,7 @@ impl Receipt {
         let error = self.error.as_deref().map(|e| unbranded(e).unwrap_or(e));
         json!({"id":self.id,"intentId":self.intent_id,"kind":self.kind,"title":self.title,
             "symbol":self.symbol,"assetId":self.asset_id,"iconUrl":self.icon_url,
-            "createdAtUnixMs":self.created_at_unix_ms,"state":self.state,"stage":self.stage,
+            "createdAtUnixMs":self.created_at_unix_ms,"state":state,"stage":stage,
             "amount":amount,"txIds":self.tx_ids,"error":error,"summary":summary})
     }
 }
@@ -712,6 +747,30 @@ fn internal(_: impl std::fmt::Display) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bank_cash_out_shows_the_naira_the_bank_got_and_waits_for_the_bank() {
+        // 5 Oct: the bank got ₦2,400 for 1.788565 USDC at Daya's ₦1,355.27; the market rate was ₦1,329.76.
+        let mut r = Receipt::plan(
+            "alice",
+            &json!({"intentId":"cash-out","kind":"offramp","summary":[
+                {"label":"Bank gets","value":"₦2,400.00"},{"label":"Fee","value":"₦24.00"},
+                {"label":"You pay","value":"₦2,424.00"},{"label":"Bank payout","value":"Waiting for your USDC"}]}),
+        );
+        r.usdc_units = Some("1788565".into());
+        r.set_state("filled", "settle", None);
+        let shown = r.public("NGN", 1_329_760_000);
+        assert_eq!(shown["amount"]["amount"], "2400");
+        assert_eq!(shown["state"], "pending");
+        r.set_line("Bank payout", "Paid ₦2,400.00".into());
+        let shown = r.public("NGN", 1_329_760_000);
+        assert_eq!(shown["amount"]["amount"], "2400");
+        assert_eq!(shown["state"], "filled");
+        // In dollars it's what left the balance.
+        assert_eq!(r.public("USD", 1_000_000)["amount"]["amount"], "1.788565");
+        r.set_line("Bank payout", "Failed — contact support".into());
+        assert_eq!(r.public("NGN", 1_329_760_000)["state"], "failed");
+    }
     #[test]
     fn older_bank_receipts_do_not_name_the_payment_partner() {
         let mut r = Receipt::ramp(

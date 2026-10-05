@@ -173,6 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = Router::new()
         .merge(perps_routes)
         .route("/health", get(health))
+        .route("/v1/app/android", get(web::android_release))
         // The web app's build, for Atlas Links in any browser.
         .route("/", get(web::index))
         .route("/claim/{id}", get(web::claim))
