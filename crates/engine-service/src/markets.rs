@@ -1418,24 +1418,29 @@ pub(super) fn unit_price(
     if output_units == 0 {
         return Err(unavailable("venue returned zero output"));
     }
-    let n = input_units
+    let exact = input_units
         .checked_mul(rate)
         .and_then(|v| v.checked_mul(10u128.pow(token_decimals)))
-        .ok_or_else(|| bad("price overflow"))?;
-    let d = output_units
-        .checked_mul(1_000_000)
-        .ok_or_else(|| bad("price overflow"))?;
-    let micros = n / d;
-    let tail = (n % d)
-        .checked_mul(1_000_000)
-        .ok_or_else(|| bad("price overflow"))?
-        / d;
-    let mut amount = format!(
-        "{}.{:06}{:06}",
-        micros / 1_000_000,
-        micros % 1_000_000,
-        tail
-    );
+        .zip(output_units.checked_mul(1_000_000))
+        .and_then(|(n, d)| Some((n / d, (n % d).checked_mul(1_000_000)? / d)));
+    let mut amount = match exact {
+        Some((micros, tail)) => format!(
+            "{}.{:06}{:06}",
+            micros / 1_000_000,
+            micros % 1_000_000,
+            tail
+        ),
+        // 24-decimal coins (NEAR) priced in naira outgrow u128 here; a float keeps 15 significant
+        // digits, more than any price shows.
+        None => {
+            let price = input_units as f64 * rate as f64 / 1e12 / output_units as f64
+                * 10f64.powi(token_decimals as i32);
+            if !price.is_finite() {
+                return Err(bad("price overflow"));
+            }
+            format!("{price:.12}")
+        }
+    };
     while amount.ends_with('0') {
         amount.pop();
     }
@@ -5192,6 +5197,26 @@ fn received_units(receipt: &Value, token: &str, wallet: &str) -> Option<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_24_decimal_coin_prices_in_naira_without_overflowing() {
+        // 0.452112 wNEAR bought for $2, at ₦1,328.44 per dollar: about ₦5,876.60 per NEAR.
+        let price = unit_price(
+            2_000_000,
+            452_112_000_000_000_000_000_000,
+            24,
+            "NGN",
+            1_328_440_000,
+        )
+        .unwrap();
+        assert!(price.amount.starts_with("5876.59"), "{}", price.amount);
+        // Small decimals keep the exact integer path.
+        assert_eq!(
+            unit_price(1_000_000, 2_000_000, 6, "USD", 1_000_000)
+                .unwrap()
+                .amount,
+            "0.5"
+        );
+    }
     #[test]
     fn stats_resolve_mints_and_base_coins_without_a_catalog_request() {
         let bonk = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263";
