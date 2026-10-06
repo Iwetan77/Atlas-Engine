@@ -3789,11 +3789,32 @@ async fn sui_coin_sell_quote(
         .into_iter()
         .find(|t| t.blockchain == "sui" && t.symbol == "SUI")
         .ok_or_else(|| venue("Cashout is unavailable"))?;
-    let recipient = destination(&state, &headers, &token, &user).await?;
-    let (symbol, name, decimals, icon_url) = sui_meta(&state, coin)
-        .await
-        .ok_or_else(|| venue("Asset details unavailable"))?;
-    let body = bridge(&state, &headers, "/sui/balance", json!({"coinType":coin})).await?;
+    // These don't depend on each other: asked together, a quote waits for the slowest (about a
+    // second) rather than all four in a row.
+    let pairs = async {
+        state
+            .near
+            .icon_http
+            .get(format!("https://api.dexscreener.com/tokens/v1/sui/{coin}"))
+            .send()
+            .await
+            .map_err(venue)?
+            .error_for_status()
+            .map_err(venue)?
+            .json::<Value>()
+            .await
+            .map_err(venue)
+    };
+    let (recipient, meta, body, pairs) = tokio::join!(
+        destination(&state, &headers, &token, &user),
+        sui_meta(&state, coin),
+        bridge(&state, &headers, "/sui/balance", json!({"coinType":coin})),
+        pairs,
+    );
+    let recipient = recipient?;
+    let (symbol, name, decimals, icon_url) =
+        meta.ok_or_else(|| venue("Asset details unavailable"))?;
+    let body = body?;
     if body["address"].as_str() != Some(&recipient) {
         return Err(venue("Balance wallet did not match"));
     }
@@ -3801,18 +3822,7 @@ async fn sui_coin_sell_quote(
         .as_str()
         .and_then(|v| v.parse::<u128>().ok())
         .ok_or_else(|| venue("Your holding is unavailable"))?;
-    let pairs: Value = state
-        .near
-        .icon_http
-        .get(format!("https://api.dexscreener.com/tokens/v1/sui/{coin}"))
-        .send()
-        .await
-        .map_err(venue)?
-        .error_for_status()
-        .map_err(venue)?
-        .json()
-        .await
-        .map_err(venue)?;
+    let pairs = pairs?;
     let price = pairs
         .as_array()
         .into_iter()
