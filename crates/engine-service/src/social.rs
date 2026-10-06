@@ -60,15 +60,26 @@ struct SendQuote {
     // A friend send or link: the network fee the quote showed (USDC units), in its Fee and total.
     network_units: u128,
 }
-// How a bank withdrawal's USDC reaches the payout address: straight from Base, straight from
-// Solana (opening the address's USDC account costs rent), or hopped from Solana to Base first.
+// How a bank withdrawal's USDC reaches the payout address: straight from Base (a fraction of a
+// cent); from Solana, bridged by Relay straight to a Base payout address (about two cents); straight
+// to a Solana payout address, only when Relay doesn't answer (opening that address's USDC account
+// costs about 25 cents of rent); or, when neither chain holds it all, hopped to Base first.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum BankRoute {
     Base,
+    Relay,
     Solana,
     Hop,
 }
-async fn bank_route(state: &AppState, evm: &str, solana: Option<&str>, usdc: u128) -> BankRoute {
+// The route, and what it should cost in network fees (USDC units; a hop's is priced by the caller).
+// Without `price`, Relay is assumed for Solana cash and not asked (the plan asks it, and falls back).
+async fn bank_route(
+    state: &AppState,
+    evm: &str,
+    solana: Option<&str>,
+    usdc: u128,
+    price: bool,
+) -> (BankRoute, u128) {
     let base_cash = state
         .markets
         .base
@@ -76,17 +87,26 @@ async fn bank_route(state: &AppState, evm: &str, solana: Option<&str>, usdc: u12
         .await
         .unwrap_or(0);
     if base_cash >= usdc {
-        return BankRoute::Base;
+        return (BankRoute::Base, 0);
     }
-    // Straight from Solana only when the wallet can also pay that transfer's network fee.
     if let Some(from) = solana {
-        if markets::solana_cash(state, from).await >= usdc
-            && markets::solana_can_send(state, from, usdc).await
-        {
-            return BankRoute::Solana;
+        let cash = markets::solana_cash(state, from).await;
+        if cash >= usdc {
+            if !price {
+                return (BankRoute::Relay, 0);
+            }
+            // Priced to the user's own Base wallet: Relay charges the same to any Base address.
+            if let Ok(moved) = state.relay_link.solana_to_base(from, evm, usdc, 0).await {
+                if cash >= moved.amount_in_units {
+                    return (BankRoute::Relay, moved.amount_in_units.saturating_sub(usdc));
+                }
+            }
+            if markets::solana_can_send(state, from, usdc).await {
+                return (BankRoute::Solana, markets::account_rent_usd(state).await);
+            }
         }
     }
-    BankRoute::Hop
+    (BankRoute::Hop, 0)
 }
 #[derive(Deserialize)]
 pub(super) struct HandleBody {
@@ -659,12 +679,12 @@ pub(super) async fn send_quote(
         .unwrap_or(0);
     // Daya takes USDC on Solana as well as Base.
     let route = match bank {
-        Some(_) => Some(bank_route(&state, &wallet, solana.as_deref(), usdc_units).await),
+        Some(_) => Some(bank_route(&state, &wallet, solana.as_deref(), usdc_units, true).await),
         None => None,
     };
     let solana_covers = match (&solana, &recipient_solana) {
         (Some(from), Some(_)) => markets::solana_cash(&state, from).await >= usdc_units,
-        (Some(_), None) => route == Some(BankRoute::Solana),
+        (Some(_), None) => matches!(route, Some((BankRoute::Relay | BankRoute::Solana, _))),
         _ => false,
     };
     let mut hop_fee = 0;
@@ -694,14 +714,13 @@ pub(super) async fn send_quote(
     } else {
         hop_fee
     };
-    // A bank withdrawal's network fee in naira, in its Fee and "You pay" from the quote on: rent
-    // for the payout address's new USDC account on Solana, or the cost of hopping cash to Base.
+    // A bank withdrawal's network fee in naira, in its Fee and "You pay" from the quote on: Relay's
+    // bridge to Base, or the cost of hopping cash to Base (Base itself costs a fraction of a cent).
     let bank_network = match route {
-        Some(route) => {
+        Some((route, estimate)) => {
             let usdc = match route {
-                BankRoute::Base => 0,
-                BankRoute::Solana => markets::account_rent_usd(&state).await,
                 BankRoute::Hop => hop_fee,
+                _ => estimate,
             };
             let ngn = usdc.saturating_mul(app_balance::fx_rate("NGN").await?) / 1_000_000;
             Some((route, ngn))
@@ -967,21 +986,59 @@ async fn bank_plan(
     fee: u128,
 ) -> Result<(Value, String, u64), ApiError> {
     let rate = app_balance::fx_rate(&quote.currency).await?;
-    let route = bank_route(
+    let (mut route, _) = bank_route(
         state,
         &quote.sender_wallet,
         quote.sender_solana.as_deref(),
         quote.usdc_units,
+        false,
     )
     .await;
-    let on_solana = route == BankRoute::Solana && quote.sender_solana.is_some();
-    let chain = if on_solana { "SOLANA" } else { "BASE" };
-    let (funding_account, address, expires) = state
+    if quote.sender_solana.is_none() && matches!(route, BankRoute::Relay | BankRoute::Solana) {
+        route = BankRoute::Hop;
+    }
+    // Relay pays a Base payout address; only a direct Solana transfer needs a Solana one.
+    let chain = if route == BankRoute::Solana {
+        "SOLANA"
+    } else {
+        "BASE"
+    };
+    let (mut funding_account, mut address, mut expires) = state
         .daya
         .open_payout(user, payout, chain, &format!("atlas-{quote_id}"))
         .await?;
-    let (intent_id, transactions, network_fee) = match (&quote.sender_solana, on_solana) {
-        (Some(from), true) => {
+    let mut relayed = None;
+    if route == BankRoute::Relay {
+        let from = quote.sender_solana.clone().unwrap_or_default();
+        match markets::plan_solana_relay(
+            state,
+            user.user_id.clone(),
+            from,
+            &address,
+            quote.usdc_units,
+        )
+        .await
+        {
+            Ok(plan) => relayed = Some(plan),
+            // Relay (or the fee step) didn't answer: pay a Solana payout address directly instead.
+            Err((_, reason)) => {
+                eprintln!(
+                    "bank withdrawal {quote_id}: Relay unavailable ({reason}); paying on Solana"
+                );
+                route = BankRoute::Solana;
+                (funding_account, address, expires) = state
+                    .daya
+                    .open_payout(user, payout, "SOLANA", &format!("atlas-{quote_id}-sol"))
+                    .await?;
+            }
+        }
+    }
+    let (intent_id, transactions, network_fee) = match (&quote.sender_solana, route) {
+        _ if relayed.is_some() => {
+            let (intent_id, transactions, network) = relayed.expect("relayed");
+            (intent_id, transactions, Some(network))
+        }
+        (Some(from), BankRoute::Solana) => {
             let (intent_id, transactions, network) = markets::plan_solana_transfer(
                 state,
                 user.user_id.clone(),

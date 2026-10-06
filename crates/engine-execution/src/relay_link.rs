@@ -1558,6 +1558,45 @@ mod tests {
         assert_eq!(state("failure"), SwapState::Failed("failure".into()));
     }
 
+    // A bank payout from Solana cash: Relay delivers to the payout partner's fresh Base address. The
+    // Solana deposit is built and simulated exactly as the engine does; nothing is signed or sent.
+    // cargo test -p engine-execution live_relay_bank_payout -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn live_relay_bank_payout_to_a_fresh_base_address() {
+        let client = RelayClient::new(std::env::var("RELAY_API_KEY").ok()).unwrap();
+        let owner = "6metVveeGpQN6YoXYmevmvtQp7k5CvCgaKBRuQUgevKR";
+        let fresh = format!(
+            "0x{:040x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let moved = client
+            .solana_to_base(owner, &fresh, 1_100_000, 0)
+            .await
+            .unwrap();
+        assert_eq!(moved.amount_out_units, 1_100_000);
+        let solana = crate::solana::SolanaAtaPreflight::new(
+            crate::solana::SolanaNetwork::Mainnet,
+            std::env::var("ATLAS_SOLANA_MAINNET_RPC_URL")
+                .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".into()),
+            "",
+        )
+        .unwrap();
+        let tx = solana
+            .v0_transaction(owner, &moved.instructions, &moved.lookup_tables)
+            .await
+            .unwrap();
+        let units = solana.preflight_swap(&tx).await.unwrap();
+        println!(
+            "Solana cash → fresh Base payout address: {} in for 1.10 USDC out (fee {}), simulated OK ({units} CU); nothing signed or sent",
+            moved.amount_in_units,
+            moved.amount_in_units - 1_100_000
+        );
+    }
+
     // Network: a real quote (nothing moves without the signature).
     // cargo test -p engine-execution live_relay -- --ignored --nocapture
     #[tokio::test]

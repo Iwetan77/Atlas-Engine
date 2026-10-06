@@ -959,6 +959,9 @@ pub(super) struct PlannedTransfer {
     // in USDC in the same transaction, so the wallet needs no SOL at all.
     #[serde(default)]
     kora: Option<engine_execution::kora::Transfer>,
+    // `to` is an address on Base, reached by Relay bridging the wallet's Solana USDC straight there.
+    #[serde(default)]
+    base: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct BaseTopup {
@@ -3225,13 +3228,44 @@ pub(super) async fn plan_solana_transfer(
     amount: u128,
     retry: bool,
 ) -> Result<(String, Vec<Value>, u128), ApiError> {
+    let steps = solana_transfer_steps(state, &from, to, amount, true).await?;
+    insert_transfer(state, owner, from, to, amount, retry, false, steps).await
+}
+
+// USDC from a Solana wallet to an address on Base, bridged by Relay straight there (a bank payout
+// address): about two cents and two seconds, with no new token account to pay rent for (opening one
+// on Solana costs about 0.002 SOL, ten times as much). The phone signs one Solana transaction, the
+// engine lands it, and Relay delivers exactly `amount`. Returns the intent, what the app signs, and
+// what the network costs the sender (USDC units).
+pub(super) async fn plan_solana_relay(
+    state: &AppState,
+    owner: String,
+    from: String,
+    base_to: &str,
+    amount: u128,
+) -> Result<(String, Vec<Value>, u128), ApiError> {
+    let steps = solana_relay_steps(state, &from, base_to, amount, true).await?;
+    insert_transfer(state, owner, from, base_to, amount, true, true, steps).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_transfer(
+    state: &AppState,
+    owner: String,
+    from: String,
+    to: &str,
+    amount: u128,
+    retry: bool,
+    base: bool,
+    steps: SolanaTransfer,
+) -> Result<(String, Vec<Value>, u128), ApiError> {
     let SolanaTransfer {
         gas,
         transaction: transfer,
         network_fee,
         lamports,
         kora,
-    } = solana_transfer_steps(state, &from, to, amount, true).await?;
+    } = steps;
     let intent_id = id("intent");
     state
         .markets
@@ -3264,6 +3298,7 @@ pub(super) async fn plan_solana_transfer(
                     lamports,
                     retry,
                     kora,
+                    base,
                 }),
                 base_topup: None,
             },
@@ -3373,6 +3408,76 @@ async fn solana_transfer_steps(
             Err((StatusCode::SERVICE_UNAVAILABLE, SOLANA_FEE_NOT_READY.into()))
         }
     }
+}
+
+// Relay's deposit for `amount` to land at `base_to` on Base, and the gas top-up that pays its Solana
+// fee when the wallet is short of SOL (no account is opened, so the usual floor is enough). Relay's
+// fee is in the USDC that leaves. On a second try (`topup` false) SOL bought by the first is waited
+// for a moment before another top-up is asked for.
+async fn solana_relay_steps(
+    state: &AppState,
+    from: &str,
+    base_to: &str,
+    amount: u128,
+    topup: bool,
+) -> Result<SolanaTransfer, ApiError> {
+    let not_ready =
+        || -> ApiError { (StatusCode::SERVICE_UNAVAILABLE, SOLANA_FEE_NOT_READY.into()) };
+    let moved = state
+        .relay_link
+        .solana_to_base(from, base_to, amount, 0)
+        .await
+        .map_err(|error| {
+            eprintln!("bridge to Base: Relay didn't quote ({error})");
+            not_ready()
+        })?;
+    let cash = solana_cash(state, from).await;
+    if cash < moved.amount_in_units {
+        return Err(short_of_cash());
+    }
+    let transaction = state
+        .solana_mainnet
+        .v0_transaction(from, &moved.instructions, &moved.lookup_tables)
+        .await
+        .map_err(unavailable)?;
+    let network_fee = moved.amount_in_units.saturating_sub(amount);
+    let mut sol = state
+        .solana_mainnet
+        .owner_sol_balance(from)
+        .await
+        .map_err(unavailable)?;
+    if !topup {
+        for _ in 0..4 {
+            if sol >= GAS_FLOOR_LAMPORTS {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            sol = state
+                .solana_mainnet
+                .owner_sol_balance(from)
+                .await
+                .map_err(unavailable)?;
+        }
+    }
+    let mut gas = None;
+    if sol < GAS_FLOOR_LAMPORTS {
+        let usdc = topup_usdc_for(state, GAS_FLOOR_LAMPORTS - sol).await;
+        if cash < moved.amount_in_units.saturating_add(usdc) {
+            return Err(short_of_cash());
+        }
+        gas = Some(
+            gasless_topup_order(state, from, usdc)
+                .await
+                .ok_or_else(not_ready)?,
+        );
+    }
+    Ok(SolanaTransfer {
+        gas,
+        transaction,
+        network_fee,
+        lamports: GAS_FLOOR_LAMPORTS,
+        kora: None,
+    })
 }
 
 // The transfer with Kora's fee payer paying its SOL and the receiver's rent, repaid in USDC in the
@@ -5166,21 +5271,23 @@ pub(super) async fn next_transactions(
             StatusCode::CONFLICT,
             "nothing to sign for this intent".into(),
         ))?;
-        // Never a second top-up: one bought on the first try may still be landing.
-        let steps =
-            match solana_transfer_steps(&state, &intent.wallet, &planned.to, planned.amount, false)
-                .await
-            {
-                Ok(steps) => steps,
-                Err((code, reason)) => {
-                    let mut failed = intent.clone();
-                    failed.status.stage = "settle".into();
-                    failed.status.state = "failed".into();
-                    failed.status.error = Some(reason.clone());
-                    state.markets.save_intent(&intent_id, &failed).await?;
-                    return Err((code, reason));
-                }
-            };
+        // Never a second top-up while one bought on the first try may still be landing.
+        let fresh = if planned.base {
+            solana_relay_steps(&state, &intent.wallet, &planned.to, planned.amount, false).await
+        } else {
+            solana_transfer_steps(&state, &intent.wallet, &planned.to, planned.amount, false).await
+        };
+        let steps = match fresh {
+            Ok(steps) => steps,
+            Err((code, reason)) => {
+                let mut failed = intent.clone();
+                failed.status.stage = "settle".into();
+                failed.status.state = "failed".into();
+                failed.status.error = Some(reason.clone());
+                state.markets.save_intent(&intent_id, &failed).await?;
+                return Err((code, reason));
+            }
+        };
         intent.gas_request_id = steps.gas.as_ref().map(|(id, _)| id.clone());
         if let Some(t) = intent.transfer.as_mut() {
             t.lamports = steps.lamports;
@@ -6236,6 +6343,7 @@ mod tests {
             lamports: NEW_ACCOUNT_FLOOR_LAMPORTS,
             retry: true,
             kora: None,
+            base: false,
         });
         intent.status.stage = "validate".into();
         intent.status.state = "pending".into();
