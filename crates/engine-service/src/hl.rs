@@ -17,6 +17,33 @@ const MARKETS_TTL: Duration = Duration::from_secs(30);
 const REFRESH_EVERY: Duration = Duration::from_secs(20);
 // Hyperliquid limits requests per address and shared hosting shares addresses: when it says "too
 // many", the last good list keeps serving for a while, and refreshes slow down instead of piling on.
+pub(super) fn usage(state: &AppState) -> Value {
+    let u = state.hl.client.usage();
+    json!({"requestsLastMinute": u.requests, "refusedLastMinute": u.refused, "lastStatus": u.last_status,
+        "relay": env::var("HYPERLIQUID_RELAY_URL").is_ok_and(|v| !v.trim().is_empty())})
+}
+
+// HYPERLIQUID_RELAY_URL + HYPERLIQUID_RELAY_SECRET: Atlas's Cloudflare Worker that asks Hyperliquid
+// from Cloudflare's addresses (Render's shared ones get "429 Too Many Requests"). Without them, or
+// with a bad pair, requests go direct.
+fn relayed(
+    client: engine_execution::hyperliquid::HyperliquidClient,
+) -> engine_execution::hyperliquid::HyperliquidClient {
+    let (Ok(url), Ok(secret)) = (
+        env::var("HYPERLIQUID_RELAY_URL"),
+        env::var("HYPERLIQUID_RELAY_SECRET"),
+    ) else {
+        return client;
+    };
+    match client.clone().with_relay(url.trim(), secret.trim()) {
+        Ok(relayed) => relayed,
+        Err(error) => {
+            eprintln!("hyperliquid relay not used: {error}");
+            client
+        }
+    }
+}
+
 const STALE_OK: Duration = Duration::from_secs(5 * 60);
 const BACKOFF_MAX: Duration = Duration::from_secs(5 * 60);
 // Hyperliquid's base taker fee (0.045%), and the price room a market order allows (3%).
@@ -341,7 +368,7 @@ impl HlState {
             None
         };
         Ok(Self {
-            client: engine_execution::hyperliquid::HyperliquidClient::new()?,
+            client: relayed(engine_execution::hyperliquid::HyperliquidClient::new()?),
             markets: Arc::new(Mutex::new(None)),
             quotes: Arc::new(Mutex::new(HashMap::new())),
             intents: IntentStore {

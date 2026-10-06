@@ -23,6 +23,21 @@ pub enum HyperliquidError {
 pub struct HyperliquidClient {
     http: Client,
     info: Url,
+    // Hyperliquid limits requests per address, and shared hosting shares addresses. A relay (Atlas's
+    // own Cloudflare Worker, `<relay>/info`, authorized by a secret header) asks from elsewhere;
+    // when it can't answer, the direct route is tried.
+    relay: Option<(Url, String)>,
+    // Every request this engine made in the last minute and how it was answered (HTTP status, 0
+    // when nothing came back): evidence of who is using up Hyperliquid's per-address limit.
+    usage: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<(std::time::Instant, u16)>>>,
+}
+
+/// This engine's own Hyperliquid traffic over the last minute.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Usage {
+    pub requests: usize,
+    pub refused: usize,
+    pub last_status: u16,
 }
 
 /// One perps market right now. `asset` is the id orders use; `coin` names it ("BTC", "xyz:TSLA").
@@ -117,19 +132,86 @@ impl HyperliquidClient {
         Ok(Self {
             http: Client::builder().timeout(Duration::from_secs(15)).build()?,
             info: Url::parse(INFO).map_err(|_| HyperliquidError::InvalidResponse("URL"))?,
+            relay: None,
+            usage: Default::default(),
         })
     }
 
+    /// Reads go through `relay` (an https origin; its `/info` forwards to Hyperliquid) with
+    /// `secret` in the `x-atlas-relay` header.
+    pub fn with_relay(mut self, relay: &str, secret: &str) -> Result<Self, HyperliquidError> {
+        let base = Url::parse(relay).map_err(|_| HyperliquidError::InvalidResponse("relay URL"))?;
+        if base.scheme() != "https" || secret.len() < 16 {
+            return Err(HyperliquidError::InvalidResponse(
+                "relay must be https with a long secret",
+            ));
+        }
+        let info = base
+            .join("/info")
+            .map_err(|_| HyperliquidError::InvalidResponse("relay URL"))?;
+        self.relay = Some((info, secret.to_owned()));
+        Ok(self)
+    }
+
+    fn note(&self, status: u16) {
+        if let Ok(mut seen) = self.usage.lock() {
+            let now = std::time::Instant::now();
+            while seen
+                .front()
+                .is_some_and(|(at, _)| now.duration_since(*at).as_secs() >= 60)
+            {
+                seen.pop_front();
+            }
+            seen.push_back((now, status));
+        }
+    }
+
+    pub fn usage(&self) -> Usage {
+        let Ok(seen) = self.usage.lock() else {
+            return Usage::default();
+        };
+        let now = std::time::Instant::now();
+        let recent: Vec<u16> = seen
+            .iter()
+            .filter(|(at, _)| now.duration_since(*at).as_secs() < 60)
+            .map(|(_, s)| *s)
+            .collect();
+        Usage {
+            requests: recent.len(),
+            refused: recent.iter().filter(|s| **s == 429).count(),
+            last_status: seen.back().map_or(0, |(_, s)| *s),
+        }
+    }
+
+    async fn ask(
+        &self,
+        url: Url,
+        secret: Option<&str>,
+        body: &Value,
+    ) -> Result<Value, HyperliquidError> {
+        let mut call = self.http.post(url).json(body);
+        if let Some(secret) = secret {
+            call = call.header("x-atlas-relay", secret);
+        }
+        let response = match call.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                self.note(0);
+                return Err(error.into());
+            }
+        };
+        self.note(response.status().as_u16());
+        Ok(response.error_for_status()?.json().await?)
+    }
+
     async fn info(&self, body: Value) -> Result<Value, HyperliquidError> {
-        Ok(self
-            .http
-            .post(self.info.clone())
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?)
+        if let Some((url, secret)) = &self.relay {
+            let relayed = self.ask(url.clone(), Some(secret), &body).await;
+            if relayed.is_ok() {
+                return relayed;
+            }
+        }
+        self.ask(self.info.clone(), None, &body).await
     }
 
     /// Every live perps market, Hyperliquid's own and the listed dexes'.

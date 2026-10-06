@@ -185,10 +185,17 @@ export function checkApproval(agentAddress, nonce, signature, wallet) {
   return {r: '0x' + signature.slice(2, 66), s: '0x' + signature.slice(66, 130), v: recovery + 27};
 }
 
+// Orders go through Atlas's relay (a Cloudflare Worker) when it's configured: Hyperliquid limits
+// requests per address and Render's are shared. A signed action carries its own nonce, so the relay
+// can't change or repeat it.
+const RELAY = process.env.HYPERLIQUID_RELAY_URL?.trim();
+const RELAY_SECRET = process.env.HYPERLIQUID_RELAY_SECRET?.trim();
+const RELAYED = RELAY?.startsWith('https://') && (RELAY_SECRET?.length ?? 0) >= 16;
+
 export async function post(body) {
-  const response = await fetch(EXCHANGE, {
+  const response = await fetch(RELAYED ? new URL('/exchange', RELAY).href : EXCHANGE, {
     method: 'POST',
-    headers: {'content-type': 'application/json'},
+    headers: {'content-type': 'application/json', ...(RELAYED ? {'x-atlas-relay': RELAY_SECRET} : {})},
     body: JSON.stringify(body),
   });
   const text = await response.text();

@@ -319,6 +319,9 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
             // Jupiter data under Atlas's own key instead of the shared keyless limit.
             "jupiter": markets::jupiter_keyed(),
         },
+        // This engine's own Hyperliquid requests in the last minute, how many were refused (429),
+        // and whether they go through Atlas's relay.
+        "hyperliquid": hl::usage(&state),
         // Bank transfers: whether Daya's key and webhook secret are set, and its last no-money check.
         "daya": daya::health(),
     }))
