@@ -593,6 +593,17 @@ Sources: [Polymarket account setup](https://docs.polymarket.com/trading/wallets-
 [geographic restrictions](https://docs.polymarket.com/api-reference/geoblock),
 [Render regions](https://render.com/docs/regions).
 
+## Hyperliquid relay (optional)
+
+Hyperliquid's API has no keys: it limits requests per address, and Render shares outbound IP ranges
+across every service in a region. `/health` shows this engine's own Hyperliquid traffic
+(`hyperliquid.requestsLastMinute`, `refusedLastMinute`, `lastStatus`); if Hyperliquid refuses while
+that count is small, the shared address is the cause. `scripts/hyperliquid-relay.js` is a Cloudflare
+Worker that forwards only `POST /info` and `POST /exchange` to api.hyperliquid.xyz when the request
+carries its secret. Deploy it, set its `RELAY_SECRET` secret, then set `HYPERLIQUID_RELAY_URL` (the
+Worker's https URL) and `HYPERLIQUID_RELAY_SECRET` (the same secret, 16+ characters) on the engine.
+Reads fall back to the direct route if the relay can't answer.
+
 ## Payment PIN
 
 GET /v1/me/pin returns {configured, lockedUntilUnixMs}. POST /v1/me/pin sets a
