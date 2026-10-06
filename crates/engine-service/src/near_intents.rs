@@ -2822,6 +2822,12 @@ async fn ref_buy_quote(
 }
 
 const NEAR_GAS_RESERVE: u128 = 50_000_000_000_000_000_000_000;
+// A sale straight to cash is one transaction to the token (wrap NEAR, register 1Click's deposit
+// address for 0.00125 NEAR, transfer) with 70 Tgas (0.007 NEAR) prepaid and mostly refunded: 0.01
+// NEAR covers it, so a sale no longer leaves 0.05 NEAR (₦350) behind. Ref swaps keep the larger
+// reserve above. The bridge's CASHOUT_RESERVE is the same amount.
+const NEAR_CASHOUT_RESERVE: u128 = 10_000_000_000_000_000_000_000;
+const NEAR_CASHOUT_SHORT: &str = "Selling needs about 0.01 NEAR in your NEAR wallet for the network fee. Buy a little NEAR first, then sell.";
 fn near_account(value: &str) -> bool {
     (2..=64).contains(&value.len())
         && value.ends_with(".near")
@@ -3306,7 +3312,6 @@ fn sell_units(
 }
 // MON kept back for the network fee when selling it: a plain transfer costs about 0.002 MON.
 const MONAD_GAS_RESERVE: u128 = 20_000_000_000_000_000;
-const NEAR_GAS_SHORT: &str = "Selling needs about 0.05 NEAR in your NEAR wallet for network fees. Buy a little NEAR first, then sell.";
 
 // A 1Click coin's USD price, as the token list gives it (memecoins sit far below a micro-dollar).
 fn token_usd(token: &Token) -> f64 {
@@ -3456,13 +3461,13 @@ async fn near_coin_sell_quote(
         .filter(|c| near_account(c))
         .ok_or_else(|| bad("Atlas can't sell this coin"))?;
     let wallet = destination(&state, &headers, &token, &user).await?;
-    if near_native(&state, &wallet).await? < NEAR_GAS_RESERVE {
-        return Err(conflict(NEAR_GAS_SHORT));
+    if near_native(&state, &wallet).await? < NEAR_CASHOUT_RESERVE {
+        return Err(conflict(NEAR_CASHOUT_SHORT));
     }
     let mut held = near_coin_held(&state, &contract, &wallet).await?;
     if contract == WRAP_NEAR {
-        // NEAR keeps its own fee money.
-        held = held.saturating_sub(NEAR_GAS_RESERVE);
+        // NEAR keeps just this sale's fee money.
+        held = held.saturating_sub(NEAR_CASHOUT_RESERVE);
     }
     let price = token_usd(&token);
     let rate = app_balance::fx_rate(&req.amount.currency).await?;
@@ -4734,19 +4739,6 @@ async fn execute_sui_sell(
             )
         })
         .unwrap_or_else(|| format!("{} SUI", markets::format_units(quote.amount, 9)));
-    // Selling NEAR keeps 0.05 NEAR in the wallet for the network fees of this sale and later ones.
-    // It isn't a fee, but unsaid it made selling everything look about ₦350 short.
-    let kept = (quote.asset.contract_address.as_deref() == Some(WRAP_NEAR)).then(|| {
-        let usd = worth_of(
-            NEAR_GAS_RESERVE,
-            token_usd(&quote.asset),
-            quote.asset.decimals,
-        );
-        format!(
-            "0.05 NEAR ({}), stays in your balance",
-            markets::say_money(usd, &quote.currency, rate)
-        )
-    });
     let status = markets::IntentStatus {
         intent_id: intent_id.clone(),
         stage: "validate".into(),
@@ -4803,15 +4795,11 @@ async fn execute_sui_sell(
         .map(|d| d.transactions.clone())
         .unwrap_or_default();
     state.near.save_intent(&intent_id, current).await?;
-    let mut summary = vec![
-        json!({"label":"You sell","value":sell_label}),
-        json!({"label":"You receive (at least)","value":markets::say_money(quote.minimum_out,&quote.currency,rate)}),
-    ];
-    if let Some(kept) = kept {
-        summary.push(json!({"label":"Kept for network fees","value":kept}));
-    }
     Ok(Json(json!({"intentId":intent_id,"kind":"sell",
-        "summary":summary,
+        "summary":[
+            {"label":"You sell","value":sell_label},
+            {"label":"You receive (at least)","value":markets::say_money(quote.minimum_out,&quote.currency,rate)}
+        ],
         "transactions":transactions,"expiresAtUnixMs":expires
     })))
 }

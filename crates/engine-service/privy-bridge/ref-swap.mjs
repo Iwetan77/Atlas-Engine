@@ -8,7 +8,10 @@ export const REF = 'v2.ref-finance.near';
 export const WRAP = 'wrap.near';
 // rpc.mainnet.near.org is deprecated and refuses requests: FastNEAR's public endpoints instead.
 const RPC = process.env.ATLAS_NEAR_MAINNET_RPC_URL ?? 'https://free.rpc.fastnear.com';
-export const GAS_RESERVE = 50000000000000000000000n; // 0.05 NEAR, including storage.
+export const GAS_RESERVE = 50000000000000000000000n; // 0.05 NEAR, including storage (Ref swaps).
+// A sale straight to cash: one transaction (wrap, register 1Click's deposit address, transfer), 70
+// Tgas prepaid plus 0.00125 NEAR storage. The engine's NEAR_CASHOUT_RESERVE is the same amount.
+export const CASHOUT_RESERVE = 10000000000000000000000n; // 0.01 NEAR
 export function account(value) {
   if (typeof value !== 'string' || value.length < 2 || value.length > 64 ||
       !/^[a-z0-9]+(?:[._-][a-z0-9]+)*$/.test(value)) throw new Error('invalid token account');
@@ -327,7 +330,7 @@ export async function prepareCashout({wallet,userId,userJwt,evmWallet,solanaWall
   const cash=cashDestination(solanaWallet,evmWallet);
   if(BigInt(amount)<=0n||BigInt(minimumOut)<=0n)throw new Error('invalid cashout');
   const native=BigInt((await rpc('query',{request_type:'view_account',finality:'final',account_id:wallet.address})).amount);
-  if(native<GAS_RESERVE)throw new Error('not enough NEAR for the network fee');
+  if(native<CASHOUT_RESERVE)throw new Error('not enough NEAR for the network fee');
   if(available(token,BigInt(await view(token,'ft_balance_of',{account_id:wallet.address})),native)<BigInt(amount))throw new Error('holding changed');
   const request={dry:false,swapType:'EXACT_INPUT',slippageTolerance:100,originAsset:`nep141:${token}`,depositType:'ORIGIN_CHAIN',
     destinationAsset:cash.asset,amount:String(amount),recipient:cash.recipient,recipientType:'DESTINATION_CHAIN',
@@ -359,10 +362,10 @@ export async function prepareSale({intentId,wallet,userId,userJwt,accessToken,ev
   return prepareCashout({wallet,userId,userJwt,evmWallet,solanaWallet,token:bound.coinType,amount:bound.amount,
     minimumOut:bound.minimumOut,scope:bound});
 }
-// What a wallet can sell of `token`: its balance, and for NEAR also native NEAR beyond the gas reserve
+// What a wallet can sell of `token`: its balance, and for NEAR also native NEAR beyond the sale's fee money
 // (1Click pays NEAR out unwrapped, so that's where most of it sits).
 export function available(token,held,native){
-  return token===WRAP?held+(native>GAS_RESERVE?native-GAS_RESERVE:0n):held;
+  return token===WRAP?held+(native>CASHOUT_RESERVE?native-CASHOUT_RESERVE:0n):held;
 }
 // NEAR sold from native NEAR is wrapped first, in the same transaction to wrap.near.
 export function wrapFirst(token,held,amount){
@@ -375,7 +378,7 @@ export async function commitCashout({cashoutId,scope,wallet,userId,userJwt,rawSi
   const token=item.scope.coinType,amount=item.scope.amount,to=item.data.depositAddress;
   const held=BigInt(await view(token,'ft_balance_of',{account_id:wallet.address}));
   const native=BigInt((await rpc('query',{request_type:'view_account',finality:'final',account_id:wallet.address})).amount);
-  if(available(token,held,native)<BigInt(amount)||native<GAS_RESERVE)throw new Error('holding changed');
+  if(available(token,held,native)<BigInt(amount)||native<CASHOUT_RESERVE)throw new Error('holding changed');
   const actions=[...wrapFirst(token,held,amount),...await depositActions(token,to,amount)];
   const result=await sendCall(wallet,token,actions,rawSign,item.scope.expiresAtUnixMs);
   return {ok:sentToken(result,token,wallet.address,to)===BigInt(amount),digest:result.transaction.hash};
@@ -420,7 +423,7 @@ export async function buildNearCashout({cashoutId,scope,wallet,userId,userJwt}) 
   const token=item.scope.coinType,amount=item.scope.amount,to=item.data.depositAddress;
   const held=BigInt(await view(token,'ft_balance_of',{account_id:wallet.address}));
   const native=BigInt((await rpc('query',{request_type:'view_account',finality:'final',account_id:wallet.address})).amount);
-  if(available(token,held,native)<BigInt(amount)||native<GAS_RESERVE)throw new Error('holding changed');
+  if(available(token,held,native)<BigInt(amount)||native<CASHOUT_RESERVE)throw new Error('holding changed');
   const actions=[...wrapFirst(token,held,amount),...await depositActions(token,to,amount)];
   return {calls:await buildNearCalls(wallet,[{receiver:token,actions}]),token,amount,to};
 }

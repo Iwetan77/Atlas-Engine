@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
-import {transaction,swapCall,directPools,indexedPool,receivedToken,account,nextNonce,checkCashoutQuote,sentToken,cashDestination,available,wrapFirst,depositActions,GAS_RESERVE} from './ref-swap.mjs';
+import {transaction,swapCall,directPools,indexedPool,receivedToken,account,nextNonce,checkCashoutQuote,sentToken,cashDestination,available,wrapFirst,depositActions,GAS_RESERVE,CASHOUT_RESERVE} from './ref-swap.mjs';
 import {PreparedSales} from './prepared-sale.mjs';
 const fixture=name=>JSON.parse(readFileSync(new URL('./fixtures/'+name,import.meta.url)));
 test('NEAR encoding matches the official near-api-js 7.3.1 vector',()=>{
@@ -81,8 +81,8 @@ test('cash lands in the Solana wallet, else Base, else nowhere',()=>{
 });
 test("NEAR sells from native NEAR beyond the gas reserve, wrapping only what's missing",()=>{
   const one=10n**24n;
-  assert.equal(available('wrap.near',0n,one),one-GAS_RESERVE);
-  assert.equal(available('wrap.near',2n,GAS_RESERVE/2n),2n);
+  assert.equal(available('wrap.near',0n,one),one-CASHOUT_RESERVE);
+  assert.equal(available('wrap.near',2n,CASHOUT_RESERVE/2n),2n);
   assert.equal(available('token.0xshitzu.near',7n,one),7n);
   assert.deepEqual(wrapFirst('wrap.near',3n,'10').map(a=>[a.method,a.deposit]),[['near_deposit','7']]);
   assert.deepEqual(wrapFirst('wrap.near',10n,'10'),[]);
