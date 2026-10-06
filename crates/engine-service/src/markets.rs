@@ -942,6 +942,19 @@ struct StoredIntent {
     // out `expected`.
     #[serde(default)]
     base_topup: Option<BaseTopup>,
+    // A plain Solana USDC transfer: where it goes, and the SOL its fee (and a new account's rent)
+    // needs in the wallet before it may be sent.
+    #[serde(default)]
+    transfer: Option<PlannedTransfer>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub(super) struct PlannedTransfer {
+    to: String,
+    amount: u128,
+    lamports: u128,
+    // A network fee that wasn't ready when the phone signed is fetched once more, and the fresh
+    // top-up and transfer are signed under the same confirmation (GET /v1/intents/{id}/next).
+    retry: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct BaseTopup {
@@ -1260,6 +1273,7 @@ impl MarketState {
                 buy_mint: None,
                 gas_request_id: None,
                 solana_transfer: false,
+                transfer: None,
                 base_topup: topup.then_some(BaseTopup {
                     uid: None,
                     permit: None,
@@ -2969,24 +2983,111 @@ async fn gas_topup_below(
     if sol >= floor {
         return None;
     }
-    if solana_cash(state, owner).await < reserve.saturating_add(GAS_TOPUP_USDC) {
+    let usdc = topup_usdc_for(state, floor - sol).await;
+    if solana_cash(state, owner).await < reserve.saturating_add(usdc) {
         return None;
     }
-    let order = state
-        .markets
-        .jupiter
-        .order(&JupiterOrderRequest {
-            input_mint: SOL_USDC.into(),
-            output_mint: SOL_MINT.into(),
-            amount_base_units: GAS_TOPUP_USDC as u64,
-            taker: Some(owner.into()),
-        })
+    gasless_topup_order(state, owner, usdc).await
+}
+
+// What a top-up that adds `missing` lamports costs: the usual $0.50, or more when SOL is dear
+// enough that $0.50 wouldn't cover it (a fifth extra for the swap), never more than $2.
+async fn topup_usdc_for(state: &AppState, missing: u128) -> u128 {
+    let price = usd_prices(&state.markets, &[SOL_MINT.to_string()])
         .await
-        .ok()?;
-    if !order.gasless {
-        return None;
+        .ok()
+        .and_then(|p| p.get(SOL_MINT).map(|(price, _)| *price))
+        .unwrap_or(0.0);
+    topup_usdc(missing, price)
+}
+fn topup_usdc(missing: u128, sol_usd: f64) -> u128 {
+    let usdc = (missing as f64 / 1e9 * sol_usd * 1.2 * 1e6).ceil() as u128;
+    usdc.clamp(GAS_TOPUP_USDC, 4 * GAS_TOPUP_USDC)
+}
+
+// Jupiter pays a small swap's fee only when one of its market makers (JupiterZ) takes it; its own
+// gasless route starts at $5. Checked 6 Oct: 2 of 5 asks for $0.50 came back as a plain route the
+// empty wallet can't pay for, so ask a few times before giving up.
+const GASLESS_ASKS: usize = 4;
+async fn gasless_topup_order(
+    state: &AppState,
+    owner: &str,
+    usdc: u128,
+) -> Option<(String, String)> {
+    for ask in 0..GASLESS_ASKS {
+        if ask > 0 {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+        match state
+            .markets
+            .jupiter
+            .order(&JupiterOrderRequest {
+                input_mint: SOL_USDC.into(),
+                output_mint: SOL_MINT.into(),
+                amount_base_units: usdc as u64,
+                taker: Some(owner.into()),
+            })
+            .await
+        {
+            Ok(order) if order.gasless => {
+                if let Some(tx) = order.transaction.filter(|t| !t.is_empty()) {
+                    return Some((order.request_id, tx));
+                }
+            }
+            Ok(order) => eprintln!("gas top-up: {} route isn't gasless", order.router),
+            Err(error) => eprintln!("gas top-up: no order: {error}"),
+        }
     }
-    Some((order.request_id, order.transaction?))
+    None
+}
+
+// What someone reads when a transfer's network fee can't be got ready; nothing was sent.
+pub(super) const SOLANA_FEE_NOT_READY: &str =
+    "Couldn't get the network fee ready just now, so nothing was sent and nothing left your balance. Try again in a minute.";
+const NO_CASH_FOR_SOLANA_FEE: &str =
+    "There isn't enough cash left over for the network fee on this transfer, so nothing was sent. Send a little less, or add money, then try again.";
+
+// Lands the gas top-up the phone signed, then waits until the wallet holds the SOL the transfer
+// needs (the RPC can trail Jupiter by a moment). Without that SOL the transfer would fail on chain
+// with "insufficient funds for rent", so it isn't sent.
+async fn transfer_fee_ready(
+    state: &AppState,
+    intent: &StoredIntent,
+    signed: &[Signed],
+) -> Result<(), String> {
+    if let (Some(request_id), Some(tx)) = (&intent.gas_request_id, signed.first()) {
+        state
+            .markets
+            .jupiter
+            .execute(request_id, &tx.transaction)
+            .await
+            .map_err(|e| format!("top-up didn't land: {e}"))?;
+    }
+    // Planned before this check existed: the transfer goes as it did then.
+    let Some(need) = intent.transfer.as_ref().map(|t| t.lamports) else {
+        return Ok(());
+    };
+    let tries = if intent.gas_request_id.is_some() {
+        8
+    } else {
+        2
+    };
+    let mut short = None;
+    for attempt in 0..tries {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        match state.solana_mainnet.owner_sol_balance(&intent.wallet).await {
+            Ok(sol) if sol >= need => return Ok(()),
+            Ok(sol) => short = Some(sol),
+            Err(_) => short = None,
+        }
+    }
+    // A balance that couldn't be read isn't a shortage: the send's own check decides.
+    match short {
+        Some(sol) => Err(format!("{sol} lamports, needs {need}")),
+        None => Ok(()),
+    }
 }
 
 // Lands a signed gas top-up by its Jupiter request (perps funding uses this directly).
@@ -3086,6 +3187,7 @@ pub(super) async fn plan_jupiter_swap(
                 buy_mint: None,
                 gas_request_id: gas.as_ref().map(|(id, _)| id.clone()),
                 solana_transfer: false,
+                transfer: None,
                 base_topup: None,
             },
         )
@@ -3100,14 +3202,23 @@ pub(super) async fn plan_jupiter_swap(
 
 // A USDC transfer on Solana from one Atlas wallet to another (a friend send when the cash is on
 // Solana): no bridge, lands in seconds. The sender pays the fee (gas tank topped up first if low).
+// With `retry`, a fee that isn't ready once the phone has signed is fetched again after the confirm
+// (the app signs the fresh steps itself); without it the transfer fails, nothing sent. Returns the
+// intent, what the app signs, and whether the transfer opens the receiver's account (rent).
 pub(super) async fn plan_solana_transfer(
     state: &AppState,
     owner: String,
     from: String,
     to: &str,
     amount: u128,
-) -> Result<(String, Vec<Value>), ApiError> {
-    let (gas, transfer) = solana_usdc_transfer(state, &from, to, amount).await?;
+    retry: bool,
+) -> Result<(String, Vec<Value>, bool), ApiError> {
+    let SolanaTransfer {
+        gas,
+        transaction: transfer,
+        opens_account,
+        lamports,
+    } = solana_transfer_steps(state, &from, to, amount).await?;
     let intent_id = id("intent");
     state
         .markets
@@ -3134,6 +3245,12 @@ pub(super) async fn plan_solana_transfer(
                 buy_mint: None,
                 gas_request_id: gas.as_ref().map(|(id, _)| id.clone()),
                 solana_transfer: true,
+                transfer: Some(PlannedTransfer {
+                    to: to.into(),
+                    amount,
+                    lamports,
+                    retry,
+                }),
                 base_topup: None,
             },
         )
@@ -3143,7 +3260,7 @@ pub(super) async fn plan_solana_transfer(
         transactions.push(json!({"chain":"solana","transaction":gas_tx,"submit":"engine"}));
     }
     transactions.push(json!({"chain":"solana","transaction":transfer,"submit":"engine"}));
-    Ok((intent_id, transactions))
+    Ok((intent_id, transactions, opens_account))
 }
 
 // A USDC transfer from a Solana wallet that the engine lands (a friend send, a 1Click deposit): the
@@ -3155,7 +3272,28 @@ pub(super) async fn solana_usdc_transfer(
     to: &str,
     amount: u128,
 ) -> Result<(Option<(String, String)>, String), ApiError> {
-    let (transfer, creates) = state
+    let steps = solana_transfer_steps(state, from, to, amount).await?;
+    Ok((steps.gas, steps.transaction))
+}
+
+pub(super) struct SolanaTransfer {
+    gas: Option<(String, String)>,
+    transaction: String,
+    // Whether it opens the receiver's USDC account (the sender pays that rent).
+    opens_account: bool,
+    // The SOL the wallet must hold when the transfer is sent.
+    lamports: u128,
+}
+
+// The transfer and, when the wallet is short of SOL, the top-up that pays for it. A wallet short of
+// SOL with no top-up to be had gets an error now, not a transfer that fails on chain.
+async fn solana_transfer_steps(
+    state: &AppState,
+    from: &str,
+    to: &str,
+    amount: u128,
+) -> Result<SolanaTransfer, ApiError> {
+    let (transaction, creates) = state
         .solana_mainnet
         .usdc_transfer_transaction(
             from,
@@ -3164,16 +3302,41 @@ pub(super) async fn solana_usdc_transfer(
         )
         .await
         .map_err(unavailable)?;
-    let floor = if creates {
-        3_000_000
+    let lamports = if creates {
+        NEW_ACCOUNT_FLOOR_LAMPORTS
     } else {
         GAS_FLOOR_LAMPORTS
     };
-    Ok((gas_topup_below(state, from, amount, floor).await, transfer))
+    let sol = state
+        .solana_mainnet
+        .owner_sol_balance(from)
+        .await
+        .map_err(unavailable)?;
+    let mut gas = None;
+    if sol < lamports {
+        let usdc = topup_usdc_for(state, lamports - sol).await;
+        if solana_cash(state, from).await < amount.saturating_add(usdc) {
+            return Err((StatusCode::CONFLICT, NO_CASH_FOR_SOLANA_FEE.into()));
+        }
+        gas = Some(
+            gasless_topup_order(state, from, usdc)
+                .await
+                .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, SOLANA_FEE_NOT_READY.into()))?,
+        );
+    }
+    Ok(SolanaTransfer {
+        gas,
+        transaction,
+        opens_account: creates,
+        lamports,
+    })
 }
 
 // Rent for a new USDC account on Solana, which the sender pays and doesn't get back.
 pub(super) const ACCOUNT_RENT_LAMPORTS: u128 = 2_039_280;
+// The SOL a wallet needs to open someone's USDC account and send to it: the rent, the fee, and the
+// ~0.00089 SOL a wallet must keep after any transaction (2,935,160 lamports, rounded up).
+const NEW_ACCOUNT_FLOOR_LAMPORTS: u128 = 3_000_000;
 
 // Whether a Solana wallet can pay for a USDC transfer of `amount` that opens the receiver's account:
 // SOL for the fee and rent already there, or USDC to spare for the gasless top-up.
@@ -3183,7 +3346,7 @@ pub(super) async fn solana_can_send(state: &AppState, owner: &str, amount: u128)
         .owner_sol_balance(owner)
         .await
         .unwrap_or(0);
-    sol >= ACCOUNT_RENT_LAMPORTS + 100_000
+    sol >= NEW_ACCOUNT_FLOOR_LAMPORTS
         || solana_cash(state, owner).await >= amount.saturating_add(GAS_TOPUP_USDC)
 }
 
@@ -3612,6 +3775,7 @@ pub(super) async fn plan_base_with_cash(
                 buy_mint: None,
                 gas_request_id: gas.as_ref().map(|(id, _)| id.clone()),
                 solana_transfer: false,
+                transfer: None,
                 base_topup: None,
             },
         )
@@ -3684,6 +3848,7 @@ pub(super) async fn plan_solana_swap_with_base_cash(
                 buy_mint: Some(buy_mint.into()),
                 gas_request_id: None,
                 solana_transfer: false,
+                transfer: None,
                 base_topup: None,
             },
         )
@@ -4089,6 +4254,7 @@ async fn execute_quote_inner(
                 buy_mint: None,
                 gas_request_id,
                 solana_transfer: false,
+                transfer: None,
                 base_topup,
             },
         )
@@ -4158,7 +4324,8 @@ pub(super) async fn signed(
     // buy once the cash has landed (sign). Anything else is a repeat: answer with the status.
     let second_step = (current.funding.is_some()
         || current.base_topup.is_some()
-        || current.fee_reserve.is_some())
+        || current.fee_reserve.is_some()
+        || (current.solana_transfer && current.transfer.as_ref().is_some_and(|t| t.retry)))
         && current.status.stage == "sign";
     if current.status.state != "pending" || (current.status.stage != "validate" && !second_step) {
         return Ok(Json(current.status));
@@ -4412,16 +4579,33 @@ pub(super) async fn signed(
         }
         // A plain USDC transfer: the engine lands it and status follows its signature.
         if current.solana_transfer {
+            let from = current.status.stage.clone();
             if !state
                 .markets
-                .claim_execution(&intent_id, &current, "validate")
+                .claim_execution(&intent_id, &current, &from)
                 .await?
             {
                 let latest = state.markets.get_intent(&intent_id).await?;
                 return Ok(Json(latest.map_or(current.status, |i| i.status)));
             }
-            run_gas_topup(&state, &current, &body.signed).await;
             let mut updated = current;
+            if let Err(reason) = transfer_fee_ready(&state, &updated, &body.signed).await {
+                eprintln!(
+                    "intent {intent_id}: network fee not ready ({reason}); transfer not sent"
+                );
+                // A top-up quote lasts about a minute, so one signed slowly may have run out: once,
+                // the app gets a fresh top-up and transfer to sign (still the same confirmation).
+                if from == "validate" && updated.transfer.as_ref().is_some_and(|t| t.retry) {
+                    updated.gas_request_id = None;
+                    updated.status.stage = "sign".into();
+                } else {
+                    updated.status.stage = "settle".into();
+                    updated.status.state = "failed".into();
+                    updated.status.error = Some(SOLANA_FEE_NOT_READY.into());
+                }
+                state.markets.save_intent(&intent_id, &updated).await?;
+                return Ok(Json(updated.status));
+            }
             match state
                 .solana_mainnet
                 .send_signed(&body.signed[main].transaction)
@@ -4863,6 +5047,39 @@ pub(super) async fn next_transactions(
         return Ok(Json(
             json!({"transactions":topup_steps(intent.base_topup.as_ref().expect("topup"))}),
         ));
+    }
+    // A transfer whose network fee wasn't ready when the phone signed: a fresh top-up and transfer,
+    // signed under the same confirmation. Asking again before they're signed makes fresh ones.
+    if intent.solana_transfer {
+        let planned = intent.transfer.clone().ok_or((
+            StatusCode::CONFLICT,
+            "nothing to sign for this intent".into(),
+        ))?;
+        let steps = match solana_transfer_steps(&state, &intent.wallet, &planned.to, planned.amount)
+            .await
+        {
+            Ok(steps) => steps,
+            Err((code, reason)) => {
+                let mut failed = intent.clone();
+                failed.status.stage = "settle".into();
+                failed.status.state = "failed".into();
+                failed.status.error = Some(reason.clone());
+                state.markets.save_intent(&intent_id, &failed).await?;
+                return Err((code, reason));
+            }
+        };
+        intent.gas_request_id = steps.gas.as_ref().map(|(id, _)| id.clone());
+        if let Some(t) = intent.transfer.as_mut() {
+            t.lamports = steps.lamports;
+        }
+        state.markets.save_intent(&intent_id, &intent).await?;
+        let mut transactions = Vec::new();
+        if let Some((_, gas_tx)) = steps.gas {
+            transactions.push(json!({"chain":"solana","transaction":gas_tx,"submit":"engine"}));
+        }
+        transactions
+            .push(json!({"chain":"solana","transaction":steps.transaction,"submit":"engine"}));
+        return Ok(Json(json!({ "transactions": transactions })));
     }
     // A Base buy whose cash came from Solana: a fresh swap for what landed.
     if intent.chain == "base" && intent.trade.is_some() {
@@ -5319,6 +5536,7 @@ mod tests {
             buy_mint: None,
             gas_request_id: None,
             solana_transfer: false,
+            transfer: None,
             base_topup: None,
         }
     }
@@ -5876,6 +6094,67 @@ mod tests {
         let old: StoredIntent = serde_json::from_value(old).unwrap();
         assert!(old.fee_preview.is_none() && old.fee_reserve.is_none());
     }
+    #[test]
+    fn a_top_up_covers_a_new_accounts_rent_at_any_sol_price() {
+        // 6 Oct, SOL $121: the usual $0.50 buys ~4.1M lamports, more than the 3M a new account needs.
+        assert_eq!(
+            topup_usdc(NEW_ACCOUNT_FLOOR_LAMPORTS, 121.4),
+            GAS_TOPUP_USDC
+        );
+        // Dearer SOL: enough for the missing lamports plus a fifth, capped at $2.
+        assert_eq!(topup_usdc(NEW_ACCOUNT_FLOOR_LAMPORTS, 300.0), 1_080_000);
+        assert_eq!(topup_usdc(NEW_ACCOUNT_FLOOR_LAMPORTS, 5_000.0), 2_000_000);
+        // No price: the usual amount.
+        assert_eq!(topup_usdc(NEW_ACCOUNT_FLOOR_LAMPORTS, 0.0), GAS_TOPUP_USDC);
+        // The floor is the rent, the fee and what a wallet must keep after any transaction.
+        assert!(NEW_ACCOUNT_FLOOR_LAMPORTS >= ACCOUNT_RENT_LAMPORTS + 5_000 + 890_880);
+    }
+
+    #[tokio::test]
+    async fn a_transfer_whose_fee_wasnt_ready_is_signed_again_once() {
+        let markets = MarketState::new().unwrap();
+        let mut intent = spot_intent("buy", 1, 1);
+        intent.trade = None;
+        intent.solana_transfer = true;
+        intent.transfer = Some(PlannedTransfer {
+            to: "Daya".into(),
+            amount: 1_100_000,
+            lamports: NEW_ACCOUNT_FLOOR_LAMPORTS,
+            retry: true,
+        });
+        intent.status.stage = "validate".into();
+        intent.status.state = "pending".into();
+        markets.insert_intent("transfer-1", &intent).await.unwrap();
+        // The first signing claims it; the fee wasn't ready, so it waits at "sign" for fresh steps.
+        assert!(markets
+            .claim_execution("transfer-1", &intent, "validate")
+            .await
+            .unwrap());
+        let mut waiting = intent.clone();
+        waiting.status.stage = "sign".into();
+        markets.save_intent("transfer-1", &waiting).await.unwrap();
+        // A repeat of the first report can't claim it again; the fresh signing can, once.
+        assert!(!markets
+            .claim_execution("transfer-1", &intent, "validate")
+            .await
+            .unwrap());
+        assert!(markets
+            .claim_execution("transfer-1", &waiting, "sign")
+            .await
+            .unwrap());
+        assert!(!markets
+            .claim_execution("transfer-1", &waiting, "sign")
+            .await
+            .unwrap());
+        // Transfers saved before this existed still load, with nothing to wait for.
+        let mut old = serde_json::to_value(&intent).unwrap();
+        old.as_object_mut().unwrap().remove("transfer");
+        assert!(serde_json::from_value::<StoredIntent>(old)
+            .unwrap()
+            .transfer
+            .is_none());
+    }
+
     #[test]
     fn limits_and_shortfalls_speak_the_users_currency() {
         // ₦1,504.69 per dollar.

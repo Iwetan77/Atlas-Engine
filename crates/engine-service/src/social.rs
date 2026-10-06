@@ -54,6 +54,37 @@ struct SendQuote {
     link: Option<(String, Option<String>, u128)>,
     // A bank withdrawal through Daya: where, the naira the bank gets, and Daya's fee on top.
     bank: Option<(daya::Payout, u128, u128)>,
+    // How the quote expected its USDC to travel, and the network fee that costs (naira micros), so
+    // the confirmation shows the same Fee and total the quote did.
+    bank_network: Option<(BankRoute, u128)>,
+}
+// How a bank withdrawal's USDC reaches the payout address: straight from Base, straight from
+// Solana (opening the address's USDC account costs rent), or hopped from Solana to Base first.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum BankRoute {
+    Base,
+    Solana,
+    Hop,
+}
+async fn bank_route(state: &AppState, evm: &str, solana: Option<&str>, usdc: u128) -> BankRoute {
+    let base_cash = state
+        .markets
+        .base
+        .balance_of(BASE_USDC, evm)
+        .await
+        .unwrap_or(0);
+    if base_cash >= usdc {
+        return BankRoute::Base;
+    }
+    // Straight from Solana only when the wallet can also pay that transfer's network fee.
+    if let Some(from) = solana {
+        if markets::solana_cash(state, from).await >= usdc
+            && markets::solana_can_send(state, from, usdc).await
+        {
+            return BankRoute::Solana;
+        }
+    }
+    BankRoute::Hop
 }
 #[derive(Deserialize)]
 pub(super) struct HandleBody {
@@ -624,16 +655,19 @@ pub(super) async fn send_quote(
         .balance_of(BASE_USDC, &wallet)
         .await
         .unwrap_or(0);
+    // Daya takes USDC on Solana as well as Base.
+    let route = match bank {
+        Some(_) => Some(bank_route(&state, &wallet, solana.as_deref(), usdc_units).await),
+        None => None,
+    };
     let solana_covers = match (&solana, &recipient_solana) {
         (Some(from), Some(_)) => markets::solana_cash(&state, from).await >= usdc_units,
-        // Daya takes USDC on Solana as well as Base.
-        (Some(from), None) if bank.is_some() => {
-            markets::solana_cash(&state, from).await >= usdc_units
-        }
+        (Some(_), None) => route == Some(BankRoute::Solana),
         _ => false,
     };
+    let mut hop_fee = 0;
     if base_cash < usdc_units && !solana_covers {
-        markets::cash_for_base(
+        if let Some((_, fee)) = markets::cash_for_base(
             &state,
             &wallet,
             solana.as_deref(),
@@ -641,8 +675,25 @@ pub(super) async fn send_quote(
             &req.amount.currency,
             rate,
         )
-        .await?;
+        .await?
+        {
+            hop_fee = fee;
+        }
     }
+    // A bank withdrawal's network fee in naira, in its Fee and "You pay" from the quote on: rent
+    // for the payout address's new USDC account on Solana, or the cost of hopping cash to Base.
+    let bank_network = match route {
+        Some(route) => {
+            let usdc = match route {
+                BankRoute::Base => 0,
+                BankRoute::Solana => markets::account_rent_usd(&state).await,
+                BankRoute::Hop => hop_fee,
+            };
+            let ngn = usdc.saturating_mul(app_balance::fx_rate("NGN").await?) / 1_000_000;
+            Some((route, ngn))
+        }
+        None => None,
+    };
     let quote_id = format!(
         "send-{:x}-{:x}",
         now(),
@@ -666,11 +717,14 @@ pub(super) async fn send_quote(
             bank: bank
                 .as_ref()
                 .map(|(payout, _, fee)| (payout.clone(), amount, *fee)),
+            bank_network,
         },
     );
     let send = money_usdc(usdc_units, &req.amount.currency, rate)?;
-    // The bank gets exactly what was asked; the user pays that plus Daya's fee, at Daya's rate.
+    // The bank gets exactly what was asked; the user pays that plus one Fee: Daya's (at Daya's
+    // rate) and the network's. The confirmation and the receipt show these same numbers.
     if let Some((_, _, fee)) = bank {
+        let fee = fee + bank_network.map_or(0, |(_, ngn)| ngn);
         let naira = |micros: u128| money_usdc(micros, "NGN", 1_000_000);
         return Ok(Json(
             json!({"quoteId":quote_id,"destinationLabel":label,"send":naira(amount + fee)?,"receive":naira(amount)?,"fee":naira(fee)?,"eta":"Usually within minutes","expiresAtUnixMs":expires}),
@@ -789,12 +843,13 @@ async fn execute_send_inner(
         _ => None,
     };
     let (intent_id, transactions, fee) = if let Some((from, to)) = solana_route {
-        let (intent_id, transactions) = markets::plan_solana_transfer(
+        let (intent_id, transactions, _) = markets::plan_solana_transfer(
             &state,
             user.user_id.clone(),
             from,
             &to,
             quote.usdc_units,
+            true,
         )
         .await?;
         (intent_id, transactions, None)
@@ -889,18 +944,14 @@ async fn bank_plan(
     fee: u128,
 ) -> Result<(Value, String, u64), ApiError> {
     let rate = app_balance::fx_rate(&quote.currency).await?;
-    let base_cash = state
-        .markets
-        .base
-        .balance_of(BASE_USDC, &quote.sender_wallet)
-        .await
-        .unwrap_or(0);
-    let on_solana = match &quote.sender_solana {
-        Some(from) if base_cash < quote.usdc_units => {
-            markets::solana_cash(state, from).await >= quote.usdc_units
-        }
-        _ => false,
-    };
+    let route = bank_route(
+        state,
+        &quote.sender_wallet,
+        quote.sender_solana.as_deref(),
+        quote.usdc_units,
+    )
+    .await;
+    let on_solana = route == BankRoute::Solana && quote.sender_solana.is_some();
     let chain = if on_solana { "SOLANA" } else { "BASE" };
     let (funding_account, address, expires) = state
         .daya
@@ -908,15 +959,21 @@ async fn bank_plan(
         .await?;
     let (intent_id, transactions, network_fee) = match (&quote.sender_solana, on_solana) {
         (Some(from), true) => {
-            let (intent_id, transactions) = markets::plan_solana_transfer(
+            let (intent_id, transactions, opens_account) = markets::plan_solana_transfer(
                 state,
                 user.user_id.clone(),
                 from.clone(),
                 &address,
                 quote.usdc_units,
+                true,
             )
             .await?;
-            (intent_id, transactions, None)
+            let rent = if opens_account {
+                markets::account_rent_usd(state).await
+            } else {
+                0
+            };
+            (intent_id, transactions, Some(rent))
         }
         _ => {
             let tx = state
@@ -937,21 +994,22 @@ async fn bank_plan(
             .await?
         }
     };
-    // Moving cash between networks first costs a little more; "You pay" is everything that leaves
-    // the balance, that included.
-    let network_ngn = match network_fee {
-        Some(usdc) => usdc.saturating_mul(app_balance::fx_rate("NGN").await?) / 1_000_000,
-        None => 0,
+    // Moving cash between networks, or opening the payout address's USDC account on Solana, costs a
+    // little more; "You pay" is everything that leaves the balance, that included. When the cash
+    // travels the way the quote expected, it's the quote's figure, so the confirmation shows the
+    // very Fee and total the screen did.
+    let network_ngn = match (quote.bank_network, network_fee) {
+        (Some((quoted, ngn)), Some(usdc)) if quoted == route && usdc > 0 => ngn,
+        (_, Some(usdc)) => usdc.saturating_mul(app_balance::fx_rate("NGN").await?) / 1_000_000,
+        (Some((quoted, ngn)), None) if quoted == route => ngn,
+        (_, None) => 0,
     };
+    // One Fee, as on the screen before: the payout partner's and the network's together.
     let mut summary = vec![
         json!({"label":"Send to","value":quote.label}),
         json!({"label":"Bank gets","value":markets::say_micros(get, "NGN")}),
-        json!({"label":"Fee","value":markets::say_micros(fee, "NGN")}),
+        json!({"label":"Fee","value":markets::say_micros(fee + network_ngn, "NGN")}),
     ];
-    if network_ngn > 0 {
-        summary
-            .push(json!({"label":"Network fee","value":markets::say_micros(network_ngn, "NGN")}));
-    }
     summary.extend([
         json!({"label":"You pay","value":markets::say_micros(get + fee + network_ngn, "NGN")}),
         json!({"label":"Rate","value":payout.rate_line()}),

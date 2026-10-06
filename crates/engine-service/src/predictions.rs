@@ -1052,15 +1052,17 @@ async fn funding(
     .await?;
     let amount = number(&q["funding"], "units")?;
     let (child, steps) = if q["funding"]["from"] == "solana" {
-        markets::plan_solana_transfer(
+        let (child, steps, _) = markets::plan_solana_transfer(
             state,
             user.user_id,
             user.solana_wallet
                 .ok_or_else(|| conflict("Cash wallet unavailable"))?,
             text(&deposit, "svm"),
             amount,
+            false,
         )
-        .await?
+        .await?;
+        (child, steps)
     } else {
         let evm = user
             .evm_wallet
