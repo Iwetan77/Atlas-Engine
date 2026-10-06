@@ -106,6 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .build()?,
         }
     };
+    std::sync::LazyLock::force(&STARTED);
     let state = AppState {
         user_id,
         base_wallet,
@@ -294,15 +295,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 // Public and secret-free: which commit Render is serving, and which RPC hosts it reads (hosts only;
 // a key in the URL never shows).
+// When this server started: a request that dropped mid-way shows up as a restart here.
+static STARTED: std::sync::LazyLock<std::time::SystemTime> =
+    std::sync::LazyLock::new(std::time::SystemTime::now);
+
+// Memory used by everything in this container (the engine and the Privy bridge), in MB: the free
+// plan has 512 MB, and running out restarts the server.
+fn memory_mb() -> Option<u64> {
+    let mut kb = 0u64;
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+        {
+            continue;
+        }
+        if let Ok(status) = std::fs::read_to_string(entry.path().join("status")) {
+            kb += status
+                .lines()
+                .find_map(|l| l.strip_prefix("VmRSS:"))
+                .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+                .unwrap_or(0);
+        }
+    }
+    Some(kb / 1024)
+}
+
 async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
     let host = |var: &str, default: &str| {
         reqwest::Url::parse(&env_url(var, default))
             .ok()
             .and_then(|u| u.host_str().map(str::to_string))
     };
+    let started = STARTED
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
     Json(serde_json::json!({
         "ok": true,
         "commit": env::var("RENDER_GIT_COMMIT").unwrap_or_else(|_| "unknown".into()),
+        "startedAtUnixMs": started,
+        "memoryMb": memory_mb(),
         "rpc": {
             "solana": host("ATLAS_SOLANA_MAINNET_RPC_URL", "https://api.mainnet-beta.solana.com"),
             "base": host("ATLAS_BASE_MAINNET_RPC_URL", "https://base-rpc.publicnode.com"),

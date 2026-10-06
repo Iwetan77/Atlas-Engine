@@ -18,6 +18,14 @@ use solana_sdk::{
 use thiserror::Error;
 
 const ORDER_URL: &str = "https://api.jup.ag/swap/v2/order";
+// The price margins a user-paid swap is built with, narrowest first (0.5%, 1.5%, 3%).
+const SLIPPAGE_STEPS_BPS: [u32; 3] = [50, 150, 300];
+
+// Jupiter's swap program refuses with custom error 6001 when the price moved past the margin.
+fn slippage_exceeded(error: &JupiterError) -> bool {
+    matches!(error, JupiterError::Preflight(SolanaPreflightError::SwapSimulation(reason))
+        if reason.contains("\"Custom\":6001"))
+}
 const BUILD_URL: &str = "https://api.jup.ag/swap/v2/build";
 const EXECUTE_URL: &str = "https://api.jup.ag/swap/v2/execute";
 // Jupiter covers the fee itself for a low-SOL taker, but only above a minimum ("Minimum $5 for
@@ -129,6 +137,7 @@ impl BuildQuote {
         request: &JupiterOrderRequest,
         units: u32,
         priority_fee: bool,
+        max_slippage_bps: u32,
     ) -> Result<String, JupiterError> {
         let invalid = || JupiterError::InvalidRequest;
         let key = |s: &str| Pubkey::from_str(s).map_err(|_| invalid());
@@ -141,8 +150,8 @@ impl BuildQuote {
             || input != request.amount_base_units
             || output == 0
             || self.swap_mode != "ExactIn"
-            || self.slippage_bps > 100
-            || minimum < output * 99 / 100
+            || self.slippage_bps > max_slippage_bps
+            || minimum < output * u128::from(10_000 - max_slippage_bps.min(10_000)) / 10_000
             || minimum > output
         {
             return Err(invalid());
@@ -262,6 +271,8 @@ pub enum JupiterError {
     },
     #[error("Jupiter could not complete this swap (code {code}): {reason}")]
     ExecutionFailed { code: i64, reason: String },
+    #[error("This coin's price is moving too fast to buy right now. Try again in a moment.")]
+    PriceMoving,
     #[error("Jupiter URL could not be parsed")]
     Url(#[from] url::ParseError),
 }
@@ -347,11 +358,29 @@ impl JupiterClient {
         Ok(order)
     }
 
-    /// Build and simulate only the user-paid route; never fall back to a gasless minimum.
+    /// Build and simulate only the user-paid route; never fall back to a gasless minimum. A
+    /// fast-moving coin can move past the margin between quoting and the check before signing
+    /// (Jupiter's 6001, slippage exceeded): the swap is built again with a wider margin, each one
+    /// simulated before it's offered.
     pub async fn user_paid_order(
         &self,
         request: &JupiterOrderRequest,
         solana: &SolanaAtaPreflight,
+    ) -> Result<(JupiterOrder, Option<UserPaidSwap>), JupiterError> {
+        for slippage_bps in SLIPPAGE_STEPS_BPS {
+            match self.user_paid_order_at(request, solana, slippage_bps).await {
+                Err(error) if slippage_exceeded(&error) => continue,
+                other => return other,
+            }
+        }
+        Err(JupiterError::PriceMoving)
+    }
+
+    async fn user_paid_order_at(
+        &self,
+        request: &JupiterOrderRequest,
+        solana: &SolanaAtaPreflight,
+        slippage_bps: u32,
     ) -> Result<(JupiterOrder, Option<UserPaidSwap>), JupiterError> {
         let mut url = Url::parse(&self.endpoint("build", BUILD_URL))?;
         url.query_pairs_mut()
@@ -365,7 +394,7 @@ impl JupiterClient {
                     .as_deref()
                     .ok_or(JupiterError::InvalidRequest)?,
             )
-            .append_pair("slippageBps", "50")
+            .append_pair("slippageBps", &slippage_bps.to_string())
             .append_pair("computeUnitPricePercentile", "medium");
         let mut call = self.http.get(url).timeout(Duration::from_secs(20));
         if let Some(key) = &self.api_key {
@@ -376,14 +405,14 @@ impl JupiterClient {
             return Err(rejected("user-paid quote", response).await);
         }
         let quote: BuildQuote = response.json().await?;
-        let initial = quote.transaction(request, 1_400_000, false)?;
+        let initial = quote.transaction(request, 1_400_000, false, slippage_bps)?;
         let consumed = solana.preflight_swap(&initial).await?;
         let units = consumed
             .saturating_mul(12)
             .div_ceil(10)
             .saturating_add(10_000)
             .min(1_400_000);
-        let transaction = quote.transaction(request, units, true)?;
+        let transaction = quote.transaction(request, units, true, slippage_bps)?;
         solana.preflight_swap(&transaction).await?;
         let prepared = UserPaidSwap {
             transaction: transaction.clone(),
@@ -604,12 +633,27 @@ mod tests {
     }
 
     #[test]
+    fn only_a_slippage_refusal_is_retried_with_a_wider_margin() {
+        let refusal =
+            |err: &str| JupiterError::Preflight(SolanaPreflightError::SwapSimulation(err.into()));
+        assert!(slippage_exceeded(&refusal(
+            r#"{"InstructionError":[2,{"Custom":6001}]}"#
+        )));
+        assert!(!slippage_exceeded(&refusal(
+            r#"{"InstructionError":[2,{"Custom":6000}]}"#
+        )));
+        assert!(!slippage_exceeded(&JupiterError::InvalidRequest));
+        assert_eq!(SLIPPAGE_STEPS_BPS[0], 50);
+        assert!(SLIPPAGE_STEPS_BPS.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
     fn user_paid_build_pins_amount_slippage_and_sole_fee_payer() {
         let v = captured_build();
         let quote: BuildQuote = serde_json::from_value(v.clone()).unwrap();
         let request = small_request();
         let bytes = STANDARD
-            .decode(quote.transaction(&request, 240_000, true).unwrap())
+            .decode(quote.transaction(&request, 240_000, true, 100).unwrap())
             .unwrap();
         let tx: VersionedTransaction = bincode::deserialize(&bytes).unwrap();
         assert_eq!(tx.message.header().num_required_signatures, 1);
@@ -626,14 +670,17 @@ mod tests {
             let mut bad = v.clone();
             bad[field] = changed;
             let bad: BuildQuote = serde_json::from_value(bad).unwrap();
-            assert!(bad.transaction(&request, 240_000, true).is_err(), "{field}");
+            assert!(
+                bad.transaction(&request, 240_000, true, 100).is_err(),
+                "{field}"
+            );
         }
         let mut changed = v;
         changed["swapInstruction"]["accounts"][0]["isSigner"] = serde_json::json!(true);
         changed["swapInstruction"]["accounts"][0]["pubkey"] =
             serde_json::json!(spl_token::id().to_string());
         let changed: BuildQuote = serde_json::from_value(changed).unwrap();
-        assert!(changed.transaction(&request, 240_000, true).is_err());
+        assert!(changed.transaction(&request, 240_000, true, 100).is_err());
     }
 
     // The real HTTP routing path, with read-only RPC responses and the live /build capture.
