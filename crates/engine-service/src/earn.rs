@@ -1020,6 +1020,10 @@ async fn execute_inner(
     ];
     if let Some(fee) = fee {
         summary.push(json!({"label":"Network fee","value":markets::say_money(fee, &quote.currency, quote.rate)}));
+        // Putting money in: what leaves the balance, the fee included.
+        if quote.deposit && !quote.all {
+            summary.push(json!({"label":"You pay","value":markets::say_money(quote.units + fee, &quote.currency, quote.rate)}));
+        }
     }
     Ok(Json(json!({
         "intentId":intent_id,

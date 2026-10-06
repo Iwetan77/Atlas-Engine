@@ -995,8 +995,9 @@ async fn too_small(
 ) -> Result<ApiError, ApiError> {
     // A price can tick up between this answer and the next try: 1% of room on the order.
     let order_budget = order_budget + order_budget / 100;
-    let (spend, reserve) = if cash >= order_budget && least_move == 0 {
-        (order_budget, 0)
+    // Atlas covers network fees from the cash, so the minimum is said as one number.
+    let spend = if cash >= order_budget && least_move == 0 {
+        order_budget
     } else {
         let from = if user.solana_wallet.is_some() {
             let sol =
@@ -1011,19 +1012,12 @@ async fn too_small(
         };
         let reserve = funding_reserve(state, user, from).await?;
         let moved = with_move_fee(order_budget.saturating_sub(cash)).max(least_move);
-        (cash + moved + reserve, reserve)
+        cash + moved + reserve
     };
     // Rounded up to a whole unit of their currency.
     let micros = (spend * rate).div_ceil(1_000_000).div_ceil(1_000_000) * 1_000_000;
     let shown = markets::say_micros(micros, currency);
-    Ok(conflict(if reserve > 0 {
-        format!(
-            "This needs at least {shown}, including {} kept for network fees.",
-            markets::say_money(reserve, currency, rate)
-        )
-    } else {
-        format!("This needs at least {shown}.")
-    }))
+    Ok(conflict(format!("This needs at least {shown}.")))
 }
 
 async fn funding(

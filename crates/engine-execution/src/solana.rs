@@ -439,6 +439,18 @@ impl SolanaAtaPreflight {
         Ok((STANDARD.encode(bytes), creates))
     }
 
+    /// Whether `owner` already has a USDC account: a transfer to it then opens none (no rent).
+    pub async fn has_usdc_account(&self, owner: &str) -> Result<bool, SolanaPreflightError> {
+        let owner = Pubkey::from_str(owner).map_err(|_| SolanaPreflightError::InvalidAddress)?;
+        let mint = Pubkey::from_str(match self.network {
+            SolanaNetwork::Mainnet => MAINNET_USDC_MINT,
+            _ => DEVNET_USDC_MINT,
+        })
+        .map_err(|_| SolanaPreflightError::InvalidResponse)?;
+        let account = get_associated_token_address_with_program_id(&owner, &mint, &spl_token::id());
+        Ok(self.account(&account).await?.is_some())
+    }
+
     /// Fee-only probe before cash lands: the same two signatures and ATA rent, with no transfers.
     /// Extra read-only signer does not spend; this unsigned probe never reaches a signing endpoint.
     pub(crate) async fn usdc_transfer_fee_probe(

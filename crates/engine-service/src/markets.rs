@@ -955,6 +955,10 @@ pub(super) struct PlannedTransfer {
     // A network fee that wasn't ready when the phone signed is fetched once more, and the fresh
     // top-up and transfer are signed under the same confirmation (GET /v1/intents/{id}/next).
     retry: bool,
+    // Sent through Kora: its fee payer fronts the SOL and the rent in the transfer itself, paid back
+    // in USDC in the same transaction, so the wallet needs no SOL at all.
+    #[serde(default)]
+    kora: Option<engine_execution::kora::Transfer>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct BaseTopup {
@@ -1419,7 +1423,7 @@ pub(super) fn short_of_gas(currency: &str, rate: u128) -> ApiError {
     (
         StatusCode::CONFLICT,
         format!(
-            "Add money to cover network fees (about {} more), then try again.",
+            "Not enough in your balance for this. Add about {} or try a smaller amount.",
             say_money(BASE_GAS_REFILL_USDC, currency, rate)
         ),
     )
@@ -2694,7 +2698,7 @@ pub(super) async fn quote(
             return Err((
                 StatusCode::CONFLICT,
                 format!(
-                    "Keep at least {} in cash to cover this sale and future network fees.",
+                    "Selling this needs {} of cash in your balance. Add money, then try again.",
                     say_money(reserve_cash, &req.amount.currency, rate)
                 ),
             ));
@@ -2758,8 +2762,10 @@ pub(super) async fn quote(
         rate,
     )?;
     let (pay, receive) = if req.side == "buy" {
+        // Everything that leaves the balance: moving cash between chains first costs its fee too.
+        let total = cash_needed + funding_fee;
         (
-            json!({"amount":format_units(cash_needed,6),"symbol":"USDC","value":money_from_usdc(cash_needed,&req.amount.currency,rate)?}),
+            json!({"amount":format_units(total,6),"symbol":"USDC","value":money_from_usdc(total,&req.amount.currency,rate)?}),
             json!({"amount":format_units(actual_out,a.decimals),"symbol":a.symbol,"value":money_from_usdc(actual_in,&req.amount.currency,rate)?}),
         )
     } else {
@@ -2816,7 +2822,7 @@ fn purchase_input(
         return Err((
             StatusCode::CONFLICT,
             format!(
-                "This purchase needs at least {} including a reserve for future network fees.",
+                "This purchase needs at least {}.",
                 say_money(reserve + MIN_USDC, currency, rate)
             ),
         ));
@@ -3007,8 +3013,8 @@ fn topup_usdc(missing: u128, sol_usd: f64) -> u128 {
 
 // Jupiter pays a small swap's fee only when one of its market makers (JupiterZ) takes it; its own
 // gasless route starts at $5. Checked 6 Oct: 2 of 5 asks for $0.50 came back as a plain route the
-// empty wallet can't pay for, so ask a few times before giving up.
-const GASLESS_ASKS: usize = 4;
+// empty wallet can't pay for, so ask three times (about 94%) before Kora pays instead.
+const GASLESS_ASKS: usize = 3;
 async fn gasless_topup_order(
     state: &AppState,
     owner: &str,
@@ -3016,7 +3022,7 @@ async fn gasless_topup_order(
 ) -> Option<(String, String)> {
     for ask in 0..GASLESS_ASKS {
         if ask > 0 {
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
         match state
             .markets
@@ -3041,11 +3047,14 @@ async fn gasless_topup_order(
     None
 }
 
-// What someone reads when a transfer's network fee can't be got ready; nothing was sent.
+// What someone reads when neither way of paying a transfer's network fee answered (a provider
+// down for a moment): nothing was sent. Atlas covers the fee from their cash, so it never asks them
+// for gas.
 pub(super) const SOLANA_FEE_NOT_READY: &str =
-    "Couldn't get the network fee ready just now, so nothing was sent and nothing left your balance. Try again in a minute.";
-const NO_CASH_FOR_SOLANA_FEE: &str =
-    "There isn't enough cash left over for the network fee on this transfer, so nothing was sent. Send a little less, or add money, then try again.";
+    "Couldn't send this just now. Nothing was sent and nothing left your balance. Try again in a minute.";
+// Kora's fee payer: about what its fee is for a new account (6 Oct: $0.302), with room, for deciding
+// whether a wallet's cash can carry it.
+const KORA_FEE_GUESS_USDC: u128 = 350_000;
 
 // Lands the gas top-up the phone signed, then waits until the wallet holds the SOL the transfer
 // needs (the RPC can trail Jupiter by a moment). Without that SOL the transfer would fail on chain
@@ -3119,8 +3128,11 @@ fn swap_error(error: engine_execution::swaps::jupiter::JupiterError) -> ApiError
             engine_execution::solana::SolanaPreflightError::InsufficientGas
         )
     ) {
-        return (StatusCode::CONFLICT,
-            "There isn't enough gas for this swap. Add a little SOL for network fees, then try again. This swap hasn't been sent.".into());
+        return (
+            StatusCode::CONFLICT,
+            "Couldn't get this swap ready just now. Nothing was sent. Try again in a minute."
+                .into(),
+        );
     }
     unavailable(error)
 }
@@ -3204,7 +3216,7 @@ pub(super) async fn plan_jupiter_swap(
 // Solana): no bridge, lands in seconds. The sender pays the fee (gas tank topped up first if low).
 // With `retry`, a fee that isn't ready once the phone has signed is fetched again after the confirm
 // (the app signs the fresh steps itself); without it the transfer fails, nothing sent. Returns the
-// intent, what the app signs, and whether the transfer opens the receiver's account (rent).
+// intent, what the app signs, and what the network costs the sender (USDC units).
 pub(super) async fn plan_solana_transfer(
     state: &AppState,
     owner: String,
@@ -3212,13 +3224,14 @@ pub(super) async fn plan_solana_transfer(
     to: &str,
     amount: u128,
     retry: bool,
-) -> Result<(String, Vec<Value>, bool), ApiError> {
+) -> Result<(String, Vec<Value>, u128), ApiError> {
     let SolanaTransfer {
         gas,
         transaction: transfer,
-        opens_account,
+        network_fee,
         lamports,
-    } = solana_transfer_steps(state, &from, to, amount).await?;
+        kora,
+    } = solana_transfer_steps(state, &from, to, amount, true).await?;
     let intent_id = id("intent");
     state
         .markets
@@ -3250,6 +3263,7 @@ pub(super) async fn plan_solana_transfer(
                     amount,
                     lamports,
                     retry,
+                    kora,
                 }),
                 base_topup: None,
             },
@@ -3260,7 +3274,7 @@ pub(super) async fn plan_solana_transfer(
         transactions.push(json!({"chain":"solana","transaction":gas_tx,"submit":"engine"}));
     }
     transactions.push(json!({"chain":"solana","transaction":transfer,"submit":"engine"}));
-    Ok((intent_id, transactions, opens_account))
+    Ok((intent_id, transactions, network_fee))
 }
 
 // A USDC transfer from a Solana wallet that the engine lands (a friend send, a 1Click deposit): the
@@ -3272,26 +3286,33 @@ pub(super) async fn solana_usdc_transfer(
     to: &str,
     amount: u128,
 ) -> Result<(Option<(String, String)>, String), ApiError> {
-    let steps = solana_transfer_steps(state, from, to, amount).await?;
+    let steps = solana_transfer_steps(state, from, to, amount, true).await?;
     Ok((steps.gas, steps.transaction))
 }
 
 pub(super) struct SolanaTransfer {
     gas: Option<(String, String)>,
     transaction: String,
-    // Whether it opens the receiver's USDC account (the sender pays that rent).
-    opens_account: bool,
-    // The SOL the wallet must hold when the transfer is sent.
+    // What the network costs the sender, in USDC units: the rent for opening the receiver's USDC
+    // account, or Kora's fee when it pays.
+    network_fee: u128,
+    // The SOL the wallet must hold when the transfer is sent (none through Kora).
     lamports: u128,
+    kora: Option<engine_execution::kora::Transfer>,
 }
 
-// The transfer and, when the wallet is short of SOL, the top-up that pays for it. A wallet short of
-// SOL with no top-up to be had gets an error now, not a transfer that fails on chain.
+// The transfer, paid for one way or another and never by asking anyone for gas: the wallet's own
+// SOL; else a gasless top-up from its cash (Jupiter, asked a few times), which leaves SOL for next
+// time; else Kora, whose fee payer fronts the SOL and rent inside the transfer for a little USDC.
+// Only when none of those answers is there an error, before anything is signed. Without `topup`
+// (a second try after one may already have been bought) it never buys SOL again: SOL that arrived
+// is used, else Kora pays.
 async fn solana_transfer_steps(
     state: &AppState,
     from: &str,
     to: &str,
     amount: u128,
+    topup: bool,
 ) -> Result<SolanaTransfer, ApiError> {
     let (transaction, creates) = state
         .solana_mainnet
@@ -3307,29 +3328,103 @@ async fn solana_transfer_steps(
     } else {
         GAS_FLOOR_LAMPORTS
     };
+    let rent = if creates {
+        account_rent_usd(state).await
+    } else {
+        0
+    };
     let sol = state
         .solana_mainnet
         .owner_sol_balance(from)
         .await
         .map_err(unavailable)?;
-    let mut gas = None;
-    if sol < lamports {
-        let usdc = topup_usdc_for(state, lamports - sol).await;
-        if solana_cash(state, from).await < amount.saturating_add(usdc) {
-            return Err((StatusCode::CONFLICT, NO_CASH_FOR_SOLANA_FEE.into()));
-        }
-        gas = Some(
-            gasless_topup_order(state, from, usdc)
-                .await
-                .ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, SOLANA_FEE_NOT_READY.into()))?,
-        );
+    if sol >= lamports {
+        return Ok(SolanaTransfer {
+            gas: None,
+            transaction,
+            network_fee: rent,
+            lamports,
+            kora: None,
+        });
     }
-    Ok(SolanaTransfer {
-        gas,
-        transaction,
-        opens_account: creates,
-        lamports,
-    })
+    let usdc = topup_usdc_for(state, lamports - sol).await;
+    if topup && solana_cash(state, from).await >= amount.saturating_add(usdc) {
+        if let Some(gas) = gasless_topup_order(state, from, usdc).await {
+            return Ok(SolanaTransfer {
+                gas: Some(gas),
+                transaction,
+                network_fee: rent,
+                lamports,
+                kora: None,
+            });
+        }
+    }
+    match kora_transfer(state, from, to, amount).await {
+        Ok(kora) => Ok(SolanaTransfer {
+            gas: None,
+            transaction: kora.transaction.clone(),
+            network_fee: u128::from(kora.fee_units),
+            lamports: 0,
+            kora: Some(kora),
+        }),
+        Err(engine_execution::kora::Error::Cash) => Err(short_of_cash()),
+        Err(error) => {
+            eprintln!("transfer fee: no gasless top-up and Kora refused ({error})");
+            Err((StatusCode::SERVICE_UNAVAILABLE, SOLANA_FEE_NOT_READY.into()))
+        }
+    }
+}
+
+// The transfer with Kora's fee payer paying its SOL and the receiver's rent, repaid in USDC in the
+// same transaction. Kora has signed only its fee-payer slot; the phone's signature makes it valid.
+async fn kora_transfer(
+    state: &AppState,
+    from: &str,
+    to: &str,
+    amount: u128,
+) -> Result<engine_execution::kora::Transfer, engine_execution::kora::Error> {
+    let amount: u64 = amount
+        .try_into()
+        .map_err(|_| engine_execution::kora::Error::Invalid)?;
+    let estimate = state
+        .markets
+        .kora
+        .estimate(&state.solana_mainnet, from, to, amount)
+        .await?;
+    // A little room for the fee to move between the estimate and the signature, as for a reserve.
+    let max_fee = estimate
+        .fee_units
+        .saturating_mul(11)
+        .div_ceil(10)
+        .saturating_add(1_000);
+    state
+        .markets
+        .kora
+        .prepare(&state.solana_mainnet, from, to, amount, max_fee)
+        .await
+}
+
+// A Kora transfer may go only as prepared: Kora's signature over the exact message, the phone's
+// too, and still inside its blockhash's life.
+async fn kora_transfer_ready(
+    state: &AppState,
+    kora: &engine_execution::kora::Transfer,
+    wallet: &str,
+    signed: &[Signed],
+) -> Result<(), String> {
+    let returned = signed.first().ok_or("nothing signed")?;
+    engine_execution::kora::checked(
+        &kora.transaction,
+        &returned.transaction,
+        wallet,
+        &kora.payer,
+        true,
+    )
+    .map_err(|_| "signed transfer doesn't match".to_string())?;
+    match state.solana_mainnet.block_height().await {
+        Ok(height) if height > kora.last_valid_block_height => Err("expired".into()),
+        _ => Ok(()),
+    }
 }
 
 // Rent for a new USDC account on Solana, which the sender pays and doesn't get back.
@@ -3347,7 +3442,16 @@ pub(super) async fn solana_can_send(state: &AppState, owner: &str, amount: u128)
         .await
         .unwrap_or(0);
     sol >= NEW_ACCOUNT_FLOOR_LAMPORTS
-        || solana_cash(state, owner).await >= amount.saturating_add(GAS_TOPUP_USDC)
+        || solana_cash(state, owner).await >= amount.saturating_add(KORA_FEE_GUESS_USDC)
+}
+
+// What a Solana transfer to `to` should cost the sender, for a quote: the rent for opening its USDC
+// account when it has none (a top-up's SOL otherwise stays in the wallet).
+pub(super) async fn solana_transfer_fee_estimate(state: &AppState, to: &str) -> u128 {
+    match state.solana_mainnet.has_usdc_account(to).await {
+        Ok(false) => account_rent_usd(state).await,
+        _ => 0,
+    }
 }
 
 // That rent in USD micros at SOL's live price (0 if the price is unavailable).
@@ -4191,8 +4295,9 @@ async fn execute_quote_inner(
     // The confirm sheet speaks their currency: cash as money, the asset as tokens.
     let rate = app_balance::fx_rate(&stored.currency).await?;
     let mut summary = if funding.is_some() {
+        // "You pay" is everything that leaves the balance, the network fee for moving cash included.
         json!([
-            {"label":"You pay","value":say_money(stored.input_units + stored.fee_preview.as_ref().map_or(0,|p| p.cash()), &stored.currency, rate)},
+            {"label":"You pay","value":say_money(stored.input_units + stored.fee_preview.as_ref().map_or(0,|p| p.cash()) + network_fee, &stored.currency, rate)},
             {"label":"You get (about)","value":format!("{} {}", format_units(output, a.decimals), a.symbol)},
             {"label":"Network fee","value":say_money(network_fee.max(1), &stored.currency, rate)},
         ])
@@ -4589,7 +4694,13 @@ pub(super) async fn signed(
                 return Ok(Json(latest.map_or(current.status, |i| i.status)));
             }
             let mut updated = current;
-            if let Err(reason) = transfer_fee_ready(&state, &updated, &body.signed).await {
+            let ready = match updated.transfer.as_ref().and_then(|t| t.kora.as_ref()) {
+                Some(kora) => {
+                    kora_transfer_ready(&state, kora, &updated.wallet, &body.signed).await
+                }
+                None => transfer_fee_ready(&state, &updated, &body.signed).await,
+            };
+            if let Err(reason) = ready {
                 eprintln!(
                     "intent {intent_id}: network fee not ready ({reason}); transfer not sent"
                 );
@@ -5055,22 +5166,25 @@ pub(super) async fn next_transactions(
             StatusCode::CONFLICT,
             "nothing to sign for this intent".into(),
         ))?;
-        let steps = match solana_transfer_steps(&state, &intent.wallet, &planned.to, planned.amount)
-            .await
-        {
-            Ok(steps) => steps,
-            Err((code, reason)) => {
-                let mut failed = intent.clone();
-                failed.status.stage = "settle".into();
-                failed.status.state = "failed".into();
-                failed.status.error = Some(reason.clone());
-                state.markets.save_intent(&intent_id, &failed).await?;
-                return Err((code, reason));
-            }
-        };
+        // Never a second top-up: one bought on the first try may still be landing.
+        let steps =
+            match solana_transfer_steps(&state, &intent.wallet, &planned.to, planned.amount, false)
+                .await
+            {
+                Ok(steps) => steps,
+                Err((code, reason)) => {
+                    let mut failed = intent.clone();
+                    failed.status.stage = "settle".into();
+                    failed.status.state = "failed".into();
+                    failed.status.error = Some(reason.clone());
+                    state.markets.save_intent(&intent_id, &failed).await?;
+                    return Err((code, reason));
+                }
+            };
         intent.gas_request_id = steps.gas.as_ref().map(|(id, _)| id.clone());
         if let Some(t) = intent.transfer.as_mut() {
             t.lamports = steps.lamports;
+            t.kora = steps.kora.clone();
         }
         state.markets.save_intent(&intent_id, &intent).await?;
         let mut transactions = Vec::new();
@@ -6121,6 +6235,7 @@ mod tests {
             amount: 1_100_000,
             lamports: NEW_ACCOUNT_FLOOR_LAMPORTS,
             retry: true,
+            kora: None,
         });
         intent.status.stage = "validate".into();
         intent.status.state = "pending".into();

@@ -2073,9 +2073,11 @@ pub(super) async fn withdraw_quote(
         "network": option.network,
         "asset": option.asset,
         "address": address,
-        "send": money(input, &currency, rate),
-        "fee": money(fee, &currency, rate),
-        "networkFee": money(network_fee, &currency, rate),
+        // One Fee and one total, the network fee in both (shown on its own, it looked like extra
+        // on top of "Total from cash").
+        "send": money(input + network_fee, &currency, rate),
+        "fee": money(fee + network_fee, &currency, rate),
+        "networkFee": money(0, &currency, rate),
         "receive": {"amount": markets::format_units(output, token.decimals), "symbol": option.asset,
             "value": receive},
         "timeEstimateSec": q.time_estimate,
@@ -2258,24 +2260,20 @@ pub(super) async fn withdraw_execute(
         fresh.amount_out.parse().map_err(internal)?,
         stored.token.decimals,
     ));
-    let mut summary = vec![
+    let summary = vec![
         json!({"label":"To","value":short_address(&stored.address)}),
         json!({"label":"Network","value":stored.option.label}),
         json!({"label":"They receive","value":markets::say_money(stored.receive, &stored.currency, rate)}),
         json!({"label":"In coins","value":format!("{get} {}", stored.option.asset)}),
-        json!({"label":"Fee","value":markets::say_money(stored.fee,&stored.currency,rate)}),
-        json!({"label":"Total from cash","value":markets::say_money(stored.amount,&stored.currency,rate)}),
+        json!({"label":"Fee","value":markets::say_money(stored.fee + stored.network_fee,&stored.currency,rate)}),
+        json!({"label":"Total from cash","value":markets::say_money(stored.amount + stored.network_fee,&stored.currency,rate)}),
     ];
-    if stored.network_fee > 0 {
-        summary.push(json!({"label":"Network fee",
-            "value":markets::say_money(stored.network_fee,&stored.currency,rate)}));
-    }
     let plan = json!({"intentId":intent_id,"kind":"withdraw","summary":summary,
         "transactions":steps,"expiresAtUnixMs":expires});
     let mut receipt = transactions::Receipt::plan(&user.user_id, &plan);
     receipt.symbol = stored.option.asset.into();
     receipt.icon_url = Some(stored.option.asset_icon.into());
-    receipt.usdc_units = Some(stored.amount.to_string());
+    receipt.usdc_units = Some((stored.amount + stored.network_fee).to_string());
     receipt.title = transactions::title(&receipt.kind, &receipt.symbol);
     state.history.put(&receipt).await?;
     Ok(Json(plan))

@@ -57,6 +57,8 @@ struct SendQuote {
     // How the quote expected its USDC to travel, and the network fee that costs (naira micros), so
     // the confirmation shows the same Fee and total the quote did.
     bank_network: Option<(BankRoute, u128)>,
+    // A friend send or link: the network fee the quote showed (USDC units), in its Fee and total.
+    network_units: u128,
 }
 // How a bank withdrawal's USDC reaches the payout address: straight from Base, straight from
 // Solana (opening the address's USDC account costs rent), or hopped from Solana to Base first.
@@ -680,6 +682,18 @@ pub(super) async fn send_quote(
             hop_fee = fee;
         }
     }
+    // A friend send's network fee, shown from the quote on: opening the friend's USDC account on
+    // Solana when they have none, or hopping cash to Base.
+    let network_units = if bank.is_some() {
+        0
+    } else if base_cash < usdc_units && solana_covers {
+        match &recipient_solana {
+            Some(to) => markets::solana_transfer_fee_estimate(&state, to).await,
+            None => 0,
+        }
+    } else {
+        hop_fee
+    };
     // A bank withdrawal's network fee in naira, in its Fee and "You pay" from the quote on: rent
     // for the payout address's new USDC account on Solana, or the cost of hopping cash to Base.
     let bank_network = match route {
@@ -718,9 +732,9 @@ pub(super) async fn send_quote(
                 .as_ref()
                 .map(|(payout, _, fee)| (payout.clone(), amount, *fee)),
             bank_network,
+            network_units,
         },
     );
-    let send = money_usdc(usdc_units, &req.amount.currency, rate)?;
     // The bank gets exactly what was asked; the user pays that plus one Fee: Daya's (at Daya's
     // rate) and the network's. The confirmation and the receipt show these same numbers.
     if let Some((_, _, fee)) = bank {
@@ -730,8 +744,10 @@ pub(super) async fn send_quote(
             json!({"quoteId":quote_id,"destinationLabel":label,"send":naira(amount + fee)?,"receive":naira(amount)?,"fee":naira(fee)?,"eta":"Usually within minutes","expiresAtUnixMs":expires}),
         ));
     }
+    // The network fee goes on top: in Fee and "You pay" here, as on the confirmation.
+    let send = money_usdc(usdc_units + network_units, &req.amount.currency, rate)?;
     let receive = money_usdc(gift_units, &req.amount.currency, rate)?;
-    let fee = money_usdc(fee_units, &req.amount.currency, rate)?;
+    let fee = money_usdc(fee_units + network_units, &req.amount.currency, rate)?;
     Ok(Json(
         json!({"quoteId":quote_id,"destinationLabel":label,"send":send,"receive":receive,"fee":fee,"eta":"After confirmation","expiresAtUnixMs":expires}),
     ))
@@ -843,7 +859,7 @@ async fn execute_send_inner(
         _ => None,
     };
     let (intent_id, transactions, fee) = if let Some((from, to)) = solana_route {
-        let (intent_id, transactions, _) = markets::plan_solana_transfer(
+        let (intent_id, transactions, network) = markets::plan_solana_transfer(
             &state,
             user.user_id.clone(),
             from,
@@ -852,7 +868,7 @@ async fn execute_send_inner(
             true,
         )
         .await?;
-        (intent_id, transactions, None)
+        (intent_id, transactions, Some(network).filter(|n| *n > 0))
     } else {
         markets::plan_base_with_cash(
             &state,
@@ -923,9 +939,16 @@ async fn execute_send_inner(
         }
     }
     if let Some(fee) = fee {
+        // The quote's figure when it's the same cost priced moments later, so the totals match.
+        let fee = if near(quote.network_units, fee) {
+            quote.network_units
+        } else {
+            fee
+        };
         summary.push(
             json!({"label":"Network fee","value":markets::say_money(fee,&quote.currency,rate)}),
         );
+        summary.push(json!({"label":"You pay","value":markets::say_money(quote.usdc_units + fee,&quote.currency,rate)}));
     }
     let plan = json!({"intentId":intent_id,"kind":"send","summary":summary,"transactions":transactions,"expiresAtUnixMs":now()+120_000});
     stored.plan = Some(plan.clone());
@@ -959,7 +982,7 @@ async fn bank_plan(
         .await?;
     let (intent_id, transactions, network_fee) = match (&quote.sender_solana, on_solana) {
         (Some(from), true) => {
-            let (intent_id, transactions, opens_account) = markets::plan_solana_transfer(
+            let (intent_id, transactions, network) = markets::plan_solana_transfer(
                 state,
                 user.user_id.clone(),
                 from.clone(),
@@ -968,12 +991,7 @@ async fn bank_plan(
                 true,
             )
             .await?;
-            let rent = if opens_account {
-                markets::account_rent_usd(state).await
-            } else {
-                0
-            };
-            (intent_id, transactions, Some(rent))
+            (intent_id, transactions, Some(network))
         }
         _ => {
             let tx = state
@@ -998,9 +1016,13 @@ async fn bank_plan(
     // little more; "You pay" is everything that leaves the balance, that included. When the cash
     // travels the way the quote expected, it's the quote's figure, so the confirmation shows the
     // very Fee and total the screen did.
-    let network_ngn = match (quote.bank_network, network_fee) {
-        (Some((quoted, ngn)), Some(usdc)) if quoted == route && usdc > 0 => ngn,
-        (_, Some(usdc)) => usdc.saturating_mul(app_balance::fx_rate("NGN").await?) / 1_000_000,
+    let actual: Option<u128> = match network_fee {
+        Some(usdc) => Some(usdc.saturating_mul(app_balance::fx_rate("NGN").await?) / 1_000_000),
+        None => None,
+    };
+    let network_ngn = match (quote.bank_network, actual) {
+        (Some((quoted, ngn)), Some(actual)) if quoted == route && near(ngn, actual) => ngn,
+        (_, Some(actual)) => actual,
         (Some((quoted, ngn)), None) if quoted == route => ngn,
         (_, None) => 0,
     };
@@ -1018,8 +1040,19 @@ async fn bank_plan(
     let plan = json!({"intentId":intent_id,"kind":"send","summary":summary,"transactions":transactions,"expiresAtUnixMs":now()+120_000});
     Ok((plan, funding_account, expires))
 }
+// The same cost priced a few seconds apart (SOL or the naira moved a hair): the quote's figure
+// stands. A different cost (another way of paying it) is shown as it is.
+fn near(quoted: u128, actual: u128) -> bool {
+    actual > 0 && quoted.abs_diff(actual) * 50 <= quoted
+}
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_fee_priced_moments_apart_keeps_the_quoted_figure() {
+        assert!(super::near(370_000_000, 371_000_000));
+        assert!(!super::near(370_000_000, 410_000_000));
+        assert!(!super::near(370_000_000, 0));
+    }
     #[test]
     fn avatars_must_be_small_images() {
         let jpeg = format!("data:image/jpeg;base64,{}", "A".repeat(400));
