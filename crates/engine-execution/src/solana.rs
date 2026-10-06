@@ -817,8 +817,12 @@ fn fee_transfer_instructions(
 }
 
 fn simulation_short_of_gas(value: &Value) -> bool {
-    if matches!(value["err"].as_str(), Some("InsufficientFundsForFee"))
-        || value["err"].get("InsufficientFundsForRent").is_some()
+    // A wallet that has never held SOL doesn't exist on chain yet: the fee payer is "not found",
+    // which is the same shortage (it's how someone who only ever received USDC looks).
+    if matches!(
+        value["err"].as_str(),
+        Some("InsufficientFundsForFee") | Some("AccountNotFound")
+    ) || value["err"].get("InsufficientFundsForRent").is_some()
     {
         return true;
     }
@@ -1014,6 +1018,8 @@ mod tests {
         assert!(simulation_short_of_gas(
             &json!({"err":"InsufficientFundsForFee"})
         ));
+        // A wallet that has only ever received USDC has no SOL account at all.
+        assert!(simulation_short_of_gas(&json!({"err":"AccountNotFound"})));
         assert!(simulation_short_of_gas(
             &json!({"err":{"InsufficientFundsForRent":{"account_index":2}}})
         ));
