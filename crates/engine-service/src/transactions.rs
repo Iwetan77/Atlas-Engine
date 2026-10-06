@@ -552,6 +552,8 @@ pub(super) struct Told {
     pub(super) error: Option<String>,
     pub(super) lines: Vec<(String, String)>,
     pub(super) units: Option<u128>,
+    // The receipt's own headline amount, as the app shows it ("₦1,700.00" for a cash out).
+    pub(super) amount: Option<String>,
 }
 impl Told {
     pub(super) fn line(&self, label: &str) -> Option<&str> {
@@ -587,6 +589,11 @@ pub(super) async fn told(
             ))
         })
         .collect();
+    let amount = public["amount"]["amount"]
+        .as_str()
+        .and_then(|a| markets::parse_micros(a).ok())
+        .zip(public["amount"]["currency"].as_str())
+        .map(|(micros, currency)| markets::say_micros(micros, currency));
     Ok(Some(Told {
         id: r.id,
         kind: r.kind,
@@ -595,6 +602,7 @@ pub(super) async fn told(
         error: public["error"].as_str().map(str::to_owned),
         lines,
         units: r.usdc_units.and_then(|u| u.parse().ok()),
+        amount,
     }))
 }
 #[derive(Deserialize)]
@@ -762,6 +770,9 @@ mod tests {
         let shown = r.public("NGN", 1_329_760_000);
         assert_eq!(shown["amount"]["amount"], "2400");
         assert_eq!(shown["state"], "pending");
+        // The email headline is this same amount, not the USDC at the market rate (₦2,378.35).
+        let micros = markets::parse_micros(shown["amount"]["amount"].as_str().unwrap()).unwrap();
+        assert_eq!(markets::say_micros(micros, "NGN"), "₦2,400.00");
         r.set_line("Bank payout", "Paid ₦2,400.00".into());
         let shown = r.public("NGN", 1_329_760_000);
         assert_eq!(shown["amount"]["amount"], "2400");

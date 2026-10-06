@@ -615,7 +615,8 @@ fn receipt_message(t: &transactions::Told, amount: Option<String>) -> Option<Mes
                         card_lines(t, &["Bank payout", "Rate", "You pay"]),
                     )
                 })
-            } else if payout.starts_with("Failed") || (t.error.is_some() && failed) {
+            } else if payout.starts_with("Failed") {
+                // The USDC reached the payout partner and the bank wasn't paid: that needs a person.
                 Some(Message {
                     warning: true,
                     ..msg(
@@ -624,6 +625,18 @@ fn receipt_message(t: &transactions::Told, amount: Option<String>) -> Option<Mes
                             .into(),
                         "Cash out",
                         card_lines(t, &["Rate"]),
+                    )
+                })
+            } else if t.error.is_some() && failed {
+                // The transfer itself never went out, so nothing left the balance.
+                Some(Message {
+                    warning: true,
+                    ..msg(
+                        "Your cash out didn't go through".into(),
+                        "Your cash out didn't go through, and nothing left your balance. You can try again in Atlas."
+                            .into(),
+                        "Cash out",
+                        card_lines(t, &["Rate", "Bank payout"]),
                     )
                 })
             } else {
@@ -726,11 +739,17 @@ async fn about_receipt(state: &AppState, owner: &str, id: &str, key: &str) {
         Ok(Some(t)) => t,
         _ => return,
     };
-    let rate = app_balance::fx_rate(&contact.currency).await.ok();
-    let amount = told
-        .units
-        .zip(rate)
-        .map(|(u, r)| markets::say_money(u, &contact.currency, r));
+    // The amount the app's receipt shows, so the email's headline and its lines agree (a cash out
+    // is the naira the bank gets, not its USDC at today's rate).
+    let amount = match told.amount.clone() {
+        Some(amount) => Some(amount),
+        None => {
+            let rate = app_balance::fx_rate(&contact.currency).await.ok();
+            told.units
+                .zip(rate)
+                .map(|(u, r)| markets::say_money(u, &contact.currency, r))
+        }
+    };
     let Some(message) = receipt_message(&told, amount) else {
         return;
     };
@@ -1138,6 +1157,7 @@ mod tests {
                 .map(|(l, v)| ((*l).into(), (*v).into()))
                 .collect(),
             units: Some(10_000_000),
+            amount: None,
         }
     }
 
@@ -1213,6 +1233,22 @@ mod tests {
             .unwrap()
             .warning
         );
+        // The transfer never went out: the email says so, headed by what the bank was to get.
+        let mut unsent = told(
+            "offramp",
+            "failed",
+            &[
+                ("Bank gets", "₦1,700.00"),
+                ("Fee", "₦17.00"),
+                ("You pay", "₦1,717.00"),
+                ("Bank payout", "Waiting for your USDC"),
+            ],
+        );
+        unsent.error = Some("The transfer didn't go through".into());
+        let unsent = receipt_message(&unsent, Some("₦1,700.00".into())).unwrap();
+        assert_eq!(unsent.amount.as_deref(), Some("₦1,700.00"));
+        assert!(unsent.lead.contains("nothing left your balance"));
+        assert!(!unsent.lines.iter().any(|(l, _)| l == "Bank payout"));
         let friend = receipt_message(
             &told("send", "filled", &[("Send to", "@bob")]),
             Some("₦5,000.00".into()),
