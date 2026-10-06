@@ -4734,6 +4734,19 @@ async fn execute_sui_sell(
             )
         })
         .unwrap_or_else(|| format!("{} SUI", markets::format_units(quote.amount, 9)));
+    // Selling NEAR keeps 0.05 NEAR in the wallet for the network fees of this sale and later ones.
+    // It isn't a fee, but unsaid it made selling everything look about ₦350 short.
+    let kept = (quote.asset.contract_address.as_deref() == Some(WRAP_NEAR)).then(|| {
+        let usd = worth_of(
+            NEAR_GAS_RESERVE,
+            token_usd(&quote.asset),
+            quote.asset.decimals,
+        );
+        format!(
+            "0.05 NEAR ({}), stays in your balance",
+            markets::say_money(usd, &quote.currency, rate)
+        )
+    });
     let status = markets::IntentStatus {
         intent_id: intent_id.clone(),
         stage: "validate".into(),
@@ -4790,11 +4803,15 @@ async fn execute_sui_sell(
         .map(|d| d.transactions.clone())
         .unwrap_or_default();
     state.near.save_intent(&intent_id, current).await?;
+    let mut summary = vec![
+        json!({"label":"You sell","value":sell_label}),
+        json!({"label":"You receive (at least)","value":markets::say_money(quote.minimum_out,&quote.currency,rate)}),
+    ];
+    if let Some(kept) = kept {
+        summary.push(json!({"label":"Kept for network fees","value":kept}));
+    }
     Ok(Json(json!({"intentId":intent_id,"kind":"sell",
-        "summary":[
-            {"label":"You sell","value":sell_label},
-            {"label":"You receive (at least)","value":markets::say_money(quote.minimum_out,&quote.currency,rate)}
-        ],
+        "summary":summary,
         "transactions":transactions,"expiresAtUnixMs":expires
     })))
 }
