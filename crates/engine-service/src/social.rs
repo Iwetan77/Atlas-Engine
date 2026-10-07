@@ -1066,7 +1066,7 @@ async fn bank_plan(
     let plan = json!({"intentId":intent_id,"kind":"send","summary":summary,"transactions":transactions,"expiresAtUnixMs":now()+120_000});
     Ok((plan, funding_account, expires))
 }
-// Naira (micros) per dollar of USDC (units) that leaves the balance: "₦1,487.75 per $1".
+// Naira (micros) per dollar of USDC (units) that leaves the balance: "₦1,487.76 per $1".
 fn all_in_rate(naira: u128, usdc: u128) -> String {
     format!(
         "{} per $1",
@@ -1083,9 +1083,9 @@ mod tests {
     #[test]
     fn a_cash_outs_network_cost_lives_in_its_rate() {
         // ₦700 to the bank + ₦7 Daya fee = 0.453205 USDC at ₦1,560; Relay adds 0.022006.
-        assert_eq!(super::all_in_rate(707_000_000, 475_211), "₦1,487.75 per $1");
+        assert_eq!(super::all_in_rate(707_000_000, 475_211), "₦1,487.76 per $1");
         // Cash already on Base: nothing to move, so it's Daya's own rate.
-        assert_eq!(super::all_in_rate(707_000_000, 453_205), "₦1,559.99 per $1");
+        assert_eq!(super::all_in_rate(707_000_000, 453_205), "₦1,560.00 per $1");
     }
     #[test]
     fn a_fee_priced_moments_apart_keeps_the_quoted_figure() {
