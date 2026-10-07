@@ -54,9 +54,6 @@ struct SendQuote {
     link: Option<(String, Option<String>, u128)>,
     // A bank withdrawal through Daya: where, the naira the bank gets, and Daya's fee on top.
     bank: Option<(daya::Payout, u128, u128)>,
-    // How the quote expected its USDC to travel, and the network fee that costs (naira micros), so
-    // the confirmation shows the same Fee and total the quote did.
-    bank_network: Option<(BankRoute, u128)>,
     // A friend send or link: the network fee the quote showed (USDC units), in its Fee and total.
     network_units: u128,
 }
@@ -714,19 +711,6 @@ pub(super) async fn send_quote(
     } else {
         hop_fee
     };
-    // A bank withdrawal's network fee in naira, in its Fee and "You pay" from the quote on: Relay's
-    // bridge to Base, or the cost of hopping cash to Base (Base itself costs a fraction of a cent).
-    let bank_network = match route {
-        Some((route, estimate)) => {
-            let usdc = match route {
-                BankRoute::Hop => hop_fee,
-                _ => estimate,
-            };
-            let ngn = usdc.saturating_mul(app_balance::fx_rate("NGN").await?) / 1_000_000;
-            Some((route, ngn))
-        }
-        None => None,
-    };
     let quote_id = format!(
         "send-{:x}-{:x}",
         now(),
@@ -750,14 +734,13 @@ pub(super) async fn send_quote(
             bank: bank
                 .as_ref()
                 .map(|(payout, _, fee)| (payout.clone(), amount, *fee)),
-            bank_network,
             network_units,
         },
     );
-    // The bank gets exactly what was asked; the user pays that plus one Fee: Daya's (at Daya's
-    // rate) and the network's. The confirmation and the receipt show these same numbers.
+    // The bank gets exactly what was asked; the user pays that plus Daya's fee, at Daya's rate.
+    // Moving the cash to the payout address (Relay's ~2 cents) lives in the confirmation's rate,
+    // never as a separate charge (see bank_plan).
     if let Some((_, _, fee)) = bank {
-        let fee = fee + bank_network.map_or(0, |(_, ngn)| ngn);
         let naira = |micros: u128| money_usdc(micros, "NGN", 1_000_000);
         return Ok(Json(
             json!({"quoteId":quote_id,"destinationLabel":label,"send":naira(amount + fee)?,"receive":naira(amount)?,"fee":naira(fee)?,"eta":"Usually within minutes","expiresAtUnixMs":expires}),
@@ -1069,33 +1052,26 @@ async fn bank_plan(
             .await?
         }
     };
-    // Moving cash between networks, or opening the payout address's USDC account on Solana, costs a
-    // little more; "You pay" is everything that leaves the balance, that included. When the cash
-    // travels the way the quote expected, it's the quote's figure, so the confirmation shows the
-    // very Fee and total the screen did.
-    let actual: Option<u128> = match network_fee {
-        Some(usdc) => Some(usdc.saturating_mul(app_balance::fx_rate("NGN").await?) / 1_000_000),
-        None => None,
-    };
-    let network_ngn = match (quote.bank_network, actual) {
-        (Some((quoted, ngn)), Some(actual)) if quoted == route && near(ngn, actual) => ngn,
-        (_, Some(actual)) => actual,
-        (Some((quoted, ngn)), None) if quoted == route => ngn,
-        (_, None) => 0,
-    };
-    // One Fee, as on the screen before: the payout partner's and the network's together.
-    let mut summary = vec![
+    // Fee is Daya's alone and You pay is the bank's amount plus it, exactly as the quote said. What
+    // moving the cash costs (Relay's ~2 cents, a hop to Base, or the rent on a fallback Solana
+    // payout address) is in the rate: naira per dollar that leaves the balance, network included.
+    let summary = vec![
         json!({"label":"Send to","value":quote.label}),
         json!({"label":"Bank gets","value":markets::say_micros(get, "NGN")}),
-        json!({"label":"Fee","value":markets::say_micros(fee + network_ngn, "NGN")}),
-    ];
-    summary.extend([
-        json!({"label":"You pay","value":markets::say_micros(get + fee + network_ngn, "NGN")}),
-        json!({"label":"Rate","value":payout.rate_line()}),
+        json!({"label":"Fee","value":markets::say_micros(fee, "NGN")}),
+        json!({"label":"You pay","value":markets::say_micros(get + fee, "NGN")}),
+        json!({"label":"Rate","value":all_in_rate(get + fee, quote.usdc_units + network_fee.unwrap_or(0))}),
         json!({"label":"Bank payout","value":"Waiting for your USDC"}),
-    ]);
+    ];
     let plan = json!({"intentId":intent_id,"kind":"send","summary":summary,"transactions":transactions,"expiresAtUnixMs":now()+120_000});
     Ok((plan, funding_account, expires))
+}
+// Naira (micros) per dollar of USDC (units) that leaves the balance: "₦1,487.75 per $1".
+fn all_in_rate(naira: u128, usdc: u128) -> String {
+    format!(
+        "{} per $1",
+        markets::say_micros(naira.saturating_mul(1_000_000) / usdc.max(1), "NGN")
+    )
 }
 // The same cost priced a few seconds apart (SOL or the naira moved a hair): the quote's figure
 // stands. A different cost (another way of paying it) is shown as it is.
@@ -1104,6 +1080,13 @@ fn near(quoted: u128, actual: u128) -> bool {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_cash_outs_network_cost_lives_in_its_rate() {
+        // ₦700 to the bank + ₦7 Daya fee = 0.453205 USDC at ₦1,560; Relay adds 0.022006.
+        assert_eq!(super::all_in_rate(707_000_000, 475_211), "₦1,487.75 per $1");
+        // Cash already on Base: nothing to move, so it's Daya's own rate.
+        assert_eq!(super::all_in_rate(707_000_000, 453_205), "₦1,559.99 per $1");
+    }
     #[test]
     fn a_fee_priced_moments_apart_keeps_the_quoted_figure() {
         assert!(super::near(370_000_000, 371_000_000));

@@ -962,6 +962,9 @@ pub(super) struct PlannedTransfer {
     // `to` is an address on Base, reached by Relay bridging the wallet's Solana USDC straight there.
     #[serde(default)]
     base: bool,
+    // Cash the planned gas top-up turns into SOL (USDC units), for the receipt once it lands.
+    #[serde(default)]
+    topup: u128,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct BaseTopup {
@@ -3059,6 +3062,24 @@ pub(super) const SOLANA_FEE_NOT_READY: &str =
 // whether a wallet's cash can carry it.
 const KORA_FEE_GUESS_USDC: u128 = 350_000;
 
+// The only place gas is ever mentioned: a receipt whose transfer needed cash turned into SOL first
+// says so, once the top-up has landed. The SOL stays in the balance. In dollars, which the receipt
+// shows in the reader's currency.
+async fn note_gas_topup(state: &AppState, owner: &str, intent_id: &str, usdc: u128) {
+    if usdc == 0 {
+        return;
+    }
+    if let Ok(Some(mut receipt)) = state.history.find(owner, intent_id).await {
+        receipt.set_line(
+            "Gas top-up (kept as SOL)",
+            format!("${}", format_units(usdc, 6)),
+        );
+        if let Err((_, error)) = state.history.put(&receipt).await {
+            eprintln!("intent {intent_id}: gas top-up not noted on the receipt: {error}");
+        }
+    }
+}
+
 // Lands the gas top-up the phone signed, then waits until the wallet holds the SOL the transfer
 // needs (the RPC can trail Jupiter by a moment). Without that SOL the transfer would fail on chain
 // with "insufficient funds for rent", so it isn't sent.
@@ -3265,6 +3286,7 @@ async fn insert_transfer(
         network_fee,
         lamports,
         kora,
+        topup,
     } = steps;
     let intent_id = id("intent");
     state
@@ -3299,6 +3321,7 @@ async fn insert_transfer(
                     retry,
                     kora,
                     base,
+                    topup,
                 }),
                 base_topup: None,
             },
@@ -3334,6 +3357,8 @@ pub(super) struct SolanaTransfer {
     // The SOL the wallet must hold when the transfer is sent (none through Kora).
     lamports: u128,
     kora: Option<engine_execution::kora::Transfer>,
+    // Cash the gas top-up turns into SOL (USDC units), 0 without one.
+    topup: u128,
 }
 
 // The transfer, paid for one way or another and never by asking anyone for gas: the wallet's own
@@ -3380,6 +3405,7 @@ async fn solana_transfer_steps(
             network_fee: rent,
             lamports,
             kora: None,
+            topup: 0,
         });
     }
     let usdc = topup_usdc_for(state, lamports - sol).await;
@@ -3391,6 +3417,7 @@ async fn solana_transfer_steps(
                 network_fee: rent,
                 lamports,
                 kora: None,
+                topup: usdc,
             });
         }
     }
@@ -3401,6 +3428,7 @@ async fn solana_transfer_steps(
             network_fee: u128::from(kora.fee_units),
             lamports: 0,
             kora: Some(kora),
+            topup: 0,
         }),
         Err(engine_execution::kora::Error::Cash) => Err(short_of_cash()),
         Err(error) => {
@@ -3460,6 +3488,7 @@ async fn solana_relay_steps(
         }
     }
     let mut gas = None;
+    let mut topup = 0;
     if sol < GAS_FLOOR_LAMPORTS {
         let usdc = topup_usdc_for(state, GAS_FLOOR_LAMPORTS - sol).await;
         if cash < moved.amount_in_units.saturating_add(usdc) {
@@ -3470,6 +3499,7 @@ async fn solana_relay_steps(
                 .await
                 .ok_or_else(not_ready)?,
         );
+        topup = usdc;
     }
     Ok(SolanaTransfer {
         gas,
@@ -3477,6 +3507,7 @@ async fn solana_relay_steps(
         network_fee,
         lamports: GAS_FLOOR_LAMPORTS,
         kora: None,
+        topup,
     })
 }
 
@@ -4822,6 +4853,10 @@ pub(super) async fn signed(
                 state.markets.save_intent(&intent_id, &updated).await?;
                 return Ok(Json(updated.status));
             }
+            if updated.gas_request_id.is_some() {
+                let usdc = updated.transfer.as_ref().map_or(0, |t| t.topup);
+                note_gas_topup(&state, &updated.owner, &intent_id, usdc).await;
+            }
             match state
                 .solana_mainnet
                 .send_signed(&body.signed[main].transaction)
@@ -5292,6 +5327,7 @@ pub(super) async fn next_transactions(
         if let Some(t) = intent.transfer.as_mut() {
             t.lamports = steps.lamports;
             t.kora = steps.kora.clone();
+            t.topup = steps.topup;
         }
         state.markets.save_intent(&intent_id, &intent).await?;
         let mut transactions = Vec::new();
@@ -6344,6 +6380,7 @@ mod tests {
             retry: true,
             kora: None,
             base: false,
+            topup: 0,
         });
         intent.status.stage = "validate".into();
         intent.status.state = "pending".into();

@@ -946,12 +946,6 @@ pub(super) struct Payout {
     bank_name: String,
     ngn_per_usdc: u128,
 }
-impl Payout {
-    pub(super) fn rate_line(&self) -> String {
-        format!("{} per $1", markets::say_micros(self.ngn_per_usdc, "NGN"))
-    }
-}
-
 // Daya's verdict on one deposit, applied to its ramp and receipt. Called by the webhook and by
 // polling; applying the same status twice changes nothing.
 async fn apply(state: &AppState, deposit: &Value) -> Result<(), ApiError> {
