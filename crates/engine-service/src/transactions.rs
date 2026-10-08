@@ -407,31 +407,49 @@ fn snapshot(owner: &str, v: &Value, source: &str) -> Receipt {
         .filter_map(|v| v.as_str().map(str::to_owned))
         .collect();
     if source == "near" {
+        // A sale getting NEAR for its fees first reads as the sale from the start.
+        let pending_sale = &v["then_sell"];
         r.kind = if v["withdraw"].is_object() {
             "withdraw"
-        } else if v["sell_sui"] == true || v["origin_chain"] == "monad" {
+        } else if v["sell_sui"] == true || v["origin_chain"] == "monad" || pending_sale.is_object()
+        {
             "sell"
         } else {
             "buy"
         }
         .into();
-        for key in ["then_swap", "sale", "ref_buy", "ref_sale", "asset"] {
-            if let Some(symbol) = v[key]["symbol"].as_str() {
+        let pending_coin = &pending_sale["sale"];
+        for coin in [
+            &v["then_swap"],
+            &v["sale"],
+            pending_coin,
+            &v["ref_buy"],
+            &v["ref_sale"],
+            &v["asset"],
+        ] {
+            let key = coin;
+            if let Some(symbol) = key["symbol"].as_str() {
                 r.symbol = symbol.into();
-                r.icon_url = v[key]["icon_url"]
-                    .as_str()
-                    .map(str::to_owned)
-                    .or(r.icon_url);
+                r.icon_url = key["icon_url"].as_str().map(str::to_owned).or(r.icon_url);
                 break;
             }
         }
         r.asset_id = v["asset_id"].as_str().map(str::to_owned);
-        let amount = if r.kind == "buy" || r.kind == "withdraw" {
+        let amount = if pending_sale.is_object() {
+            &pending_sale["minimum_out"]
+        } else if r.kind == "buy" || r.kind == "withdraw" {
             &v["amount"]
         } else {
             &v["minimum_out"]
         };
         r.usdc_units = amount.as_u64().map(|n| n.to_string());
+        // Gas comes up only when cash was actually turned into NEAR for a sale's fees.
+        if let Some(gas) = v["gas_bought"].as_u64().filter(|n| *n > 0) {
+            r.set_line(
+                "Gas top-up (kept as NEAR)",
+                format!("${}", markets::format_units(u128::from(gas), 6)),
+            );
+        }
     } else if source == "hl" {
         r.kind = if v["quote"]["close"] == true {
             "perp_close"

@@ -74,6 +74,9 @@ struct StoredQuote {
     monad_sale: bool,
     // Paid from Solana through Relay into 1Click's Base deposit address (see pay_from).
     relayed: bool,
+    // A NEAR sale from a wallet short of NEAR for its network fee: USDC (units) swapped into NEAR
+    // first, from the user's cash, before the sale itself (see sale_gas).
+    gas_first: Option<u128>,
 }
 #[derive(Clone)]
 struct SuiRecovery {
@@ -207,6 +210,24 @@ struct StoredIntent {
     // Cash leaving Atlas as a coin for someone else's wallet: not a buy, so nothing for the trade book.
     #[serde(default)]
     withdraw: Option<Withdrawal>,
+    // A NEAR sale waiting on NEAR for its network fee: this intent first buys that NEAR from the
+    // user's cash; once it lands, the intent becomes this sale (stage sign, signed via /next).
+    #[serde(default)]
+    then_sell: Option<PendingSale>,
+    // USDC (units) a sale turned into NEAR for its fees first, for its receipt.
+    #[serde(default)]
+    gas_bought: u128,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct PendingSale {
+    // The cash wallet the sale pays into, and the NEAR wallet it sells from.
+    wallet: String,
+    near_wallet: String,
+    asset: Token,
+    asset_id: String,
+    amount: u128,
+    minimum_out: u128,
+    sale: Option<SuiSale>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Withdrawal {
@@ -2266,6 +2287,8 @@ pub(super) async fn withdraw_execute(
                 expected_value: String::new(),
                 handed_nonce: None,
                 device: None,
+                then_sell: None,
+                gas_bought: 0,
                 relay: None,
                 withdraw: Some(Withdrawal {
                     network: stored.option.label.into(),
@@ -2707,6 +2730,7 @@ async fn sui_quote(
             asset_id: req.asset_id.clone(),
             monad_sale: false,
             relayed: from_solana && origin == BASE_USDC_1CLICK,
+            gas_first: None,
         },
     );
     Ok(Json(
@@ -2831,6 +2855,7 @@ async fn ref_buy_quote(
             asset_id: req.asset_id.clone(),
             monad_sale: false,
             relayed: from_solana && origin == BASE_USDC_1CLICK,
+            gas_first: None,
         },
     );
     Ok(Json(
@@ -2849,7 +2874,44 @@ const NEAR_GAS_RESERVE: u128 = 50_000_000_000_000_000_000_000;
 // NEAR covers it, so a sale no longer leaves 0.05 NEAR (₦350) behind. Ref swaps keep the larger
 // reserve above. The bridge's CASHOUT_RESERVE is the same amount.
 const NEAR_CASHOUT_RESERVE: u128 = 10_000_000_000_000_000_000_000;
-const NEAR_CASHOUT_SHORT: &str = "Selling needs about 0.01 NEAR in your NEAR wallet for the network fee. Buy a little NEAR first, then sell.";
+// What a Ref sale's transactions need in the wallet: the swap's 180 Tgas (0.018 NEAR, mostly refunded)
+// and token storage, then the cashout's 0.01.
+const NEAR_REF_SALE_GAS: u128 = 30_000_000_000_000_000_000_000;
+// 1Click's smallest swap into NEAR (checked 8 Oct).
+const NEAR_GAS_MIN_USDC: u128 = 150_000;
+
+// Selling a NEAR coin pays NEAR's network fee from the NEAR wallet. A wallet without `need` of it gets
+// NEAR first, bought from the user's cash: never asked of them, and up to NEAR_GAS_RESERVE, enough
+// for this sale and the next few, which stays in the balance. The USDC (units) to swap, or None when
+// the wallet has enough.
+async fn sale_gas(
+    state: &AppState,
+    near_wallet: &str,
+    need: u128,
+) -> Result<Option<u128>, ApiError> {
+    let native = near_native(state, near_wallet).await?;
+    if native >= need {
+        return Ok(None);
+    }
+    let near_usd = state
+        .near
+        .tokens()
+        .await?
+        .into_iter()
+        .find(|t| t.blockchain == "near" && t.contract_address.as_deref() == Some(WRAP_NEAR))
+        .map(|t| token_usd(&t))
+        .filter(|p| *p > 0.0)
+        .ok_or_else(|| venue("Selling is unavailable for a moment. Try again shortly."))?;
+    Ok(Some(gas_usdc(
+        NEAR_GAS_RESERVE.saturating_sub(native),
+        near_usd,
+    )))
+}
+// USDC (units) that buys `missing` yoctoNEAR at `near_usd`, with room for the swap's price.
+fn gas_usdc(missing: u128, near_usd: f64) -> u128 {
+    let usdc = (missing as f64 / 1e24 * near_usd * 1.15 * 1e6).ceil() as u128;
+    usdc.max(NEAR_GAS_MIN_USDC)
+}
 fn near_account(value: &str) -> bool {
     (2..=64).contains(&value.len())
         && value.ends_with(".near")
@@ -3624,9 +3686,15 @@ async fn near_coin_sell_quote(
         .filter(|c| near_account(c))
         .ok_or_else(|| bad("Atlas can't sell this coin"))?;
     let wallet = destination(&state, &headers, &token, &user).await?;
-    if near_native(&state, &wallet).await? < NEAR_CASHOUT_RESERVE {
-        return Err(conflict(NEAR_CASHOUT_SHORT));
-    }
+    let gas_first = if contract == WRAP_NEAR {
+        // Selling NEAR itself: buying NEAR to pay for it makes no sense; there's just too little.
+        if near_native(&state, &wallet).await? < NEAR_CASHOUT_RESERVE {
+            return Err(bad("That's too little NEAR to sell."));
+        }
+        None
+    } else {
+        sale_gas(&state, &wallet, NEAR_CASHOUT_RESERVE).await?
+    };
     let mut held = near_coin_held(&state, &contract, &wallet).await?;
     if contract == WRAP_NEAR {
         // NEAR keeps just this sale's fee money.
@@ -3717,6 +3785,7 @@ async fn near_coin_sell_quote(
             asset_id: req.asset_id.clone(),
             monad_sale: false,
             relayed: false,
+            gas_first,
         },
     );
     Ok(Json(sale_json(
@@ -3793,6 +3862,7 @@ async fn monad_sell_quote(
             asset_id: req.asset_id.clone(),
             monad_sale: true,
             relayed: false,
+            gas_first: None,
         },
     );
     Ok(Json(sale_json(
@@ -3881,6 +3951,7 @@ async fn mon_buy_quote(
             asset_id: req.asset_id.clone(),
             monad_sale: false,
             relayed: false,
+            gas_first: None,
         },
     );
     let currency = &req.amount.currency;
@@ -4089,6 +4160,7 @@ async fn sui_coin_sell_quote(
             asset_id: req.asset_id.clone(),
             monad_sale: false,
             relayed: false,
+            gas_first: None,
         },
     );
     Ok(Json(
@@ -4177,8 +4249,15 @@ async fn ref_sell_quote(
         .checked_mul(99)
         .ok_or_else(|| bad("Amount too large"))?
         / 100;
-    // Price cashout conservatively, allowing gas; execution uses the actual net swap credit.
-    let cashout = min_sui - NEAR_GAS_RESERVE;
+    // NEAR for the fees: bought first when the wallet is short (see sale_gas); otherwise the proceeds
+    // top the reserve up only by what it's missing, so repeat sales don't pile NEAR up.
+    let gas_first = sale_gas(&state, &recipient, NEAR_REF_SALE_GAS).await?;
+    let keep = match gas_first {
+        Some(_) => 0,
+        None => NEAR_GAS_RESERVE.saturating_sub(near_native(&state, &recipient).await?),
+    };
+    // Price cashout conservatively; execution uses the actual net swap credit.
+    let cashout = min_sui - keep;
     let (cash_asset, cash_wallet) = cash_target(&user)?;
     let deadline = deadline_utc(180);
     let units = cashout.to_string();
@@ -4238,6 +4317,7 @@ async fn ref_sell_quote(
             asset_id: req.asset_id.clone(),
             monad_sale: false,
             relayed: false,
+            gas_first,
         },
     );
     Ok(Json(
@@ -4441,6 +4521,7 @@ async fn sui_sell_quote(
             asset_id: req.asset_id.clone(),
             monad_sale: false,
             relayed: false,
+            gas_first: None,
         },
     );
     Ok(Json(json!({
@@ -4670,6 +4751,7 @@ pub(super) async fn quote(
             asset_id: req.asset_id.clone(),
             monad_sale: false,
             relayed: from_solana && origin == BASE_USDC_1CLICK,
+            gas_first: None,
         },
     );
     Ok(Json(
@@ -4744,6 +4826,8 @@ async fn execute_monad_sale(
                 expected_value: format!("0x{value:x}"),
                 handed_nonce: Some(nonce),
                 device: None,
+                then_sell: None,
+                gas_bought: 0,
                 withdraw: None,
                 relay: Some(RelayLeg {
                     request_id: swap.request_id,
@@ -4874,6 +4958,8 @@ async fn execute_mon_buy(
                 expected_value: String::new(),
                 handed_nonce: None,
                 device: None,
+                then_sell: None,
+                gas_bought: 0,
                 withdraw: None,
                 relay: Some(RelayLeg {
                     request_id: swap.request_id,
@@ -4933,6 +5019,9 @@ async fn execute_sui_sell(
     user: &app_balance::VerifiedWallets,
     quote: StoredQuote,
 ) -> Result<Json<Value>, ApiError> {
+    if let Some(usdc) = quote.gas_first {
+        return execute_sale_after_gas(state, user, quote, usdc).await;
+    }
     let intent_id = id("intent");
     let expires = now() + 120_000;
     let rate = app_balance::fx_rate(&quote.currency).await?;
@@ -4988,6 +5077,8 @@ async fn execute_sui_sell(
                 device: None,
                 withdraw: None,
                 relay: None,
+                then_sell: None,
+                gas_bought: 0,
             },
         )
         .await?;
@@ -5011,6 +5102,174 @@ async fn execute_sui_sell(
         "transactions":transactions,"expiresAtUnixMs":expires
     })))
 }
+// A NEAR sale from a wallet short of NEAR for its fees: the plan first swaps `usdc` of the user's cash
+// into NEAR (1Click, to the NEAR wallet: a Base transfer, or Relay from Solana); once it has landed
+// the same intent becomes the sale (see become_sale), which the app signs under this confirmation
+// (/next). The confirmation shows the sale; gas isn't something anyone is asked about.
+async fn execute_sale_after_gas(
+    state: &AppState,
+    user: &app_balance::VerifiedWallets,
+    quote: StoredQuote,
+    usdc: u128,
+) -> Result<Json<Value>, ApiError> {
+    let unavailable = || venue("Selling is unavailable for a moment. Try again shortly.");
+    let near = state
+        .near
+        .tokens()
+        .await?
+        .into_iter()
+        .find(|t| t.blockchain == "near" && t.contract_address.as_deref() == Some(WRAP_NEAR))
+        .ok_or_else(unavailable)?;
+    let rate = app_balance::fx_rate(&quote.currency).await?;
+    let (wallet, from_solana, _, origin) =
+        pay_from(state, user, usdc, &quote.currency, rate).await?;
+    let relayed = from_solana && origin == BASE_USDC_1CLICK;
+    let gas_topup = deposit_ready(state, &wallet, from_solana, usdc, &quote.currency).await?;
+    let deadline = deadline_utc(if gas_topup { 20 * 60 } else { 240 });
+    let units = usdc.to_string();
+    let request = QuoteRequest::exact_input(
+        origin,
+        &near.asset_id,
+        &units,
+        &quote.recipient,
+        refund_to(user, &wallet, origin),
+        &deadline,
+        false,
+    );
+    let fresh = state.near.client.quote(&request).await.map_err(venue)?;
+    let deposit = fresh.deposit_address.clone().ok_or_else(unavailable)?;
+    let minimum: u128 = fresh
+        .min_amount_out
+        .as_deref()
+        .unwrap_or(&fresh.amount_out)
+        .parse()
+        .map_err(internal)?;
+    let DepositSteps {
+        expected_to,
+        expected_data,
+        transactions,
+        gas_request_id,
+        topup,
+    } = deposit_steps(
+        state,
+        &wallet,
+        from_solana,
+        relayed,
+        gas_topup,
+        &deposit,
+        fresh.deposit_memo.as_deref(),
+        usdc,
+    )
+    .await?;
+    let intent_id = id("intent");
+    let expires = now() + 120_000;
+    let sell_label = quote
+        .sale
+        .as_ref()
+        .map(|sale| {
+            format!(
+                "{} {}",
+                markets::format_units(sale.amount, sale.decimals),
+                sale.symbol
+            )
+        })
+        .unwrap_or_default();
+    let receive = markets::say_money(quote.minimum_out, &quote.currency, rate);
+    state
+        .near
+        .insert_intent(
+            &intent_id,
+            StoredIntent {
+                owner: user.user_id.clone(),
+                wallet,
+                expected_to,
+                expected_data,
+                deposit_address: deposit,
+                deposit_memo: fresh.deposit_memo,
+                asset: Some(near),
+                expires,
+                status: markets::IntentStatus {
+                    intent_id: intent_id.clone(),
+                    stage: "validate".into(),
+                    state: "pending".into(),
+                    tx_ids: Vec::new(),
+                    error: None,
+                },
+                then_swap: None,
+                sell_sui: false,
+                sale: None,
+                amount: usdc,
+                minimum_out: minimum,
+                sui_wallet: None,
+                from_solana,
+                gas_request_id,
+                gas_topup,
+                gas_order: None,
+                topup,
+                sale_permission_used: false,
+                ref_wallet: None,
+                asset_id: quote.asset_id.clone(),
+                origin_chain: String::new(),
+                expected_value: String::new(),
+                handed_nonce: None,
+                device: None,
+                withdraw: None,
+                relay: None,
+                then_sell: Some(PendingSale {
+                    wallet: quote.wallet,
+                    near_wallet: quote.recipient,
+                    asset: quote.asset,
+                    asset_id: quote.asset_id,
+                    amount: quote.amount,
+                    minimum_out: quote.minimum_out,
+                    sale: quote.sale,
+                }),
+                gas_bought: 0,
+            },
+        )
+        .await?;
+    Ok(Json(json!({"intentId":intent_id,"kind":"sell",
+        "summary":[
+            {"label":"You sell","value":sell_label},
+            {"label":"You receive (at least)","value":receive}
+        ],
+        "transactions":transactions,"expiresAtUnixMs":expires
+    })))
+}
+
+// The NEAR for a sale's fees has landed: the intent becomes that sale, waiting for the app to sign it
+// (/next prepares it, /signed commits it), as a Ref sale's cashout does. Its transaction ids start
+// empty, which is how a Ref sale knows its swap comes first.
+fn become_sale(current: &mut StoredIntent, sale: PendingSale) {
+    current.then_sell = None;
+    current.gas_bought = current.amount;
+    current.sell_sui = true;
+    current.wallet = sale.wallet;
+    current.sui_wallet = Some(sale.near_wallet);
+    current.asset = Some(sale.asset);
+    current.asset_id = sale.asset_id;
+    current.amount = sale.amount;
+    current.minimum_out = sale.minimum_out;
+    current.sale = sale.sale;
+    current.deposit_address = String::new();
+    current.deposit_memo = None;
+    current.expected_to = String::new();
+    current.expected_data = String::new();
+    current.from_solana = false;
+    current.gas_request_id = None;
+    current.gas_topup = false;
+    current.gas_order = None;
+    current.topup = None;
+    current.sale_permission_used = false;
+    current.device = None;
+    current.ref_wallet = None;
+    current.expires = now() + 180_000;
+    current.status.stage = "sign".into();
+    current.status.state = "pending".into();
+    current.status.tx_ids.clear();
+    current.status.error = None;
+}
+
 // Before a deposit to 1Click: the cash is still there, and Base can pay its gas. True when an empty
 // Base tank tops itself up first (a gasless CoW order), which gives the deposit more time.
 async fn deposit_ready(
@@ -5329,6 +5588,8 @@ pub(super) async fn execute(
                 device: None,
                 withdraw: None,
                 relay: None,
+                then_sell: None,
+                gas_bought: 0,
             },
         )
         .await?;
@@ -6009,6 +6270,14 @@ pub(super) async fn status(
                         result.stage = "sign".into();
                         current.expires = now() + 180_000;
                         // The coins wait in the user's wallet until their phone approves /next.
+                    } else if let Some(sale) = current.then_sell.clone() {
+                        // The NEAR for the sale's fees is in (read from the chain, as the bridge
+                        // will): the intent becomes the sale.
+                        if near_native(&state, &sale.near_wallet).await? < NEAR_CASHOUT_RESERVE {
+                            return Ok(Json(current.status.clone()));
+                        }
+                        become_sale(&mut current, sale);
+                        result = current.status.clone();
                     } else {
                         result.state = "filled".into();
                         let tx = result.tx_ids.first().cloned();
@@ -6911,6 +7180,60 @@ mod tests {
             6,
             1.0
         )));
+    }
+    #[test]
+    fn a_sale_short_of_near_buys_just_enough_first() {
+        // 8 Oct, NEAR $5.13: an empty wallet gets 0.05 NEAR, with room for the swap's price.
+        assert_eq!(gas_usdc(NEAR_GAS_RESERVE, 5.13), 294_975);
+        // Nearly there: still 1Click's smallest swap, $0.15.
+        assert_eq!(gas_usdc(NEAR_GAS_RESERVE / 50, 5.13), NEAR_GAS_MIN_USDC);
+    }
+    #[test]
+    fn once_its_near_lands_the_intent_becomes_the_sale() {
+        let token = |symbol: &str| Token {
+            asset_id: format!("nep141:{symbol}.near"),
+            blockchain: "near".into(),
+            symbol: symbol.into(),
+            decimals: 18,
+            contract_address: Some(format!("{symbol}.near")),
+            price: None,
+            coingecko_id: None,
+        };
+        let mut intent: StoredIntent = serde_json::from_value(json!({
+            "owner":"alice","wallet":"SolanaPayer","expected_to":"0xdeposit","expected_data":"",
+            "deposit_address":"0xdeposit","deposit_memo":null,"expires":0,
+            "status":{"intentId":"intent-1","stage":"settle","state":"pending","txIds":["gas-tx","1click-tx"],"error":null},
+            "from_solana":true,"gas_request_id":"jup","amount":295000,"minimum_out":50
+        }))
+        .unwrap();
+        intent.asset = Some(token("wrap"));
+        become_sale(
+            &mut intent,
+            PendingSale {
+                wallet: "0xcash".into(),
+                near_wallet: "aa".repeat(32),
+                asset: token("blackdragon"),
+                asset_id: "near:ref:blackdragon.near".into(),
+                amount: 10,
+                minimum_out: 9,
+                sale: None,
+            },
+        );
+        assert!(intent.sell_sui && intent.then_sell.is_none());
+        assert_eq!(
+            (intent.status.stage.as_str(), intent.status.state.as_str()),
+            ("sign", "pending")
+        );
+        // A Ref sale's swap comes first exactly when it has no transaction yet.
+        assert!(intent.status.tx_ids.is_empty());
+        assert_eq!(intent.wallet, "0xcash");
+        assert!(
+            intent.deposit_address.is_empty()
+                && !intent.from_solana
+                && intent.gas_request_id.is_none()
+        );
+        assert!(!intent.sale_permission_used && intent.expires > now());
+        assert_eq!(intent.gas_bought, 295_000);
     }
     #[test]
     fn a_near_coin_is_offered_only_with_a_way_in_and_a_way_out() {
