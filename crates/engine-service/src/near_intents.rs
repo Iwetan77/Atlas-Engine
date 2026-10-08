@@ -123,6 +123,10 @@ struct SuiSwap {
     // SUI (MIST) to swap, after keeping SUI_GAS_RESERVE for gas.
     sui_in: u128,
     expected_out: u128,
+    // NEAR: what's kept back for gas, only what the wallet was missing of NEAR_GAS_RESERVE (older
+    // plans, without it, kept the whole reserve).
+    #[serde(default)]
+    keep: Option<u128>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SuiSale {
@@ -604,6 +608,7 @@ impl NearState {
                         icon_url: sale.icon_url.clone(),
                         sui_in: 0,
                         expected_out: 0,
+                        keep: None,
                     },
                 );
             }
@@ -2683,6 +2688,7 @@ async fn sui_quote(
                 icon_url,
                 sui_in,
                 expected_out,
+                keep: None,
             }),
             asset_id: req.asset_id.clone(),
             monad_sale: false,
@@ -2743,13 +2749,14 @@ async fn ref_buy_quote(
         .unwrap_or(&q.amount_out)
         .parse()
         .map_err(internal)?;
-    if minimum <= NEAR_GAS_RESERVE * 2 || minimum > sui_out {
-        return Err(bad(
-            "That amount is too small after the network fee. Try a bigger amount.",
-        ));
+    // NEAR kept back for this coin's later sale: only what the wallet is missing of the reserve, so
+    // repeat buys don't pile NEAR up.
+    let keep = NEAR_GAS_RESERVE.saturating_sub(near_native(&state, &destination).await?);
+    if minimum <= keep + NEAR_GAS_RESERVE || minimum > sui_out {
+        return Err(bad("That amount is too small to buy. Try a bigger amount."));
     }
     // The swap spends what's sure to arrive (1Click's minimum), not its estimate, less NEAR for gas.
-    let sui_in = minimum - NEAR_GAS_RESERVE;
+    let sui_in = minimum - keep;
     let routed = bridge(
         &state,
         &headers,
@@ -2804,6 +2811,7 @@ async fn ref_buy_quote(
                 icon_url,
                 sui_in,
                 expected_out,
+                keep: Some(keep),
             }),
             asset_id: req.asset_id.clone(),
             monad_sale: false,
@@ -3198,12 +3206,14 @@ async fn search_listed(
     rate: u128,
 ) -> Result<SearchAssets, ApiError> {
     let list = state.near.tokens().await?;
+    let routes = near_routes(state);
     let query = query.to_ascii_lowercase();
     // Closest first: the symbol itself, then symbols starting with it, then containing it, then
     // coins that only match by their chain's name ("near" lists every NEAR coin, NEAR first).
     let mut matches: Vec<(u8, &Token, String)> = list
         .iter()
         .filter(|t| supported(t))
+        .filter(|t| t.blockchain != "near" || routes.get(&t.asset_id).is_none_or(|r| r.tradeable()))
         .filter_map(|t| {
             let symbol = display_symbol(t);
             let lower = symbol.to_ascii_lowercase();
@@ -3424,6 +3434,145 @@ async fn sellable(
         _ => false,
     }
 }
+// Which NEAR coins can really be bought and sold, checked live every 15 minutes: straight through
+// 1Click's market makers, or on Ref (NEAR's own exchange, where most NEAR memes trade; Atlas reaches
+// it through NEAR, which 1Click always quotes). Checked 8 Oct: of 31 NEAR coins 1Click lists, 14
+// trade both ways there, 9 more only on Ref, and QTC, SWEAT and a few others nowhere. A coin with no
+// way in and out isn't offered.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+struct NearRoute {
+    direct_buy: bool,
+    direct_sell: bool,
+    on_ref: bool,
+}
+impl NearRoute {
+    fn tradeable(&self) -> bool {
+        (self.direct_buy || self.on_ref) && (self.direct_sell || self.on_ref)
+    }
+}
+type NearRoutes = Arc<HashMap<String, NearRoute>>;
+static NEAR_ROUTES: std::sync::LazyLock<Mutex<Option<(Instant, NearRoutes)>>> =
+    std::sync::LazyLock::new(Default::default);
+static NEAR_ROUTES_REFRESH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+const NEAR_ROUTES_FRESH: Duration = Duration::from_secs(15 * 60);
+// Stand-in accounts for the checks: dry quotes name a recipient and a refund address, nothing moves.
+const PROBE_NEAR: &str = "61746c61732d726f7574652d636865636b2d6e6f7468696e672d6d6f7665732e";
+const PROBE_SOLANA: &str = "6metVveeGpQN6YoXYmevmvtQp7k5CvCgaKBRuQUgevKR";
+const PROBE_USD: u128 = 5_000_000;
+
+// The last check (empty until the first finishes), and a fresh one started in the background when
+// it's old; a search never waits for it.
+fn near_routes(state: &AppState) -> NearRoutes {
+    let held = NEAR_ROUTES.lock().ok().and_then(|held| held.clone());
+    let stale = held
+        .as_ref()
+        .is_none_or(|(at, _)| at.elapsed() > NEAR_ROUTES_FRESH);
+    if stale && !NEAR_ROUTES_REFRESH.swap(true, Ordering::Relaxed) {
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Some(routes) = check_near_routes(&state).await {
+                if let Ok(mut held) = NEAR_ROUTES.lock() {
+                    *held = Some((Instant::now(), Arc::new(routes)));
+                }
+            }
+            NEAR_ROUTES_REFRESH.store(false, Ordering::Relaxed);
+        });
+    }
+    held.map(|(_, routes)| routes).unwrap_or_default()
+}
+
+async fn check_near_routes(state: &AppState) -> Option<HashMap<String, NearRoute>> {
+    let tokens: Vec<Token> = state
+        .near
+        .tokens()
+        .await
+        .ok()?
+        .into_iter()
+        .filter(|t| t.blockchain == "near" && supported(t))
+        .collect();
+    let gate = Arc::new(tokio::sync::Semaphore::new(6));
+    let mut checks = tokio::task::JoinSet::new();
+    for token in tokens {
+        let (state, gate) = (state.clone(), gate.clone());
+        checks.spawn(async move {
+            let _turn = gate.acquire_owned().await.ok()?;
+            let route = check_near_route(&state, &token).await;
+            Some((token.asset_id, route))
+        });
+    }
+    let mut routes = HashMap::new();
+    while let Some(done) = checks.join_next().await {
+        if let Ok(Some((asset, route))) = done {
+            routes.insert(asset, route);
+        }
+    }
+    // A check that reached nothing (1Click down) says nothing about the coins: keep the last one.
+    routes
+        .values()
+        .any(|r| r.direct_buy || r.direct_sell || r.on_ref)
+        .then_some(routes)
+}
+
+async fn check_near_route(state: &AppState, token: &Token) -> NearRoute {
+    if token.contract_address.as_deref() == Some(WRAP_NEAR) {
+        return NearRoute {
+            direct_buy: true,
+            direct_sell: true,
+            on_ref: true,
+        };
+    }
+    let deadline = deadline_utc(180);
+    let usd = PROBE_USD.to_string();
+    let buy = QuoteRequest::exact_input(
+        SOLANA_USDC_1CLICK,
+        &token.asset_id,
+        &usd,
+        PROBE_NEAR,
+        PROBE_SOLANA,
+        &deadline,
+        true,
+    );
+    let units = units_worth(PROBE_USD, token_usd(token), token.decimals).to_string();
+    let sell = QuoteRequest::exact_input(
+        &token.asset_id,
+        SOLANA_USDC_1CLICK,
+        &units,
+        PROBE_SOLANA,
+        PROBE_NEAR,
+        &deadline,
+        true,
+    );
+    let ref_check = async {
+        match token.contract_address.as_deref() {
+            Some(contract) if near_account(contract) => {
+                ref_assets(state, contract).await.is_ok_and(|found| {
+                    found
+                        .iter()
+                        .any(|a| a["token"] == contract && a["tradeable"] == true)
+                })
+            }
+            _ => false,
+        }
+    };
+    let (direct_buy, direct_sell, on_ref) = tokio::join!(
+        state.near.client.quote(&buy),
+        async {
+            if units == "0" {
+                None
+            } else {
+                Some(state.near.client.quote(&sell).await)
+            }
+        },
+        ref_check,
+    );
+    NearRoute {
+        direct_buy: direct_buy.is_ok(),
+        direct_sell: matches!(direct_sell, Some(Ok(_))),
+        on_ref,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn sale_json(
     quote_id: &str,
@@ -4399,22 +4548,30 @@ pub(super) async fn quote(
         .ok_or_else(|| bad("amount too large"))?
         / rate;
     markets::check_limits(amount, &req.amount.currency, rate)?;
-    // A NEAR coin's sale is paid for in NEAR. With none in the wallet, the coin is bought through
-    // NEAR and Ref, which keeps 0.05 NEAR back for those fees.
+    // A NEAR coin goes in through NEAR and Ref when 1Click's market makers don't take it, or when the
+    // wallet has no NEAR yet: that route buys the NEAR its later sale needs (0.05, kept in the
+    // balance). Otherwise straight through 1Click; nobody is ever asked to buy NEAR themselves.
     if let Some(contract) = token
         .contract_address
         .clone()
         .filter(|c| token.blockchain == "near" && c != WRAP_NEAR && near_account(c))
     {
-        if near_native(&state, &destination).await? < NEAR_GAS_RESERVE {
-            let symbol = token.symbol.clone();
-            return ref_buy_quote(state, headers, req, user, &contract)
-                .await
-                .map_err(|_| {
-                    conflict(&format!(
-                        "Buying {symbol} needs a little NEAR in your NEAR wallet for the fees of selling it later. Buy a little NEAR first."
-                    ))
-                });
+        let direct_known_dead = near_routes(&state)
+            .get(&token.asset_id)
+            .is_some_and(|r| !r.direct_buy);
+        if direct_known_dead || near_native(&state, &destination).await? < NEAR_GAS_RESERVE {
+            match ref_buy_quote(
+                state.clone(),
+                headers.clone(),
+                req.clone(),
+                user.clone(),
+                &contract,
+            )
+            .await
+            {
+                Ok(quoted) => return Ok(quoted),
+                Err((_, reason)) => eprintln!("{}: no Ref route ({reason})", token.symbol),
+            }
         }
     }
     // Atlas won't buy a coin it can't sell back to cash.
@@ -5774,7 +5931,7 @@ pub(super) async fn status(
                     let got = delivered(&venue_status).unwrap_or(current.minimum_out);
                     if let Some(swap) = &mut current.then_swap {
                         let reserve = if swap.network == "near" {
-                            NEAR_GAS_RESERVE
+                            swap.keep.unwrap_or(NEAR_GAS_RESERVE)
                         } else {
                             SUI_GAS_RESERVE
                         };
@@ -6699,6 +6856,23 @@ mod tests {
             6,
             1.0
         )));
+    }
+    #[test]
+    fn a_near_coin_is_offered_only_with_a_way_in_and_a_way_out() {
+        let r = |direct_buy, direct_sell, on_ref| NearRoute {
+            direct_buy,
+            direct_sell,
+            on_ref,
+        };
+        // 8 Oct: AURORA through 1Click only, BLACKDRAGON on Ref only, RHEA sells but won't buy
+        // through 1Click (Ref buys it), QTC nowhere.
+        assert!(r(true, true, false).tradeable());
+        assert!(r(false, false, true).tradeable());
+        assert!(r(false, true, true).tradeable());
+        assert!(!r(false, false, false).tradeable());
+        assert!(!r(true, false, false).tradeable());
+        assert_eq!(PROBE_NEAR.len(), 64);
+        assert!(PROBE_NEAR.bytes().all(|b| b.is_ascii_hexdigit()));
     }
     #[test]
     fn memecoins_far_below_a_microdollar_still_price() {
