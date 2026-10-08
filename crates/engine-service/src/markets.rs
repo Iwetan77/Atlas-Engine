@@ -3438,6 +3438,19 @@ async fn solana_transfer_steps(
     }
 }
 
+// USDC from a Solana wallet delivered by Relay to an address on Base (a 1Click deposit address),
+// for the NEAR Intents flows: the gas top-up when the wallet needs one, the transaction, and Relay's
+// fee (USDC units, in what leaves the wallet).
+pub(super) async fn solana_relay_transfer(
+    state: &AppState,
+    from: &str,
+    base_to: &str,
+    amount: u128,
+) -> Result<(Option<(String, String)>, String, u128), ApiError> {
+    let steps = solana_relay_steps(state, from, base_to, amount, true).await?;
+    Ok((steps.gas, steps.transaction, steps.network_fee))
+}
+
 // Relay's deposit for `amount` to land at `base_to` on Base, and the gas top-up that pays its Solana
 // fee when the wallet is short of SOL (no account is opened, so the usual floor is enough). Relay's
 // fee is in the USDC that leaves. On a second try (`topup` false) SOL bought by the first is waited

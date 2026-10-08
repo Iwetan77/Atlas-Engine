@@ -72,6 +72,8 @@ struct StoredQuote {
     // The Atlas asset id traded (for the trade book), and a Monad sale (the phone sends the coin).
     asset_id: String,
     monad_sale: bool,
+    // Paid from Solana through Relay into 1Click's Base deposit address (see pay_from).
+    relayed: bool,
 }
 #[derive(Clone)]
 struct SuiRecovery {
@@ -218,6 +220,7 @@ struct WithdrawQuote {
     owner: String,
     wallet: String,
     from_solana: bool,
+    relayed: bool,
     network_fee: u128,
     option: &'static DepositOption,
     token: Token,
@@ -1950,7 +1953,16 @@ async fn withdraw_route(
     fee_to: &str,
     currency: &str,
     rate: u128,
-) -> Result<(String, bool, u128, engine_execution::near_intents::Quote), ApiError> {
+) -> Result<
+    (
+        String,
+        bool,
+        u128,
+        &'static str,
+        engine_execution::near_intents::Quote,
+    ),
+    ApiError,
+> {
     let mut funding = pay_from(
         state,
         user,
@@ -1967,7 +1979,7 @@ async fn withdraw_route(
             option,
             &units,
             address,
-            &funding.0,
+            refund_to(user, &funding.0, funding.3),
             &deadline,
             fee_to.into(),
             true,
@@ -1982,8 +1994,8 @@ async fn withdraw_route(
         withdraw_cost(input, receive)?;
         markets::check_limits(input, currency, rate)?;
         let checked = pay_from(state, user, input, currency, rate).await?;
-        if checked.0 == funding.0 && checked.1 == funding.1 {
-            return Ok((checked.0, checked.1, checked.2, q));
+        if checked.0 == funding.0 && checked.1 == funding.1 && checked.3 == funding.3 {
+            return Ok((checked.0, checked.1, checked.2, checked.3, q));
         }
         funding = checked;
     }
@@ -2043,7 +2055,7 @@ pub(super) async fn withdraw_quote(
             ))
         })?;
     let output = withdraw_units(amount, &token, option.dollar)?;
-    let (wallet, from_solana, network_fee, q) = withdraw_route(
+    let (wallet, from_solana, network_fee, origin, q) = withdraw_route(
         &state, &user, option, output, amount, &address, &fee_to, &currency, rate,
     )
     .await?;
@@ -2059,6 +2071,7 @@ pub(super) async fn withdraw_quote(
             owner: user.user_id,
             wallet,
             from_solana,
+            relayed: from_solana && origin == BASE_USDC_1CLICK,
             network_fee,
             option,
             token: token.clone(),
@@ -2170,7 +2183,7 @@ pub(super) async fn withdraw_execute(
     .await?;
     let deadline = deadline_utc(if gas_topup { 20 * 60 } else { 240 });
     let units = stored.minimum_out.to_string();
-    let origin = if stored.from_solana {
+    let origin = if stored.from_solana && !stored.relayed {
         SOLANA_USDC_1CLICK
     } else {
         BASE_USDC_1CLICK
@@ -2180,7 +2193,7 @@ pub(super) async fn withdraw_execute(
         stored.option,
         &units,
         &stored.address,
-        &stored.wallet,
+        refund_to(&user, &stored.wallet, origin),
         &deadline,
         fee_to,
         false,
@@ -2206,6 +2219,7 @@ pub(super) async fn withdraw_execute(
         &state,
         &stored.wallet,
         stored.from_solana,
+        stored.relayed,
         gas_topup,
         &deposit,
         fresh.deposit_memo.as_deref(),
@@ -2629,7 +2643,7 @@ async fn sui_quote(
         &sui.asset_id,
         &units,
         &destination,
-        &wallet,
+        refund_to(&user, &wallet, origin),
         &deadline,
         true,
     );
@@ -2692,6 +2706,7 @@ async fn sui_quote(
             }),
             asset_id: req.asset_id.clone(),
             monad_sale: false,
+            relayed: from_solana && origin == BASE_USDC_1CLICK,
         },
     );
     Ok(Json(
@@ -2737,7 +2752,7 @@ async fn ref_buy_quote(
         &sui.asset_id,
         &units,
         &destination,
-        &wallet,
+        refund_to(&user, &wallet, origin),
         &deadline,
         true,
     );
@@ -2815,6 +2830,7 @@ async fn ref_buy_quote(
             }),
             asset_id: req.asset_id.clone(),
             monad_sale: false,
+            relayed: from_solana && origin == BASE_USDC_1CLICK,
         },
     );
     Ok(Json(
@@ -3700,6 +3716,7 @@ async fn near_coin_sell_quote(
             }),
             asset_id: req.asset_id.clone(),
             monad_sale: false,
+            relayed: false,
         },
     );
     Ok(Json(sale_json(
@@ -3775,6 +3792,7 @@ async fn monad_sell_quote(
             sale: None,
             asset_id: req.asset_id.clone(),
             monad_sale: true,
+            relayed: false,
         },
     );
     Ok(Json(sale_json(
@@ -3862,6 +3880,7 @@ async fn mon_buy_quote(
             network_fee: amount.saturating_sub(worth),
             asset_id: req.asset_id.clone(),
             monad_sale: false,
+            relayed: false,
         },
     );
     let currency = &req.amount.currency;
@@ -4069,6 +4088,7 @@ async fn sui_coin_sell_quote(
             }),
             asset_id: req.asset_id.clone(),
             monad_sale: false,
+            relayed: false,
         },
     );
     Ok(Json(
@@ -4217,6 +4237,7 @@ async fn ref_sell_quote(
             }),
             asset_id: req.asset_id.clone(),
             monad_sale: false,
+            relayed: false,
         },
     );
     Ok(Json(
@@ -4419,6 +4440,7 @@ async fn sui_sell_quote(
             network_fee: 0,
             asset_id: req.asset_id.clone(),
             monad_sale: false,
+            relayed: false,
         },
     );
     Ok(Json(json!({
@@ -4466,6 +4488,17 @@ async fn pay_from(
         None => 0,
     };
     if let Some(s) = solana {
+        // From Solana, Relay brings the cash to 1Click's Base deposit address: about 2 cents, where
+        // a deposit straight to 1Click's Solana address opens a new account there (~25 cents of rent,
+        // checked 6 Oct). The direct deposit stays as the fallback when Relay doesn't answer.
+        if let (Some(e), true) = (evm, solana_cash >= amount) {
+            if let Ok(moved) = state.relay_link.solana_to_base(s, e, amount, 0).await {
+                if solana_cash >= moved.amount_in_units {
+                    let fee = moved.amount_in_units.saturating_sub(amount);
+                    return Ok((s.into(), true, fee, BASE_USDC_1CLICK));
+                }
+            }
+        }
         if solana_cash >= amount && markets::solana_can_send(state, s, amount).await {
             let fee = markets::account_rent_usd(state).await;
             return Ok((s.into(), true, fee, SOLANA_USDC_1CLICK));
@@ -4479,6 +4512,15 @@ async fn pay_from(
         currency,
         rate,
     ))
+}
+
+// Where 1Click refunds a deposit, on the deposit's own chain: the wallet that pays it, or for Solana
+// cash that Relay carries into a Base deposit address, the user's own Base wallet.
+fn refund_to<'a>(user: &'a app_balance::VerifiedWallets, wallet: &'a str, origin: &str) -> &'a str {
+    match user.evm_wallet.as_deref() {
+        Some(evm) if origin == BASE_USDC_1CLICK && is_solana(wallet) => evm,
+        _ => wallet,
+    }
 }
 
 // A Solana address (base58, 32 bytes).
@@ -4590,7 +4632,7 @@ pub(super) async fn quote(
         &token.asset_id,
         &units,
         &destination,
-        &wallet,
+        refund_to(&user, &wallet, origin),
         &deadline,
         true,
     );
@@ -4627,6 +4669,7 @@ pub(super) async fn quote(
             network_fee,
             asset_id: req.asset_id.clone(),
             monad_sale: false,
+            relayed: from_solana && origin == BASE_USDC_1CLICK,
         },
     );
     Ok(Json(
@@ -5009,16 +5052,18 @@ struct DepositSteps {
 // What the app signs to pay `amount` of USDC into a 1Click deposit address: from Solana, [gas
 // top-up?, transfer] that the engine lands; from Base, the transfer (nothing yet when the tank tops
 // up first; /next hands it out).
+#[allow(clippy::too_many_arguments)]
 async fn deposit_steps(
     state: &AppState,
     wallet: &str,
     from_solana: bool,
+    relayed: bool,
     gas_topup: bool,
     deposit: &str,
     memo: Option<&str>,
     amount: u128,
 ) -> Result<DepositSteps, ApiError> {
-    let expected_chain = if from_solana {
+    let expected_chain = if from_solana && !relayed {
         is_solana(deposit)
     } else {
         is_evm(deposit)
@@ -5027,7 +5072,15 @@ async fn deposit_steps(
         return Err(venue("1Click returned an unsupported deposit destination"));
     }
     if from_solana {
-        let (gas, transfer) = markets::solana_usdc_transfer(state, wallet, deposit, amount).await?;
+        // Relay carries the cash from the Solana wallet into 1Click's Base deposit address (one
+        // Solana transaction the engine lands); else a plain transfer to a Solana deposit address.
+        let (gas, transfer) = if relayed {
+            let (gas, transaction, _) =
+                markets::solana_relay_transfer(state, wallet, deposit, amount).await?;
+            (gas, transaction)
+        } else {
+            markets::solana_usdc_transfer(state, wallet, deposit, amount).await?
+        };
         let mut transactions = Vec::new();
         if let Some((_, gas_tx)) = &gas {
             transactions.push(json!({"chain":"solana","transaction":gas_tx,"submit":"engine"}));
@@ -5187,16 +5240,17 @@ pub(super) async fn execute(
     .await?;
     let deadline = deadline_utc(if gas_topup { 20 * 60 } else { 240 });
     let amount = stored.amount.to_string();
+    let origin = if stored.from_solana && !stored.relayed {
+        SOLANA_USDC_1CLICK
+    } else {
+        BASE_USDC_1CLICK
+    };
     let req = QuoteRequest::exact_input(
-        if stored.from_solana {
-            SOLANA_USDC_1CLICK
-        } else {
-            BASE_USDC_1CLICK
-        },
+        origin,
         &stored.asset.asset_id,
         &amount,
         &destination,
-        &stored.wallet,
+        refund_to(&user, &stored.wallet, origin),
         &deadline,
         false,
     );
@@ -5225,6 +5279,7 @@ pub(super) async fn execute(
         &state,
         &stored.wallet,
         stored.from_solana,
+        stored.relayed,
         gas_topup,
         &deposit,
         fresh.deposit_memo.as_deref(),
