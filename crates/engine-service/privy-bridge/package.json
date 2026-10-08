@@ -11,7 +11,8 @@
     "@noble/curves": "1.9.7",
     "@noble/hashes": "1.8.0",
     "@privy-io/node": "0.22.0",
-    "viem": "2.56.0"
+    "viem": "2.56.0",
+    "web-push": "3.6.7"
   },
   "engines": {
     "node": ">=20"

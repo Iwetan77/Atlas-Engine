@@ -547,8 +547,9 @@ pub(super) async fn resolve_user(
         .await?
         .ok_or((StatusCode::NOT_FOUND, "unknown handle".into()))?;
 
+    let avatar = state.social.avatar(&record.user_id).await?;
     Ok(Json(
-        json!({"handle":record.handle,"displayName":record.display_name}),
+        json!({"handle":record.handle,"displayName":record.display_name,"avatar":avatar}),
     ))
 }
 pub(super) async fn banks(

@@ -241,7 +241,7 @@ impl EmailState {
             return Ok(pg
                 .query(
                     "SELECT user_id, email, name, enabled, currency, wallet, perps_watch, perps_seen_ms
-                     FROM atlas_email_contacts WHERE perps_watch AND enabled AND wallet IS NOT NULL
+                     FROM atlas_email_contacts WHERE perps_watch AND wallet IS NOT NULL
                      ORDER BY perps_seen_ms LIMIT 200",
                     &[],
                 )
@@ -257,7 +257,7 @@ impl EmailState {
             .map_err(internal)?
             .contacts
             .iter()
-            .filter(|(_, c)| c.perps_watch && c.enabled && c.wallet.is_some())
+            .filter(|(_, c)| c.perps_watch && c.wallet.is_some())
             .map(|(id, c)| (id.clone(), c.clone()))
             .collect())
     }
@@ -728,13 +728,34 @@ impl LowerFirst for String {
 // ---- When to send ----
 
 // The receipt `id` of `owner` has news: email them about it (once per `key`).
+async fn notify(state: &AppState, owner: &str, key: &str, message: &Message) {
+    let body = message
+        .lead
+        .replace("Reply to this email", "Contact Atlas support");
+    if state
+        .notifications
+        .emit(
+            owner,
+            key,
+            &message.subject,
+            &body,
+            &message.link,
+            message.warning,
+        )
+        .await
+        .is_err()
+    {
+        eprintln!("A money notification could not be queued");
+        if let Ok(mut handled) = state.emails.handled.lock() {
+            handled.remove(key);
+        }
+    }
+}
+
 async fn about_receipt(state: &AppState, owner: &str, id: &str, key: &str) {
     let Ok(Some(contact)) = state.emails.contact(owner).await else {
         return;
     };
-    if !contact.enabled {
-        return;
-    }
     let told = match transactions::told(state, owner, id, &contact.currency).await {
         Ok(Some(t)) => t,
         _ => return,
@@ -753,6 +774,7 @@ async fn about_receipt(state: &AppState, owner: &str, id: &str, key: &str) {
     let Some(message) = receipt_message(&told, amount) else {
         return;
     };
+    notify(state, owner, key, &message).await;
     state
         .emails
         .deliver(owner, key, |c| Some(render(c.name.as_deref(), &message)))
@@ -801,6 +823,7 @@ async fn to_recipient(
         warning: false,
         link: SITE.into(),
     };
+    notify(state, &recipient, &format!("{key}:to"), &message).await;
     state
         .emails
         .deliver(&recipient, &format!("{key}:to"), |c| {
@@ -811,7 +834,7 @@ async fn to_recipient(
 
 // After any status the app reads: a finished one may be news.
 pub(super) fn after_status(state: &AppState, headers: &HeaderMap, status: &markets::IntentStatus) {
-    if state.emails.key.is_none() || !matches!(status.state.as_str(), "filled" | "failed") {
+    if !matches!(status.state.as_str(), "filled" | "failed") {
         return;
     }
     let key = format!("tx:{}:{}", status.intent_id, status.state);
@@ -831,7 +854,7 @@ pub(super) fn after_status(state: &AppState, headers: &HeaderMap, status: &marke
 // A bank top-up or cash-out moved on (Daya's webhook or a check).
 pub(super) fn ramp_changed(state: &AppState, owner: &str, receipt: &str, kind: &str, status: &str) {
     let news = matches!(status, "completed" | "failed");
-    if state.emails.key.is_none() || !news || !matches!(kind, "onramp" | "offramp") {
+    if !news || !matches!(kind, "onramp" | "offramp") {
         return;
     }
     let key = format!("ramp:{receipt}:{status}");
@@ -844,7 +867,7 @@ pub(super) fn ramp_changed(state: &AppState, owner: &str, receipt: &str, kind: &
 
 // A deposit from another network settled (or was refunded).
 pub(super) fn deposit_changed(state: &AppState, owner: &str, address: &str, status: &str) {
-    if state.emails.key.is_none() || !matches!(status, "SUCCESS" | "REFUNDED" | "FAILED") {
+    if !matches!(status, "SUCCESS" | "REFUNDED" | "FAILED") {
         return;
     }
     let key = format!("deposit:{address}:{status}");
@@ -930,9 +953,6 @@ pub(super) async fn update_settings(
 // closed a position, or a position close to liquidation. Accounts with nothing left open stop being
 // watched until the next trade.
 pub(super) fn keep_watching(state: AppState) {
-    if state.emails.key.is_none() {
-        return;
-    }
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(WATCH_EVERY).await;
@@ -1004,6 +1024,7 @@ async fn watch_one(state: &AppState, user_id: &str, contact: &Contact) -> Result
                 link: SITE.into(),
             };
             let key = format!("liq:{user_id}:{}:{}", fill.coin, fill.time_ms / 600_000);
+            notify(state, user_id, &key, &message).await;
             state
                 .emails
                 .deliver(user_id, &key, |c| Some(render(c.name.as_deref(), &message)))
@@ -1056,6 +1077,7 @@ async fn watch_one(state: &AppState, user_id: &str, contact: &Contact) -> Result
             link: SITE.into(),
         };
         let key = format!("tpsl:{user_id}:{}", fill.oid);
+        notify(state, user_id, &key, &message).await;
         state
             .emails
             .deliver(user_id, &key, |c| Some(render(c.name.as_deref(), &message)))
@@ -1097,6 +1119,7 @@ async fn watch_one(state: &AppState, user_id: &str, contact: &Contact) -> Result
             link: SITE.into(),
         };
         let key = format!("nearliq:{user_id}:{}:{}", p.coin, now() / HALF_DAY_MS);
+        notify(state, user_id, &key, &message).await;
         state
             .emails
             .deliver(user_id, &key, |c| Some(render(c.name.as_deref(), &message)))
@@ -1326,7 +1349,7 @@ mod tests {
         );
         assert!(!emails.set_enabled("did:privy:nobody", false).await.unwrap());
         emails.watch_perps("did:privy:a").await.unwrap();
-        // Turned off: not watched for alerts.
-        assert!(emails.watched().await.unwrap().is_empty());
+        // Turning email off keeps money alerts active in the Atlas inbox.
+        assert_eq!(emails.watched().await.unwrap().len(), 1);
     }
 }

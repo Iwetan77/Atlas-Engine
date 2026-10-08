@@ -111,6 +111,37 @@ export async function market(id){
  if(!/^\d{1,15}$/.test(id??''))throw new Error('Market not found');const raw=await request('gamma','/markets/'+id),view=marketView(raw);
  if(!view)throw new Error('Market details unavailable');knownMarkets.set(view.conditionId,view.marketId);return {raw,view};
 }
+const histories=new Map();
+export function historyPoints(body, now=Date.now()) {
+ if(!Array.isArray(body?.history))throw new Error('Prediction history is unavailable.');
+ const points=new Map();
+ for(const row of body.history){
+  if(typeof row?.t!=='number'||!Number.isFinite(row.t)||row.t<=0||row.t*1000>now+60000||
+     typeof row?.p!=='number'||!Number.isFinite(row.p)||row.p<0||row.p>1)continue;
+  points.set(Math.round(row.t*1000),row.p);
+ }
+ const sorted=[...points].sort((a,b)=>a[0]-b[0]);
+ if(sorted.length<=480)return sorted;
+ return Array.from({length:480},(_,i)=>sorted[Math.round(i*(sorted.length-1)/479)]);
+}
+export async function priceHistory({marketId,range='1D'}){
+ const ranges={'1D':['1d',5],'1W':['1w',30],'1M':['1m',120],ALL:['max',360]};
+ if(!Object.hasOwn(ranges,range))throw new Error('Invalid chart range');
+ if(!/^\d{1,15}$/.test(marketId??''))throw new Error('Market not found');
+ const key=marketId+':'+range, cached=histories.get(key);
+ if(cached&&cached.expires>Date.now())return cached.promise;
+ const promise=(async()=>{
+  const {view}=await market(marketId),[interval,fidelity]=ranges[range];
+  const series=await Promise.all(view.outcomes.map(async outcome=>{
+   const body=await request('clob','/prices-history?'+new URLSearchParams({market:outcome.tokenId,interval,fidelity:String(fidelity)}));
+   return {label:outcome.label,tokenId:outcome.tokenId,points:historyPoints(body)};
+  }));
+  return {marketId,range,series};
+ })();
+ if(histories.size>=100)histories.clear();
+ const slot={expires:Date.now()+30000,promise};histories.set(key,slot);
+ try{return await promise;}catch(error){if(histories.get(key)===slot)histories.delete(key);throw error;}
+}
 export function positionView(p){
  const token=p.token_id;
  if(!/^\d+$/.test(token??'')||!/^0x[0-9a-fA-F]{64}$/.test(p.condition_id??'')||
@@ -554,7 +585,8 @@ export async function progress(owner,input){
 export async function handle(route,input,{owner,userId,solanaWallet}){
  if(!owner)throw new Error('Your Atlas wallet is not ready.');
  switch(route){
- case 'markets':return markets(input);
+ case 'chart':return priceHistory(input);
+  case 'markets':return markets(input);
  case 'market':return (await market(input.marketId)).view;
  case 'availability':return availability();
  case 'account':return account(owner);

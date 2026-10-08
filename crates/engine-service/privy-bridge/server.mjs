@@ -1,3 +1,4 @@
+import {notificationKeys,sendWebNotification} from './notifications.mjs';
 import {handle as predictions,availability as predictionAvailability} from './polymarket.mjs';
 function approvalFailure(error,fallback){const reason=error.message??fallback;return error.maybeSent||error.sent?.length?reason:reason+'; nothing was sent';}
 import {DeviceApprovals,deviceSign} from './device-approval.mjs';
@@ -56,6 +57,18 @@ async function ensureReceivingWallet(userId, chainType) {
 }
 
 const server = createServer(async (request, response) => {
+  // Internal notification transport. These routes never sign or move user money.
+  if(request.method==='POST' && ['/internal/notifications/keys','/internal/notifications/send'].includes(request.url)){
+    if(!['127.0.0.1','::1','::ffff:127.0.0.1'].includes(request.socket.remoteAddress)){
+      send(response,403,{error:'Internal route'});return;
+    }
+    try{
+      let raw='';for await(const chunk of request){raw+=chunk;if(raw.length>16384)throw new Error('Request too large');}
+      const input=JSON.parse(raw||'{}');
+      send(response,200,request.url.endsWith('/keys')?notificationKeys():await sendWebNotification(input));
+    }catch{send(response,503,{error:'Notification transport unavailable'});}
+    return;
+  }
   // Public deployment readiness, never account data, credentials or a signing route.
   if(request.method==='GET'&&request.url==='/predictions/readiness'){
     try{send(response,200,await predictionAvailability());}

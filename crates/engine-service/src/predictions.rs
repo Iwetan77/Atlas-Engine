@@ -314,6 +314,26 @@ pub(super) async fn market(
         bridge(&state, &headers, "market", json!({"marketId":id})).await?,
     ))
 }
+#[derive(Deserialize)]
+pub(super) struct ChartQuery {
+    range: Option<String>,
+}
+pub(super) async fn chart(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<ChartQuery>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        bridge(
+            &state,
+            &headers,
+            "chart",
+            json!({"marketId":id,"range":query.range.as_deref().unwrap_or("1D")}),
+        )
+        .await?,
+    ))
+}
 // Public readiness contains no user data. The country is the service's egress, never the user's.
 pub(super) async fn availability(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let AuthMode::Privy { bridge_url, http } = &state.auth else {

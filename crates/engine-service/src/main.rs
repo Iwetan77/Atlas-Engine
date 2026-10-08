@@ -12,10 +12,12 @@ mod gasless;
 mod hl;
 mod markets;
 mod near_intents;
+mod notifications;
 mod pending;
 mod pin;
 mod positions;
 mod predictions;
+mod push;
 mod social;
 mod solana_fees;
 mod transactions;
@@ -56,6 +58,8 @@ struct AppState {
     links: cashlinks::LinkStore,
     comments: comments::CommentStore,
     emails: emails::EmailState,
+    notifications: notifications::NotificationState,
+    push: push::PushState,
     hl: hl::HlState,
     earn: earn::EarnState,
     social: social::SocialState,
@@ -107,6 +111,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     std::sync::LazyLock::force(&STARTED);
+    let notifications = notifications::NotificationState::new().await?;
+    let push = push::PushState::new(notifications.pg.clone()).await?;
     let state = AppState {
         user_id,
         base_wallet,
@@ -128,6 +134,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         links: cashlinks::LinkStore::new().await?,
         comments: comments::CommentStore::new().await?,
         emails: emails::EmailState::new().await?,
+        notifications,
+        push,
         hl: hl::HlState::new().await?,
         earn: earn::EarnState::default(),
         social: social::SocialState::new().await?,
@@ -150,6 +158,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     daya::keep_checked(state.clone());
     // Perps alerts by email (liquidations, take-profit and stop-loss closes, close calls).
     emails::keep_watching(state.clone());
+    push::keep_delivering(state.clone());
     let perps_routes = Router::new()
         .route(
             "/v1/perps/onboarding",
@@ -186,6 +195,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/og.png", get(web::asset))
         .fallback_service(get(web::page))
         .route("/v1/balance", get(app_balance::balance))
+        .route("/v1/notifications", get(notifications::list))
+        .route("/v1/notifications/read", post(notifications::read))
+        .route("/v1/notifications/config", get(push::config))
+        .route("/v1/notifications/register", post(push::register))
+        .route("/v1/notifications/unregister", post(push::unregister))
         .route("/v1/transactions", get(transactions::list))
         .route("/v1/transactions/{id}", get(transactions::detail))
         .route("/v1/assets", get(markets::assets))
@@ -252,6 +266,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/v1/predictions/markets", get(predictions::markets))
         .route("/v1/predictions/markets/{id}", get(predictions::market))
+        .route(
+            "/v1/predictions/markets/{id}/chart",
+            get(predictions::chart),
+        )
         .route(
             "/v1/predictions/markets/{id}/comments",
             get(comments::list).post(comments::post),
