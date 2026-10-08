@@ -191,6 +191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/assets/{*path}", get(web::asset))
         .route("/favicon.ico", get(web::asset))
         .route("/atlas-icon.png", get(web::asset))
+        .route("/atlas-push-sw.js", get(web::asset))
         .route("/manifest.webmanifest", get(web::asset))
         .route("/og.png", get(web::asset))
         .fallback_service(get(web::page))

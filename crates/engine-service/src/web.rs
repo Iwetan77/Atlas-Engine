@@ -42,6 +42,7 @@ fn page_file(path: &str) -> Option<&'static str> {
         "/send" => Some("send.html"),
         "/more" => Some("more.html"),
         "/transactions" => Some("transactions.html"),
+        "/notifications" => Some("notifications.html"),
         "/earn" => Some("earn.html"),
         "/predictions" => Some("predictions.html"),
         "/predictions/cash" => Some("predictions/cash.html"),
@@ -130,6 +131,14 @@ mod tests {
         assert!(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("web/payment-pin.html")
             .is_file());
+        assert_eq!(page_file("/notifications"), Some("notifications.html"));
+        assert_eq!(page_file("/notifications/"), Some("notifications.html"));
+        for name in ["notifications.html", "atlas-push-sw.js"] {
+            assert!(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("web")
+                .join(name)
+                .is_file());
+        }
         assert_eq!(page_file("/install"), Some("install.html"));
         assert_eq!(page_file("/install/"), Some("install.html"));
         assert_eq!(page_file("/send/wallet"), Some("send/wallet.html"));
