@@ -631,3 +631,11 @@ changing it (or rotating the fallback Privy secret) requires a controlled recove
 Do not replace it without that process. /health exposes only keys.paymentPin, never its value.
 PIN changes require the current PIN and revoke earlier approvals. There is no login-only forgotten
 PIN reset endpoint. Signing remains on the user's device; the PIN does not give the server a wallet key.
+
+### Bank receipts and foreground refresh
+
+Bank cash-out receipts separate wallet funding from bank settlement. They become successful only
+after the payout is paid, and unsigned plans retain their `validate` stage. A foreground receipt has
+its own five-second refresh budget, independent of the thirty-second Activity refresh; Daya polling
+remains limited to once per funding account every twenty seconds and signed webhooks update receipts
+as events arrive. Reading a receipt never starts a transfer or signs a transaction.

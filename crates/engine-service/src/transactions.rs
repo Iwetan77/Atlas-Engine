@@ -145,7 +145,9 @@ impl Receipt {
             .and_then(|v| markets::parse_micros(&v.replace(',', "")).ok());
         let state = match payout {
             Some(v) if v.starts_with("Failed") => Some(("failed", "settle")),
-            Some(v) if !v.starts_with("Paid") && self.state != "failed" => {
+            Some(v)
+                if !v.starts_with("Paid") && self.state != "failed" && self.stage != "validate" =>
+            {
                 Some(("pending", "settle"))
             }
             _ => None,
@@ -653,15 +655,24 @@ fn page(
     };
     Ok((rows, next))
 }
-fn refresh(state: &AppState, headers: &HeaderMap, owner: &str, rows: &[Receipt]) {
+fn refresh(state: &AppState, headers: &HeaderMap, owner: &str, rows: &[Receipt], focused: bool) {
     let Ok(mut held) = state.history.refreshing.lock() else {
         return;
     };
     held.retain(|_, at| at.elapsed() < Duration::from_secs(30));
-    if held.contains_key(owner) {
+    let key = if focused {
+        format!(
+            "receipt:{owner}:{}",
+            rows.first().map(|r| r.id.as_str()).unwrap_or("")
+        )
+    } else {
+        format!("history:{owner}")
+    };
+    let interval = Duration::from_secs(if focused { 5 } else { 30 });
+    if held.get(&key).is_some_and(|at| at.elapsed() < interval) {
         return;
     }
-    held.insert(owner.into(), Instant::now());
+    held.insert(key, Instant::now());
     drop(held);
     // Bank transfers through Daya: a naira deposit still on its way, or a cash-out in its first days
     // (its USDC send may be done while the bank payout isn't).
@@ -737,7 +748,7 @@ pub(super) async fn list(
     let rows = records(&state, &owner).await?;
     let limit = q.limit.unwrap_or(20).clamp(1, 50);
     let (rows, next) = page(rows, q.cursor.as_deref(), limit)?;
-    refresh(&state, &headers, &owner, &rows);
+    refresh(&state, &headers, &owner, &rows, false);
     Ok(Json(
         json!({"transactions":rows.iter().map(|r|r.public(currency,rate)).collect::<Vec<_>>(),"nextCursor":next}),
     ))
@@ -758,7 +769,7 @@ pub(super) async fn detail(
         .iter()
         .find(|r| r.id == id)
         .ok_or((StatusCode::NOT_FOUND, "transaction not found".into()))?;
-    refresh(&state, &headers, &owner, std::slice::from_ref(row));
+    refresh(&state, &headers, &owner, std::slice::from_ref(row), true);
     Ok(Json(
         row.public(currency, app_balance::fx_rate(currency).await?),
     ))
@@ -784,6 +795,8 @@ mod tests {
                 {"label":"You pay","value":"₦2,424.00"},{"label":"Bank payout","value":"Waiting for your USDC"}]}),
         );
         r.usdc_units = Some("1788565".into());
+        // An unsigned draft is still awaiting confirmation, not a transfer in flight.
+        assert_eq!(r.public("NGN", 1_329_760_000)["stage"], "validate");
         r.set_state("filled", "settle", None);
         let shown = r.public("NGN", 1_329_760_000);
         assert_eq!(shown["amount"]["amount"], "2400");
