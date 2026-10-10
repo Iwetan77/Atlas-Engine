@@ -63,6 +63,7 @@ struct AppState {
     notifications: notifications::NotificationState,
     push: push::PushState,
     price_alerts: price_alerts::AlertState,
+    asset_shares: asset_share::ShareState,
     hl: hl::HlState,
     earn: earn::EarnState,
     social: social::SocialState,
@@ -116,6 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::sync::LazyLock::force(&STARTED);
     let notifications = notifications::NotificationState::new().await?;
     let push = push::PushState::new(notifications.pg.clone()).await?;
+    let asset_shares = asset_share::ShareState::new(notifications.pg.clone()).await?;
     let state = AppState {
         user_id,
         base_wallet,
@@ -140,6 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         notifications,
         push,
         price_alerts: price_alerts::AlertState::new().await?,
+        asset_shares,
         hl: hl::HlState::new().await?,
         earn: earn::EarnState::default(),
         social: social::SocialState::new().await?,
@@ -189,11 +192,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .merge(perps_routes)
         .route("/health", get(health))
         .route("/v1/app/android", get(web::android_release))
+        .route("/download/android", get(web::android_download))
         // The web app's build, for Atlas Links in any browser.
         .route("/", get(web::index))
         .route("/claim/{id}", get(web::claim))
         .route("/invite/{id}", get(web::claim))
         .route("/asset/{id}", get(asset_share::share))
+        .route("/v1/asset-shares", post(asset_share::create))
+        .route("/v1/asset-shares/{code}", get(asset_share::lookup))
+        .route("/a/{code}", get(asset_share::short_share))
+        .route("/a/{code}/card.png", get(asset_share::card))
         .route("/_expo/{*path}", get(web::asset))
         .route("/assets/{*path}", get(web::asset))
         .route("/favicon.ico", get(web::asset))
@@ -208,7 +216,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/notifications/config", get(push::config))
         .route("/v1/notifications/register", post(push::register))
         .route("/v1/notifications/unregister", post(push::unregister))
-        .route("/v1/notifications/test", post(push::test))
         .route(
             "/v1/price-alerts",
             get(price_alerts::list).post(price_alerts::create),
