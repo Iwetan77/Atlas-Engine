@@ -430,6 +430,19 @@ impl RelayClient {
             .await
     }
 
+    /// Keep a cash-link payout on Base, avoiding a fresh recipient's Solana token-account
+    /// setup. The solver pays Base gas out of the quoted input, using the same pinned
+    /// EIP-3009 receiver as cross-chain payouts.
+    pub async fn base_to_base_all(
+        &self,
+        escrow: &str,
+        recipient: &str,
+        amount_in_units: u128,
+    ) -> Result<GaslessMove, RelayError> {
+        self.gasless_move(escrow, base_dest(recipient), Exact::In(amount_in_units))
+            .await
+    }
+
     async fn gasless_move(
         &self,
         evm: &str,
@@ -451,8 +464,12 @@ impl RelayClient {
                 "originChainId":BASE_CHAIN_ID,"destinationChainId":dest.chain,
                 "originCurrency":BASE_USDC.to_ascii_lowercase(),"destinationCurrency":dest.currency,
                 "amount":amount.to_string(),"tradeType":trade_type,"usePermit":true,
-                // Dollars to dollars: 0.5% is room enough (Relay's default is wider).
-                "slippageTolerance":"50"
+                // Same-chain sends otherwise return a normal transfer that needs escrow ETH.
+                // Force the solver's supported gasless authorization instead.
+                "forceSolverExecution":dest.chain == BASE_CHAIN_ID,
+                // Same-token Base delivery needs no price room; keep the full quoted
+                // payout guaranteed instead of reserving 0.5% on large gifts.
+                "slippageTolerance":if dest.chain == BASE_CHAIN_ID { "0" } else { "50" }
             }))
             .send()
             .await?;
@@ -565,6 +582,9 @@ fn parse_gasless_move(
         return Err(invalid("fee too high"));
     }
     let (request_id, typed_data, api) = base_authorization(body, evm, amount_in_units)?;
+    if dest.chain == BASE_CHAIN_ID {
+        validate_base_payout_order(body, evm, dest.recipient, amount_in_units, least_out)?;
+    }
     Ok(GaslessMove {
         request_id,
         amount_in_units,
@@ -572,6 +592,64 @@ fn parse_gasless_move(
         typed_data,
         api,
     })
+}
+
+// A same-chain solver payout is still an order, not an arbitrary escrow call. Bind the
+// quoted minimum to one Base USDC payment, with no extra calls, fees, or refund destinations.
+fn validate_base_payout_order(
+    body: &Value,
+    escrow: &str,
+    recipient: &str,
+    amount_in: u128,
+    minimum_out: u128,
+) -> Result<(), RelayError> {
+    let invalid = RelayError::InvalidResponse;
+    let protocol = &body["protocol"]["v2"];
+    let order = &protocol["orderData"];
+    let payment = &protocol["paymentDetails"];
+    let [input] = order["inputs"].as_array().map(Vec::as_slice).unwrap_or(&[]) else {
+        return Err(invalid("expected one Base payout input"));
+    };
+    let [output] = order["output"]["payments"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+    else {
+        return Err(invalid("expected one Base payout recipient"));
+    };
+    if order["output"]["chainId"] != "base"
+        || input["payment"]["chainId"] != "base"
+        || !same(BASE_CHAIN_ID, &input["payment"]["currency"], BASE_USDC)
+        || units(&input["payment"]["amount"]) != Some(amount_in)
+        || payment["chainId"] != "base"
+        || !same(BASE_CHAIN_ID, &payment["currency"], BASE_USDC)
+        || !same(BASE_CHAIN_ID, &payment["depository"], DEPOSITORY)
+        || units(&payment["amount"]) != Some(amount_in)
+        || !same(BASE_CHAIN_ID, &output["recipient"], recipient)
+        || !same(BASE_CHAIN_ID, &output["currency"], BASE_USDC)
+        || units(&output["minimumAmount"]) != Some(minimum_out)
+        || units(&output["expectedAmount"]) != units(&body["details"]["currencyOut"]["amount"])
+        || !order["output"]["calls"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+        || !order["fees"].as_array().is_some_and(Vec::is_empty)
+    {
+        return Err(invalid("Base payout order differs from the quote"));
+    }
+    let refunds = input["refunds"]
+        .as_array()
+        .ok_or(invalid("Base payout refunds"))?;
+    if refunds.is_empty()
+        || refunds.iter().any(|refund| {
+            refund["chainId"] != "base"
+                || !same(BASE_CHAIN_ID, &refund["currency"], BASE_USDC)
+                || !(same(BASE_CHAIN_ID, &refund["recipient"], escrow)
+                    || same(BASE_CHAIN_ID, &refund["recipient"], recipient))
+        })
+    {
+        return Err(invalid("Base payout refund destination changed"));
+    }
+    Ok(())
 }
 
 // A gasless Base quote's one step: an EIP-3009 authorization from `evm` to Relay's receiver for
@@ -1158,6 +1236,160 @@ mod tests {
             Exact::Out(5_000_000)
         )
         .is_err());
+    }
+
+    // Shape captured from an unsigned same-chain forceSolverExecution quote, with
+    // synthetic wallets, request, nonce and amounts. Nothing is signed or submitted.
+    fn base_payout_quote() -> Value {
+        let recipient = "0x1111111111111111111111111111111111111111";
+        let mut quote = live_quote();
+        quote["details"]["recipient"] = json!(recipient);
+        quote["details"]["currencyIn"]["amount"] = json!("1060000");
+        quote["details"]["currencyOut"] = json!({
+            "currency":{"chainId":BASE_CHAIN_ID,"address":BASE_USDC},
+            "amount":"1033000","minimumAmount":"1028000"
+        });
+        quote["steps"][0]["items"][0]["data"]["sign"]["value"]["value"] = json!("1060000");
+        quote["protocol"] = json!({"v2":{
+            "paymentDetails":{"chainId":"base","currency":BASE_USDC,
+                "depository":DEPOSITORY,"amount":"1060000"},
+            "orderData":{"inputs":[{
+                "payment":{"chainId":"base","currency":BASE_USDC,"amount":"1060000"},
+                "refunds":[
+                    {"chainId":"base","currency":BASE_USDC,"recipient":EVM},
+                    {"chainId":"base","currency":BASE_USDC,"recipient":recipient}
+                ]
+            }],"output":{"chainId":"base","payments":[{
+                "recipient":recipient,"currency":BASE_USDC,"minimumAmount":"1028000","expectedAmount":"1033000"
+            }],"calls":[]},"fees":[]}
+        }});
+        quote
+    }
+
+    #[test]
+    fn same_chain_gasless_payout_keeps_the_checked_authorization_and_recipient() {
+        let body = base_payout_quote();
+        let recipient = body["details"]["recipient"].as_str().unwrap();
+        let parsed =
+            parse_gasless_move(&body, EVM, base_dest(recipient), Exact::In(1_060_000)).unwrap();
+        assert_eq!(parsed.amount_in_units, 1_060_000);
+        assert_eq!(parsed.amount_out_units, 1_028_000);
+        assert_eq!(parsed.typed_data["message"]["to"], RECEIVER);
+        assert_eq!(parsed.api, "swap");
+        let bad_paths = [
+            vec![
+                "protocol",
+                "v2",
+                "orderData",
+                "output",
+                "payments",
+                "0",
+                "recipient",
+            ],
+            vec![
+                "protocol",
+                "v2",
+                "orderData",
+                "output",
+                "payments",
+                "0",
+                "currency",
+            ],
+            vec!["protocol", "v2", "paymentDetails", "depository"],
+            vec![
+                "protocol",
+                "v2",
+                "orderData",
+                "inputs",
+                "0",
+                "refunds",
+                "0",
+                "recipient",
+            ],
+        ];
+        for path in bad_paths {
+            let bad = with(
+                body.clone(),
+                &path,
+                json!("0x2222222222222222222222222222222222222222"),
+            );
+            assert!(
+                parse_gasless_move(&bad, EVM, base_dest(recipient), Exact::In(1_060_000)).is_err(),
+                "{path:?}"
+            );
+        }
+        for (path, value) in [
+            (
+                vec![
+                    "protocol",
+                    "v2",
+                    "orderData",
+                    "output",
+                    "payments",
+                    "0",
+                    "minimumAmount",
+                ],
+                json!("1"),
+            ),
+            (
+                vec![
+                    "protocol",
+                    "v2",
+                    "orderData",
+                    "output",
+                    "payments",
+                    "0",
+                    "minimumAmount",
+                ],
+                json!("1028001"),
+            ),
+            (
+                vec![
+                    "protocol",
+                    "v2",
+                    "orderData",
+                    "output",
+                    "payments",
+                    "0",
+                    "expectedAmount",
+                ],
+                json!("1033001"),
+            ),
+            (
+                vec!["protocol", "v2", "orderData", "output", "calls"],
+                json!([{"to":recipient}]),
+            ),
+            (
+                vec!["protocol", "v2", "orderData", "fees"],
+                json!([{"amount":"1"}]),
+            ),
+            (
+                vec!["protocol", "v2", "paymentDetails", "amount"],
+                json!("1060001"),
+            ),
+        ] {
+            let bad = with(body.clone(), &path, value);
+            assert!(
+                parse_gasless_move(&bad, EVM, base_dest(recipient), Exact::In(1_060_000)).is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "live Relay read-only quote; no funds moved"]
+    async fn live_same_chain_cashlink_quote() {
+        let client = RelayClient::new(std::env::var("RELAY_API_KEY").ok()).unwrap();
+        let quote = client
+            .base_to_base_all(EVM, "0x1111111111111111111111111111111111111111", 1_060_000)
+            .await
+            .unwrap();
+        assert_eq!(quote.amount_in_units, 1_060_000);
+        assert!(quote.amount_out_units >= 1_000_000);
+        assert_eq!(quote.typed_data["message"]["to"], RECEIVER);
+        println!(
+            "Base cash-link payout: {} units in, at least {} out; unsigned",
+            quote.amount_in_units, quote.amount_out_units
+        );
     }
 
     #[test]

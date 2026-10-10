@@ -298,6 +298,47 @@ fn is_version(text: &str) -> bool {
         && text.len() <= 32
 }
 
+// Resolve the release's APK on the server so Android opens the download, not the GitHub app.
+pub(super) async fn android_download() -> Response {
+    let result = async {
+        let response = reqwest::Client::builder()
+            .timeout(Duration::from_secs(12))
+            .build()
+            .ok()?
+            .head(ANDROID_DOWNLOAD)
+            .header("User-Agent", "atlas-engine")
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() || !trusted_apk_url(response.url()) {
+            return None;
+        }
+        Some(response.url().to_string())
+    }
+    .await;
+    match result {
+        Some(url) => (
+            [(header::CACHE_CONTROL, "no-store")],
+            axum::response::Redirect::temporary(&url),
+        )
+            .into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The update download is temporarily unavailable. Try again shortly.",
+        )
+            .into_response(),
+    }
+}
+fn trusted_apk_url(url: &reqwest::Url) -> bool {
+    url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && matches!(
+            url.host_str(),
+            Some("release-assets.githubusercontent.com" | "objects.githubusercontent.com")
+        )
+}
+
 // GET /v1/app/android → { latestVersion, minimumVersion, downloadUrl }. Public: it only says
 // which app version is newest.
 pub(super) async fn android_release() -> Json<serde_json::Value> {
@@ -307,13 +348,30 @@ pub(super) async fn android_release() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "latestVersion": latest_android().await,
         "minimumVersion": minimum,
-        "downloadUrl": ANDROID_DOWNLOAD,
+        "downloadUrl": "https://justatlas.xyz/download/android",
     }))
 }
 
 #[cfg(test)]
 mod release_tests {
     use super::*;
+    #[test]
+    fn apk_downloads_only_use_github_artifact_hosts() {
+        for url in [
+            "https://release-assets.githubusercontent.com/artifact",
+            "https://objects.githubusercontent.com/artifact",
+        ] {
+            assert!(trusted_apk_url(&reqwest::Url::parse(url).unwrap()));
+        }
+        for url in [
+            "https://github.com/Iwetan77/Atlas",
+            "https://release-assets.githubusercontent.com.evil.com/x",
+            "http://release-assets.githubusercontent.com/x",
+            "https://user@objects.githubusercontent.com/x",
+        ] {
+            assert!(!trusted_apk_url(&reqwest::Url::parse(url).unwrap()));
+        }
+    }
     #[test]
     fn only_plain_versions_are_offered() {
         assert!(is_version("1.0.11"));
