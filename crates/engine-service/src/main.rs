@@ -2,6 +2,7 @@
 //! account is available only when the operator explicitly enables local demo mode.
 
 mod app_balance;
+mod asset_share;
 mod asset_stats;
 mod cashlinks;
 mod comments;
@@ -17,6 +18,7 @@ mod pending;
 mod pin;
 mod positions;
 mod predictions;
+mod price_alerts;
 mod push;
 mod social;
 mod solana_fees;
@@ -60,6 +62,7 @@ struct AppState {
     emails: emails::EmailState,
     notifications: notifications::NotificationState,
     push: push::PushState,
+    price_alerts: price_alerts::AlertState,
     hl: hl::HlState,
     earn: earn::EarnState,
     social: social::SocialState,
@@ -136,6 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         emails: emails::EmailState::new().await?,
         notifications,
         push,
+        price_alerts: price_alerts::AlertState::new().await?,
         hl: hl::HlState::new().await?,
         earn: earn::EarnState::default(),
         social: social::SocialState::new().await?,
@@ -159,6 +163,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Perps alerts by email (liquidations, take-profit and stop-loss closes, close calls).
     emails::keep_watching(state.clone());
     push::keep_delivering(state.clone());
+    price_alerts::keep_watching(state.clone());
     let perps_routes = Router::new()
         .route(
             "/v1/perps/onboarding",
@@ -187,6 +192,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The web app's build, for Atlas Links in any browser.
         .route("/", get(web::index))
         .route("/claim/{id}", get(web::claim))
+        .route("/invite/{id}", get(web::claim))
+        .route("/asset/{id}", get(asset_share::share))
         .route("/_expo/{*path}", get(web::asset))
         .route("/assets/{*path}", get(web::asset))
         .route("/favicon.ico", get(web::asset))
@@ -201,9 +208,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/notifications/config", get(push::config))
         .route("/v1/notifications/register", post(push::register))
         .route("/v1/notifications/unregister", post(push::unregister))
+        .route("/v1/notifications/test", post(push::test))
+        .route(
+            "/v1/price-alerts",
+            get(price_alerts::list).post(price_alerts::create),
+        )
+        .route("/v1/price-alerts/{id}/cancel", post(price_alerts::cancel))
         .route("/v1/transactions", get(transactions::list))
         .route("/v1/transactions/{id}", get(transactions::detail))
         .route("/v1/assets", get(markets::assets))
+        .route("/v1/assets/{asset_id}", get(markets::asset_detail))
         .route("/v1/assets/{asset_id}/chart", get(markets::chart))
         .route("/v1/assets/{asset_id}/stats", get(asset_stats::stats))
         .route("/v1/positions/spot", get(positions::spot))
