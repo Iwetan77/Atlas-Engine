@@ -14,11 +14,21 @@ export function validSubscription(subscription) {
 }
 export function notificationKeys() { return webpush.generateVAPIDKeys(); }
 
-// Lock-screen alerts contain no balances, amounts, asset names, recipients or transaction IDs.
-export async function sendWebNotification({subscription, keys, noticeId}, send = webpush.sendNotification) {
+function summary(text, limit, fallback) {
+  return Array.from((typeof text === 'string' ? text : '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim()).slice(0, limit).join('') || fallback;
+}
+function localPath(value) {
+  if (typeof value !== 'string' || !value.startsWith('/') || value.startsWith('//') || /[\\\r\n]/.test(value)) return '/notifications';
+  try {
+    const url = new URL(value, 'https://justatlas.xyz');
+    return url.origin === 'https://justatlas.xyz' ? url.pathname + url.search : '/notifications';
+  } catch { return '/notifications'; }
+}
+// Only server-created inbox summaries are sent; full details remain behind sign-in.
+export async function sendWebNotification({subscription, keys, noticeId, title, body, url}, send = webpush.sendNotification) {
   if (!validSubscription(subscription)) return {status:'expired'};
   if (!/^[a-f0-9]{32}$/.test(noticeId ?? '')) throw new Error('Invalid notification');
-  const payload = {id:noticeId,title:'Atlas',body:'You have a new Atlas money update.',url:'/notifications'};
+  const payload = {id:noticeId,title:summary(title,100,'Atlas'),body:summary(body,240,'Open Atlas to see the details.'),url:localPath(url)};
   try {
     await send(subscription, JSON.stringify(payload), {
       vapidDetails: {subject:'mailto:hello@justatlas.xyz', publicKey:keys.publicKey, privateKey:keys.privateKey},

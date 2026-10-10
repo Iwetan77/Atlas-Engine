@@ -439,6 +439,19 @@ impl SolanaAtaPreflight {
         Ok((STANDARD.encode(bytes), creates))
     }
 
+    /// Live rent for a standard SPL USDC account. Network rent can change; fee comparisons
+    /// must not assume the historical 2,039,280-lamport value.
+    pub async fn usdc_account_rent_lamports(&self) -> Result<u64, SolanaPreflightError> {
+        self.rpc(
+            "getMinimumBalanceForRentExemption",
+            json!([spl_token::state::Account::LEN, {"commitment":"confirmed"}]),
+        )
+        .await?
+        .as_u64()
+        .filter(|rent| *rent > 0)
+        .ok_or(SolanaPreflightError::InvalidResponse)
+    }
+
     /// Whether `owner` already has a USDC account: a transfer to it then opens none (no rent).
     pub async fn has_usdc_account(&self, owner: &str) -> Result<bool, SolanaPreflightError> {
         let owner = Pubkey::from_str(owner).map_err(|_| SolanaPreflightError::InvalidAddress)?;
