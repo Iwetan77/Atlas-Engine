@@ -1410,17 +1410,18 @@ pub(super) struct OnrampQuery {
 }
 
 // What paying in `amount` naira gets: (naira paid, Daya's deposit fee, USDC that lands, the rate).
-// The USDC (units) that paying `pay` naira micros lands: the deposit fee comes off the naira, the
-// rest converts at Daya's rate, and the delivery fee comes off the USDC.
+// The USDC (units) that paying `pay` naira micros lands: the deposit fee comes off the naira and
+// the rest converts at Daya's rate. Daya's crypto-withdrawal fee is for withdrawals from a merchant
+// balance; a naira deposit settled on-chain carries only its deposit fee.
 fn lands(pay: u128, rate: &Rate, fees: &Fees) -> u128 {
-    ((pay - fees.deposit(pay)) * 1_000_000 / rate.ngn_per_usdc).saturating_sub(fees.usdc_payout_fee)
+    (pay - fees.deposit(pay)) * 1_000_000 / rate.ngn_per_usdc
 }
 
 // The whole naira to transfer so that `target` naira (micros, at the balance's own naira rate
-// `ngn_fx`) lands: the delivery fee, Daya's conversion and the deposit fee all go on top.
+// `ngn_fx`) lands: Daya's conversion and the deposit fee go on top.
 fn pay_for(target: u128, rate: &Rate, fees: &Fees, ngn_fx: u128) -> u128 {
     let usdc = (target * 1_000_000).div_ceil(ngn_fx.max(1));
-    let after_fee = ((usdc + fees.usdc_payout_fee) * rate.ngn_per_usdc).div_ceil(1_000_000);
+    let after_fee = (usdc * rate.ngn_per_usdc).div_ceil(1_000_000);
     // The deposit fee is a share up to a cap: whichever needs less.
     let by_share = if fees.deposit_pct < 100_000_000 {
         (after_fee * 100_000_000).div_ceil(100_000_000 - fees.deposit_pct)
@@ -1490,14 +1491,15 @@ pub(super) async fn onramp_quote(
     }
     let currency = body.currency.as_deref().unwrap_or("NGN");
     markets::checked_currency(currency)?;
-    let ((pay, fee, usdc, rate, fees), fx) = tokio::try_join!(
+    let ((pay, fee, usdc, rate, _), fx) = tokio::try_join!(
         onramp_amounts(&state.daya, &body.amount, body.receive),
         app_balance::fx_rate(currency)
     )?;
     Ok(Json(json!({
         "pay": naira(pay),
         "fee": naira(fee),
-        "networkFee": markets::say_money(fees.usdc_payout_fee, currency, fx),
+        // Kept for older apps: delivery to the wallet costs nothing on top of the deposit fee.
+        "networkFee": markets::say_money(0, currency, fx),
         "receive": {"amount": markets::format_units(usdc * fx / 1_000_000, 6), "currency": currency},
         "rate": format!("{} per $1", markets::say_micros(rate.ngn_per_usdc, "NGN")),
     })))
@@ -2294,11 +2296,11 @@ mod tests {
             min_ngn: 1_000_000_000,
             fetched: Instant::now(),
         };
-        // ₦5,500 to land at ₦1,530/$ (the balance's rate): $3.594771 plus the $0.20 delivery fee at
-        // ₦1,560/$, plus 1%, in whole naira: ₦5,980.
+        // ₦5,500 to land at ₦1,530/$ (the balance's rate): $3.594772 at ₦1,560/$, plus 1%, in whole
+        // naira: ₦5,665. Daya's $0.20 crypto-withdrawal fee is not a top-up charge.
         let fx = 1_530_000_000;
         let pay = pay_for(5_500_000_000, &rate, &fees, fx);
-        assert_eq!(pay, 5_980_000_000);
+        assert_eq!(pay, 5_665_000_000);
         assert!(lands(pay, &rate, &fees) * fx / 1_000_000 >= 5_500_000_000);
         // And never more than a naira over what's needed.
         assert!(lands(pay - 1_000_000, &rate, &fees) * fx / 1_000_000 < 5_500_000_000);
