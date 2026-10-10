@@ -32,12 +32,13 @@ pub(super) struct DayaState {
     postgres: Option<Arc<tokio_postgres::Client>>,
     // Without DATABASE_URL, ramps live here (and are lost on restart).
     ramps: Arc<Mutex<HashMap<String, Ramp>>>,
-    customers: Arc<Mutex<HashMap<String, String>>>,
+    customers: Arc<Mutex<HashMap<String, (String, String)>>>,
     banks: Arc<Mutex<Option<(Instant, Arc<Vec<Value>>)>>>,
     names: Arc<Mutex<HashMap<String, (Instant, Option<String>)>>>,
     rates: Arc<Mutex<HashMap<&'static str, Rate>>>,
     fees: Arc<Mutex<Option<(Instant, Fees)>>>,
-    polled: Arc<Mutex<HashMap<String, Instant>>>,
+    polled: Arc<Mutex<HashMap<String, Poll>>>,
+    updates: Arc<Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
     // Without DATABASE_URL, bank recipients live here: (owner, bank, number) → recipient.
     recipients: Arc<Mutex<HashMap<(String, String, String), Recipient>>>,
 }
@@ -78,6 +79,11 @@ struct Ramp {
     paid_ngn: Option<String>,
     #[serde(default)]
     tx: Option<String>,
+    // Once Daya knows the deposit, read it directly instead of scanning the merchant list.
+    #[serde(default)]
+    deposit_id: Option<String>,
+    #[serde(default)]
+    provider_updated_ms: u64,
     // Add money: the bank account to pay and the exact amount.
     #[serde(default)]
     account: Value,
@@ -86,6 +92,32 @@ impl Ramp {
     fn done(&self) -> bool {
         matches!(self.status.as_str(), "completed" | "failed" | "expired")
     }
+}
+
+struct Poll {
+    at: Instant,
+    busy: bool,
+}
+// Dropping a canceled or timed-out read releases its slot as well.
+struct PollGuard {
+    polled: Arc<Mutex<HashMap<String, Poll>>>,
+    account: String,
+}
+impl Drop for PollGuard {
+    fn drop(&mut self) {
+        if let Ok(mut held) = self.polled.lock() {
+            if let Some(poll) = held.get_mut(&self.account) {
+                poll.busy = false;
+            }
+        }
+    }
+}
+
+fn customer_matches(customer: &Value, email: &str) -> bool {
+    customer["email"]
+        .as_str()
+        .is_some_and(|actual| actual.trim().eq_ignore_ascii_case(email))
+        && customer["id"].as_str().is_some_and(|id| !id.is_empty())
 }
 
 #[derive(Clone)]
@@ -204,6 +236,7 @@ impl DayaState {
             rates: Default::default(),
             fees: Default::default(),
             polled: Default::default(),
+            updates: Default::default(),
             recipients: Default::default(),
         };
         if let Ok(url) = env::var("DATABASE_URL") {
@@ -225,6 +258,39 @@ impl DayaState {
             state.postgres = Some(Arc::new(pg));
         }
         Ok(state)
+    }
+
+    fn update_lock(&self, account: &str) -> Result<Arc<tokio::sync::Mutex<()>>, ApiError> {
+        let mut held = self.updates.lock().map_err(internal)?;
+        held.retain(|_, lock| lock.strong_count() > 0);
+        let lock = held
+            .get(account)
+            .and_then(std::sync::Weak::upgrade)
+            .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(())));
+        held.insert(account.into(), Arc::downgrade(&lock));
+        Ok(lock)
+    }
+    fn start_poll(&self, account: &str, focused: bool) -> Result<Option<PollGuard>, ApiError> {
+        let interval = Duration::from_secs(if focused { 3 } else { 20 });
+        let mut held = self.polled.lock().map_err(internal)?;
+        held.retain(|_, poll| poll.busy || poll.at.elapsed() < Duration::from_secs(30));
+        if held
+            .get(account)
+            .is_some_and(|poll| poll.busy || poll.at.elapsed() < interval)
+        {
+            return Ok(None);
+        }
+        held.insert(
+            account.into(),
+            Poll {
+                at: Instant::now(),
+                busy: true,
+            },
+        );
+        Ok(Some(PollGuard {
+            polled: self.polled.clone(),
+            account: account.into(),
+        }))
     }
 
     async fn call(
@@ -464,9 +530,6 @@ impl DayaState {
     // The user's Daya customer, found by email or made once. Atlas signs in with Google or email,
     // so every user has one.
     async fn customer(&self, user: &app_balance::VerifiedWallets) -> Result<String, ApiError> {
-        if let Some(id) = self.customers.lock().map_err(internal)?.get(&user.user_id) {
-            return Ok(id.clone());
-        }
         let email = user
             .email
             .as_deref()
@@ -476,6 +539,12 @@ impl DayaState {
                 StatusCode::CONFLICT,
                 "Bank transfers need an email on your account.".into(),
             ))?;
+        if let Some((held_email, id)) = self.customers.lock().map_err(internal)?.get(&user.user_id)
+        {
+            if held_email == &email {
+                return Ok(id.clone());
+            }
+        }
         let find = || async {
             let found = self
                 .get("/v1/customers", &[("email", email.as_str())])
@@ -484,7 +553,7 @@ impl DayaState {
             Ok::<_, ApiError>(
                 data(&found)
                     .as_array()
-                    .and_then(|list| list.first())
+                    .and_then(|list| list.iter().find(|c| customer_matches(c, &email)))
                     .and_then(|c| c["id"].as_str())
                     .map(str::to_owned),
             )
@@ -509,7 +578,13 @@ impl DayaState {
                     )
                     .await
                 {
-                    Ok(made) => data(&made)["id"].as_str().map(str::to_owned),
+                    Ok(made) => {
+                        let made = data(&made);
+                        if !customer_matches(made, &email) {
+                            return Err(internal("created customer email did not match its owner"));
+                        }
+                        made["id"].as_str().map(str::to_owned)
+                    }
                     // Made by a request that raced this one.
                     Err(f) if f.status == 409 => find().await?,
                     Err(f) => return Err(f.api()),
@@ -520,7 +595,7 @@ impl DayaState {
         self.customers
             .lock()
             .map_err(internal)?
-            .insert(user.user_id.clone(), id.clone());
+            .insert(user.user_id.clone(), (email, id.clone()));
         Ok(id)
     }
 
@@ -661,6 +736,7 @@ impl DayaState {
         let bank = &account["settlement_destination"]["destination_bank"];
         let sound = details["chain"].as_str().is_none_or(|c| c == chain)
             && account["asset"].as_str().is_none_or(|a| a == "USDC")
+            && account["customer_id"].as_str() == Some(customer.as_str())
             && bank["account_number"]
                 .as_str()
                 .is_none_or(|n| n == payout.account_number)
@@ -707,6 +783,8 @@ impl DayaState {
             usdc_units: Some(usdc_units.to_string()),
             paid_ngn: None,
             tx: None,
+            deposit_id: None,
+            provider_updated_ms: 0,
             account: Value::Null,
         })
         .await
@@ -946,20 +1024,76 @@ pub(super) struct Payout {
     bank_name: String,
     ngn_per_usdc: u128,
 }
-// Daya's verdict on one deposit, applied to its ramp and receipt. Called by the webhook and by
-// polling; applying the same status twice changes nothing.
+// Webhooks and polls share a lock so an older observation cannot race a completion.
 async fn apply(state: &AppState, deposit: &Value) -> Result<(), ApiError> {
+    if let Some(ramp) = apply_deposit(&state.daya, &state.history, deposit).await? {
+        emails::ramp_changed(state, &ramp.owner, &ramp.receipt, &ramp.kind, &ramp.status);
+    }
+    Ok(())
+}
+async fn apply_deposit(
+    daya: &DayaState,
+    history: &transactions::HistoryStore,
+    deposit: &Value,
+) -> Result<Option<Ramp>, ApiError> {
     let Some(fa) = deposit["funding_account_id"].as_str() else {
-        return Ok(());
+        return Ok(None);
     };
-    let Some(mut ramp) = state.daya.ramp("funding_account", fa).await? else {
-        return Ok(());
+    let lock = daya.update_lock(fa)?;
+    let _guard = lock.lock().await;
+    let Some(mut ramp) = daya.ramp("funding_account", fa).await? else {
+        return Ok(None);
     };
+    let previous = ramp.status.clone();
+    if !merge_deposit(&mut ramp, deposit) {
+        // If saving the ramp succeeded but its receipt failed, a duplicate repairs that receipt.
+        mirror_receipt(history, &ramp).await?;
+        return Ok(None);
+    }
+    // Keep the provider observation before acknowledging it; a retry also repairs its receipt.
+    daya.keep(&ramp).await?;
+    mirror_receipt(history, &ramp).await?;
+    if previous != ramp.status {
+        eprintln!(
+            "daya receipt {}: {} -> {} at {} ({} ms since account opened, provider update {})",
+            ramp.receipt,
+            previous,
+            ramp.status,
+            now_ms(),
+            now_ms().saturating_sub(ramp.created_ms),
+            ramp.provider_updated_ms
+        );
+    }
+    Ok(Some(ramp))
+}
+fn merge_deposit(ramp: &mut Ramp, deposit: &Value) -> bool {
     let status = deposit["status"]
         .as_str()
         .unwrap_or("")
         .to_ascii_uppercase();
-    let (next, message) = match status.as_str() {
+    let settlement = deposit["settlement_status"]
+        .as_str()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    let status = if status == "REVERSED" || settlement == "REVERSED" {
+        "REVERSED"
+    } else if status == "FAILED" || settlement == "FAILED" {
+        "FAILED"
+    } else if matches!(status.as_str(), "REQUIRES_REVIEW" | "FLAGGED")
+        || matches!(settlement.as_str(), "REQUIRES_REVIEW" | "FLAGGED")
+    {
+        "REQUIRES_REVIEW"
+    } else if matches!(status.as_str(), "COMPLETED" | "SETTLED") {
+        // A received crypto deposit is not proof that its bank settlement has finished.
+        if settlement.is_empty() || matches!(settlement.as_str(), "COMPLETED" | "SETTLED") {
+            "COMPLETED"
+        } else {
+            "PROCESSING"
+        }
+    } else {
+        status.as_str()
+    };
+    let (next, message) = match status {
         "PENDING" | "RECEIVED" => ("received", None),
         "PROCESSING" => ("processing", None),
         "COMPLETED" | "SETTLED" => ("completed", None),
@@ -979,11 +1113,38 @@ async fn apply(state: &AppState, deposit: &Value) -> Result<(), ApiError> {
             }),
         ),
         "REVERSED" => ("failed", Some("This payment was reversed. Contact support.")),
-        _ => return Ok(()),
+        _ => return false,
     };
-    if ramp.done() && next != "failed" {
-        return Ok(());
+    let updated = deposit["updated_at"]
+        .as_str()
+        .and_then(parse_time)
+        .unwrap_or(0);
+    if updated > 0 && updated < ramp.provider_updated_ms {
+        return false;
     }
+    let newer = updated > ramp.provider_updated_ms;
+    // A completed payment can only be superseded by an actual reversal. Failed payments stay failed.
+    if ramp.status == "failed" || (ramp.status == "completed" && status != "REVERSED") {
+        return false;
+    }
+    // Missing/equal provider timestamps cannot move an in-flight payment backwards.
+    let rank = |status: &str| match status {
+        "received" => 1,
+        "processing" => 2,
+        "review" => 3,
+        "completed" | "failed" => 4,
+        _ => 0,
+    };
+    if !newer && rank(next) < rank(&ramp.status) {
+        return false;
+    }
+    if let Some(id) = deposit["id"].as_str().filter(|id| !id.is_empty()) {
+        if ramp.deposit_id.as_deref().is_some_and(|known| known != id) {
+            return false;
+        }
+        ramp.deposit_id = Some(id.into());
+    }
+    ramp.provider_updated_ms = ramp.provider_updated_ms.max(updated);
     ramp.status = next.into();
     ramp.message = message.map(str::to_owned);
     if let Some(tx) = deposit["tx_hash"].as_str().filter(|t| !t.is_empty()) {
@@ -1006,13 +1167,17 @@ async fn apply(state: &AppState, deposit: &Value) -> Result<(), ApiError> {
             ramp.paid_ngn = micros_of(&customer_amount["amount"]).map(|n| n.to_string());
         }
     }
-    update_receipt(state, &ramp).await?;
-    state.daya.keep(&ramp).await
+    true
 }
 
 // Mirrors a ramp's state on its history receipt.
 async fn update_receipt(state: &AppState, ramp: &Ramp) -> Result<(), ApiError> {
-    let Some(mut receipt) = state.history.find(&ramp.owner, &ramp.receipt).await? else {
+    mirror_receipt(&state.history, ramp).await?;
+    emails::ramp_changed(state, &ramp.owner, &ramp.receipt, &ramp.kind, &ramp.status);
+    Ok(())
+}
+async fn mirror_receipt(history: &transactions::HistoryStore, ramp: &Ramp) -> Result<(), ApiError> {
+    let Some(mut receipt) = history.find(&ramp.owner, &ramp.receipt).await? else {
         return Ok(());
     };
     if ramp.kind == "onramp" {
@@ -1051,34 +1216,62 @@ async fn update_receipt(state: &AppState, ramp: &Ramp) -> Result<(), ApiError> {
             _ => "Failed — contact support".into(),
         };
         receipt.set_line("Bank payout", line);
-        if ramp.status == "failed" || ramp.status == "review" {
-            receipt.set_error(ramp.message.clone());
+        // The provider's deposit/payout verdict is stronger than a delayed source intent.
+        // Waiting preserves an unsigned draft or a source submission error.
+        match ramp.status.as_str() {
+            "completed" => receipt.set_state("filled", "settle", None),
+            "failed" | "expired" => receipt.set_state("failed", "settle", ramp.message.clone()),
+            "received" | "processing" | "review" => {
+                receipt.set_state("pending", "settle", ramp.message.clone())
+            }
+            _ => {}
         }
     }
     if let Some(tx) = &ramp.tx {
         receipt.add_tx(tx.clone());
     }
-    state.history.put(&receipt).await?;
-    emails::ramp_changed(state, &ramp.owner, &ramp.receipt, &ramp.kind, &ramp.status);
+    history.put(&receipt).await?;
     Ok(())
 }
 
-// Asks Daya about a receipt's ramp when its webhook may have been missed: at most every 20 seconds
-// per ramp, and never once it's settled.
+// A visible receipt checks at most every three seconds; background history every twenty.
+// Concurrent readers share one provider read, and a known deposit is retrieved by its ID.
 pub(super) async fn observe(state: &AppState, owner: &str, receipt: &str) -> Result<(), ApiError> {
+    observe_inner(state, owner, receipt, false).await
+}
+pub(super) async fn observe_focused(
+    state: &AppState,
+    owner: &str,
+    receipt: &str,
+) -> Result<(), ApiError> {
+    observe_inner(state, owner, receipt, true).await
+}
+async fn observe_inner(
+    state: &AppState,
+    owner: &str,
+    receipt: &str,
+    focused: bool,
+) -> Result<(), ApiError> {
     let Some(mut ramp) = state.daya.ramp("receipt", receipt).await? else {
         return Ok(());
     };
-    if ramp.owner != owner || ramp.done() {
+    if ramp.owner != owner || matches!(ramp.status.as_str(), "completed" | "failed") {
         return Ok(());
     }
-    {
-        let mut polled = state.daya.polled.lock().map_err(internal)?;
-        polled.retain(|_, at| at.elapsed() < Duration::from_secs(20));
-        if polled.contains_key(&ramp.funding_account) {
-            return Ok(());
+    let Some(_poll) = state.daya.start_poll(&ramp.funding_account, focused)? else {
+        return Ok(());
+    };
+    if let Some(id) = &ramp.deposit_id {
+        let fresh = state
+            .daya
+            .get(&format!("/v1/deposits/{id}"), &[])
+            .await
+            .map_err(Failure::api)?;
+        let deposit = data(&fresh);
+        if deposit["funding_account_id"].as_str() == Some(ramp.funding_account.as_str()) {
+            return apply(state, deposit).await;
         }
-        polled.insert(ramp.funding_account.clone(), Instant::now());
+        return Err(internal("deposit did not match its funding account"));
     }
     let kind = if ramp.kind == "onramp" {
         "NGN_DEPOSIT"
@@ -1086,25 +1279,50 @@ pub(super) async fn observe(state: &AppState, owner: &str, receipt: &str) -> Res
         "CRYPTO_DEPOSIT"
     };
     let since = format_time(ramp.created_ms.saturating_sub(5 * 60_000));
-    let found = state
-        .daya
-        .get(
-            "/v1/deposits",
-            &[("type", kind), ("from", since.as_str()), ("limit", "200")],
-        )
-        .await
-        .map_err(Failure::api)?;
-    let deposit = data(&found)
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|d| d["funding_account_id"].as_str() == Some(&ramp.funding_account))
-        .max_by_key(|d| d["updated_at"].as_str().unwrap_or("").to_owned());
-    if let Some(deposit) = deposit {
-        return apply(state, deposit).await;
+    let mut scanned_all = false;
+    for page in 1..=10 {
+        let page_text = page.to_string();
+        let found = state
+            .daya
+            .get(
+                "/v1/deposits",
+                &[
+                    ("type", kind),
+                    ("from", since.as_str()),
+                    ("limit", "200"),
+                    ("page", page_text.as_str()),
+                ],
+            )
+            .await
+            .map_err(Failure::api)?;
+        let rows = data(&found)
+            .as_array()
+            .ok_or_else(|| internal("unreadable deposit list"))?;
+        if let Some(deposit) = rows
+            .iter()
+            .filter(|d| d["funding_account_id"].as_str() == Some(ramp.funding_account.as_str()))
+            .max_by_key(|d| d["updated_at"].as_str().and_then(parse_time).unwrap_or(0))
+        {
+            return apply(state, deposit).await;
+        }
+        let pages = found["total_pages"].as_u64();
+        if pages.is_some_and(|last| page >= last) || (pages.is_none() && rows.len() < 200) {
+            scanned_all = true;
+            break;
+        }
     }
     // Nothing arrived and the account has lapsed (a late transfer is reviewed by Daya, not lost).
-    if ramp.kind == "onramp" && now_ms() > ramp.expires_ms + 10 * 60_000 {
+    if scanned_all && ramp.kind == "onramp" && now_ms() > ramp.expires_ms + 10 * 60_000 {
+        let lock = state.daya.update_lock(&ramp.funding_account)?;
+        let _guard = lock.lock().await;
+        ramp = state
+            .daya
+            .ramp("funding_account", &ramp.funding_account)
+            .await?
+            .unwrap_or(ramp);
+        if ramp.status != "waiting" {
+            return Ok(());
+        }
         ramp.status = "expired".into();
         ramp.message = Some("No transfer arrived before this account expired. If you sent money after that, contact support.".into());
         update_receipt(state, &ramp).await?;
@@ -1113,7 +1331,7 @@ pub(super) async fn observe(state: &AppState, owner: &str, receipt: &str) -> Res
     Ok(())
 }
 
-// POST /v1/daya/webhook: Daya's signed lifecycle events. Answered at once; applied in the background.
+// POST /v1/daya/webhook: acknowledge only after the signed observation is saved.
 pub(super) async fn webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1134,20 +1352,26 @@ pub(super) async fn webhook(
     let Ok(event) = serde_json::from_slice::<Value>(&body) else {
         return StatusCode::BAD_REQUEST;
     };
-    let name = event["event"].as_str().unwrap_or("").to_owned();
-    tokio::spawn(async move {
-        let result = if name.starts_with("deposit.") {
-            apply(&state, &event["data"]).await
-        } else if name == "funding_account.failed" || name == "funding_account.disabled" {
-            account_closed(&state, &event["data"]).await
-        } else {
-            Ok(())
-        };
-        if let Err((_, error)) = result {
-            eprintln!("daya webhook {name}: {error}");
+    let name = event["event"].as_str().unwrap_or("");
+    let result = if name.starts_with("deposit.") {
+        let mut deposit = event["data"].clone();
+        if deposit["updated_at"].as_str().is_none() {
+            deposit["updated_at"] = event["timestamp"].clone();
         }
-    });
-    StatusCode::OK
+        apply(&state, &deposit).await
+    } else if name == "funding_account.failed" || name == "funding_account.disabled" {
+        account_closed(&state, &event["data"]).await
+    } else {
+        Ok(())
+    };
+    match result {
+        Ok(()) => StatusCode::OK,
+        Err((_, error)) => {
+            eprintln!("daya webhook {name}: {error}");
+            // Daya retries non-2xx delivery. Never acknowledge a failed database update.
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+    }
 }
 
 // A naira account that closed before any money came in.
@@ -1155,6 +1379,8 @@ async fn account_closed(state: &AppState, account: &Value) -> Result<(), ApiErro
     let Some(id) = account["id"].as_str() else {
         return Ok(());
     };
+    let lock = state.daya.update_lock(id)?;
+    let _guard = lock.lock().await;
     let Some(mut ramp) = state.daya.ramp("funding_account", id).await? else {
         return Ok(());
     };
@@ -1340,6 +1566,7 @@ pub(super) async fn onramp_open(
         .is_some_and(|a| a.eq_ignore_ascii_case(&wallet))
         && to["destination_chain"] == ONRAMP_CHAIN
         && to["destination_asset"] == "USDC"
+        && account["customer_id"].as_str() == Some(customer.as_str())
         && !id.is_empty()
         && exact
             .as_deref()
@@ -1387,6 +1614,8 @@ pub(super) async fn onramp_open(
         usdc_units: Some(usdc.to_string()),
         paid_ngn: None,
         tx: None,
+        deposit_id: None,
+        provider_updated_ms: 0,
         account: account_view,
     };
     state.daya.keep(&ramp).await?;
@@ -1827,6 +2056,199 @@ pub(super) fn format_time(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn stored_receipt(history: &transactions::HistoryStore) -> Value {
+        serde_json::to_value(history.find("alice", "bank-send").await.unwrap().unwrap()).unwrap()
+    }
+    fn memory_state() -> DayaState {
+        DayaState {
+            http: reqwest::Client::new(),
+            key: None,
+            webhook_secret: None,
+            postgres: None,
+            ramps: Default::default(),
+            customers: Default::default(),
+            banks: Default::default(),
+            names: Default::default(),
+            rates: Default::default(),
+            fees: Default::default(),
+            polled: Default::default(),
+            updates: Default::default(),
+            recipients: Default::default(),
+        }
+    }
+    fn bank_ramp() -> Ramp {
+        Ramp {
+            funding_account: "fa".into(),
+            owner: "alice".into(),
+            kind: "offramp".into(),
+            receipt: "bank-send".into(),
+            created_ms: 0,
+            expires_ms: u64::MAX,
+            status: "waiting".into(),
+            message: None,
+            usdc_units: Some("1000000".into()),
+            paid_ngn: None,
+            tx: None,
+            deposit_id: None,
+            provider_updated_ms: 0,
+            account: Value::Null,
+        }
+    }
+    fn deposit(status: &str, second: u64) -> Value {
+        json!({"id":"dep", "funding_account_id":"fa", "status":status,
+            "updated_at":format!("2026-10-10T10:00:{second:02}Z"),
+            "customer_amount":{"currency":"NGN","amount":"500"}})
+    }
+    async fn bank_fixture() -> (DayaState, transactions::HistoryStore) {
+        let daya = memory_state();
+        let history = transactions::HistoryStore::default();
+        daya.keep(&bank_ramp()).await.unwrap();
+        history.put(&transactions::Receipt::plan("alice", &json!({
+            "intentId":"bank-send", "kind":"offramp",
+            "summary":[{"label":"Bank gets","value":"₦500.00"},{"label":"Bank payout","value":"Waiting for your USDC"}]
+        }))).await.unwrap();
+        (daya, history)
+    }
+
+    #[tokio::test]
+    async fn concurrent_poll_and_webhook_cannot_undo_a_paid_bank_receipt() {
+        let (daya, history) = bank_fixture().await;
+        let complete = deposit("COMPLETED", 20);
+        let stale = deposit("RECEIVED", 5);
+        let (a, b) = tokio::join!(
+            apply_deposit(&daya, &history, &complete),
+            apply_deposit(&daya, &history, &stale),
+        );
+        a.unwrap();
+        b.unwrap();
+        let ramp = daya.ramp("receipt", "bank-send").await.unwrap().unwrap();
+        let receipt = history.find("alice", "bank-send").await.unwrap().unwrap();
+        assert_eq!(ramp.status, "completed");
+        assert_eq!(ramp.deposit_id.as_deref(), Some("dep"));
+        assert_eq!(serde_json::to_value(&receipt).unwrap()["state"], "filled");
+        assert!(serde_json::to_value(&receipt).unwrap()["summary"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["label"] == "Bank payout" && l["value"] == "Paid ₦500.00"));
+        assert!(history.find("bob", "bank-send").await.unwrap().is_none());
+        assert!(apply_deposit(&daya, &history, &deposit("FAILED", 10))
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            daya.ramp("receipt", "bank-send")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "completed"
+        );
+        apply_deposit(&daya, &history, &deposit("REVERSED", 30))
+            .await
+            .unwrap();
+        assert_eq!(stored_receipt(&history).await["state"], "failed");
+    }
+
+    #[tokio::test]
+    async fn receiving_crypto_waits_for_settlement_and_clears_a_resolved_review() {
+        let (daya, history) = bank_fixture().await;
+        let mut incoming = deposit("COMPLETED", 10);
+        incoming["settlement_status"] = json!("PROCESSING");
+        apply_deposit(&daya, &history, &incoming).await.unwrap();
+        assert_eq!(
+            daya.ramp("receipt", "bank-send")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "processing"
+        );
+        assert_eq!(stored_receipt(&history).await["state"], "pending");
+        incoming = deposit("REQUIRES_REVIEW", 20);
+        apply_deposit(&daya, &history, &incoming).await.unwrap();
+        assert!(!stored_receipt(&history).await["error"].is_null());
+        apply_deposit(&daya, &history, &deposit("PROCESSING", 30))
+            .await
+            .unwrap();
+        assert!(stored_receipt(&history).await["error"].is_null());
+        let mut wrong = deposit("COMPLETED", 40);
+        wrong["id"] = json!("another-deposit");
+        assert!(apply_deposit(&daya, &history, &wrong)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            daya.ramp("receipt", "bank-send")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "processing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_completion_repairs_a_receipt_if_a_previous_mirror_failed() {
+        let (daya, history) = bank_fixture().await;
+        let complete = deposit("COMPLETED", 20);
+        apply_deposit(&daya, &history, &complete).await.unwrap();
+        let mut receipt = history.find("alice", "bank-send").await.unwrap().unwrap();
+        receipt.set_state("pending", "settle", None);
+        receipt.set_line("Bank payout", "Waiting for your USDC".into());
+        history.put(&receipt).await.unwrap();
+        apply_deposit(&daya, &history, &complete).await.unwrap();
+        assert_eq!(stored_receipt(&history).await["state"], "filled");
+    }
+
+    #[tokio::test]
+    async fn a_waiting_draft_is_unsigned_and_late_funds_can_leave_expiry() {
+        let (daya, history) = bank_fixture().await;
+        mirror_receipt(&history, &bank_ramp()).await.unwrap();
+        assert_eq!(stored_receipt(&history).await["stage"], "validate");
+        let mut ramp = bank_ramp();
+        ramp.kind = "onramp".into();
+        ramp.status = "expired".into();
+        daya.keep(&ramp).await.unwrap();
+        apply_deposit(&daya, &history, &deposit("REQUIRES_REVIEW", 20))
+            .await
+            .unwrap();
+        assert_eq!(
+            daya.ramp("receipt", "bank-send")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "review"
+        );
+    }
+
+    #[test]
+    fn focused_poll_is_not_held_back_by_history_and_inflight_reads_do_not_overlap() {
+        let daya = memory_state();
+        let held = daya.start_poll("fa", false).unwrap().unwrap();
+        assert!(daya.start_poll("fa", true).unwrap().is_none());
+        daya.polled.lock().unwrap().get_mut("fa").unwrap().at =
+            Instant::now() - Duration::from_secs(4);
+        // Even after its rate limit, an unfinished provider request stays single-flight.
+        assert!(daya.start_poll("fa", true).unwrap().is_none());
+        drop(held);
+        assert!(daya.start_poll("fa", false).unwrap().is_none());
+        let focused = daya.start_poll("fa", true).unwrap().unwrap();
+        assert!(daya.start_poll("fa", true).unwrap().is_none());
+        drop(focused);
+        assert!(!daya.polled.lock().unwrap()["fa"].busy);
+    }
+
+    #[test]
+    fn customers_are_matched_to_the_exact_sign_in_email_not_the_first_list_item() {
+        let first = json!({"id":"ivan", "email":"ivan@example.com"});
+        let actual = json!({"id":"ada", "email":"ADA@example.com"});
+        assert!(!customer_matches(&first, "ada@example.com"));
+        assert!(customer_matches(&actual, "ada@example.com"));
+        assert!(!customer_matches(&json!({"id":"ada"}), "ada@example.com"));
+    }
 
     #[test]
     fn times_round_trip() {

@@ -144,6 +144,7 @@ impl Receipt {
             .and_then(|v| v.trim().strip_prefix('₦'))
             .and_then(|v| markets::parse_micros(&v.replace(',', "")).ok());
         let state = match payout {
+            Some(v) if v.starts_with("Paid") => Some(("filled", "settle")),
             Some(v) if v.starts_with("Failed") => Some(("failed", "settle")),
             Some(v)
                 if !v.starts_with("Paid") && self.state != "failed" && self.stage != "validate" =>
@@ -679,8 +680,10 @@ fn refresh(state: &AppState, headers: &HeaderMap, owner: &str, rows: &[Receipt],
     for r in rows
         .iter()
         .filter(|r| {
-            (r.kind == "onramp" && r.state == "pending")
-                || (r.kind == "offramp" && now().saturating_sub(r.created_at_unix_ms) < 3 * DAY_MS)
+            !focused
+                && ((r.kind == "onramp" && r.state == "pending")
+                    || (r.kind == "offramp"
+                        && now().saturating_sub(r.created_at_unix_ms) < 3 * DAY_MS))
         })
         .take(4)
     {
@@ -769,9 +772,37 @@ pub(super) async fn detail(
         .iter()
         .find(|r| r.id == id)
         .ok_or((StatusCode::NOT_FOUND, "transaction not found".into()))?;
+    // Include a newly observed bank state in this response, not the next poll's response.
+    // Unsigned drafts stay unsigned; provider reads cannot start a transfer.
+    let bank = matches!(row.kind.as_str(), "onramp" | "offramp");
+    if bank && row.stage != "validate" {
+        let focused_state = state.clone();
+        let focused_owner = owner.clone();
+        let focused_id = id.clone();
+        let mut observing = tokio::spawn(async move {
+            daya::observe_focused(&focused_state, &focused_owner, &focused_id).await
+        });
+        // Detach on the screen's deadline, rather than canceling the provider read.
+        // Its result still updates the saved receipt for the next foreground poll.
+        let _ = tokio::time::timeout(Duration::from_secs(4), &mut observing).await;
+    }
     refresh(&state, &headers, &owner, std::slice::from_ref(row), true);
+    let fresh = if bank {
+        state.history.find(&owner, &id).await?.map(|mut fresh| {
+            // A waiting ramp has not changed its saved draft's state. Keep the live source state.
+            if fresh.stage == "validate" && row.stage != "validate" {
+                fresh.set_state(&row.state, &row.stage, row.error.clone());
+            }
+            fresh
+        })
+    } else {
+        None
+    };
     Ok(Json(
-        row.public(currency, app_balance::fx_rate(currency).await?),
+        fresh
+            .as_ref()
+            .unwrap_or(row)
+            .public(currency, app_balance::fx_rate(currency).await?),
     ))
 }
 fn internal(_: impl std::fmt::Display) -> ApiError {
@@ -808,6 +839,11 @@ mod tests {
         let shown = r.public("NGN", 1_329_760_000);
         assert_eq!(shown["amount"]["amount"], "2400");
         assert_eq!(shown["state"], "filled");
+        // Source intent updates can lag (or time out); the paid bank verdict still wins.
+        r.set_state("pending", "fund", None);
+        assert_eq!(r.public("NGN", 1_329_760_000)["state"], "filled");
+        r.set_state("failed", "fund", Some("source status unavailable".into()));
+        assert_eq!(r.public("NGN", 1_329_760_000)["state"], "filled");
         // In dollars it's what left the balance.
         assert_eq!(r.public("USD", 1_000_000)["amount"]["amount"], "1.788565");
         r.set_line("Bank payout", "Failed — contact support".into());

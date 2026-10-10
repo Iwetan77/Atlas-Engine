@@ -6746,3 +6746,91 @@ impl MarketState {
             .or_else(|| base_assets().into_iter().find(|a| a.id == id))
     }
 }
+
+// Public market metadata contains no account or wallet data. Shared links resolve this exact
+// asset ID instead of trusting names/prices supplied by a URL.
+#[derive(Deserialize)]
+pub(super) struct AssetDetailQuery {
+    currency: Option<String>,
+}
+pub(super) async fn asset_detail(
+    State(state): State<AppState>,
+    Path(asset_id): Path<String>,
+    Query(q): Query<AssetDetailQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let currency = q.currency.unwrap_or_else(|| "NGN".into());
+    checked_currency(&currency)?;
+    let rate = app_balance::fx_rate(&currency).await?;
+    Ok(Json(
+        asset_detail_value(&state, &asset_id, &currency, rate).await?,
+    ))
+}
+pub(super) async fn asset_detail_value(
+    state: &AppState,
+    asset_id: &str,
+    currency: &str,
+    rate: u128,
+) -> Result<Value, ApiError> {
+    if asset_id.is_empty() || asset_id.len() > 300 {
+        return Err(bad("invalid asset"));
+    }
+    if asset_id.starts_with("near:") {
+        return near_intents::asset_detail(state, asset_id, currency, rate).await;
+    }
+    let asset = find_asset(&state.markets, asset_id).await?;
+    let (price, change) = if asset.chain == "solana" {
+        let prices = usd_prices(&state.markets, std::slice::from_ref(&asset.token)).await?;
+        let (usd, change) = prices
+            .get(&asset.token)
+            .ok_or_else(|| unavailable("Price unavailable"))?;
+        (
+            money_from_usd(*usd, currency, rate)?,
+            change.map(|c| format!("{c:.2}")),
+        )
+    } else {
+        let out = base_rate(&state.markets, &asset)
+            .await
+            .ok_or_else(|| unavailable("Price unavailable"))?;
+        (
+            json!(unit_price(1_000_000, out, asset.decimals, currency, rate)?),
+            None,
+        )
+    };
+    Ok(
+        json!({"assetId":asset.id,"symbol":asset.symbol,"name":asset.name,"kind":asset.kind,
+        "chain":asset.chain,"price":price,"change24hPct":change,"iconUrl":asset.icon_url,
+        "verified":asset.verified,"tradeable":true}),
+    )
+}
+// Alert workers refuse the ten-minute display fallback: an old price must not fire a target.
+pub(super) async fn alert_price(
+    state: &AppState,
+    asset_id: &str,
+) -> Result<(String, f64), ApiError> {
+    let row = asset_detail_value(state, asset_id, "USD", 1_000_000).await?;
+    if !asset_id.starts_with("near:") {
+        let asset = find_asset(&state.markets, asset_id).await?;
+        if asset.chain == "solana" {
+            let fresh = state
+                .markets
+                .prices
+                .lock()
+                .map_err(internal)?
+                .get(&asset.token)
+                .is_some_and(|(at, _, _)| at.elapsed() < PRICE_TTL);
+            if !fresh {
+                return Err(unavailable("A fresh price is unavailable"));
+            }
+        }
+    }
+    let usd = row["price"]["amount"]
+        .as_str()
+        .and_then(|p| p.parse::<f64>().ok())
+        .filter(|p| p.is_finite() && *p > 0.0)
+        .ok_or_else(|| unavailable("Price unavailable"))?;
+    let symbol = row["symbol"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| unavailable("Asset unavailable"))?;
+    Ok((symbol.to_owned(), usd))
+}

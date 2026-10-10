@@ -7534,3 +7534,68 @@ impl NearState {
         self.client.status(address, memo).await.map_err(venue)
     }
 }
+
+pub(super) async fn asset_detail(
+    state: &AppState,
+    asset_id: &str,
+    currency: &str,
+    rate: u128,
+) -> Result<Value, ApiError> {
+    if let Some(coin) = asset_id
+        .strip_prefix("near:sui:")
+        .filter(|c| sui_coin_type(c))
+    {
+        let price = sui_coin_price(state.near.icon_http.clone(), coin.to_owned())
+            .await
+            .filter(|p| p.is_finite() && *p > 0.0)
+            .ok_or_else(|| venue("Price unavailable"))?;
+        let listed = state.near.listed_for_search();
+        return sui_search_row(
+            &state.near,
+            coin,
+            price,
+            currency,
+            rate,
+            listed.has("sui", coin),
+        )
+        .await;
+    }
+    if let Some(token) = asset_id.strip_prefix("near:ref:").filter(|t| {
+        (2..=64).contains(&t.len())
+            && t.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+    }) {
+        return search_ref_unlisted(state, token, currency, rate)
+            .await?
+            .assets
+            .into_iter()
+            .find(|a| a["assetId"].as_str() == Some(asset_id))
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "Asset unavailable".into()));
+    }
+    let id = asset_id
+        .strip_prefix("near:")
+        .ok_or_else(|| bad("invalid asset"))?;
+    let token = state
+        .near
+        .tokens()
+        .await?
+        .into_iter()
+        .find(|t| t.asset_id == id && supported(t))
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Asset unavailable".into()))?;
+    let usd = token_usd(&token);
+    if !usd.is_finite() || usd <= 0.0 {
+        return Err(venue("Price unavailable"));
+    }
+    let symbol = display_symbol(&token);
+    let name = if symbol == "NEAR" {
+        "NEAR".to_owned()
+    } else {
+        format!("{} on {}", token.symbol, token.blockchain)
+    };
+    Ok(
+        json!({"assetId":asset_id,"symbol":symbol,"name":name,"kind":"crypto","chain":token.blockchain,
+        "price":markets::money_from_usd(usd,currency,rate)?,"change24hPct":null,
+        "iconUrl":state.near.icon_for(&token),"verified":true,
+        "tradeable":token.blockchain != "near" || near_routes(state).get(&token.asset_id).is_none_or(|r| r.tradeable())}),
+    )
+}

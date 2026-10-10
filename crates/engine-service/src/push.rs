@@ -213,6 +213,44 @@ pub(super) async fn register(
         &[&id,&owner,&input.kind,&input.subscription.to_string(),&now()]).await.map_err(internal)?;
     Ok(Json(json!({"id":id})))
 }
+// A user-triggered test exercises the same durable outbox as real money updates.
+pub(super) async fn test(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let owner = app_balance::verified_wallets(&state, &headers)
+        .await?
+        .user_id;
+    let count: i64 = state
+        .push
+        .database()?
+        .query_one(
+            "SELECT COUNT(*) FROM atlas_notification_devices WHERE owner=$1",
+            &[&owner],
+        )
+        .await
+        .map_err(internal)?
+        .get(0);
+    if count == 0 {
+        return Err((
+            StatusCode::PRECONDITION_REQUIRED,
+            "Enable notifications on this device first.".into(),
+        ));
+    }
+    state
+        .notifications
+        .emit(
+            &owner,
+            &format!("push-test:{}", now() / 60_000),
+            "Notifications are ready",
+            "This is your Atlas device notification test.",
+            "/notifications",
+            false,
+        )
+        .await?;
+    Ok(Json(json!({"queued": true})))
+}
+
 #[derive(Deserialize)]
 pub(super) struct Unregister {
     id: String,
