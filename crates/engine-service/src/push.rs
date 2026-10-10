@@ -213,44 +213,6 @@ pub(super) async fn register(
         &[&id,&owner,&input.kind,&input.subscription.to_string(),&now()]).await.map_err(internal)?;
     Ok(Json(json!({"id":id})))
 }
-// A user-triggered test exercises the same durable outbox as real money updates.
-pub(super) async fn test(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
-    let owner = app_balance::verified_wallets(&state, &headers)
-        .await?
-        .user_id;
-    let count: i64 = state
-        .push
-        .database()?
-        .query_one(
-            "SELECT COUNT(*) FROM atlas_notification_devices WHERE owner=$1",
-            &[&owner],
-        )
-        .await
-        .map_err(internal)?
-        .get(0);
-    if count == 0 {
-        return Err((
-            StatusCode::PRECONDITION_REQUIRED,
-            "Enable notifications on this device first.".into(),
-        ));
-    }
-    state
-        .notifications
-        .emit(
-            &owner,
-            &format!("push-test:{}", now() / 60_000),
-            "Notifications are ready",
-            "This is your Atlas device notification test.",
-            "/notifications",
-            false,
-        )
-        .await?;
-    Ok(Json(json!({"queued": true})))
-}
-
 #[derive(Deserialize)]
 pub(super) struct Unregister {
     id: String,
@@ -276,6 +238,9 @@ struct Job {
     payload: Value,
     attempts: i32,
     receipt: Option<String>,
+    title: String,
+    body: String,
+    url: String,
 }
 async fn jobs(pg: &tokio_postgres::Client) -> Result<Vec<Job>, ApiError> {
     // Lease the batch long enough for twenty bounded transport requests; lock out other instances.
@@ -289,8 +254,9 @@ async fn jobs(pg: &tokio_postgres::Client) -> Result<Vec<Job>, ApiError> {
         let device: String = r.get("device_id");
         let found = pg
             .query_opt(
-                "SELECT kind,payload FROM atlas_notification_devices WHERE id=$1 AND owner=$2",
-                &[&device, &owner],
+                "SELECT d.kind,d.payload,n.title,n.body,n.url FROM atlas_notification_devices d
+                 JOIN atlas_notifications n ON n.id=$2 AND n.owner=d.owner WHERE d.id=$1 AND d.owner=$3",
+                &[&device, &r.get::<_, String>("event_id"), &owner],
             )
             .await
             .map_err(internal)?;
@@ -304,6 +270,9 @@ async fn jobs(pg: &tokio_postgres::Client) -> Result<Vec<Job>, ApiError> {
                 payload: serde_json::from_str(d.get("payload")).map_err(internal)?,
                 attempts: r.get("attempts"),
                 receipt: r.get("receipt"),
+                title: push_text(d.get("title"), 100),
+                body: push_text(d.get("body"), 240),
+                url: push_url(d.get("url")),
             });
         } else {
             pg.execute("DELETE FROM atlas_notification_outbox WHERE id=$1", &[&jid])
@@ -313,6 +282,24 @@ async fn jobs(pg: &tokio_postgres::Client) -> Result<Vec<Job>, ApiError> {
     }
     Ok(jobs)
 }
+fn push_text(text: &str, limit: usize) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(limit)
+        .collect()
+}
+fn push_url(url: &str) -> String {
+    let local = url.strip_prefix("https://justatlas.xyz").unwrap_or(url);
+    let path = local.split('#').next().unwrap_or("");
+    if path.starts_with('/') && !path.starts_with("//") && !path.contains(['\\', '\r', '\n']) {
+        path.to_owned()
+    } else {
+        "/notifications".into()
+    }
+}
 async fn deliver(state: &AppState, j: &Job) -> Result<(String, Option<String>), ApiError> {
     if j.kind == "web" {
         let keys = state.push.keys(state).await?;
@@ -321,19 +308,19 @@ async fn deliver(state: &AppState, j: &Job) -> Result<(String, Option<String>), 
             .transport(
                 state,
                 "send",
-                json!({"subscription":j.payload,"keys":keys,"noticeId":j.notice}),
+                json!({"subscription":j.payload,"keys":keys,"noticeId":j.notice,"title":j.title,"body":j.body,"url":j.url}),
             )
             .await?;
         return Ok((v["status"].as_str().unwrap_or("retry").into(), None));
     }
-    // Only a generic alert and opaque notification id leave Atlas. Details require an authenticated inbox read.
+    // Deliver the event summary requested by the user; owner and device are matched above.
     let (route, payload) = if let Some(receipt) = &j.receipt {
         ("getReceipts", json!({"ids":[receipt]}))
     } else {
         (
             "send",
-            json!({"to":j.payload["token"],"title":"Atlas","body":"You have a new Atlas money update.",
-            "sound":"default","channelId":"money","data":{"id":j.notice,"url":"/notifications"},"ttl":3600}),
+            json!({"to":j.payload["token"],"title":j.title,"body":j.body,
+            "sound":"default","channelId":"money","data":{"id":j.notice,"url":j.url},"ttl":3600}),
         )
     };
     let mut request = state
@@ -417,6 +404,30 @@ pub(super) fn keep_delivering(state: AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn push_summaries_keep_money_details_and_bound_content() {
+        assert_eq!(
+            push_text("You received ₦500.00 from @ade", 240),
+            "You received ₦500.00 from @ade"
+        );
+        assert_eq!(push_text("a\n\rb\u{0000}c", 240), "a bc");
+        assert_eq!(
+            push_text("💰".repeat(300).as_str(), 240).chars().count(),
+            240
+        );
+        assert_eq!(
+            push_url("/transaction/receipt#private"),
+            "/transaction/receipt"
+        );
+        for url in [
+            "https://evil.com/",
+            "//evil.com/",
+            "/\\evil.com/",
+            "/receipt\nunsafe",
+        ] {
+            assert_eq!(push_url(url), "/notifications");
+        }
+    }
     #[test]
     fn registrations_only_use_real_push_services() {
         assert!(valid(

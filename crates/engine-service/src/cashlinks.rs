@@ -2,7 +2,8 @@
 //! EVM key) and only its address reaches the engine, until someone claims. The sender's plan funds
 //! that escrow with USDC on Base, plus a few cents so Relay's fee doesn't come out of the gift.
 //! Whoever opens the link and signs in claims it: the bridge, given the secret they hold, signs one
-//! authorization paying the escrow out through Relay to their Solana wallet, with no gas. The sender
+//! authorization paying the escrow out through Relay to their cheapest supported cash wallet,
+//! without reducing the promised gift principal. The sender
 //! can take it back the same way, and after 30 days only the sender can.
 use super::*;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -10,8 +11,9 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 pub(super) const LINK_DAYS: u64 = 30;
-// Funded on top of the amount: Relay's payout fee (about 3 cents) and its 0.5% price room, so the
-// friend gets at least the full amount.
+// Funded on top of the gift for claim delivery. It is a spending cap, not permission
+// to deduct from the principal: expensive first-time Solana account setup must use the
+// cheaper Base payout or fail before signing. Any unused reserve goes to the recipient.
 pub(super) const CLAIM_FEE_UNITS: u128 = 60_000;
 // A claim that was cut off halfway (the engine restarted) can be tried again after this.
 const CLAIM_STALE_MS: u64 = 10 * 60 * 1000;
@@ -248,7 +250,7 @@ fn status_of(link: &Link, state: &str, error: Option<String>) -> markets::Intent
     }
 }
 
-// Claims a link: to the claimer's Solana wallet, or, for the sender, back to their own.
+// Claims a link into the claimer's cheapest supported cash wallet, or reclaims to the sender.
 pub(super) async fn claim(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -266,11 +268,13 @@ pub(super) async fn claim(
     )
     .await?;
     let user = app_balance::verified_wallets(&state, &headers).await?;
-    let to = user
-        .solana_wallet
-        .clone()
-        .filter(|w| !w.is_empty())
-        .ok_or_else(|| conflict("Your account is still being set up. Try again in a moment."))?;
+    let solana = user.solana_wallet.as_deref().filter(|w| !w.is_empty());
+    let base = user.evm_wallet.as_deref().filter(|w| !w.is_empty());
+    if solana.is_none() && base.is_none() {
+        return Err(conflict(
+            "Your account is still being set up. Try again in a moment.",
+        ));
+    }
     let escrow = escrow_id(&id).ok_or((StatusCode::NOT_FOUND, "no such link".into()))?;
     let link = state
         .links
@@ -313,11 +317,41 @@ pub(super) async fn claim(
             "The money for this link is still on its way. Try again in a minute.",
         ));
     }
-    let payout = state
-        .relay_link
-        .base_to_solana_all(&escrow, &to, held)
-        .await
-        .map_err(|_| conflict("Couldn't claim right now. Try again shortly."))?;
+    // Quote both available wallets concurrently. A fresh Solana USDC account can cost
+    // more than the entire reserve; holding the gift on Base avoids that setup cost.
+    // Neither quote is signed or submitted until its minimum preserves the principal.
+    let (base_quote, solana_quote) = tokio::join!(
+        async {
+            match base {
+                Some(to) => tokio::time::timeout(
+                    std::time::Duration::from_secs(4),
+                    state.relay_link.base_to_base_all(&escrow, to, held),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok),
+                None => None,
+            }
+        },
+        async {
+            match solana {
+                Some(to) => tokio::time::timeout(
+                    std::time::Duration::from_secs(4),
+                    state.relay_link.base_to_solana_all(&escrow, to, held),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok),
+                None => None,
+            }
+        }
+    );
+    let payout = cheapest_payout(
+        if sender { 0 } else { link.amount_units },
+        held,
+        base_quote,
+        solana_quote,
+    )?;
     // Only one claim gets past here.
     let mut claiming = link.clone();
     claiming.state = "claiming".into();
@@ -367,6 +401,38 @@ pub(super) async fn claim(
     done.claimer = Some(user.user_id);
     state.links.transition(&claiming, &done).await?;
     Ok(Json(status_of(&done, "pending", None)))
+}
+
+// The larger guaranteed payout is the cheaper route. Quotes always spend the full
+// escrow so spare delivery reserve reaches the recipient. Principal is USDC, not the
+// displayed local-currency amount, which follows FX after the link was created.
+fn cheapest_payout(
+    principal: u128,
+    held: u128,
+    base: Option<engine_execution::relay_link::GaslessMove>,
+    solana: Option<engine_execution::relay_link::GaslessMove>,
+) -> Result<engine_execution::relay_link::GaslessMove, ApiError> {
+    let available = base.is_some() || solana.is_some();
+    // Base wins a tie, since it avoids an unnecessary cross-chain move.
+    base.into_iter()
+        .chain(solana)
+        .filter(|quote| {
+            quote.amount_in_units == held
+                && quote.amount_out_units > 0
+                && quote.amount_out_units >= principal
+        })
+        .reduce(|best, candidate| {
+            if candidate.amount_out_units > best.amount_out_units {
+                candidate
+            } else {
+                best
+            }
+        })
+        .ok_or_else(|| conflict(if available {
+            "Claim delivery is too expensive right now. Your gift has not moved. Try again later or ask the sender to take it back."
+        } else {
+            "Couldn't prepare the claim right now. Your gift has not moved. Try again shortly."
+        }))
 }
 
 // The escrow's signature over Relay's payout authorization, made by the bridge from the link's
@@ -478,6 +544,67 @@ mod tests {
             claimer: None,
             settled: false,
         }
+    }
+
+    fn payout(input: u128, output: u128, id: &str) -> engine_execution::relay_link::GaslessMove {
+        engine_execution::relay_link::GaslessMove {
+            request_id: id.into(),
+            amount_in_units: input,
+            amount_out_units: output,
+            typed_data: Value::Null,
+            api: "swap".into(),
+        }
+    }
+
+    #[test]
+    fn new_solana_account_cost_cannot_reduce_the_gift() {
+        let held = 1_060_000;
+        let base = payout(held, 1_034_000, "base");
+        let first_solana = payout(held, 824_500, "solana-account-setup");
+        let chosen = cheapest_payout(1_000_000, held, Some(base), Some(first_solana)).unwrap();
+        assert_eq!(chosen.request_id, "base");
+        assert_eq!(chosen.amount_out_units, 1_034_000);
+        // Even the generic Relay fee ceiling is not permission to eat principal.
+        assert!(
+            cheapest_payout(1_000_000, held, None, Some(payout(held, 824_500, "solana"))).is_err()
+        );
+    }
+
+    #[test]
+    fn the_cheapest_claim_returns_unused_reserve_and_pins_the_escrow_spend() {
+        let held = 1_060_000;
+        let chosen = cheapest_payout(
+            1_000_000,
+            held,
+            Some(payout(held, 1_035_000, "base")),
+            Some(payout(held, 1_039_000, "solana-existing-account")),
+        )
+        .unwrap();
+        assert_eq!(chosen.request_id, "solana-existing-account");
+        assert!(chosen.amount_out_units > 1_000_000);
+        assert!(cheapest_payout(
+            1_000_000,
+            held,
+            Some(payout(held + 1, 1_060_000, "wrong-spend")),
+            None
+        )
+        .is_err());
+        assert!(cheapest_payout(1_000_000, held, None, None).is_err());
+        assert!(cheapest_payout(1_000_000, held, Some(payout(held, 0, "empty")), None).is_err());
+    }
+
+    #[test]
+    fn same_guaranteed_payout_stays_on_base_and_sender_can_recover_partial_funding() {
+        let chosen = cheapest_payout(
+            1_000_000,
+            1_060_000,
+            Some(payout(1_060_000, 1_030_000, "base")),
+            Some(payout(1_060_000, 1_030_000, "solana")),
+        )
+        .unwrap();
+        assert_eq!(chosen.request_id, "base");
+        // A sender reclaim is allowed even if only part of the original gift arrived.
+        assert!(cheapest_payout(0, 40_000, Some(payout(40_000, 15_000, "recover")), None).is_ok());
     }
 
     #[test]

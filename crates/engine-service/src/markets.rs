@@ -987,6 +987,12 @@ struct CashMove {
     // Moved by Relay from Solana with a transaction the engine landed (`swap_id` is Relay's request).
     #[serde(default)]
     relay: bool,
+    // Newly prepared Solana funding deposits bind the exact message and its source wallet.
+    // Defaults keep already-pending intents from before this field readable.
+    #[serde(default)]
+    source_wallet: Option<String>,
+    #[serde(default)]
+    source_transaction: Option<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Authorization {
@@ -2939,6 +2945,8 @@ async fn move_to_solana(
                     api: quote.api,
                 }),
                 relay: true,
+                source_wallet: None,
+                source_transaction: None,
             },
             None,
         ));
@@ -2961,6 +2969,8 @@ async fn move_to_solana(
             tx_hash: None,
             authorization: None,
             relay: false,
+            source_wallet: None,
+            source_transaction: None,
         },
         Some((deposit.to, deposit.data)),
     ))
@@ -3603,14 +3613,61 @@ pub(super) async fn solana_transfer_fee_estimate(state: &AppState, to: &str) -> 
     }
 }
 
-// That rent in USD micros at SOL's live price (0 if the price is unavailable).
+// The direct Solana bank quote must include a fresh recipient's rent. Unknown SOL prices are
+// unavailable quotes, not a zero fee that would accidentally beat Relay.
+pub(super) async fn solana_bank_transfer_estimate(
+    state: &AppState,
+    owner: &str,
+    cash: u128,
+    amount: u128,
+) -> Option<u128> {
+    let (rent, sol) = tokio::join!(
+        account_rent_usd_checked(state),
+        state.solana_mainnet.owner_sol_balance(owner),
+    );
+    let rent = rent?;
+    let sol = sol.ok()?;
+    if sol >= NEW_ACCOUNT_FLOOR_LAMPORTS {
+        Some(rent)
+    } else if cash >= amount.saturating_add(KORA_FEE_GUESS_USDC.max(rent)) {
+        // Kora can repay its fee payer in USDC if a gasless top-up isn't available. The actual fee
+        // is checked against this quote before signing; it can never quietly expand the charge.
+        Some(rent.max(KORA_FEE_GUESS_USDC))
+    } else {
+        None
+    }
+}
+
+pub(super) async fn solana_transfer_fee_estimate_checked(
+    state: &AppState,
+    to: &str,
+) -> Result<u128, ApiError> {
+    match state.solana_mainnet.has_usdc_account(to).await {
+        Ok(true) => Ok(0),
+        Ok(false) => account_rent_usd_checked(state).await.ok_or_else(|| {
+            unavailable("Couldn't price this transfer's network fee. Try again shortly.")
+        }),
+        Err(error) => Err(unavailable(error)),
+    }
+}
+
+// That rent in USD micros at SOL's live price (0 for older callers when it is unavailable).
 pub(super) async fn account_rent_usd(state: &AppState) -> u128 {
-    let price = usd_prices(&state.markets, &[SOL_MINT.to_string()])
-        .await
-        .ok()
-        .and_then(|p| p.get(SOL_MINT).map(|(price, _)| *price))
-        .unwrap_or(0.0);
-    (ACCOUNT_RENT_LAMPORTS as f64 / 1e9 * price * 1e6).ceil() as u128
+    account_rent_usd_checked(state).await.unwrap_or(0)
+}
+
+async fn account_rent_usd_checked(state: &AppState) -> Option<u128> {
+    let mints = [SOL_MINT.to_string()];
+    let (prices, rent) = tokio::join!(
+        usd_prices(&state.markets, &mints),
+        state.solana_mainnet.usdc_account_rent_lamports(),
+    );
+    let price = prices.ok()?.get(SOL_MINT).map(|(price, _)| *price)?;
+    let rent = rent.ok()?;
+    if !price.is_finite() || price <= 0.0 {
+        return None;
+    }
+    Some((rent as f64 / 1e9 * price * 1e6).ceil() as u128)
 }
 
 // The Base gas tank, paid by the user, never by Atlas. At or above the floor the wallet pays its own
@@ -3832,8 +3889,27 @@ pub(super) async fn cash_for_base(
     cash_for_base_with(state, evm, solana, needed, currency, rate, false).await
 }
 
-// The same; with `refuel` the hop always happens and carries ETH for an empty gas tank on top.
-pub(super) async fn cash_for_base_with(
+// A reviewed cross-chain funding quote. Relay delivers the exact shortfall plus a cent,
+// avoiding Layerswap's $1 minimum and its retained cash cushion when Relay is available.
+struct BaseFundingQuote {
+    send: u128,
+    fee: u128,
+    relay: Option<engine_execution::relay_link::SolanaMove>,
+}
+
+fn relay_base_funding_amounts(held: u128, needed: u128, refuel: bool) -> (u128, u128) {
+    (
+        needed.saturating_sub(held).saturating_add(10_000),
+        if refuel { BASE_GAS_BY_RELAY_USDC } else { 0 },
+    )
+}
+
+fn base_funding_cost_fits(cash: u128, send: u128, source_fee_reserve: u128) -> bool {
+    send.checked_add(source_fee_reserve)
+        .is_some_and(|total| cash >= total)
+}
+
+async fn base_funding_quote(
     state: &AppState,
     evm: &str,
     solana: Option<&str>,
@@ -3841,7 +3917,7 @@ pub(super) async fn cash_for_base_with(
     currency: &str,
     rate: u128,
     refuel: bool,
-) -> Result<Option<(u128, u128)>, ApiError> {
+) -> Result<Option<BaseFundingQuote>, ApiError> {
     let base_cash = state
         .markets
         .base
@@ -3851,10 +3927,27 @@ pub(super) async fn cash_for_base_with(
     if base_cash >= needed && !refuel {
         return Ok(None);
     }
-    let sol_cash = match solana {
-        Some(owner) => solana_cash(state, owner).await,
-        None => 0,
-    };
+    // Quote the same destination refuel as the execution plan whenever Base cash is short.
+    // The quote must not be cheap merely because it omitted the gas the Base action needs.
+    let refuel = refuel || !wallet_pays_gas(state, evm).await;
+    let sol = solana.ok_or_else(short_of_cash)?;
+    let (sol_cash, source_reserve) =
+        tokio::join!(solana_cash(state, sol), solana_fee_reserve(state, sol),);
+    let (land, gas) = relay_base_funding_amounts(base_cash, needed, refuel);
+    if base_funding_cost_fits(sol_cash, land.saturating_add(gas), source_reserve) {
+        if let Ok(moved) = state.relay_link.solana_to_base(sol, evm, land, gas).await {
+            if moved.amount_out_units >= land
+                && base_funding_cost_fits(sol_cash, moved.amount_in_units, source_reserve)
+            {
+                return Ok(Some(BaseFundingQuote {
+                    send: moved.amount_in_units,
+                    fee: moved.amount_in_units.saturating_sub(land),
+                    relay: Some(moved),
+                }));
+            }
+        }
+    }
+    // A real fallback quote; the additional cash remains in the user's Base balance.
     let shortfall = needed.saturating_sub(base_cash).max(1_000_000);
     let fee = state
         .layerswap
@@ -3863,10 +3956,31 @@ pub(super) async fn cash_for_base_with(
         .map_err(|_| unavailable("Couldn't move cash from Solana right now; try again shortly"))?;
     let refuel_cost = if refuel { BASE_REFUEL_USDC } else { 0 };
     let send = shortfall + fee + shortfall / 100 + 50_000 + refuel_cost;
-    if sol_cash < send {
+    if !base_funding_cost_fits(sol_cash, send, source_reserve) {
         return Err(not_enough_cash(base_cash + sol_cash, currency, rate));
     }
-    Ok(Some((send, fee)))
+    Ok(Some(BaseFundingQuote {
+        send,
+        fee,
+        relay: None,
+    }))
+}
+
+// The same quote as confirmation uses. With refuel, the exact Relay move also carries ETH.
+pub(super) async fn cash_for_base_with(
+    state: &AppState,
+    evm: &str,
+    solana: Option<&str>,
+    needed: u128,
+    currency: &str,
+    rate: u128,
+    refuel: bool,
+) -> Result<Option<(u128, u128)>, ApiError> {
+    Ok(
+        base_funding_quote(state, evm, solana, needed, currency, rate, refuel)
+            .await?
+            .map(|quote| (quote.send, quote.fee)),
+    )
 }
 
 // Base USDC to send so at least `needed` is on Solana (see funding_for); None when Solana already
@@ -3900,8 +4014,8 @@ pub(super) async fn cash_for_solana(
 }
 
 // Plans Base transactions paid from the unified balance. With enough on Base they go out as they
-// are. Otherwise the plan is one Solana transaction moving the shortfall over (Layerswap) and the
-// Base transactions are sent once it lands (GET /v1/intents/{id}/next), still one confirm.
+// are. Otherwise one Solana transaction moves the shortfall through Relay (Layerswap fallback),
+// and the Base transactions follow once it lands (GET /v1/intents/{id}/next), still one confirm.
 // Returns the intent, what the app signs now, and the fee for moving cash (None when none moves).
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn plan_base_with_cash(
@@ -3947,10 +4061,10 @@ pub(super) async fn plan_base_with_cash(
         state.markets.save_intent(&intent_id, &intent).await?;
         return Ok((intent_id, steps, None));
     }
-    // Otherwise an empty tank gets ETH on a hop from Solana (Layerswap refuel). Atlas never pays gas:
+    // Otherwise an empty tank gets ETH on the same cash hop from Solana. Atlas never pays gas:
     // with neither, the user is asked for a little more.
     let refuel = !wallet_pays_gas(state, &evm).await;
-    let hop = match cash_for_base_with(
+    let hop = match base_funding_quote(
         state,
         &evm,
         solana.as_deref(),
@@ -3974,7 +4088,7 @@ pub(super) async fn plan_base_with_cash(
         }
         other => other?,
     };
-    let Some((send, fee)) = hop else {
+    let Some(funding_quote) = hop else {
         let transactions = as_base(&txs);
         let intent_id = state
             .markets
@@ -3987,13 +4101,47 @@ pub(super) async fn plan_base_with_cash(
         "Privy Solana wallet is not ready".into(),
     ))?;
     let intent_id = id("intent");
-    let deposit = state
-        .layerswap
-        .solana_to_base(&sol, &evm, send, &intent_id, refuel)
+    let send = funding_quote.send;
+    let fee = funding_quote.fee;
+    let (request, amount, transaction, relay) = if let Some(moved) = funding_quote.relay {
+        let transaction = state
+            .solana_mainnet
+            .v0_transaction(&sol, &moved.instructions, &moved.lookup_tables)
+            .await
+            .map_err(unavailable)?;
+        (moved.request_id, moved.amount_in_units, transaction, true)
+    } else {
+        let deposit = state
+            .layerswap
+            .solana_to_base(&sol, &evm, send, &intent_id, refuel)
+            .await
+            .map_err(unavailable)?;
+        (
+            deposit.swap_id,
+            deposit.amount_units,
+            deposit.transaction,
+            false,
+        )
+    };
+    // A low source gas tank must have a working top-up before any signable deposit is returned.
+    let source_sol = state
+        .solana_mainnet
+        .owner_sol_balance(&sol)
         .await
         .map_err(unavailable)?;
-    // The Solana deposit pays its own fee; a low wallet gets its tank topped up first.
-    let gas = gas_topup(state, &sol, send).await;
+    let gas = if source_sol < GAS_FLOOR_LAMPORTS {
+        let topup_units = topup_usdc_for(state, GAS_FLOOR_LAMPORTS - source_sol).await;
+        if !base_funding_cost_fits(solana_cash(state, &sol).await, amount, topup_units) {
+            return Err(short_of_cash());
+        }
+        Some(
+            gasless_topup_order(state, &sol, topup_units)
+                .await
+                .ok_or_else(|| unavailable(SOLANA_FEE_NOT_READY))?,
+        )
+    } else {
+        None
+    };
     state
         .markets
         .insert_intent(
@@ -4019,11 +4167,13 @@ pub(super) async fn plan_base_with_cash(
                 },
                 trade: None,
                 funding: Some(CashMove {
-                    swap_id: deposit.swap_id,
-                    amount_units: deposit.amount_units,
+                    swap_id: request,
+                    amount_units: amount,
                     tx_hash: None,
                     authorization: None,
-                    relay: false,
+                    relay,
+                    source_wallet: Some(sol.clone()),
+                    source_transaction: Some(transaction.clone()),
                 }),
                 buy_mint: None,
                 gas_request_id: gas.as_ref().map(|(id, _)| id.clone()),
@@ -4037,8 +4187,7 @@ pub(super) async fn plan_base_with_cash(
     if let Some((_, gas_tx)) = gas {
         transactions.push(json!({"chain":"solana","transaction":gas_tx,"submit":"engine"}));
     }
-    transactions
-        .push(json!({"chain":"solana","transaction":deposit.transaction,"submit":"engine"}));
+    transactions.push(json!({"chain":"solana","transaction":transaction,"submit":"engine"}));
     Ok((intent_id, transactions, Some(fee)))
 }
 
@@ -4253,6 +4402,8 @@ async fn execute_quote_inner(
             tx_hash: None,
             authorization: None,
             relay: true,
+            source_wallet: None,
+            source_transaction: None,
         });
         output = stored.output_units;
     } else if a.chain == "base" {
@@ -4758,6 +4909,54 @@ pub(super) async fn signed(
                 || body.signed[main].index != main
             {
                 return Err(bad("signed report does not match the transfer from Solana"));
+            }
+            let bound_signature = match current.funding.as_ref() {
+                Some(cash) => match (&cash.source_wallet, &cash.source_transaction) {
+                    (Some(wallet), Some(transaction)) => Some(
+                        engine_execution::solana::checked_swap_signature(
+                            transaction,
+                            &body.signed[main].transaction,
+                            wallet,
+                        )
+                        .map_err(|_| bad("signed funding transaction differs from your plan"))?,
+                    ),
+                    (None, None) => None, // Intents prepared before message binding existed.
+                    _ => return Err(bad("funding source binding is incomplete")),
+                },
+                None => None,
+            };
+            if let Some(signature) = bound_signature {
+                let from = current.status.stage.clone();
+                let mut updated = current;
+                updated.funding.as_mut().expect("funding").tx_hash = Some(signature.clone());
+                updated.status.tx_ids = vec![signature];
+                updated.status.stage = "fund".into();
+                // Keep the bridge request and exact source signature before any broadcast.
+                // Repeated confirmations cannot top up or fund the same action a second time.
+                if !state
+                    .markets
+                    .claim_execution_to(&intent_id, &updated, &from, "fund")
+                    .await?
+                {
+                    return Ok(Json(
+                        state
+                            .markets
+                            .get_intent(&intent_id)
+                            .await?
+                            .map_or(updated.status, |intent| intent.status),
+                    ));
+                }
+                run_gas_topup(&state, &updated, &body.signed).await;
+                // Submission may have succeeded despite a transport error. The durable Relay
+                // or Layerswap tracker resolves the known request instead of preparing again.
+                if let Err(error) = state
+                    .solana_mainnet
+                    .send_signed(&body.signed[main].transaction)
+                    .await
+                {
+                    eprintln!("intent {intent_id}: funding submission unresolved: {error}");
+                }
+                return Ok(Json(updated.status));
             }
             run_gas_topup(&state, &current, &body.signed).await;
             state
@@ -5722,6 +5921,59 @@ fn received_units(receipt: &Value, token: &str, wallet: &str) -> Option<u128> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shared_base_funding_bridges_only_the_shortfall() {
+        assert_eq!(
+            relay_base_funding_amounts(300_000, 436_095, false),
+            (146_095, 0)
+        );
+        assert_eq!(relay_base_funding_amounts(0, 50_000, false), (60_000, 0));
+        // A gas-only hop retains a cent of USDC, not the old $1 minimum plus cash cushion.
+        assert_eq!(
+            relay_base_funding_amounts(500_000, 400_000, true),
+            (10_000, BASE_GAS_BY_RELAY_USDC)
+        );
+    }
+
+    #[test]
+    fn shared_base_funding_reserves_source_fee_before_preparing_a_deposit() {
+        assert!(base_funding_cost_fits(522_006, 22_006, 500_000));
+        assert!(!base_funding_cost_fits(522_005, 22_006, 500_000));
+        assert!(!base_funding_cost_fits(u128::MAX, u128::MAX, 1));
+        assert!(base_funding_cost_fits(22_006, 22_006, 0));
+    }
+
+    #[test]
+    fn relay_funding_message_binding_survives_restart_and_legacy_intents_remain_readable() {
+        let bound = CashMove {
+            swap_id: "0xrequest".into(),
+            amount_units: 146_095,
+            tx_hash: None,
+            authorization: None,
+            relay: true,
+            source_wallet: Some("source-solana-wallet".into()),
+            source_transaction: Some("original-message".into()),
+        };
+        let saved = serde_json::to_value(&bound).unwrap();
+        let loaded: CashMove = serde_json::from_value(saved).unwrap();
+        assert!(loaded.relay);
+        assert_eq!(
+            loaded.source_wallet.as_deref(),
+            Some("source-solana-wallet")
+        );
+        assert_eq!(
+            loaded.source_transaction.as_deref(),
+            Some("original-message")
+        );
+        let old: CashMove = serde_json::from_value(serde_json::json!({
+            "swap_id":"legacy-layerswap", "amount_units":1_060_000, "tx_hash":null
+        }))
+        .unwrap();
+        assert!(!old.relay);
+        assert!(old.source_wallet.is_none());
+        assert!(old.source_transaction.is_none());
+    }
+
     use super::*;
     #[test]
     fn a_24_decimal_coin_prices_in_naira_without_overflowing() {
@@ -5828,6 +6080,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn base_funding_saves_the_source_signature_with_the_send_once_claim() {
+        let markets = MarketState::new().unwrap();
+        let mut intent = spot_intent("buy", 500_000, 4_000_000);
+        intent.chain = "base".into();
+        intent.status.stage = "validate".into();
+        intent.status.state = "pending".into();
+        intent.funding = Some(CashMove {
+            swap_id: "relay-request".into(),
+            amount_units: 550_000,
+            tx_hash: None,
+            authorization: None,
+            relay: true,
+            source_wallet: Some("source-wallet".into()),
+            source_transaction: Some("checked-source-message".into()),
+        });
+        markets
+            .insert_intent("base-funding", &intent)
+            .await
+            .unwrap();
+        let mut submitted = intent.clone();
+        submitted.status.stage = "fund".into();
+        submitted.status.tx_ids = vec!["source-signature".into()];
+        submitted.funding.as_mut().unwrap().tx_hash = Some("source-signature".into());
+        assert!(markets
+            .claim_execution_to("base-funding", &submitted, "validate", "fund")
+            .await
+            .unwrap());
+        assert!(!markets
+            .claim_execution_to("base-funding", &submitted, "validate", "fund")
+            .await
+            .unwrap());
+        let stored = markets.get_intent("base-funding").await.unwrap().unwrap();
+        assert_eq!(stored.status.stage, "fund");
+        assert_eq!(stored.status.tx_ids, vec!["source-signature"]);
+        let funding = stored.funding.unwrap();
+        assert!(funding.relay);
+        assert_eq!(funding.swap_id, "relay-request");
+        assert_eq!(funding.tx_hash.as_deref(), Some("source-signature"));
+        assert_eq!(funding.source_wallet.as_deref(), Some("source-wallet"));
+        assert_eq!(
+            funding.source_transaction.as_deref(),
+            Some("checked-source-message")
+        );
+    }
+
+    #[tokio::test]
     async fn user_paid_swap_saves_its_signature_with_the_send_once_claim() {
         let markets = MarketState::new().unwrap();
         let mut intent = spot_intent("buy", 500_000, 4_000_000);
@@ -5915,6 +6213,8 @@ mod tests {
             tx_hash: None,
             authorization: None,
             relay: false,
+            source_wallet: None,
+            source_transaction: None,
         });
         markets
             .insert_intent("intent-funded", &funded)
@@ -5944,6 +6244,8 @@ mod tests {
                 api: "swap".into(),
             }),
             relay: true,
+            source_wallet: None,
+            source_transaction: None,
         });
         markets
             .insert_intent("intent-gasless", &gasless)
