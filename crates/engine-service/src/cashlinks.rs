@@ -5,7 +5,9 @@
 //! authorization paying the escrow out through Relay to their Solana wallet, with no gas. The sender
 //! can take it back the same way, and after 30 days only the sender can.
 use super::*;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 pub(super) const LINK_DAYS: u64 = 30;
 // Funded on top of the amount: Relay's payout fee (about 3 cents) and its 0.5% price room, so the
@@ -36,6 +38,8 @@ pub(super) struct Link {
     pub(super) request_id: Option<String>,
     #[serde(default)]
     pub(super) claimer: Option<String>,
+    #[serde(default)]
+    pub(super) settled: bool,
 }
 
 #[derive(Clone)]
@@ -59,10 +63,25 @@ impl LinkStore {
                     escrow TEXT PRIMARY KEY,
                     owner TEXT NOT NULL,
                     state TEXT NOT NULL,
-                    payload TEXT NOT NULL
-                )",
+                    payload TEXT NOT NULL,
+                    short_code TEXT UNIQUE
+                );
+                ALTER TABLE atlas_cashlinks ADD COLUMN IF NOT EXISTS short_code TEXT;
+                CREATE UNIQUE INDEX IF NOT EXISTS atlas_cashlinks_short_code ON atlas_cashlinks(short_code)",
                 )
                 .await?;
+            // Older escrow-address links remain valid and gain the same short alias.
+            for row in client
+                .query(
+                    "SELECT escrow FROM atlas_cashlinks WHERE short_code IS NULL",
+                    &[],
+                )
+                .await?
+            {
+                let escrow: String = row.get(0);
+                client.execute("UPDATE atlas_cashlinks SET short_code=$2 WHERE escrow=$1 AND short_code IS NULL",
+                    &[&escrow, &short_code(&escrow)]).await?;
+            }
             Some(Arc::new(client))
         } else {
             None
@@ -73,12 +92,16 @@ impl LinkStore {
         })
     }
 
-    pub(super) async fn get(&self, escrow: &str) -> Result<Option<Link>, ApiError> {
+    pub(super) async fn get(&self, id: &str) -> Result<Option<Link>, ApiError> {
+        let escrow = escrow_id(id);
+        if escrow.is_none() && !valid_short_code(id) {
+            return Ok(None);
+        }
         if let Some(pg) = &self.postgres {
             let row = pg
                 .query_opt(
-                    "SELECT payload FROM atlas_cashlinks WHERE escrow=$1",
-                    &[&escrow],
+                    "SELECT payload FROM atlas_cashlinks WHERE escrow=$1 OR short_code=$2",
+                    &[&escrow.unwrap_or_default(), &id],
                 )
                 .await
                 .map_err(internal)?;
@@ -86,7 +109,14 @@ impl LinkStore {
                 .map(|r| serde_json::from_str(r.get::<_, &str>("payload")).map_err(internal))
                 .transpose();
         }
-        Ok(self.memory.lock().map_err(internal)?.get(escrow).cloned())
+        let memory = self.memory.lock().map_err(internal)?;
+        Ok(match escrow {
+            Some(escrow) => memory.get(&escrow).cloned(),
+            None => memory
+                .values()
+                .find(|link| short_code(&link.escrow) == id)
+                .cloned(),
+        })
     }
 
     // A new link; false if one already uses this escrow.
@@ -95,15 +125,19 @@ impl LinkStore {
         if let Some(pg) = &self.postgres {
             let added = pg
                 .execute(
-                    "INSERT INTO atlas_cashlinks (escrow, owner, state, payload) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING",
-                    &[&link.escrow, &link.owner, &link.state, &payload],
+                    "INSERT INTO atlas_cashlinks (escrow, owner, state, payload, short_code) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",
+                    &[&link.escrow, &link.owner, &link.state, &payload, &short_code(&link.escrow)],
                 )
                 .await
                 .map_err(internal)?;
             return Ok(added == 1);
         }
         let mut memory = self.memory.lock().map_err(internal)?;
-        if memory.contains_key(&link.escrow) {
+        if memory.contains_key(&link.escrow)
+            || memory
+                .values()
+                .any(|held| short_code(&held.escrow) == short_code(&link.escrow))
+        {
             return Ok(false);
         }
         memory.insert(link.escrow.clone(), link.clone());
@@ -111,13 +145,13 @@ impl LinkStore {
     }
 
     // Saves `link` only if it's still in state `from`: two claims racing, one wins.
-    pub(super) async fn transition(&self, from: &str, link: &Link) -> Result<bool, ApiError> {
+    pub(super) async fn transition(&self, from: &Link, link: &Link) -> Result<bool, ApiError> {
         let payload = serde_json::to_string(link).map_err(internal)?;
         if let Some(pg) = &self.postgres {
             let changed = pg
                 .execute(
-                    "UPDATE atlas_cashlinks SET state=$2, payload=$3 WHERE escrow=$1 AND state=$4",
-                    &[&link.escrow, &link.state, &payload, &from],
+                    "UPDATE atlas_cashlinks SET state=$2, payload=$3 WHERE escrow=$1 AND ('{\"claim_started_ms\":0,\"request_id\":null,\"claimer\":null,\"settled\":false}'::jsonb || payload::jsonb)=$4::text::jsonb",
+                    &[&link.escrow, &link.state, &payload, &serde_json::to_string(from).map_err(internal)?],
                 )
                 .await
                 .map_err(internal)?;
@@ -125,7 +159,7 @@ impl LinkStore {
         }
         let mut memory = self.memory.lock().map_err(internal)?;
         match memory.get(&link.escrow) {
-            Some(current) if current.state == from => {
+            Some(current) if current == from => {
                 memory.insert(link.escrow.clone(), link.clone());
                 Ok(true)
             }
@@ -147,6 +181,17 @@ pub(super) fn escrow_id(raw: &str) -> Option<String> {
     (hex.len() == 40 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then(|| format!("0x{hex}"))
 }
 
+pub(super) fn short_code(escrow: &str) -> String {
+    let hash = Sha256::digest(escrow.to_ascii_lowercase().as_bytes());
+    URL_SAFE_NO_PAD.encode(&hash[..9])
+}
+fn valid_short_code(id: &str) -> bool {
+    id.len() == 12
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 fn conflict(message: &str) -> ApiError {
     (StatusCode::CONFLICT, message.into())
 }
@@ -154,7 +199,9 @@ fn conflict(message: &str) -> ApiError {
 // What the claim page shows. Mid-claim reads as claimed so nobody tries twice.
 fn public_state(link: &Link, now: u64) -> &'static str {
     match link.state.as_str() {
-        "claimed" | "claiming" => "claimed",
+        "claiming" => "processing",
+        "claimed" if !link.settled => "processing",
+        "claimed" => "claimed",
         "cancelled" => "cancelled",
         _ if now >= link.expires_ms => "expired",
         _ => "open",
@@ -165,10 +212,9 @@ pub(super) async fn get(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let escrow = escrow_id(&id).ok_or((StatusCode::NOT_FOUND, "no such link".into()))?;
     let link = state
         .links
-        .get(&escrow)
+        .get(&id)
         .await?
         .ok_or((StatusCode::NOT_FOUND, "no such link".into()))?;
     let rate = app_balance::fx_rate(&link.currency).await?;
@@ -176,6 +222,8 @@ pub(super) async fn get(
     let micros = link.amount_units.saturating_mul(rate) / 1_000_000;
     Ok(Json(json!({
         "linkId":link.escrow,
+        "shortCode":short_code(&link.escrow),
+        "claimIntentId":link.request_id.as_ref().map(|_| format!("cashlink-{}", link.escrow)),
         "amount":{"amount":format!("{}.{:02}", micros / 1_000_000, micros % 1_000_000 / 10_000),
             "currency":link.currency},
         "sender":{"displayName":link.sender_name,"handle":link.sender_handle},
@@ -231,7 +279,17 @@ pub(super) async fn claim(
         .ok_or((StatusCode::NOT_FOUND, "no such link".into()))?;
     let now = now_ms();
     let sender = link.owner == user.user_id;
-    let stale_claim = link.state == "claiming" && now > link.claim_started_ms + CLAIM_STALE_MS;
+    // A lost acknowledgement follows the recorded Relay request, never a second payout.
+    if link.request_id.is_some() && link.claimer.as_deref() == Some(user.user_id.as_str()) {
+        return Ok(Json(status_of(
+            &link,
+            if link.settled { "filled" } else { "pending" },
+            None,
+        )));
+    }
+    let stale_claim = link.state == "claiming"
+        && link.request_id.is_none()
+        && now > link.claim_started_ms + CLAIM_STALE_MS;
     if link.state != "open" && !stale_claim {
         return Err(conflict(if link.state == "cancelled" {
             "The sender took this link back."
@@ -264,7 +322,10 @@ pub(super) async fn claim(
     let mut claiming = link.clone();
     claiming.state = "claiming".into();
     claiming.claim_started_ms = now;
-    if !state.links.transition(&link.state, &claiming).await? {
+    claiming.request_id = Some(payout.request_id.clone());
+    claiming.claimer = Some(user.user_id.clone());
+    claiming.settled = false;
+    if !state.links.transition(&link, &claiming).await? {
         return Err(conflict("This link is already being claimed."));
     }
     let undo = |reason: String| {
@@ -274,7 +335,7 @@ pub(super) async fn claim(
             eprintln!("link {}: claim stopped: {reason}", link.escrow);
             let mut open = link;
             open.state = "open".into();
-            let _ = state.links.transition(&claiming.state, &open).await;
+            let _ = state.links.transition(&claiming, &open).await;
         }
     };
     let signature = match sign_payout(&state, &headers, &body.secret, &payout.typed_data).await {
@@ -292,14 +353,19 @@ pub(super) async fn claim(
         .submit(&payout.request_id, &payout.api, &signature)
         .await
     {
-        undo(error.to_string()).await;
-        return Err(conflict("Couldn't claim right now. Try again shortly."));
+        // The provider may have accepted before the connection broke. Keep its exact request
+        // for status recovery instead of reopening the escrow and creating another payout.
+        eprintln!(
+            "link {}: payout acknowledgement unavailable: {error}",
+            link.escrow
+        );
+        return Ok(Json(status_of(&claiming, "pending", None)));
     }
     let mut done = claiming.clone();
     done.state = if sender { "cancelled" } else { "claimed" }.into();
     done.request_id = Some(payout.request_id);
     done.claimer = Some(user.user_id);
-    state.links.transition("claiming", &done).await?;
+    state.links.transition(&claiming, &done).await?;
     Ok(Json(status_of(&done, "pending", None)))
 }
 
@@ -358,14 +424,26 @@ pub(super) async fn status(
         return Ok(Json(status_of(&link, "pending", None)));
     };
     Ok(Json(match state.relay_link.state(&request).await {
-        Ok(engine_execution::layerswap::SwapState::Completed) => status_of(&link, "filled", None),
+        Ok(engine_execution::layerswap::SwapState::Completed) => {
+            let mut done = link.clone();
+            done.settled = true;
+            done.state = if done.claimer.as_deref() == Some(done.owner.as_str()) {
+                "cancelled"
+            } else {
+                "claimed"
+            }
+            .into();
+            let _ = state.links.transition(&link, &done).await?;
+            status_of(&done, "filled", None)
+        }
         Ok(engine_execution::layerswap::SwapState::Failed(_)) => {
             // Relay returns the money to the escrow: the link can be claimed again.
             let mut open = link.clone();
             open.state = "open".into();
             open.request_id = None;
             open.claimer = None;
-            let _ = state.links.transition(&link.state, &open).await;
+            open.settled = false;
+            let _ = state.links.transition(&link, &open).await;
             status_of(
                 &link,
                 "failed",
@@ -398,6 +476,7 @@ mod tests {
             claim_started_ms: 0,
             request_id: None,
             claimer: None,
+            settled: false,
         }
     }
 
@@ -419,8 +498,11 @@ mod tests {
     fn the_claim_page_sees_one_simple_state() {
         assert_eq!(public_state(&link("open", 10), 5), "open");
         assert_eq!(public_state(&link("open", 10), 10), "expired");
-        assert_eq!(public_state(&link("claiming", 10), 5), "claimed");
-        assert_eq!(public_state(&link("claimed", 10), 50), "claimed");
+        assert_eq!(public_state(&link("claiming", 10), 5), "processing");
+        assert_eq!(public_state(&link("claimed", 10), 50), "processing");
+        let mut done = link("claimed", 10);
+        done.settled = true;
+        assert_eq!(public_state(&done, 50), "claimed");
         assert_eq!(public_state(&link("cancelled", 10), 5), "cancelled");
     }
 
@@ -433,10 +515,23 @@ mod tests {
         let open = link("open", u64::MAX);
         assert!(store.insert(&open).await.unwrap());
         assert!(!store.insert(&open).await.unwrap());
+        // New short invitations and old full-address links resolve the same funded escrow.
+        assert_eq!(short_code(&open.escrow), "qKMtQ_AlrWjl");
+        assert_eq!(
+            store.get(&short_code(&open.escrow)).await.unwrap(),
+            Some(open.clone())
+        );
+        assert_eq!(
+            store
+                .get(&open.escrow.to_uppercase().replacen("0X", "0x", 1))
+                .await
+                .unwrap(),
+            Some(open.clone())
+        );
         let mut claiming = open.clone();
         claiming.state = "claiming".into();
-        assert!(store.transition("open", &claiming).await.unwrap());
-        assert!(!store.transition("open", &claiming).await.unwrap());
+        assert!(store.transition(&open, &claiming).await.unwrap());
+        assert!(!store.transition(&open, &claiming).await.unwrap());
         let back: Link = serde_json::from_str(&serde_json::to_string(&claiming).unwrap()).unwrap();
         assert_eq!(store.get(&open.escrow).await.unwrap(), Some(back));
     }

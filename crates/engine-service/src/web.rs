@@ -15,8 +15,75 @@ fn root() -> PathBuf {
 }
 
 // GET /claim/{id}: the claim page (the link's id and secret are read by the page itself).
-pub(super) async fn claim() -> Response {
-    file("claim/[linkId].html").await
+pub(super) async fn claim(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let handle = id.strip_prefix('@').filter(|handle| {
+        (3..=20).contains(&handle.len())
+            && handle
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    });
+    let (title, description, url): (String, String, String) = if let Some(handle) = handle {
+        (
+            format!("@{handle} invites you to Atlas"),
+            "One balance for stocks, memes and crypto. Join your friends on Atlas.".into(),
+            format!("https://justatlas.xyz/invite/@{handle}"),
+        )
+    } else if let Ok(Some(link)) = state.links.get(&id).await {
+        let sender = link
+            .sender_handle
+            .map(|handle| format!("@{handle}"))
+            .or(link.sender_name)
+            .unwrap_or_else(|| "Your friend".into());
+        (format!("{sender} invites you to Atlas"), "A money gift is waiting for you. Open the full private link, sign in and claim it securely.".into(),
+            format!("https://justatlas.xyz/invite/{}", cashlinks::short_code(&link.escrow)))
+    } else {
+        (
+            "You've been invited to Atlas".into(),
+            "Open your private invitation to receive money with Atlas.".into(),
+            "https://justatlas.xyz".into(),
+        )
+    };
+    // This handler serves both old /claim/address and new /invite/code URLs.
+    let relative = if id.starts_with('@') || !id.starts_with("0x") {
+        "invite/[code].html"
+    } else {
+        "claim/[linkId].html"
+    };
+    let mut response = page_with_metadata(relative, &title, &description, &url).await;
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    response
+        .headers_mut()
+        .insert("referrer-policy", "no-referrer".parse().unwrap());
+    response
+        .headers_mut()
+        .insert("x-robots-tag", "noindex, nofollow".parse().unwrap());
+    response
+}
+
+pub(super) async fn page_with_metadata(
+    relative: &str,
+    title: &str,
+    description: &str,
+    url: &str,
+) -> Response {
+    let response = file(relative).await;
+    if response.status() != StatusCode::OK {
+        return response;
+    }
+    let (parts, body) = response.into_parts();
+    let Ok(body) = axum::body::to_bytes(body, 4 * 1024 * 1024).await else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Ok(mut html) = String::from_utf8(body.to_vec()) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    html = asset_share::social_metadata(&html, title, description, url);
+    Response::from_parts(parts, axum::body::Body::from(html))
 }
 // GET /: the web app's home, where "Open Atlas" lands after a claim.
 pub(super) async fn index() -> Response {
@@ -66,6 +133,7 @@ fn page_file(path: &str) -> Option<&'static str> {
                 ["transaction", id] if valid_id(id) => Some("transaction/[id].html"),
                 ["mini", id] if valid_id(id) => Some("mini/[appId].html"),
                 ["claim", id] if valid_id(id) => Some("claim/[linkId].html"),
+                ["invite", id] if valid_id(id) => Some("invite/[code].html"),
                 _ => None,
             }
         }
@@ -154,6 +222,10 @@ mod tests {
         );
         assert_eq!(page_file("/transaction/123"), Some("transaction/[id].html"));
         assert_eq!(page_file("/claim/123"), Some("claim/[linkId].html"));
+        assert_eq!(
+            page_file("/invite/7Ab23_example"),
+            Some("invite/[code].html")
+        );
         for path in [
             "/v1/me",
             "/v1/intents/123",

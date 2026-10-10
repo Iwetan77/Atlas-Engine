@@ -751,8 +751,16 @@ pub(super) async fn send_quote(
     let send = money_usdc(usdc_units + network_units, &req.amount.currency, rate)?;
     let receive = money_usdc(gift_units, &req.amount.currency, rate)?;
     let fee = money_usdc(fee_units + network_units, &req.amount.currency, rate)?;
+    let mut breakdown = Vec::new();
+    if fee_units > 0 {
+        breakdown.push(json!({"label":"Claim delivery reserve","amount":money_usdc(fee_units, &req.amount.currency, rate)?}));
+    }
+    if network_units > 0 {
+        breakdown.push(json!({"label":"Network delivery","amount":money_usdc(network_units, &req.amount.currency, rate)?}));
+    }
     Ok(Json(
-        json!({"quoteId":quote_id,"destinationLabel":label,"send":send,"receive":receive,"fee":fee,"eta":"After confirmation","expiresAtUnixMs":expires}),
+        json!({"quoteId":quote_id,"destinationLabel":label,"send":send,"receive":receive,"fee":fee,
+            "feeBreakdown":breakdown,"eta":"After confirmation","expiresAtUnixMs":expires}),
     ))
 }
 async fn execute_send_inner(
@@ -905,6 +913,7 @@ async fn execute_send_inner(
                 claim_started_ms: 0,
                 request_id: None,
                 claimer: None,
+                settled: false,
             })
             .await?;
         if !recorded {
@@ -936,7 +945,7 @@ async fn execute_send_inner(
     if let Some((_, note, gift)) = &quote.link {
         summary[1] =
             json!({"label":"They get","value":markets::say_money(*gift,&quote.currency,rate)});
-        summary.push(json!({"label":"Claim fee","value":markets::say_money(cashlinks::CLAIM_FEE_UNITS,&quote.currency,rate)}));
+        summary.push(json!({"label":"Claim delivery reserve","value":markets::say_money(cashlinks::CLAIM_FEE_UNITS,&quote.currency,rate)}));
         if let Some(note) = note {
             summary.push(json!({"label":"Note","value":note}));
         }
