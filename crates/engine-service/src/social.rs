@@ -1010,6 +1010,7 @@ async fn bank_plan(
     get: u128,
     fee: u128,
 ) -> Result<(Value, String, u64), ApiError> {
+    let started = Instant::now();
     let rate = app_balance::fx_rate(&quote.currency).await?;
     let mut route = quote
         .bank_route
@@ -1116,7 +1117,11 @@ async fn bank_plan(
         json!({"label":"Rate","value":all_in_rate(get.saturating_add(total_fee), quote.usdc_units.saturating_add(network))}),
         json!({"label":"Bank payout","value":"Waiting for your USDC"}),
     ]);
-    eprintln!("bank withdrawal {quote_id}: route={route:?} quoted_network_usdc={} prepared_network_usdc={network}", quote.network_units);
+    eprintln!(
+        "bank withdrawal {quote_id}: route={route:?} quoted_network_usdc={} prepared_network_usdc={network} prepared_in_ms={}",
+        quote.network_units,
+        started.elapsed().as_millis()
+    );
     let plan = json!({"intentId":intent_id,"kind":"send","summary":summary,"transactions":transactions,"expiresAtUnixMs":now()+120_000});
     Ok((plan, funding_account, expires))
 }
