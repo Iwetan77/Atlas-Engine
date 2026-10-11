@@ -56,75 +56,49 @@ struct SendQuote {
     link: Option<(String, Option<String>, u128)>,
     // A bank withdrawal through Daya: where, the naira the bank gets, and Daya's fee on top.
     bank: Option<(daya::Payout, u128, u128)>,
-    // The network fee the quote showed (USDC units), in its Fee and total.
+    // Additional USDC charged for delivery, separately from the bank payout fee.
     network_units: u128,
     // Bank confirmations keep the costed route, rather than assuming a new bridge unconditionally.
     bank_route: Option<BankRoute>,
 }
-// Keep USDC on the chain that already holds enough of it. For Solana-funded bank payouts,
-// compare direct transfer rent/fees with a live Relay quote; avoid a bridge when direct is cheaper.
+// Keep cash on its current chain. A Solana-funded payout goes straight to Daya on Solana;
+// only a balance split across chains needs the existing consolidation route.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum BankRoute {
     Base,
-    Relay,
     Solana,
     Hop,
 }
 
-fn cheapest_solana_bank_route(
-    relay_fee: Option<u128>,
-    direct_fee: Option<u128>,
-) -> Option<(BankRoute, u128)> {
-    match (relay_fee, direct_fee) {
-        (Some(relay), Some(direct)) if direct <= relay => Some((BankRoute::Solana, direct)),
-        (Some(relay), _) => Some((BankRoute::Relay, relay)),
-        (_, Some(direct)) => Some((BankRoute::Solana, direct)),
-        _ => None,
+fn same_chain_bank_route(base_cash: u128, solana_cash: u128, amount: u128) -> BankRoute {
+    if base_cash >= amount {
+        BankRoute::Base
+    } else if solana_cash >= amount {
+        BankRoute::Solana
+    } else {
+        BankRoute::Hop
     }
 }
 
-// Relay charges a little more to pay an address that has never held USDC (its balance is new on
-// Base), and every Daya payout address is new. So the quote is priced to a never-used address, with
-// a fraction of a cent for Base gas moving before confirmation: the confirmation never finds the
-// delivery dearer than the quote showed, and the receipt shows what it actually cost.
-const RELAY_GAS_CUSHION_USDC: u128 = 2_000;
-fn unused_base_address() -> String {
-    let bytes: [u8; 20] = rand::random();
-    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    format!("0x{hex}")
-}
-
-// Daya issues the exact deposit address at confirmation. Before then, direct Solana is costed as
-// a fresh ATA, never as a zero-fee transfer to an account whose existence we haven't checked.
 async fn bank_route(
     state: &AppState,
     solana: Option<&str>,
     usdc: u128,
     base_cash: u128,
-) -> (BankRoute, u128) {
+) -> Result<(BankRoute, u128), ApiError> {
     if base_cash >= usdc {
-        return (BankRoute::Base, 0);
+        return Ok((BankRoute::Base, 0));
     }
     if let Some(from) = solana {
         let cash = markets::solana_cash(state, from).await;
-        if cash >= usdc {
-            let payout_address = unused_base_address();
-            let (relayed, direct) = tokio::join!(
-                state
-                    .relay_link
-                    .solana_to_base(from, &payout_address, usdc, 0),
-                markets::solana_bank_transfer_estimate(state, from, cash, usdc),
-            );
-            let relay_fee = relayed
-                .ok()
-                .filter(|moved| cash >= moved.amount_in_units)
-                .map(|moved| moved.amount_in_units.saturating_sub(usdc) + RELAY_GAS_CUSHION_USDC);
-            if let Some(route) = cheapest_solana_bank_route(relay_fee, direct) {
-                return route;
-            }
+        if same_chain_bank_route(base_cash, cash, usdc) == BankRoute::Solana {
+            let network = markets::solana_bank_transfer_estimate(state, from, cash, usdc)
+                .await?
+                .ok_or_else(|| bad("Not enough USDC for this transfer and its network fee."))?;
+            return Ok((BankRoute::Solana, network));
         }
     }
-    (BankRoute::Hop, 0)
+    Ok((BankRoute::Hop, 0))
 }
 
 fn checked_bank_network_fee(quoted: u128, actual: u128) -> Result<(), ApiError> {
@@ -713,12 +687,12 @@ pub(super) async fn send_quote(
         .unwrap_or(0);
     // Daya takes USDC on Solana as well as Base.
     let route = match bank {
-        Some(_) => Some(bank_route(&state, solana.as_deref(), usdc_units, base_cash).await),
+        Some(_) => Some(bank_route(&state, solana.as_deref(), usdc_units, base_cash).await?),
         None => None,
     };
     let solana_covers = match (&solana, &recipient_solana) {
         (Some(from), Some(_)) => markets::solana_cash(&state, from).await >= usdc_units,
-        (Some(_), None) => matches!(route, Some((BankRoute::Relay | BankRoute::Solana, _))),
+        (Some(_), None) => matches!(route, Some((BankRoute::Solana, _))),
         _ => false,
     };
     let mut hop_fee = 0;
@@ -780,15 +754,15 @@ pub(super) async fn send_quote(
             bank_route: route.map(|(route, _)| route),
         },
     );
-    // The bank gets the amount requested. One Fee holds everything on top of it: Daya's payout fee
-    // and the delivery; never hidden inside an unexplained exchange-rate change.
+    // Fee is Daya's bank payout charge. Only a new USDC debit appears as Network fee;
+    // rent or transaction fees paid from the existing SOL reserve add no USDC charge.
     if let Some((_, _, fee)) = bank {
         let network_ngn = bank_network_naira(network_units, rate);
         let total_fee = fee.saturating_add(network_ngn);
         let naira = |micros: u128| money_usdc(micros, "NGN", 1_000_000);
         return Ok(Json(json!({"quoteId":quote_id,"destinationLabel":label,
                 "send":naira(amount.saturating_add(total_fee))?,"receive":naira(amount)?,
-                "fee":naira(total_fee)?,"feeBreakdown":[],
+                "fee":naira(fee)?,"networkFee":naira(network_ngn)?,"feeBreakdown":[],
                 "eta":"Usually within minutes","expiresAtUnixMs":expires})));
     }
     // The network fee goes on top: in Fee and "You pay" here, as on the confirmation.
@@ -1018,66 +992,34 @@ async fn bank_plan(
     fee: u128,
 ) -> Result<(Value, String, u64), ApiError> {
     let rate = app_balance::fx_rate(&quote.currency).await?;
-    let mut route = quote
+    let route = quote
         .bank_route
         .ok_or_else(|| bad("bank route was not quoted"))?;
-    if quote.sender_solana.is_none() && matches!(route, BankRoute::Relay | BankRoute::Solana) {
+    if quote.sender_solana.is_none() && route == BankRoute::Solana {
         return Err((
             StatusCode::CONFLICT,
             "The wallet changed. Check a fresh quote.".into(),
         ));
     }
-    // Relay pays a Base payout address; only a direct Solana transfer needs a Solana one.
     let chain = if route == BankRoute::Solana {
         "SOLANA"
     } else {
         "BASE"
     };
-    let (mut funding_account, mut address, mut expires) = state
+    let (funding_account, address, expires) = state
         .daya
         .open_payout(user, payout, chain, &format!("atlas-{quote_id}"))
         .await?;
-    let mut relayed = None;
-    if route == BankRoute::Relay {
-        let from = quote.sender_solana.clone().unwrap_or_default();
-        match markets::plan_solana_relay(
-            state,
-            user.user_id.clone(),
-            from,
-            &address,
-            quote.usdc_units,
-        )
-        .await
-        {
-            Ok(plan) => relayed = Some(plan),
-            // Relay (or the fee step) didn't answer: pay a Solana payout address directly instead.
-            Err((_, reason)) => {
-                eprintln!(
-                    "bank withdrawal {quote_id}: Relay unavailable ({reason}); paying on Solana"
-                );
-                (funding_account, address, expires) = state
-                    .daya
-                    .open_payout(user, payout, "SOLANA", &format!("atlas-{quote_id}-sol"))
-                    .await?;
-                let direct = markets::solana_transfer_fee_estimate_checked(state, &address).await?;
-                checked_bank_network_fee(quote.network_units, direct)?;
-                route = BankRoute::Solana;
-            }
-        }
-    }
     let (intent_id, transactions, network_fee) = match (&quote.sender_solana, route) {
-        _ if relayed.is_some() => {
-            let (intent_id, transactions, network) = relayed.expect("relayed");
-            (intent_id, transactions, Some(network))
-        }
         (Some(from), BankRoute::Solana) => {
-            let (intent_id, transactions, network) = markets::plan_solana_transfer(
+            let (intent_id, transactions, network) = markets::plan_solana_bank_transfer(
                 state,
                 user.user_id.clone(),
                 from.clone(),
                 &address,
                 quote.usdc_units,
-                true,
+                quote.network_units,
+                rate,
             )
             .await?;
             (intent_id, transactions, Some(network))
@@ -1102,18 +1044,19 @@ async fn bank_plan(
         }
     };
     let network = network_fee.unwrap_or(0);
-    // A quote's route can become more expensive, including Kora rent or a failed bridge fallback.
-    // Reject it before the phone receives anything to sign; a fresh quote needs a fresh review.
+    // A reserve can change between quoting and confirmation. Never give the phone a plan
+    // that spends more USDC for its network fee than the person reviewed.
     checked_bank_network_fee(quote.network_units, network)?;
     let network_ngn = bank_network_naira(network, rate);
     let total_fee = fee.saturating_add(network_ngn);
-    // One Fee: Daya's payout fee and the delivery as it was actually prepared.
+    // Keep the bank charge separate from any fresh USDC spent to fund the network.
     let summary = vec![
         json!({"label":"Send to","value":quote.label}),
         json!({"label":"Bank gets","value":markets::say_micros(get, "NGN")}),
-        json!({"label":"Fee","value":markets::say_micros(total_fee, "NGN")}),
+        json!({"label":"Fee","value":markets::say_micros(fee, "NGN")}),
+        json!({"label":"Network fee","value":if network == 0 { "Free".into() } else { markets::say_micros(network_ngn, "NGN") }}),
         json!({"label":"You pay","value":markets::say_micros(get.saturating_add(total_fee), "NGN")}),
-        json!({"label":"Rate","value":all_in_rate(get.saturating_add(total_fee), quote.usdc_units.saturating_add(network))}),
+        json!({"label":"Rate","value":all_in_rate(get.saturating_add(fee), quote.usdc_units)}),
         json!({"label":"Bank payout","value":"Waiting for your USDC"}),
     ];
     eprintln!("bank withdrawal {quote_id}: route={route:?} quoted_network_usdc={} prepared_network_usdc={network}", quote.network_units);
@@ -1135,50 +1078,23 @@ fn near(quoted: u128, actual: u128) -> bool {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn same_chain_bank_delivery_wins_when_cheaper_or_equal() {
+    fn funded_solana_bank_sends_do_not_bridge_to_base() {
         assert_eq!(
-            cheapest_solana_bank_route(Some(30_000), Some(5_000)),
-            Some((BankRoute::Solana, 5_000))
+            same_chain_bank_route(0, 1_500_000, 1_100_000),
+            BankRoute::Solana
         );
         assert_eq!(
-            cheapest_solana_bank_route(Some(30_000), Some(30_000)),
-            Some((BankRoute::Solana, 30_000))
-        );
-    }
-
-    #[test]
-    fn fresh_solana_recipient_rent_is_compared_with_bridge_cost() {
-        assert_eq!(
-            cheapest_solana_bank_route(Some(22_006), Some(300_000)),
-            Some((BankRoute::Relay, 22_006))
+            same_chain_bank_route(700_000, 1_500_000, 1_100_000),
+            BankRoute::Solana
         );
         assert_eq!(
-            cheapest_solana_bank_route(Some(300_000), Some(22_006)),
-            Some((BankRoute::Solana, 22_006))
-        );
-    }
-
-    #[test]
-    fn missing_direct_price_cannot_beat_a_valid_relay_quote() {
-        assert_eq!(
-            cheapest_solana_bank_route(Some(22_006), None),
-            Some((BankRoute::Relay, 22_006))
+            same_chain_bank_route(1_500_000, 1_500_000, 1_100_000),
+            BankRoute::Base
         );
         assert_eq!(
-            cheapest_solana_bank_route(None, Some(300_000)),
-            Some((BankRoute::Solana, 300_000))
+            same_chain_bank_route(700_000, 700_000, 1_100_000),
+            BankRoute::Hop
         );
-        assert_eq!(cheapest_solana_bank_route(None, None), None);
-    }
-
-    #[test]
-    fn bank_relay_quotes_price_a_never_used_payout_address() {
-        let (a, b) = (unused_base_address(), unused_base_address());
-        assert!(markets::looks_like_evm_address(&a));
-        assert_ne!(a, b);
-        // Relay's live fee to a new address was 343 units above a funded one (6.83 USDC, Oct 10);
-        // the quote is priced to a new address, and the cushion covers Base gas moving after it.
-        assert!(checked_bank_network_fee(22_895 + RELAY_GAS_CUSHION_USDC, 22_895 + 1_500).is_ok());
     }
 
     #[test]
@@ -1191,7 +1107,7 @@ mod tests {
     }
 
     #[test]
-    fn bank_network_delivery_is_in_total_fee_not_hidden_in_rate() {
+    fn bank_network_charge_is_added_once_to_the_total() {
         let delivery = bank_network_naira(22_006, 1_560_000_000);
         assert_eq!(delivery, 34_329_360); // ₦34.32936 at ₦1,560 per USDC.
         assert_eq!(707_000_000_u128 + delivery, 741_329_360);
@@ -1199,7 +1115,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cash_outs_network_cost_lives_in_its_rate() {
+    fn provider_rate_is_distinct_from_network_cash_charge() {
         // ₦700 to the bank + ₦7 Daya fee = 0.453205 USDC at ₦1,560; Relay adds 0.022006.
         assert_eq!(super::all_in_rate(707_000_000, 475_211), "₦1,487.76 per $1");
         // Cash already on Base: nothing to move, so it's Daya's own rate.

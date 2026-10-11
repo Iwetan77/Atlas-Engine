@@ -120,6 +120,30 @@ impl Receipt {
             None => self.summary.push(line),
         }
     }
+    // A refreshed bank signing can cost less; keep its receipt total consistent with the new step.
+    pub(super) fn set_bank_network_fee(&mut self, usdc: u128, rate: u128) {
+        let ngn = usdc.saturating_mul(rate).div_ceil(1_000_000);
+        let amount = |label| {
+            self.line(label)
+                .and_then(|v| v.strip_prefix('₦'))
+                .and_then(|v| markets::parse_micros(&v.replace(',', "")).ok())
+        };
+        if let (Some(get), Some(fee)) = (amount("Bank gets"), amount("Fee")) {
+            self.set_line(
+                "Network fee",
+                if usdc == 0 {
+                    "Free".into()
+                } else {
+                    markets::say_micros(ngn, "NGN")
+                },
+            );
+            self.set_line(
+                "You pay",
+                markets::say_micros(get.saturating_add(fee).saturating_add(ngn), "NGN"),
+            );
+        }
+    }
+
     pub(super) fn add_tx(&mut self, tx: String) {
         if !self.tx_ids.contains(&tx) {
             self.tx_ids.push(tx);
@@ -815,6 +839,31 @@ fn internal(_: impl std::fmt::Display) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bank_receipt_keeps_payout_fee_separate_and_updates_network_cost_once() {
+        let mut r = Receipt::plan(
+            "owner",
+            &json!({
+                "intentId":"bank", "kind":"send", "summary":[
+                    {"label":"Bank gets","value":"₦200.00"},
+                    {"label":"Fee","value":"₦20.00"},
+                    {"label":"Network fee","value":"₦700.00"},
+                    {"label":"You pay","value":"₦920.00"}
+                ]
+            }),
+        );
+        r.set_bank_network_fee(0, 1_500_000_000);
+        assert_eq!(r.line("Fee"), Some("₦20.00"));
+        assert_eq!(r.line("Network fee"), Some("Free"));
+        assert_eq!(r.line("You pay"), Some("₦220.00"));
+        r.set_bank_network_fee(20_000, 1_500_000_000);
+        assert_eq!(r.line("Fee"), Some("₦20.00"));
+        assert_eq!(r.line("Network fee"), Some("₦30.00"));
+        assert_eq!(r.line("You pay"), Some("₦250.00"));
+        r.set_bank_network_fee(20_000, 1_500_000_000);
+        assert_eq!(r.line("You pay"), Some("₦250.00"));
+    }
 
     #[test]
     fn a_bank_cash_out_shows_the_naira_the_bank_got_and_waits_for_the_bank() {
