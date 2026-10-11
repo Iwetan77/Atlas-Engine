@@ -70,33 +70,49 @@ enum BankRoute {
     Hop,
 }
 
-fn same_chain_bank_route(base_cash: u128, solana_cash: u128, amount: u128) -> BankRoute {
-    if base_cash >= amount {
-        BankRoute::Base
-    } else if solana_cash >= amount {
-        BankRoute::Solana
-    } else {
-        BankRoute::Hop
+fn same_chain_bank_route(
+    base_fee: Option<u128>,
+    solana_fee: Option<u128>,
+) -> Option<(BankRoute, u128)> {
+    match (base_fee, solana_fee) {
+        (Some(base), Some(solana)) if solana < base => Some((BankRoute::Solana, solana)),
+        (Some(base), _) => Some((BankRoute::Base, base)),
+        (_, Some(solana)) => Some((BankRoute::Solana, solana)),
+        _ => None,
     }
 }
 
 async fn bank_route(
     state: &AppState,
+    evm: &str,
     solana: Option<&str>,
     usdc: u128,
     base_cash: u128,
 ) -> Result<(BankRoute, u128), ApiError> {
-    if base_cash >= usdc {
+    let base_fee = if base_cash >= usdc {
+        markets::base_bank_transfer_estimate(state, evm, base_cash, usdc).await?
+    } else {
+        None
+    };
+    if base_fee == Some(0) {
         return Ok((BankRoute::Base, 0));
     }
+    let mut fully_funded = base_cash >= usdc;
+    let mut solana_fee = None;
     if let Some(from) = solana {
         let cash = markets::solana_cash(state, from).await;
-        if same_chain_bank_route(base_cash, cash, usdc) == BankRoute::Solana {
-            let network = markets::solana_bank_transfer_estimate(state, from, cash, usdc)
-                .await?
-                .ok_or_else(|| bad("Not enough USDC for this transfer and its network fee."))?;
-            return Ok((BankRoute::Solana, network));
+        if cash >= usdc {
+            fully_funded = true;
+            solana_fee = markets::solana_bank_transfer_estimate(state, from, cash, usdc).await?;
         }
+    }
+    if let Some(route) = same_chain_bank_route(base_fee, solana_fee) {
+        return Ok(route);
+    }
+    if fully_funded {
+        return Err(bad(
+            "Not enough USDC for this transfer and its network fee.",
+        ));
     }
     Ok((BankRoute::Hop, 0))
 }
@@ -687,7 +703,9 @@ pub(super) async fn send_quote(
         .unwrap_or(0);
     // Daya takes USDC on Solana as well as Base.
     let route = match bank {
-        Some(_) => Some(bank_route(&state, solana.as_deref(), usdc_units, base_cash).await?),
+        Some(_) => {
+            Some(bank_route(&state, &wallet, solana.as_deref(), usdc_units, base_cash).await?)
+        }
         None => None,
     };
     let solana_covers = match (&solana, &recipient_solana) {
@@ -697,17 +715,33 @@ pub(super) async fn send_quote(
     };
     let mut hop_fee = 0;
     if base_cash < usdc_units && !solana_covers {
-        if let Some((_, fee)) = markets::cash_for_base(
-            &state,
-            &wallet,
-            solana.as_deref(),
-            usdc_units,
-            &req.amount.currency,
-            rate,
-        )
-        .await?
-        {
+        let funding = if bank.is_some() {
+            markets::cash_for_bank_base(
+                &state,
+                &wallet,
+                solana.as_deref(),
+                usdc_units,
+                &req.amount.currency,
+                rate,
+            )
+            .await?
+        } else {
+            markets::cash_for_base(
+                &state,
+                &wallet,
+                solana.as_deref(),
+                usdc_units,
+                &req.amount.currency,
+                rate,
+            )
+            .await?
+        };
+        if let Some((_, fee)) = funding {
             hop_fee = fee;
+            if bank.is_some() {
+                hop_fee = hop_fee
+                    .saturating_add(markets::bank_hop_source_fee(&state, solana.as_deref()).await?);
+            }
         }
     }
     // A friend send's network fee, shown from the quote on: opening the friend's USDC account on
@@ -995,7 +1029,8 @@ async fn bank_plan(
     let route = quote
         .bank_route
         .ok_or_else(|| bad("bank route was not quoted"))?;
-    if quote.sender_solana.is_none() && route == BankRoute::Solana {
+    if route == BankRoute::Solana && user.solana_wallet.as_deref() != quote.sender_solana.as_deref()
+    {
         return Err((
             StatusCode::CONFLICT,
             "The wallet changed. Check a fresh quote.".into(),
@@ -1030,7 +1065,7 @@ async fn bank_plan(
                 .base
                 .transfer_transaction(BASE_USDC, &quote.sender_wallet, &address, quote.usdc_units)
                 .map_err(internal)?;
-            markets::plan_base_with_cash(
+            markets::plan_base_bank_with_cash(
                 state,
                 user.user_id.clone(),
                 quote.sender_wallet.clone(),
@@ -1078,23 +1113,28 @@ fn near(quoted: u128, actual: u128) -> bool {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn funded_solana_bank_sends_do_not_bridge_to_base() {
+    fn funded_bank_routes_use_native_reserves_without_a_bridge() {
         assert_eq!(
-            same_chain_bank_route(0, 1_500_000, 1_100_000),
-            BankRoute::Solana
+            same_chain_bank_route(None, Some(0)),
+            Some((BankRoute::Solana, 0))
         );
         assert_eq!(
-            same_chain_bank_route(700_000, 1_500_000, 1_100_000),
-            BankRoute::Solana
+            same_chain_bank_route(Some(0), Some(0)),
+            Some((BankRoute::Base, 0))
         );
         assert_eq!(
-            same_chain_bank_route(1_500_000, 1_500_000, 1_100_000),
-            BankRoute::Base
+            same_chain_bank_route(Some(500_000), Some(0)),
+            Some((BankRoute::Solana, 0))
         );
         assert_eq!(
-            same_chain_bank_route(700_000, 700_000, 1_100_000),
-            BankRoute::Hop
+            same_chain_bank_route(Some(0), Some(500_000)),
+            Some((BankRoute::Base, 0))
         );
+        assert_eq!(
+            same_chain_bank_route(None, Some(500_000)),
+            Some((BankRoute::Solana, 500_000))
+        );
+        assert_eq!(same_chain_bank_route(None, None), None); // Only split cash requires consolidation.
     }
 
     #[test]
