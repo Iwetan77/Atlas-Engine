@@ -332,7 +332,27 @@ fn allowed_icon_url(text: &str) -> Option<reqwest::Url> {
     {
         return None;
     }
-    let host = url.host_str()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    // Memecoin logos mostly live on decentralized storage, served from gateways and their CDNs
+    // (an Irys link redirects to a datasprite-cdn.com subdomain): those domains and their
+    // subdomains. Never an IP literal or a bare top-level name.
+    let storage = [
+        "irys.xyz",
+        "datasprite-cdn.com",
+        "arweave.net",
+        "mypinata.cloud",
+        "nftstorage.link",
+        "dweb.link",
+        "w3s.link",
+        "ipfs.io",
+        "cf-ipfs.com",
+    ];
+    if storage
+        .iter()
+        .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+    {
+        return Some(url);
+    }
     let approved = [
         "raw.githubusercontent.com",
         "cdn.jsdelivr.net",
@@ -348,7 +368,7 @@ fn allowed_icon_url(text: &str) -> Option<reqwest::Url> {
         "cryptologos.cc",
         "cdn.dexscreener.com",
     ];
-    approved.contains(&host).then_some(url)
+    approved.contains(&host.as_str()).then_some(url)
 }
 fn local_icon_data(symbol: &str) -> Option<String> {
     let bytes: &[u8] = match symbol.to_ascii_uppercase().as_str() {
@@ -377,7 +397,14 @@ async fn icon_data(row: &Value) -> Option<String> {
     let url = allowed_icon_url(row["iconUrl"].as_str()?)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(4))
-        .redirect(reqwest::redirect::Policy::none())
+        // A gateway's redirect to its CDN is followed only to another approved host, at most three.
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 3 || allowed_icon_url(attempt.url().as_str()).is_none() {
+                attempt.stop()
+            } else {
+                attempt.follow()
+            }
+        }))
         .build()
         .ok()?;
     let mut response = client.get(url).send().await.ok()?.error_for_status().ok()?;
@@ -489,12 +516,51 @@ fn currency_symbol(currency: &str) -> &str {
         _ => currency,
     }
 }
+// What a chain is called on the card.
+fn chain_label(chain: &str) -> Option<&'static str> {
+    Some(match chain {
+        "solana" => "Solana",
+        "base" => "Base",
+        "robinhood" | "hood" => "Robinhood",
+        "near" => "NEAR",
+        "sui" => "Sui",
+        "monad" => "Monad",
+        "hyperliquid" => "Hyperliquid",
+        _ => return None,
+    })
+}
+// About how wide a line of Inter is at `size` (for placing what follows it; the card has no layout).
+fn text_width(text: &str, size: f64) -> f64 {
+    text.chars().count() as f64 * size * 0.6
+}
 fn card_svg(row: &Value, code: &str, icon: Option<&str>) -> String {
-    let symbol = bounded_text(row["symbol"].as_str().unwrap_or("ASSET"), 18);
-    let name = bounded_text(
-        row["name"].as_str().unwrap_or("Discover your next move"),
-        38,
+    let raw_symbol = row["symbol"].as_str().unwrap_or("ASSET");
+    let symbol = bounded_text(raw_symbol, 18);
+    let raw_name = row["name"].as_str().unwrap_or("");
+    // A coin named after its own symbol says what it is instead of repeating itself.
+    let kind = match row["kind"].as_str().unwrap_or("") {
+        "meme" => "Meme",
+        "stock" => "Stock",
+        _ => "Crypto",
+    };
+    let chain = chain_label(row["chain"].as_str().unwrap_or(""));
+    let subtitle = if raw_name.is_empty() || raw_name.eq_ignore_ascii_case(raw_symbol) {
+        match chain {
+            Some(chain) => format!("{kind} on {chain}"),
+            None => kind.to_owned(),
+        }
+    } else {
+        raw_name.to_owned()
+    };
+    let subtitle = bounded_text(&subtitle, 34);
+    let chip = bounded_text(
+        &match chain {
+            Some(chain) => format!("{} · {}", kind.to_uppercase(), chain.to_uppercase()),
+            None => kind.to_uppercase(),
+        },
+        28,
     );
+    let chip_width = text_width(&chip, 18.0) + 44.0;
     let amount = row["price"]["amount"].as_str().unwrap_or("—");
     let currency = row["price"]["currency"].as_str().unwrap_or("NGN");
     let n = amount
@@ -509,36 +575,83 @@ fn card_svg(row: &Value, code: &str, icon: Option<&str>) -> String {
     };
     let price = bounded_text(
         &format!("{}{}", currency_symbol(currency), grouped_amount(&value)),
-        30,
+        24,
     );
-    let headline_size = if symbol.chars().count() > 14 {
-        48
-    } else if symbol.chars().count() > 10 {
-        56
-    } else {
-        66
+    let headline_size = match raw_symbol.chars().count() {
+        0..=9 => 66,
+        10..=13 => 54,
+        _ => 44,
     };
-    let artwork=icon.map(|data|format!("<image x='76' y='128' width='108' height='108' href='{}' clip-path='url(#avatar)'/>",escape(data)))
-        .unwrap_or_else(||format!("<text x='130' y='203' text-anchor='middle' font-size='45' font-weight='700' fill='white'>{}</text>",bounded_text(row["symbol"].as_str().unwrap_or("A"),3)));
+    // The day's move, when it's known: green up, red down, beside "Price when shared".
+    let change = row["change24hPct"]
+        .as_str()
+        .and_then(|c| c.parse::<f64>().ok())
+        .or_else(|| row["change24hPct"].as_f64())
+        .filter(|c| c.is_finite());
+    let mut note_x = 76.0;
+    let change_pill = match change {
+        Some(c) => {
+            let (fill, ink, sign) = if c >= 0.0 {
+                ("#163A2B", "#3DDC97", "+")
+            } else {
+                ("#3D1A24", "#FF6B8A", "−")
+            };
+            let label = format!("{sign}{:.2}% today", c.abs());
+            let width = text_width(&label, 22.0) + 36.0;
+            note_x = 72.0 + width + 18.0;
+            format!(
+                "<rect x='72' y='436' width='{width:.0}' height='42' rx='21' fill='{fill}'/><text x='{:.0}' y='465' text-anchor='middle' fill='{ink}' font-size='22' font-weight='700'>{label}</text>",
+                72.0 + width / 2.0
+            )
+        }
+        None => String::new(),
+    };
+    let unverified = if row["verified"] == json!(false) {
+        "<text x='264' y='326' fill='#F5B94A' font-size='21' font-weight='700'>Unverified coin · check its address before trading</text>"
+    } else {
+        ""
+    };
+    let initials: String = raw_symbol
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .take(2)
+        .collect::<String>()
+        .to_uppercase();
+    let artwork = icon
+        .map(|data| {
+            format!(
+                "<image x='72' y='170' width='156' height='156' href='{}' clip-path='url(#avatar)'/>",
+                escape(data)
+            )
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "<circle cx='150' cy='248' r='78' fill='url(#mono)'/><text x='150' y='270' text-anchor='middle' font-size='60' font-weight='700' fill='white'>{}</text>",
+                escape(if initials.is_empty() { "A" } else { &initials })
+            )
+        });
     format!(
         r##"<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
-    <defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#20141F"/><stop offset="1" stop-color="#14151C"/></linearGradient><clipPath id="avatar"><circle cx="130" cy="182" r="54"/></clipPath></defs>
+    <defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#22131F"/><stop offset="1" stop-color="#12131A"/></linearGradient><linearGradient id="mono" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#FF2E7E"/><stop offset="1" stop-color="#7A1F49"/></linearGradient><clipPath id="avatar"><circle cx="150" cy="248" r="78"/></clipPath></defs>
     <rect width="1200" height="630" rx="36" fill="url(#bg)"/>
-    <circle cx="1170" cy="-40" r="430" fill="#FF2E7E" opacity=".09"/><circle cx="1120" cy="30" r="280" fill="none" stroke="#FF2E7E" stroke-width="2" opacity=".25"/>
+    <circle cx="1150" cy="-30" r="420" fill="#FF2E7E" opacity=".08"/><circle cx="1110" cy="40" r="270" fill="none" stroke="#FF2E7E" stroke-width="2" opacity=".22"/>
     <g font-family="Inter">
-      <rect x="72" y="56" width="94" height="34" rx="17" fill="#FF2E7E"/><text x="119" y="80" text-anchor="middle" fill="white" font-size="17" font-weight="700">ATLAS</text>
-      <text x="188" y="81" fill="#B4B6C4" font-size="20">YOUR NEXT MOVE</text>
-      <circle cx="130" cy="182" r="58" fill="#33313E"/>{artwork}
-      <text x="210" y="176" fill="white" font-size="36" font-weight="700">{name}</text>
-      <text x="212" y="217" fill="#B4B6C4" font-size="24">{symbol}</text>
-      <text x="72" y="327" fill="white" font-size="{headline_size}" font-weight="700">Trade {symbol} on Atlas</text>
-      <text x="76" y="391" fill="#FF8AB5" font-size="37" font-weight="700">{price}</text>
-      <text x="76" y="435" fill="#B4B6C4" font-size="20">Price at time of preview · Stocks, memes and crypto</text>
-      <path d="M72 485H1128" stroke="#3C3743" stroke-width="2"/>
-      <text x="76" y="532" fill="#B4B6C4" font-size="21">Click the link below to explore and trade</text>
-      <text x="76" y="573" fill="white" font-size="26" font-weight="700">justatlas.xyz/a/{code}</text>
-      <text x="1115" y="571" text-anchor="end" fill="#FF2E7E" font-size="39" font-weight="700">atlas.</text>
-    </g></svg>"##
+      <text x="72" y="104" fill="#FF2E7E" font-size="46" font-weight="700">atlas.</text>
+      <rect x="{chip_x:.0}" y="70" width="{chip_width:.0}" height="44" rx="22" fill="#2A2533" stroke="#3E3746" stroke-width="2"/><text x="{chip_mid:.0}" y="99" text-anchor="middle" fill="#D8D9E3" font-size="18" font-weight="700" letter-spacing="1.5">{chip}</text>
+      <circle cx="150" cy="248" r="84" fill="none" stroke="#FF2E7E" stroke-width="4" opacity=".55"/><circle cx="150" cy="248" r="78" fill="#33313E"/>{artwork}
+      <text x="262" y="246" fill="white" font-size="{headline_size}" font-weight="700">{symbol}</text>
+      <text x="264" y="292" fill="#B4B6C4" font-size="30">{subtitle}</text>
+      {unverified}
+      <text x="72" y="414" fill="#FF8AB5" font-size="68" font-weight="700">{price}</text>
+      {change_pill}<text x="{note_x:.0}" y="465" fill="#8E90A0" font-size="21">Price when shared</text>
+      <path d="M72 514H1128" stroke="#3C3743" stroke-width="2"/>
+      <text x="72" y="564" fill="white" font-size="30" font-weight="700">Trade {symbol} on Atlas</text>
+      <text x="72" y="600" fill="#FF8AB5" font-size="24">justatlas.xyz/a/{code}</text>
+      <text x="1128" y="564" text-anchor="end" fill="#B4B6C4" font-size="22">Stocks, memes and crypto</text>
+      <text x="1128" y="598" text-anchor="end" fill="#B4B6C4" font-size="22">in one balance</text>
+    </g></svg>"##,
+        chip_x = 1128.0 - chip_width,
+        chip_mid = 1128.0 - chip_width / 2.0,
     )
 }
 fn render_card(svg: &str) -> Result<Vec<u8>, ApiError> {
@@ -754,7 +867,18 @@ mod tests {
         assert!(
             allowed_icon_url("https://raw.githubusercontent.com/org/repo/main/icon.png").is_some()
         );
+        // Memecoin logos on Irys, and the CDN an Irys link redirects to.
+        for good in [
+            "https://gateway.irys.xyz/3KNgu99JvZ961wXUxcZ8LXDXjaWK4651Wo9oUZSA5U4L",
+            "https://ejwftxcn24p4gwtwhgznpxylz72qbdnln6lb2z24yr6yfxhdl7oq.mainnet-1.datasprite-cdn.com/3KNgu",
+            "https://pump.mypinata.cloud/ipfs/bafkrei",
+        ] {
+            assert!(allowed_icon_url(good).is_some(), "{good}");
+        }
         for bad in [
+            "https://irys.xyz.evil.test/x",
+            "https://evilirys.xyz/x",
+            "https://gateway.irys.xyz:8443/x",
             "http://raw.githubusercontent.com/x",
             "https://127.0.0.1/x",
             "https://localhost/x",
@@ -785,6 +909,41 @@ mod tests {
         )
         .is_none());
     }
+    #[tokio::test]
+    #[ignore = "live: fetches a memecoin logo from Irys (redirected to its CDN)"]
+    async fn live_irys_logo_reaches_the_card() {
+        let row = json!({"symbol":"KNOTS","name":"KNOTS","kind":"meme","chain":"solana","verified":true,
+            "change24hPct":"23.48","price":{"amount":"5.06","currency":"NGN"},
+            "iconUrl":"https://gateway.irys.xyz/3KNgu99JvZ961wXUxcZ8LXDXjaWK4651Wo9oUZSA5U4L"});
+        let icon = icon_data(&row)
+            .await
+            .expect("the Irys logo, through its CDN redirect");
+        let png = render_card(&card_svg(&row, "u70AVP2a", Some(&icon))).unwrap();
+        std::fs::write(std::env::temp_dir().join("atlas-card-knots-logo.png"), png).unwrap();
+    }
+    #[test]
+    fn a_coin_named_after_its_symbol_says_what_it_is_and_shows_its_day() {
+        let row = json!({"symbol":"KNOTS","name":"KNOTS","kind":"meme","chain":"solana","verified":true,
+            "change24hPct":"23.48","price":{"amount":"5.06","currency":"NGN"}});
+        let svg = card_svg(&row, "u70AVP2a", None);
+        assert!(svg.contains("Meme on Solana"));
+        assert!(svg.contains("MEME · SOLANA"));
+        assert!(svg.contains("+23.48% today"));
+        assert!(!svg.contains("Unverified"));
+        // Without a logo: the coin's two letters, never "KN…".
+        assert!(svg.contains(">KN</text>"));
+        assert!(!svg.contains("…"));
+        let down = json!({"symbol":"X","name":"Ex","verified":false,"change24hPct":"-4.5",
+            "price":{"amount":"1","currency":"NGN"}});
+        let svg = card_svg(&down, "AbCd1234", None);
+        assert!(svg.contains("−4.50% today"));
+        assert!(svg.contains("Unverified coin"));
+        assert!(svg.contains(">Ex</text>"));
+        let png = render_card(&svg).unwrap();
+        std::fs::write(std::env::temp_dir().join("atlas-card-fallback.png"), png).unwrap();
+        let png = render_card(&card_svg(&row, "u70AVP2a", None)).unwrap();
+        std::fs::write(std::env::temp_dir().join("atlas-card-knots.png"), png).unwrap();
+    }
     #[test]
     fn social_card_is_a_real_png_with_brand_asset_and_short_footer() {
         let row =
@@ -799,6 +958,10 @@ mod tests {
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
         let image = image::load_from_memory(&png).unwrap();
         assert_eq!((image.width(), image.height()), (1200, 630));
-        std::fs::write("/tmp/atlas-asset-social-preview.png", png).unwrap();
+        std::fs::write(
+            std::env::temp_dir().join("atlas-asset-social-preview.png"),
+            png,
+        )
+        .unwrap();
     }
 }
