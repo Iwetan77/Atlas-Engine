@@ -611,7 +611,6 @@ impl DayaState {
         idempotency: &str,
         rail: &str,
     ) -> Result<(Value, Value), ApiError> {
-        let started = Instant::now();
         let made = self
             .call(
                 reqwest::Method::POST,
@@ -628,11 +627,6 @@ impl DayaState {
             .to_owned();
         for attempt in 0..8 {
             if let Some(details) = ready_instruction(&account, rail) {
-                // How long the user waited on Daya for payment details after confirming.
-                eprintln!(
-                    "daya funding account {id}: {rail} ready in {} ms ({attempt} re-checks)",
-                    started.elapsed().as_millis()
-                );
                 return Ok((account.clone(), details.clone()));
             }
             if matches!(account["status"].as_str(), Some("FAILED" | "DISABLED")) {
