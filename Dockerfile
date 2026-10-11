@@ -1,12 +1,13 @@
 FROM rust:1-bookworm AS rust-build
 WORKDIR /src
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock LICENSE ./
 COPY crates ./crates
 RUN cargo build --locked --release -p engine-service
 
 FROM node:22-bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /app/privy-bridge
+COPY LICENSE /app/LICENSE
 COPY crates/engine-service/privy-bridge/package.json crates/engine-service/privy-bridge/package-lock.json ./
 RUN npm ci --omit=dev
 # Every bridge module (a new one is picked up without editing this line).
