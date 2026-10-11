@@ -493,6 +493,10 @@ impl DayaState {
             .lock()
             .map_err(internal)?
             .insert(side, rate.clone());
+        // The balance's naira is what a dollar of it pays out: Daya's selling rate.
+        if side == "SELL" {
+            app_balance::set_daya_ngn(rate.ngn_per_usdc);
+        }
         Ok(rate)
     }
 
@@ -1708,13 +1712,17 @@ pub(super) fn keep_checked(state: AppState) {
                 daya.banks()
             );
             let check = match result {
-                // Daya's public fee schedule too, so what the app charges can be checked against it.
-                Ok((_, _, fees, _)) => json!({"ok": true, "at": now_ms(), "fees": {
+                // Daya's public fee schedule and the rates every quote shows, so what the app
+                // charges (and the naira the balance is valued at) can be checked against them.
+                Ok((sell, buy, fees, _)) => json!({"ok": true, "at": now_ms(), "fees": {
                     "ngnDepositPercent": markets::format_units(fees.deposit_pct, 6),
                     "ngnDepositCap": markets::format_units(fees.deposit_cap, 6),
                     "usdcPayoutUsd": markets::format_units(fees.usdc_payout_fee, 6),
                     "ngnPayoutPercent": markets::format_units(fees.payout_pct, 6),
                     "ngnPayoutCap": markets::format_units(fees.payout_cap, 6),
+                }, "rates": {
+                    "buyNgnPerUsd": markets::format_units(buy.ngn_per_usdc, 6),
+                    "sellNgnPerUsd": markets::format_units(sell.ngn_per_usdc, 6),
                 }}),
                 Err((_, error)) => json!({"ok": false, "at": now_ms(), "error": error}),
             };

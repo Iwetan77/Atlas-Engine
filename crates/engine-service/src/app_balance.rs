@@ -1187,10 +1187,34 @@ static FX_HTTP: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(
         .unwrap_or_default()
 });
 
+// Naira is valued at Daya's own rate for selling USDC: what a dollar in the balance actually pays
+// out to a Nigerian bank, not the official rate (about 3% below what dollars cost in Nigeria, which
+// made every top-up look 3% dearer than it was). Refreshed with Daya's rates every ten minutes;
+// the official rate stands in only when Daya's is missing or stale.
+const DAYA_NGN_TTL: Duration = Duration::from_secs(20 * 60);
+static DAYA_NGN: std::sync::LazyLock<Mutex<Option<(Instant, u128)>>> =
+    std::sync::LazyLock::new(Default::default);
+pub(super) fn set_daya_ngn(ngn_per_usdc: u128) {
+    if ngn_per_usdc > 0 {
+        if let Ok(mut held) = DAYA_NGN.lock() {
+            *held = Some((Instant::now(), ngn_per_usdc));
+        }
+    }
+}
+fn fresh_daya_ngn(held: Option<(Instant, u128)>) -> Option<u128> {
+    held.filter(|(at, _)| at.elapsed() < DAYA_NGN_TTL)
+        .map(|(_, rate)| rate)
+}
+
 // Rate is represented as destination-currency micros per USD.
 pub(super) async fn fx_rate(currency: &str) -> Result<u128, ApiError> {
     if currency == "USD" {
         return Ok(1_000_000);
+    }
+    if currency == "NGN" {
+        if let Some(rate) = fresh_daya_ngn(*DAYA_NGN.lock().map_err(internal)?) {
+            return Ok(rate);
+        }
     }
     if let Some((at, rate)) = FX_RATES.lock().map_err(internal)?.get(currency) {
         if at.elapsed() < FX_TTL {
@@ -1270,6 +1294,17 @@ fn money(base_units: u128, currency: &str, rate_micros: u128) -> Result<Money, A
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn naira_uses_dayas_rate_while_fresh_then_the_official_one() {
+        let now = Instant::now();
+        assert_eq!(
+            fresh_daya_ngn(Some((now, 1_356_000_000))),
+            Some(1_356_000_000)
+        );
+        let stale = now - DAYA_NGN_TTL - Duration::from_secs(1);
+        assert_eq!(fresh_daya_ngn(Some((stale, 1_356_000_000))), None);
+        assert_eq!(fresh_daya_ngn(None), None);
+    }
     #[test]
     fn portfolio_value_uses_raw_token_units() {
         // A $1 quote buys 0.0005 WETH. Half a WETH is therefore $1,000.
