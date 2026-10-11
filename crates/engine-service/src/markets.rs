@@ -690,6 +690,27 @@ pub(super) async fn catalog(state: &MarketState) -> Result<Arc<Vec<Asset>>, ApiE
     Ok(assets)
 }
 
+// Browsing can keep the known token metadata while one background task refreshes it.
+// Execution still calls catalog() itself and retains its original refresh semantics.
+async fn browse_catalog(state: &MarketState) -> Result<Arc<Vec<Asset>>, ApiError> {
+    let cached = state.catalog.lock().map_err(internal)?.clone();
+    if let Some((at, assets)) = cached {
+        if at.elapsed() >= CATALOG_TTL {
+            if let Ok(guard) = state.catalog_refresh.clone().try_lock_owned() {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let _guard = guard;
+                    let _ = catalog(&state).await;
+                });
+            }
+        }
+        return Ok(assets);
+    }
+    // A cold instance fetches the catalog once even when several devices open markets.
+    let _guard = state.catalog_refresh.lock().await;
+    catalog(state).await
+}
+
 // Trending: what's rising most, with each kind judged against its own kind. A meme up 300% and a
 // stock up 6% can both be the top mover of their kind, so the top meme, stock and coin all lead.
 // Assets that aren't rising follow, most traded first.
@@ -801,6 +822,57 @@ pub(super) fn stats_token(id: &str) -> Option<(&'static str, String)> {
 }
 
 // Live USD price and 24h change for Solana mints, from Jupiter, 50 at a time, shared for 15 seconds.
+// Each Jupiter request accepts up to 50 mints. Lists of 100 used to wait for the
+// first batch before requesting the second. Browsing fetches four batches at most
+// together; execution's price reads retain their original behavior.
+async fn browse_prices(
+    state: &MarketState,
+    mints: &[String],
+) -> Result<HashMap<String, (f64, Option<f64>)>, ApiError> {
+    let batches = mints.chunks(50).map(|chunk| chunk.to_vec());
+    let state = state.clone();
+    read_market_batches(batches, move |chunk| {
+        let state = state.clone();
+        async move { usd_prices(&state, &chunk).await }
+    })
+    .await
+}
+
+async fn read_market_batches<I, F, Fut>(
+    mut batches: I,
+    fetch: F,
+) -> Result<HashMap<String, (f64, Option<f64>)>, ApiError>
+where
+    I: Iterator<Item = Vec<String>>,
+    F: Fn(Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<HashMap<String, (f64, Option<f64>)>, ApiError>>
+        + Send
+        + 'static,
+{
+    let mut pending = tokio::task::JoinSet::new();
+    for _ in 0..4 {
+        if let Some(batch) = batches.next() {
+            pending.spawn(fetch(batch));
+        }
+    }
+    let mut result = HashMap::new();
+    let mut failed = None;
+    while let Some(answer) = pending.join_next().await {
+        match answer {
+            Ok(Ok(prices)) => result.extend(prices),
+            Ok(Err(error)) => failed = Some(error),
+            Err(error) => failed = Some(unavailable(error)),
+        }
+        if let Some(batch) = batches.next() {
+            pending.spawn(fetch(batch));
+        }
+    }
+    match failed {
+        Some(error) if result.is_empty() => Err(error),
+        _ => Ok(result),
+    }
+}
+
 pub(super) async fn usd_prices(
     state: &MarketState,
     mints: &[String],
@@ -877,6 +949,7 @@ pub(super) struct MarketState {
     quotes: Arc<Mutex<HashMap<String, StoredQuote>>>,
     intents: Arc<Mutex<HashMap<String, StoredIntent>>>,
     catalog: Arc<Mutex<Option<(Instant, Arc<Vec<Asset>>)>>>,
+    catalog_refresh: Arc<tokio::sync::Mutex<()>>,
     pasted: Arc<Mutex<HashMap<String, (Instant, Option<Asset>)>>>,
     prices: Arc<Mutex<HashMap<String, (Instant, f64, Option<f64>)>>>,
     // Base tokens: how many base units $1 buys (Kyber), shared for a few seconds.
@@ -1089,6 +1162,7 @@ impl MarketState {
             quotes: Arc::new(Mutex::new(HashMap::new())),
             intents: Arc::new(Mutex::new(HashMap::new())),
             catalog: Arc::new(Mutex::new(None)),
+            catalog_refresh: Arc::new(tokio::sync::Mutex::new(())),
             pasted: Arc::new(Mutex::new(HashMap::new())),
             prices: Arc::new(Mutex::new(HashMap::new())),
             base_rates: Arc::new(Mutex::new(HashMap::new())),
@@ -1764,12 +1838,6 @@ pub(super) async fn assets(
     };
     let raw = q.q.unwrap_or_default();
     let raw = raw.trim();
-    // The sign-in check, the currency's rate and the coin list don't wait on each other.
-    let ((), rate, catalog) = tokio::try_join!(
-        app_balance::signed_in(&state, &headers),
-        app_balance::fx_rate(&currency),
-        catalog(&state.markets),
-    )?;
     let part = q.part.as_deref().unwrap_or("all").to_owned();
     if !matches!(part.as_str(), "all" | "listed" | "other") {
         return Err(bad("part must be listed or other"));
@@ -1777,8 +1845,16 @@ pub(super) async fn assets(
     let (want_listed, want_other) = (part != "other", part != "listed");
     let key = format!("{currency}|{category}|{part}|{raw}");
     if let Some(answer) = state.markets.recent_search(&key) {
+        // Cached public market data still requires this caller's signed-in check.
+        app_balance::signed_in(&state, &headers).await?;
         return Ok(Json(answer));
     }
+    // Only uncached lists need FX/catalog work. Metadata refresh never blocks a warm list.
+    let ((), rate, catalog) = tokio::try_join!(
+        app_balance::signed_in(&state, &headers),
+        app_balance::fx_rate(&currency),
+        browse_catalog(&state.markets),
+    )?;
     // Other chains (NEAR, Sui, Monad) are searched while Atlas's own list is priced, not after it.
     let other_chains = async {
         if want_other && !raw.is_empty() && kind.is_none_or(|k| k == "crypto") {
@@ -2011,7 +2087,7 @@ async fn listed_assets(
         .collect();
     let solana = {
         let markets = state.markets.clone();
-        tokio::spawn(async move { usd_prices(&markets, &mints).await })
+        tokio::spawn(async move { browse_prices(&markets, &mints).await })
     };
     let base: Vec<_> = picked
         .iter()
@@ -5921,6 +5997,51 @@ fn received_units(receipt: &Value, token: &str, wallet: &str) -> Option<u128> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn warm_market_catalog_does_not_wait_for_an_expired_metadata_refresh() {
+        let state = MarketState::new().unwrap();
+        let assets = Arc::new(Vec::new());
+        *state.catalog.lock().unwrap() = Some((Instant::now() - CATALOG_TTL, assets.clone()));
+        let _refresh_in_progress = state.catalog_refresh.lock().await;
+        let returned = tokio::time::timeout(Duration::from_millis(50), browse_catalog(&state))
+            .await
+            .expect("cached browsing must not wait for the refresh")
+            .unwrap();
+        assert!(Arc::ptr_eq(&returned, &assets));
+    }
+
+    #[tokio::test]
+    async fn browsing_price_batches_run_together_and_keep_other_sources_on_failure() {
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let batches = vec![vec!["first".into()], vec!["second".into()]];
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            read_market_batches(batches.into_iter(), move |batch| {
+                let entered = entered.clone();
+                async move {
+                    entered.wait().await;
+                    if batch[0] == "first" {
+                        return Err(unavailable("one provider batch failed"));
+                    }
+                    Ok(HashMap::from([(batch[0].clone(), (2.0, None))]))
+                }
+            }),
+        )
+        .await
+        .expect("two batches must enter before either answers")
+        .unwrap();
+        assert_eq!(result.get("second"), Some(&(2.0, None)));
+    }
+
+    #[tokio::test]
+    async fn browsing_price_batches_preserve_failure_when_no_prices_are_available() {
+        let result = read_market_batches(vec![vec!["missing".into()]].into_iter(), |_| async {
+            Err(unavailable("prices unavailable"))
+        })
+        .await;
+        assert!(result.is_err());
+    }
+
     #[test]
     fn shared_base_funding_bridges_only_the_shortfall() {
         assert_eq!(
