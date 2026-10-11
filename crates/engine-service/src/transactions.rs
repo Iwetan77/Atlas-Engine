@@ -414,7 +414,10 @@ fn snapshot(owner: &str, v: &Value, source: &str) -> Receipt {
         let pending_sale = &v["then_sell"];
         r.kind = if v["withdraw"].is_object() {
             "withdraw"
-        } else if v["sell_sui"] == true || v["origin_chain"] == "monad" || pending_sale.is_object()
+        } else if v["sell_sui"] == true
+            || v["origin_chain"] == "monad"
+            || v["origin_chain"] == "robinhood"
+            || pending_sale.is_object()
         {
             "sell"
         } else {

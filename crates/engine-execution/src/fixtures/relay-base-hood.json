@@ -1,0 +1,155 @@
+{
+ "requestId": "0x179172659871a9e36da01f57f2eb0940c647977032d07110a79a90aa8a2e0298",
+ "steps": [
+  {
+   "id": "authorize1",
+   "kind": "signature",
+   "requestId": "0x179172659871a9e36da01f57f2eb0940c647977032d07110a79a90aa8a2e0298",
+   "items": [
+    {
+     "data": {
+      "sign": {
+       "signatureKind": "eip712",
+       "types": {
+        "ReceiveWithAuthorization": [
+         {
+          "name": "from",
+          "type": "address"
+         },
+         {
+          "name": "to",
+          "type": "address"
+         },
+         {
+          "name": "value",
+          "type": "uint256"
+         },
+         {
+          "name": "validAfter",
+          "type": "uint256"
+         },
+         {
+          "name": "validBefore",
+          "type": "uint256"
+         },
+         {
+          "name": "nonce",
+          "type": "bytes32"
+         }
+        ]
+       },
+       "domain": {
+        "name": "USD Coin",
+        "version": "2",
+        "chainId": 8453,
+        "verifyingContract": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+       },
+       "primaryType": "ReceiveWithAuthorization",
+       "value": {
+        "from": "0xd8da6bf26964af9d7eed9e03e53415d37aa96045",
+        "to": "0xccc88a9d1b4ed6b0eaba998850414b24f1c315be",
+        "value": "2000000",
+        "validAfter": 0,
+        "validBefore": 1791727198,
+        "nonce": "0xcfb6b90c5d625663180a8088aa650fd58e8df0a77d4d05bd4922ca3d70c53cc9"
+       }
+      },
+      "post": {
+       "endpoint": "/execute/permits",
+       "method": "POST",
+       "body": {
+        "kind": "eip3009",
+        "requestId": "0x179172659871a9e36da01f57f2eb0940c647977032d07110a79a90aa8a2e0298",
+        "api": "swap"
+       }
+      }
+     }
+    }
+   ]
+  }
+ ],
+ "details": {
+  "sender": "0xd8da6bf26964af9d7eed9e03e53415d37aa96045",
+  "recipient": "0xd8da6bf26964af9d7eed9e03e53415d37aa96045",
+  "currencyIn": {
+   "currency": {
+    "chainId": 8453,
+    "address": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "symbol": "USDC",
+    "decimals": 6
+   },
+   "amount": "2000000",
+   "minimumAmount": "2000000"
+  },
+  "currencyOut": {
+   "currency": {
+    "chainId": 4663,
+    "address": "0x39dbed3a2bd333467115de45665cc57f813c4571",
+    "symbol": "PONS",
+    "decimals": 18
+   },
+   "amount": "4854128130265658992",
+   "minimumAmount": "4708504286357689222"
+  }
+ },
+ "protocol": {
+  "v2": {
+   "orderId": "0x7f2418bbc0c147df13e498a39ccdc7135d3a7d2b3f6c5710167054996575cfb4",
+   "paymentDetails": {
+    "chainId": "base",
+    "depository": "0x4cd00e387622c35bddb9b4c962c136462338bc31",
+    "currency": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "amount": "2000000"
+   },
+   "orderData": {
+    "version": "v1",
+    "solverChainId": "base",
+    "solver": "0xf70da97812cb96acdf810712aa562db8dfa3dbef",
+    "salt": "0xc4b998aa0699a9e565f60461fa34becf7a875854dfac68ad0c452a64e86be75d",
+    "inputs": [
+     {
+      "payment": {
+       "chainId": "base",
+       "currency": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+       "amount": "2000000",
+       "weight": "1"
+      },
+      "refunds": [
+       {
+        "chainId": "base",
+        "recipient": "0xd8da6bf26964af9d7eed9e03e53415d37aa96045",
+        "currency": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+        "minimumAmount": "0",
+        "deadline": 1792331398,
+        "extraData": "0x000000000000000000000000b92fe925dc43a0ecde6c8b1a2709c170ec4fff4f"
+       },
+       {
+        "chainId": "robinhood",
+        "recipient": "0xd8da6bf26964af9d7eed9e03e53415d37aa96045",
+        "currency": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+        "minimumAmount": "0",
+        "deadline": 1792331398,
+        "extraData": "0x000000000000000000000000b92fe925dc43a0ecde6c8b1a2709c170ec4fff4f"
+       }
+      ]
+     }
+    ],
+    "output": {
+     "chainId": "robinhood",
+     "payments": [
+      {
+       "recipient": "0xd8da6bf26964af9d7eed9e03e53415d37aa96045",
+       "currency": "0x39dbed3a2bd333467115de45665cc57f813c4571",
+       "minimumAmount": "4708504286357689222",
+       "expectedAmount": "4854128130265658992"
+      }
+     ],
+     "calls": [],
+     "deadline": 1792331398,
+     "extraData": "0x000000000000000000000000b92fe925dc43a0ecde6c8b1a2709c170ec4fff4f"
+    },
+    "fees": []
+   }
+  }
+ }
+}
