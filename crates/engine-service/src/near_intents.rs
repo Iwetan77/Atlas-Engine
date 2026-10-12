@@ -253,6 +253,9 @@ struct StoredIntent {
     // USDC (units) a sale turned into NEAR for its fees first, for its receipt.
     #[serde(default)]
     gas_bought: u128,
+    // A Robinhood trade refunded as USDG, on its way back to Trading.
+    #[serde(default)]
+    refund: Option<Refund>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct PendingSale {
@@ -299,6 +302,33 @@ struct RelayLeg {
     api: String,
     // The quoted amount out (MON wei bought, or USDC units a sale brings), for the trade book.
     expected_out: u128,
+    // The user's currency when they confirmed, for what a refund says.
+    #[serde(default)]
+    currency: String,
+}
+// A Robinhood trade Relay couldn't finish and refunded as USDG in the user's wallet there: a buy
+// whose coin swap failed on arrival (the price moved), or a sale's dollars it couldn't pay out.
+// Bringing it back to Trading is the trade's own last step: the phone signs one gasless USDG
+// authorization under the confirmation the trade already has, and Relay lands USDC in Trading.
+#[derive(Clone, Serialize, Deserialize)]
+struct Refund {
+    // When Relay was seen refunding (or a try came back): how long to look for the USDG before
+    // calling it refunded where the trade was paid from.
+    since: u64,
+    // Relay's quote the phone signs (made again when stale), and whether it was handed over.
+    #[serde(default)]
+    moved: Option<RefundMove>,
+    #[serde(default)]
+    handed: bool,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct RefundMove {
+    request_id: String,
+    typed_data: Value,
+    api: String,
+    // The USDG units taken (all the wallet held) and the USDC units that land in Trading.
+    held: u128,
+    back: u128,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct DeviceStep {
@@ -2450,6 +2480,7 @@ pub(super) async fn withdraw_execute(
                 device: None,
                 then_sell: None,
                 gas_bought: 0,
+                refund: None,
                 relay: None,
                 withdraw: Some(Withdrawal {
                     network: stored.option.label.into(),
@@ -5468,12 +5499,14 @@ async fn execute_monad_sale(
                 device: None,
                 then_sell: None,
                 gas_bought: 0,
+                refund: None,
                 withdraw: None,
                 relay: Some(RelayLeg {
                     request_id: swap.request_id,
                     typed_data: None,
                     api: String::new(),
                     expected_out: swap.expected_out_units,
+                    currency: String::new(),
                 }),
             },
         )
@@ -5611,12 +5644,14 @@ async fn execute_mon_buy(
                 device: None,
                 then_sell: None,
                 gas_bought: 0,
+                refund: None,
                 withdraw: None,
                 relay: Some(RelayLeg {
                     request_id: swap.request_id,
                     typed_data,
                     api,
                     expected_out: swap.expected_out_units,
+                    currency: String::new(),
                 }),
             },
         )
@@ -5771,12 +5806,14 @@ async fn execute_hood_buy(
                 device: None,
                 then_sell: None,
                 gas_bought: 0,
+                refund: None,
                 withdraw: None,
                 relay: Some(RelayLeg {
                     request_id: swap.request_id,
                     typed_data,
                     api,
                     expected_out: swap.expected_out_units,
+                    currency: stored.currency.clone(),
                 }),
             },
         )
@@ -5887,12 +5924,14 @@ async fn execute_hood_sale(
                 device: None,
                 then_sell: None,
                 gas_bought: 0,
+                refund: None,
                 withdraw: None,
                 relay: Some(RelayLeg {
                     request_id: swap.request_id,
                     typed_data: None,
                     api: String::new(),
                     expected_out: swap.expected_out_units,
+                    currency: stored.currency.clone(),
                 }),
             },
         )
@@ -6004,6 +6043,7 @@ async fn execute_sui_sell(
                 relay: None,
                 then_sell: None,
                 gas_bought: 0,
+                refund: None,
             },
         )
         .await?;
@@ -6152,6 +6192,7 @@ async fn execute_sale_after_gas(
                     sale: quote.sale,
                 }),
                 gas_bought: 0,
+                refund: None,
             },
         )
         .await?;
@@ -6545,6 +6586,7 @@ pub(super) async fn execute(
                 relay: None,
                 then_sell: None,
                 gas_bought: 0,
+                refund: None,
             },
         )
         .await?;
@@ -6909,6 +6951,15 @@ pub(super) async fn signed(
             .await
             .map(Json);
     }
+    // A refunded Robinhood trade's last step: the phone's approval of bringing it back.
+    if current.refund.is_some()
+        && current.status.stage == "sign"
+        && current.status.state == "pending"
+    {
+        return refund_signed(&state, &headers, &id, current, body)
+            .await
+            .map(Json);
+    }
     // After a gas top-up, the Base transfer is reported from the sign stage.
     let second_step = current.gas_topup && current.status.stage == "sign";
     if current.status.stage != "validate" && !second_step {
@@ -7120,7 +7171,9 @@ pub(super) async fn status(
         ));
     }
     if let Some(leg) = current.relay.clone() {
-        return relay_status(&state, &id, current, leg).await.map(Json);
+        return relay_status(&state, &user, &id, current, leg)
+            .await
+            .map(Json);
     }
     let mut result = current.status.clone();
     if current.sell_sui && result.state == "pending" {
@@ -7346,6 +7399,7 @@ pub(super) async fn status(
 // filled. A sale nobody reported is followed by its wallet nonce, as with 1Click.
 async fn relay_status(
     state: &AppState,
+    user: &app_balance::VerifiedWallets,
     id: &str,
     mut current: StoredIntent,
     leg: RelayLeg,
@@ -7353,6 +7407,9 @@ async fn relay_status(
     let mut result = current.status.clone();
     if result.state != "pending" {
         return Ok(result);
+    }
+    if current.refund.is_some() {
+        return refund_status(state, id, current).await;
     }
     // A sale the phone sent from its own wallet on Monad or Robinhood Chain.
     let chain = match current.origin_chain.as_str() {
@@ -7438,18 +7495,27 @@ async fn relay_status(
         }
         engine_execution::layerswap::SwapState::Failed(reason) => {
             eprintln!("intent {id}: Relay {reason}");
-            result.state = "failed".into();
-            let robinhood_buy = !sale
-                && current
+            let robinhood = chain == Some(EvmChain::Robinhood)
+                || current
                     .asset
                     .as_ref()
                     .is_some_and(|a| a.blockchain == "hood");
+            // Relay may refund a Robinhood trade as USDG in the wallet there: the trade then brings
+            // it back to Trading as its last step.
+            if robinhood && trading_wallet(user).is_some() {
+                current.refund = Some(Refund {
+                    since: now(),
+                    moved: None,
+                    handed: false,
+                });
+                result.stage = "refund".into();
+                result.error = None;
+                current.status = result;
+                return refund_status(state, id, current).await;
+            }
+            result.state = "failed".into();
             result.error = Some(if sale {
                 format!("The sale didn't go through. Relay returns your {symbol} to your wallet.")
-            } else if robinhood_buy {
-                // Relay refunds a Robinhood buy where it stopped: the cash, or dollars (USDG) on
-                // Robinhood Chain, which the balance shows.
-                "The purchase didn't go through. Relay returns your money to your wallet, as cash or as USDG on Robinhood Chain.".into()
             } else {
                 "The purchase didn't go through. Relay returns your money to your wallet.".into()
             });
@@ -7458,6 +7524,233 @@ async fn relay_status(
     current.status = result.clone();
     state.near.save_intent(id, current).await?;
     Ok(result)
+}
+
+// How long to look for a refund's USDG in the wallet once Relay says it refunded. Relay reports a
+// refund once it's paid, so it's normally there at the first look; none by then means Relay refunded
+// where the trade was paid from.
+const REFUND_LOOK_MS: u64 = 30_000;
+const REFUNDED: &str =
+    "The price moved, so this buy was refunded. Your money is back in your trading balance.";
+
+// The wallet a Robinhood trade's refund lands in: the buy's recipient there, or the selling wallet.
+fn refund_wallet(current: &StoredIntent) -> &str {
+    if current.origin_chain == "robinhood" {
+        &current.wallet
+    } else {
+        current.ref_wallet.as_deref().unwrap_or_default()
+    }
+}
+// Trading: the user's Solana wallet, where a refund comes back to.
+fn trading_wallet(user: &app_balance::VerifiedWallets) -> Option<&str> {
+    user.solana_wallet.as_deref().filter(|w| !w.is_empty())
+}
+// Seconds an EIP-3009 authorization still has before its deadline.
+fn signable_for(typed_data: &Value) -> u64 {
+    let deadline = &typed_data["message"]["validBefore"];
+    deadline
+        .as_str()
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| deadline.as_u64())
+        .unwrap_or(0)
+        .saturating_sub(now() / 1000)
+}
+
+// A refunded Robinhood trade: look for its USDG (stage refund), wait for the phone's approval
+// (stage sign, handed out by /next), then follow Relay until the USDC is in Trading. A try that
+// doesn't move it (Relay gives up, or never used the approval before its deadline) looks again.
+async fn refund_status(
+    state: &AppState,
+    id: &str,
+    mut current: StoredIntent,
+) -> Result<markets::IntentStatus, ApiError> {
+    let mut result = current.status.clone();
+    let Some(mut refund) = current.refund.clone() else {
+        return Ok(result);
+    };
+    if result.state != "pending" || result.stage != "refund" {
+        return Ok(result);
+    }
+    let sale = current.origin_chain == "robinhood";
+    if let Some(moved) = refund.moved.clone().filter(|_| refund.handed) {
+        match state
+            .relay_link
+            .state(&moved.request_id)
+            .await
+            .map_err(venue)?
+        {
+            engine_execution::layerswap::SwapState::Completed => {
+                if sale {
+                    // The coin was sold into those dollars: it's a sale, for what reached Trading.
+                    result.state = "filled".into();
+                    result.error = None;
+                    let tx = result.tx_ids.first().cloned();
+                    record_fill(state, id, &current, "sell", current.amount, moved.back, tx).await;
+                } else {
+                    result.state = "failed".into();
+                    result.error = Some(refunded(&current, moved.back).await);
+                }
+                current.status = result.clone();
+                state.near.save_intent(id, current).await?;
+                return Ok(result);
+            }
+            engine_execution::layerswap::SwapState::Waiting
+                if !markets::typed_authorization_dead(state, &moved.typed_data).await =>
+            {
+                return Ok(result);
+            }
+            _ => {
+                eprintln!(
+                    "intent {id}: refund {} didn't move; looking again",
+                    moved.request_id
+                );
+                refund.handed = false;
+                refund.moved = None;
+                refund.since = now();
+            }
+        }
+    }
+    if state.near.hood_usdg(refund_wallet(&current)).await? > 0 {
+        result.stage = "sign".into();
+    } else if now() >= refund.since.saturating_add(REFUND_LOOK_MS) {
+        let symbol = current.asset.as_ref().map_or("coin", |a| a.symbol.as_str());
+        result.state = "failed".into();
+        result.error = Some(if sale {
+            format!("The sale didn't go through, so your {symbol} is back in your wallet.")
+        } else {
+            REFUNDED.into()
+        });
+    }
+    current.refund = Some(refund);
+    current.status = result.clone();
+    state.near.save_intent(id, current).await?;
+    Ok(result)
+}
+// What a refunded Robinhood buy says once its money is back in Trading.
+async fn refunded(current: &StoredIntent, back: u128) -> String {
+    let currency = current
+        .relay
+        .as_ref()
+        .map(|l| l.currency.as_str())
+        .filter(|c| !c.is_empty())
+        .unwrap_or("USD");
+    match app_balance::fx_rate(currency).await {
+        Ok(rate) => format!(
+            "The price moved, so this buy was refunded. {} is back in your trading balance.",
+            markets::say_money(back, currency, rate)
+        ),
+        Err(_) => REFUNDED.into(),
+    }
+}
+// Relay's quote for bringing back all the USDG the wallet holds, kept while it has two minutes or
+// more to be signed in; asking after that makes a fresh one.
+async fn refund_move(
+    state: &AppState,
+    user: &app_balance::VerifiedWallets,
+    current: &mut StoredIntent,
+) -> Result<RefundMove, ApiError> {
+    let mut refund = current
+        .refund
+        .clone()
+        .ok_or_else(|| conflict("nothing to sign for this intent"))?;
+    if let Some(moved) = refund
+        .moved
+        .clone()
+        .filter(|m| signable_for(&m.typed_data) >= 120)
+    {
+        return Ok(moved);
+    }
+    let solana = trading_wallet(user)
+        .ok_or_else(|| conflict("Your wallet is still being set up. Try again in a moment."))?;
+    let evm = refund_wallet(current).to_owned();
+    let held = state.near.hood_usdg(&evm).await?;
+    if held == 0 {
+        // Already moved by another try: back to looking, which settles what happened.
+        refund.moved = None;
+        refund.since = now();
+        current.refund = Some(refund);
+        current.status.stage = "refund".into();
+        return Err(conflict("Your refund is already on its way back."));
+    }
+    let quote = state
+        .relay_link
+        .hood_usdg_to_solana(&evm, solana, held)
+        .await
+        .map_err(|error| {
+            eprintln!("refund: Relay didn't quote ({error})");
+            venue("Couldn't bring your refund back right now. It's safe; try again shortly.")
+        })?;
+    let moved = RefundMove {
+        request_id: quote.request_id,
+        typed_data: quote.typed_data,
+        api: quote.api,
+        held,
+        back: quote.amount_out_units,
+    };
+    refund.moved = Some(moved.clone());
+    current.refund = Some(refund);
+    Ok(moved)
+}
+// The phone's approval of bringing a refund back: checked against the quote it was given, then
+// handed to Relay. Handed first, so a repeated report can't hand it over twice; an unanswered
+// hand-off is followed through Relay and the approval's deadline.
+async fn refund_signed(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+    mut current: StoredIntent,
+    body: markets::Submission,
+) -> Result<markets::IntentStatus, ApiError> {
+    let mut refund = current
+        .refund
+        .clone()
+        .ok_or_else(|| conflict("nothing to sign for this intent"))?;
+    let moved = refund
+        .moved
+        .clone()
+        .ok_or_else(|| conflict("nothing to sign for this intent"))?;
+    let [approval] = body.signed.as_slice() else {
+        return Err(bad("signed report does not match the refund plan"));
+    };
+    if !body.sent.is_empty() || approval.index != 0 {
+        return Err(bad("signed report does not match the refund plan"));
+    }
+    let signature = gasless::verify(
+        state,
+        headers,
+        refund_wallet(&current),
+        &moved.typed_data,
+        &approval.transaction,
+    )
+    .await
+    .map_err(|reason| {
+        eprintln!("intent {id}: refund approval refused: {reason}");
+        bad("That approval doesn't match your refund. Try again.")
+    })?;
+    refund.handed = true;
+    current.refund = Some(refund.clone());
+    current.status.stage = "refund".into();
+    state.near.save_intent(id, current.clone()).await?;
+    match state
+        .relay_link
+        .submit(&moved.request_id, &moved.api, &signature)
+        .await
+    {
+        Ok(()) => {}
+        // Relay said no: it won't use this approval, so look again (a fresh quote to sign).
+        Err(engine_execution::relay_link::RelayError::Rejected { status, reason })
+            if status.is_client_error() =>
+        {
+            eprintln!("intent {id}: Relay refused the refund ({status}: {reason})");
+            refund.handed = false;
+            refund.moved = None;
+            refund.since = now();
+            current.refund = Some(refund);
+            state.near.save_intent(id, current.clone()).await?;
+        }
+        Err(error) => eprintln!("intent {id}: refund hand-off unanswered: {error}"),
+    }
+    Ok(current.status)
 }
 
 // What 1Click says reached the recipient, once settled.
@@ -7632,6 +7925,19 @@ pub(super) async fn next(
             ));
         }
     }
+    // A refunded Robinhood trade: the one USDG approval that brings it back to Trading, signed
+    // under the trade's confirmation.
+    if current.status.stage == "sign"
+        && current.status.state == "pending"
+        && current.refund.is_some()
+    {
+        let moved = refund_move(&state, &user, &mut current).await;
+        state.near.save_intent(&id, current.clone()).await?;
+        let moved = moved?;
+        return Ok(Json(
+            json!({"transactions":[gasless::step(&moved.typed_data, "robinhood")]}),
+        ));
+    }
     if current.status.stage == "sign"
         && current.status.state == "pending"
         && current.then_swap.is_some()
@@ -7694,7 +8000,8 @@ pub(super) async fn pending_rows(
         .await?
         .into_iter()
         .filter(|i| {
-            i.status.state == "pending" && matches!(i.status.stage.as_str(), "fund" | "settle")
+            i.status.state == "pending"
+                && matches!(i.status.stage.as_str(), "fund" | "settle" | "refund")
         })
         .take(16)
     {
@@ -7731,7 +8038,7 @@ pub(super) async fn pending_rows(
             .or_else(|| intent.asset.as_ref().map(|a| a.symbol.as_str()))
             .unwrap_or("Coin");
         rows.push(json!({"intentId":intent.status.intent_id,"assetId":intent.asset_id,"symbol":symbol,
-            "kind":if intent.sell_sui{"sell"}else if intent.withdraw.is_some(){"withdraw"}else{"buy"},"stage":intent.status.stage,"error":intent.status.error}));
+            "kind":if intent.refund.is_some(){"refund"}else if intent.sell_sui{"sell"}else if intent.withdraw.is_some(){"withdraw"}else{"buy"},"stage":intent.status.stage,"error":intent.status.error}));
     }
     Ok(rows)
 }
@@ -7823,6 +8130,25 @@ pub(super) async fn resume(
     } else {
         drop(_step);
         let next = next(state.clone(), headers.clone(), id.clone()).await?.0;
+        // A refund waiting on Robinhood Chain: what comes back to Trading, and Relay's few cents.
+        let refund = state.near.get_intent(&id).await?.and_then(|i| {
+            let currency = i.relay.map(|l| l.currency).filter(|c| !c.is_empty());
+            i.refund.and_then(|r| r.moved).map(|m| (m, currency))
+        });
+        if let Some((moved, currency)) = refund {
+            let currency = currency.unwrap_or_else(|| "USD".into());
+            let rate = app_balance::fx_rate(&currency).await?;
+            let say = |units| markets::say_money(units, &currency, rate);
+            let expires = (now() + 120_000)
+                .min((now() / 1000 + signable_for(&moved.typed_data)).saturating_sub(10) * 1000);
+            return Ok(Json(
+                json!({"intentId":id,"stage":"sign","kind":"move","summary":[
+                    {"label":"You move","value":say(moved.held)},
+                    {"label":"Arrives in Trading","value":say(moved.back)},
+                    {"label":"Fee","value":say(moved.held.saturating_sub(moved.back))}],
+                "transactions":next["transactions"],"expiresAtUnixMs":expires}),
+            ));
+        }
         let (kind, finish, value) = match &intent.withdraw {
             Some(w) => (
                 "withdraw",
@@ -7860,6 +8186,37 @@ pub(super) async fn resume(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_refund_comes_from_the_robinhood_wallet_that_holds_it() {
+        // Intents saved before refunds existed read back with none.
+        let buy: super::StoredIntent = serde_json::from_value(serde_json::json!({
+            "owner":"u","wallet":"SolanaWallet","expected_to":"","expected_data":"",
+            "deposit_address":"","deposit_memo":null,"expires":0,"ref_wallet":"0xbuyer",
+            "status":{"intentId":"i","stage":"settle","state":"pending","txIds":[],"error":null},
+            "relay":{"request_id":"0x1","expected_out":1}}))
+        .unwrap();
+        assert!(buy.refund.is_none());
+        assert_eq!(buy.relay.as_ref().unwrap().currency, "");
+        // A buy's refund is in the wallet it bought into; a sale's in the wallet it sold from.
+        assert_eq!(super::refund_wallet(&buy), "0xbuyer");
+        let mut sale = buy.clone();
+        sale.origin_chain = "robinhood".into();
+        sale.wallet = "0xseller".into();
+        assert_eq!(super::refund_wallet(&sale), "0xseller");
+    }
+
+    #[test]
+    fn a_refund_approval_is_signable_only_before_its_deadline() {
+        let now = super::now() / 1000;
+        let at = |deadline: serde_json::Value| {
+            super::signable_for(&serde_json::json!({"message":{"validBefore":deadline}}))
+        };
+        assert!(at(serde_json::json!((now + 300).to_string())) >= 299);
+        assert!(at(serde_json::json!(now + 300)) >= 299);
+        assert_eq!(at(serde_json::json!(now - 1)), 0);
+        assert_eq!(super::signable_for(&serde_json::json!({})), 0);
+    }
+
     #[test]
     fn a_relay_deposit_cannot_exceed_the_reviewed_fee() {
         assert!(super::confirmed_relay_fee(20_000, Some(80_000)).is_err());

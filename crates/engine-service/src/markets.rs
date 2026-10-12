@@ -3225,10 +3225,16 @@ fn expired_authorization_block(block: &Value, deadline: u64) -> Option<&str> {
 // Whether a gasless move's USDC authorization is past its deadline in a finalized Base block and
 // was never used on chain, so nothing moved and nothing can. Unknown is never dead.
 async fn authorization_dead(state: &AppState, cash: &CashMove) -> bool {
-    let Some(auth) = &cash.authorization else {
-        return false;
-    };
-    let message = &auth.typed_data["message"];
+    match &cash.authorization {
+        Some(auth) => typed_authorization_dead(state, &auth.typed_data).await,
+        None => false,
+    }
+}
+
+// The same for any EIP-3009 authorization Relay was handed (USDC on Base, or USDG on Robinhood
+// Chain): past its deadline in a finalized block of its token's chain, and never used there.
+pub(super) async fn typed_authorization_dead(state: &AppState, typed_data: &Value) -> bool {
+    let message = &typed_data["message"];
     let deadline = message["validBefore"]
         .as_str()
         .and_then(|s| s.parse::<u64>().ok())
@@ -3245,8 +3251,15 @@ async fn authorization_dead(state: &AppState, cash: &CashMove) -> bool {
     if from.len() != 40 || nonce.len() != 64 {
         return false;
     }
+    // Still before its deadline here: no finalized block can be past it yet.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    if now <= deadline {
+        return false;
+    }
     // Read on the token's own chain: USDC on Base, or a refund's USDG on Robinhood Chain.
-    let domain = &auth.typed_data["domain"];
+    let domain = &typed_data["domain"];
     let chain = domain["chainId"]
         .as_u64()
         .or_else(|| domain["chainId"].as_str().and_then(|c| c.parse().ok()));

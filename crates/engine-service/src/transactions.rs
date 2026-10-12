@@ -271,7 +271,6 @@ pub(super) fn title(kind: &str, symbol: &str) -> String {
         "withdraw" => "Withdraw",
         "move_to_trading" => "Moved to trading",
         "move_to_spendable" => "Moved to spendable",
-        "move_recover" => "Refund back in Trading",
         _ => "Transaction",
     };
     if symbol.is_empty() {
