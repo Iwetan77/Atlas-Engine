@@ -1,7 +1,13 @@
 //! Solana USDC destination preflight for Gateway spends.
 //! The relayer pays account rent; the user's wallet never needs SOL.
 
-use std::{path::PathBuf, str::FromStr, time::Duration};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    str::FromStr,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use reqwest::Client;
@@ -42,6 +48,9 @@ pub struct SolanaAtaPreflight {
     rpc_url: String,
     network: SolanaNetwork,
     relayer_keypair_path: PathBuf,
+    // The last block height at which each recently handed-out blockhash is valid, from the same
+    // answer as the blockhash, so a transaction built on it can later be proven expired.
+    blockhashes: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -96,6 +105,7 @@ impl SolanaAtaPreflight {
             rpc_url: rpc_url.into(),
             network,
             relayer_keypair_path: relayer_keypair_path.into(),
+            blockhashes: Arc::default(),
         })
     }
 
@@ -411,13 +421,7 @@ impl SolanaAtaPreflight {
         let destination =
             get_associated_token_address_with_program_id(&to, &mint, &spl_token::id());
         let creates = self.account(&destination).await?.is_none();
-        let blockhash = self
-            .rpc("getLatestBlockhash", json!([{"commitment":"confirmed"}]))
-            .await?;
-        let blockhash = blockhash["value"]["blockhash"]
-            .as_str()
-            .ok_or(SolanaPreflightError::InvalidResponse)?;
-        let hash = Hash::from_str(blockhash).map_err(|_| SolanaPreflightError::InvalidResponse)?;
+        let hash = self.recorded_blockhash().await?;
         let instructions = vec![
             create_associated_token_account_idempotent(&from, &to, &mint, &spl_token::id()),
             spl_token::instruction::transfer_checked(
@@ -625,15 +629,7 @@ impl SolanaAtaPreflight {
                 addresses,
             });
         }
-        let blockhash = self
-            .rpc("getLatestBlockhash", json!([{"commitment":"confirmed"}]))
-            .await?;
-        let hash = Hash::from_str(
-            blockhash["value"]["blockhash"]
-                .as_str()
-                .ok_or_else(invalid)?,
-        )
-        .map_err(|_| invalid())?;
+        let hash = self.recorded_blockhash().await?;
         let message =
             v0::Message::try_compile(&payer, &built, &tables, hash).map_err(|_| invalid())?;
         let signers = usize::from(message.header.num_required_signatures);
@@ -670,6 +666,72 @@ impl SolanaAtaPreflight {
             .as_u64()
             .and_then(|n| u32::try_from(n).ok())
             .ok_or(SolanaPreflightError::InvalidResponse)
+    }
+
+    /// A fresh blockhash, remembering the last block height it's valid at (see `last_valid_height`).
+    async fn recorded_blockhash(&self) -> Result<Hash, SolanaPreflightError> {
+        let block = self
+            .rpc("getLatestBlockhash", json!([{"commitment":"confirmed"}]))
+            .await?;
+        let text = block["value"]["blockhash"]
+            .as_str()
+            .ok_or(SolanaPreflightError::InvalidResponse)?;
+        let hash = Hash::from_str(text).map_err(|_| SolanaPreflightError::InvalidResponse)?;
+        if let (Some(height), Ok(mut known)) = (
+            block["value"]["lastValidBlockHeight"].as_u64(),
+            self.blockhashes.lock(),
+        ) {
+            // A blockhash is good for about a minute: older ones are of no use to anyone.
+            if known.len() > 4_096 {
+                known.clear();
+            }
+            known.insert(text.to_owned(), height);
+        }
+        Ok(hash)
+    }
+
+    /// The last block height at which a transaction built here (base64) can land: what Solana
+    /// said about its blockhash when it was handed out. None for one built elsewhere or before a
+    /// restart.
+    pub fn last_valid_height(&self, transaction_base64: &str) -> Option<u64> {
+        let bytes = STANDARD.decode(transaction_base64).ok()?;
+        let tx: solana_sdk::transaction::VersionedTransaction =
+            bincode::deserialize(&bytes).ok()?;
+        let blockhash = tx.message.recent_blockhash().to_string();
+        self.blockhashes.lock().ok()?.get(&blockhash).copied()
+    }
+
+    /// Whether a transaction that could land only up to block height `last_valid_height` never
+    /// will: Solana has finalized past that height, and a look at the ledger made at or after
+    /// that finalized point finds no trace of `signature`. Any doubt answers false.
+    pub async fn never_landed(
+        &self,
+        signature: &str,
+        last_valid_height: u64,
+    ) -> Result<bool, SolanaPreflightError> {
+        // The finalized blockhash's own expiry is 150 blocks past the finalized height.
+        let finalized = self
+            .rpc("getLatestBlockhash", json!([{"commitment":"finalized"}]))
+            .await?;
+        let (Some(slot), Some(expiry)) = (
+            finalized["context"]["slot"].as_u64(),
+            finalized["value"]["lastValidBlockHeight"].as_u64(),
+        ) else {
+            return Ok(false);
+        };
+        if expiry.saturating_sub(150) <= last_valid_height {
+            return Ok(false);
+        }
+        let statuses = self
+            .rpc(
+                "getSignatureStatuses",
+                json!([[signature], {"searchTransactionHistory": true}]),
+            )
+            .await?;
+        Ok(statuses["context"]["slot"]
+            .as_u64()
+            .is_some_and(|seen| seen >= slot)
+            && statuses["value"][0].is_null())
     }
 
     pub async fn block_height(&self) -> Result<u64, SolanaPreflightError> {

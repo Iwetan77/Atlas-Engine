@@ -19,18 +19,20 @@ pub(super) const CLIENT_HEADER: &str = "x-atlas-balances";
 const UPDATE_FOR_BALANCES: &str =
     "Update Atlas to keep trading and sending: your balance now has Spendable and Trading.";
 
-// The quotes that pay from Spendable or Trading. Adding money, closing positions and moves aren't
-// here: they work the same for every app.
-fn needs_pockets(path: &str) -> bool {
-    matches!(
-        path,
-        "/v1/quotes"
-            | "/v1/sends/quote"
-            | "/v1/perps/quotes"
-            | "/v1/predictions/quotes"
-            | "/v1/earn/quotes"
-            | "/v1/withdrawals/quote"
-    )
+// Whether a quote request pays from Spendable or Trading: buying, sending, opening a position,
+// saving and withdrawing to a wallet. Selling, prediction sales and claims, and taking savings out
+// bring money in, so they work the same for every app, as do adding money, moves and closes.
+fn pays_from_a_balance(path: &str, body: &Value) -> bool {
+    match path {
+        "/v1/sends/quote" | "/v1/perps/quotes" | "/v1/withdrawals/quote" => true,
+        "/v1/quotes" | "/v1/predictions/quotes" => body["side"] == "buy",
+        "/v1/earn/quotes" => body["action"] == "deposit",
+        _ => false,
+    }
+}
+
+fn gated_path(path: &str) -> bool {
+    pays_from_a_balance(path, &json!({"side":"buy","action":"deposit"}))
 }
 
 pub(super) async fn client_gate(
@@ -42,11 +44,25 @@ pub(super) async fn client_gate(
         .get(CLIENT_HEADER)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.trim().parse::<u32>().is_ok_and(|n| n >= 1));
-    if request.method() == axum::http::Method::POST && needs_pockets(request.uri().path()) && !knows
-    {
+    let path = request.uri().path().to_owned();
+    if knows || request.method() != axum::http::Method::POST || !gated_path(&path) {
+        return Ok(next.run(request).await);
+    }
+    // Read the request to see what it does, then hand it on unchanged.
+    let (parts, body) = request.into_parts();
+    let bytes = axum::body::to_bytes(body, 64 * 1024)
+        .await
+        .map_err(|_| bad("request too large"))?;
+    let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    if pays_from_a_balance(&path, &value) {
         return Err((StatusCode::CONFLICT, UPDATE_FOR_BALANCES.into()));
     }
-    Ok(next.run(request).await)
+    Ok(next
+        .run(axum::extract::Request::from_parts(
+            parts,
+            axum::body::Body::from(bytes),
+        ))
+        .await)
 }
 const QUOTE_MS: u64 = 30_000;
 // A cent of room under everything in the balance, so a Max move's next quote still fits.
@@ -375,25 +391,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_quotes_that_pay_from_a_balance_need_an_app_that_knows_both() {
+    fn only_actions_that_pay_from_a_balance_need_an_app_that_knows_both() {
+        let buy = json!({"side":"buy"});
+        let sell = json!({"side":"sell"});
+        assert!(pays_from_a_balance("/v1/quotes", &buy));
+        assert!(!pays_from_a_balance("/v1/quotes", &sell));
+        assert!(pays_from_a_balance("/v1/predictions/quotes", &buy));
+        for side in ["sell", "redeem", "withdraw"] {
+            assert!(!pays_from_a_balance(
+                "/v1/predictions/quotes",
+                &json!({ "side": side })
+            ));
+        }
+        assert!(pays_from_a_balance(
+            "/v1/earn/quotes",
+            &json!({"action":"deposit"})
+        ));
+        assert!(!pays_from_a_balance(
+            "/v1/earn/quotes",
+            &json!({"action":"withdraw"})
+        ));
         for path in [
-            "/v1/quotes",
             "/v1/sends/quote",
             "/v1/perps/quotes",
-            "/v1/predictions/quotes",
-            "/v1/earn/quotes",
             "/v1/withdrawals/quote",
         ] {
-            assert!(needs_pockets(path), "{path}");
+            assert!(pays_from_a_balance(path, &Value::Null), "{path}");
         }
         for path in [
             "/v1/moves/quote",
             "/v1/onramp/bank/quote",
             "/v1/deposit/quote",
             "/v1/quotes/q-1/execute",
-            "/v1/balance",
+            "/v1/perps/positions/p-1/close-quote",
         ] {
-            assert!(!needs_pockets(path), "{path}");
+            assert!(!gated_path(path), "{path}");
         }
     }
 

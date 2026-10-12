@@ -1059,11 +1059,11 @@ pub(super) struct PlannedTransfer {
     // this message, from this wallet. None for older intents.
     #[serde(default)]
     transaction: Option<String>,
-    // Solana's finalized block height when the signed transfer was handed to the network: once the
-    // chain is well past it, the transfer's blockhash can't be valid any more, so one it never saw
-    // never will. 0 when unknown (then it's never given up).
+    // The last block height at which the planned transaction can land, as Solana said when it
+    // handed out its blockhash. Once Solana has finalized past it with no trace of the transfer,
+    // it never landed. 0 when unknown (then it's never given up).
     #[serde(default)]
-    sent_height: u64,
+    last_valid_height: u64,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct BaseTopup {
@@ -3182,6 +3182,19 @@ async fn move_to_solana(
     ))
 }
 
+// The finalized block's number (as given) when its timestamp is past `deadline`: the block an
+// authorization's absence can be read at. None for anything else.
+fn expired_authorization_block(block: &Value, deadline: u64) -> Option<&str> {
+    let timestamp =
+        u64::from_str_radix(block["timestamp"].as_str()?.strip_prefix("0x")?, 16).ok()?;
+    if timestamp <= deadline {
+        return None;
+    }
+    let number = block["number"].as_str()?;
+    u64::from_str_radix(number.strip_prefix("0x")?, 16).ok()?;
+    Some(number)
+}
+
 // Whether a gasless move's USDC authorization is past its deadline in a finalized Base block and
 // was never used on chain, so nothing moved and nothing can. Unknown is never dead.
 async fn authorization_dead(state: &AppState, cash: &CashMove) -> bool {
@@ -3200,33 +3213,31 @@ async fn authorization_dead(state: &AppState, cash: &CashMove) -> bool {
     ) else {
         return false;
     };
-    // Only once Base has finalized a block past the deadline: every block that could still have
-    // used it is final then, and no later one can.
-    let finalized = base_rpc(
-        &state.markets,
-        "eth_getBlockByNumber",
-        json!(["finalized", false]),
-    )
-    .await;
-    let past_deadline = finalized
-        .ok()
-        .as_ref()
-        .and_then(|block| block["timestamp"].as_str())
-        .and_then(|t| u64::from_str_radix(t.trim_start_matches("0x"), 16).ok())
-        .is_some_and(|timestamp| timestamp > deadline);
-    if !past_deadline {
-        return false;
-    }
     let from = from.trim_start_matches("0x").to_ascii_lowercase();
     let nonce = nonce.trim_start_matches("0x").to_ascii_lowercase();
     if from.len() != 40 || nonce.len() != 64 {
         return false;
     }
-    // USDC's authorizationState(authorizer, nonce): true once the authorization was used.
+    // Only against a finalized Base block past the deadline: every block that could still have
+    // used it is final then, and no later one can.
+    let Ok(block) = base_rpc(
+        &state.markets,
+        "eth_getBlockByNumber",
+        json!(["finalized", false]),
+    )
+    .await
+    else {
+        return false;
+    };
+    let Some(number) = expired_authorization_block(&block, deadline) else {
+        return false;
+    };
+    // USDC's authorizationState(authorizer, nonce) at that same block: true once it was used. A
+    // node that can't answer for that block leaves it unknown.
     let used = base_rpc(
         &state.markets,
         "eth_call",
-        json!([{"to":BASE_USDC,"data":format!("0xe94a0102{from:0>64}{nonce}")},"latest"]),
+        json!([{"to":BASE_USDC,"data":format!("0xe94a0102{from:0>64}{nonce}")},number]),
     )
     .await;
     match used.ok().as_ref().and_then(Value::as_str) {
@@ -3387,10 +3398,6 @@ pub(super) async fn plan_move_to_spendable(
     .await?;
     Ok((intent_id, transactions, cost))
 }
-
-// A blockhash is good for 150 blocks after the block it was read at, which is at most about 32
-// blocks past the finalized height when the transfer was sent: 200 is safely beyond both.
-const TRANSFER_EXPIRY_BLOCKS: u64 = 200;
 
 // The gas tank. Every Solana transaction needs a little SOL for its fee unless Jupiter pays it
 // (gasless swaps). Below this, a Solana step gets a top-up first.
@@ -3734,6 +3741,10 @@ async fn insert_transfer(
     } = steps;
     let intent_id = id("intent");
     let planned = kora.is_none().then(|| transfer.clone());
+    let last_valid_height = planned
+        .as_deref()
+        .and_then(|tx| state.solana_mainnet.last_valid_height(tx))
+        .unwrap_or(0);
     state
         .markets
         .insert_intent(
@@ -3773,7 +3784,7 @@ async fn insert_transfer(
                     bank_ngn_per_usdc,
                     gas_committed: 0,
                     relay_request,
-                    sent_height: 0,
+                    last_valid_height,
                 }),
                 base_topup: None,
             },
@@ -5317,24 +5328,8 @@ pub(super) async fn signed(
             StatusCode::CONFLICT,
             "Privy Base wallet is not ready".into(),
         ))?;
-        if !state
-            .markets
-            .claim_execution(&intent_id, &current, "validate")
-            .await?
-        {
-            let latest = state.markets.get_intent(&intent_id).await?;
-            return Ok(Json(latest.map_or(current.status, |i| i.status)));
-        }
-        let mut updated = current;
-        let request_id = updated
-            .funding
-            .as_ref()
-            .map(|c| c.swap_id.clone())
-            .unwrap_or_default();
-        // Refused (a bad signature, or Relay said no) moved nothing. No answer at all may still
-        // have been taken: the status poll follows Relay's request, and the USDC authorization
-        // itself once it can no longer be used.
-        let moved = match gasless::verify(
+        // A signature that doesn't check out moves nothing and changes nothing.
+        let signature = gasless::verify(
             &state,
             &headers,
             &evm,
@@ -5342,33 +5337,51 @@ pub(super) async fn signed(
             &body.signed[0].transaction,
         )
         .await
-        {
-            Ok(signature) => match state
-                .relay_link
-                .submit(&request_id, &auth.api, &signature)
-                .await
-            {
-                Ok(()) => Ok(()),
-                Err(engine_execution::relay_link::RelayError::Rejected { status, reason })
-                    if status.is_client_error() =>
-                {
-                    Err(format!("{status}: {reason}"))
-                }
-                Err(error) => {
-                    eprintln!("intent {intent_id}: gasless move unresolved: {error}");
-                    Ok(())
-                }
-            },
-            Err(reason) => Err(reason),
-        };
-        updated.status.stage = "fund".into();
-        if let Err(reason) = moved {
+        .map_err(|reason| {
             eprintln!("intent {intent_id}: gasless move not started: {reason}");
-            updated.status.state = "failed".into();
-            updated.status.error = Some(gasless::NOT_MOVED.into());
+            bad(gasless::NOT_MOVED)
+        })?;
+        let request_id = current
+            .funding
+            .as_ref()
+            .map(|c| c.swap_id.clone())
+            .unwrap_or_default();
+        // Saved as moving before Relay is asked, so whatever happens next, the status poll follows
+        // Relay's request and, once it can no longer be used, the authorization itself.
+        if !state
+            .markets
+            .claim_execution_to(&intent_id, &current, "validate", "fund")
+            .await?
+        {
+            let latest = state.markets.get_intent(&intent_id).await?;
+            return Ok(Json(latest.map_or(current.status, |i| i.status)));
         }
-        state.markets.save_intent(&intent_id, &updated).await?;
-        return Ok(Json(updated.status));
+        let mut moving = current;
+        moving.status.stage = "fund".into();
+        match state
+            .relay_link
+            .submit(&request_id, &auth.api, &signature)
+            .await
+        {
+            Ok(()) => {}
+            // Relay said no: nothing moved.
+            Err(engine_execution::relay_link::RelayError::Rejected { status, reason })
+                if status.is_client_error() =>
+            {
+                eprintln!("intent {intent_id}: gasless move refused: {status}: {reason}");
+                let mut failed = moving.clone();
+                failed.status.state = "failed".into();
+                failed.status.error = Some(gasless::NOT_MOVED.into());
+                state
+                    .markets
+                    .replace_plan(&intent_id, &moving, &failed)
+                    .await?;
+            }
+            // No answer: it may still have been taken.
+            Err(error) => eprintln!("intent {intent_id}: gasless move unresolved: {error}"),
+        }
+        let latest = state.markets.get_intent(&intent_id).await?;
+        return Ok(Json(latest.map_or(moving.status, |i| i.status)));
     }
     if let Some(reserve) = current
         .fee_reserve
@@ -5587,10 +5600,6 @@ pub(super) async fn signed(
             if let Some(signature) = &bound {
                 updated.status.tx_ids = vec![signature.clone()];
                 updated.status.stage = "settle".into();
-                let height = state.solana_mainnet.block_height().await.unwrap_or(0);
-                if let Some(t) = updated.transfer.as_mut() {
-                    t.sent_height = height;
-                }
                 state.markets.save_intent(&intent_id, &updated).await?;
                 match state
                     .solana_mainnet
@@ -5940,16 +5949,16 @@ pub(super) async fn intent_status(
             .as_ref()
             .filter(|t| t.base)
             .and_then(|t| t.relay_request.clone());
-        // Not seen after the chain finalized well past where it was sent: its blockhash has run out
-        // (a transaction's lasts 150 blocks from when it was fetched), so it can never land.
-        let sent = current.transfer.as_ref().map_or(0, |t| t.sent_height);
+        // Solana finalized past the last block its blockhash allowed, with no trace of it: it can
+        // never land.
+        let last_valid = current.transfer.as_ref().map_or(0, |t| t.last_valid_height);
         let expired = landed.is_none()
-            && sent > 0
+            && last_valid > 0
             && state
                 .solana_mainnet
-                .block_height()
+                .never_landed(&signature, last_valid)
                 .await
-                .is_ok_and(|height| height > sent + TRANSFER_EXPIRY_BLOCKS);
+                .unwrap_or(false);
         match landed {
             None if expired => {
                 updated.status.state = "failed".into();
@@ -6164,6 +6173,11 @@ pub(super) async fn next_transactions(
             t.topup = steps.topup;
             t.relay_request = steps.relay_request.clone();
             t.transaction = steps.kora.is_none().then(|| steps.transaction.clone());
+            t.last_valid_height = t
+                .transaction
+                .as_deref()
+                .and_then(|tx| state.solana_mainnet.last_valid_height(tx))
+                .unwrap_or(0);
         }
         state.markets.save_intent(&intent_id, &intent).await?;
         let mut transactions = Vec::new();
@@ -6698,6 +6712,25 @@ mod tests {
         );
         assert_eq!(coingecko_coin("solana", "x"), None);
     }
+    #[test]
+    fn an_unused_authorization_is_read_at_a_finalized_block_past_its_deadline() {
+        let block = |number: &str, timestamp: &str| json!({"number":number,"timestamp":timestamp});
+        // 0x3e8 = 1000: not past a deadline of 1000.
+        assert_eq!(
+            expired_authorization_block(&block("0x64", "0x3e8"), 1000),
+            None
+        );
+        assert_eq!(
+            expired_authorization_block(&block("0x65", "0x3e9"), 1000),
+            Some("0x65")
+        );
+        assert_eq!(
+            expired_authorization_block(&block("latest", "0x3e9"), 1000),
+            None
+        );
+        assert_eq!(expired_authorization_block(&Value::Null, 1000), None);
+    }
+
     #[test]
     fn a_move_saved_under_its_first_flag_name_still_ends_when_relay_delivers() {
         let mut saved = serde_json::to_value(spot_intent("buy", 1, 1)).unwrap();
@@ -7505,7 +7538,7 @@ mod tests {
             gas_committed: 0,
             relay_request: None,
             transaction: None,
-            sent_height: 0,
+            last_valid_height: 0,
         });
         intent.status.stage = "validate".into();
         intent.status.state = "pending".into();
