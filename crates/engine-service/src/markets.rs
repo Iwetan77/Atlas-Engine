@@ -1011,6 +1011,10 @@ struct StoredIntent {
     // A plain Solana USDC transfer (a friend send), landed by the engine rather than Jupiter.
     #[serde(default)]
     solana_transfer: bool,
+    // Cash moving between the user's own Spendable (Base) and Trading (Solana) balances: done once
+    // Relay has delivered it, with nothing to buy or send after.
+    #[serde(default)]
+    pocket_move: bool,
     // Base transactions from a wallet with no ETH: a gasless CoW top-up runs first, then /next hands
     // out `expected`.
     #[serde(default)]
@@ -1047,6 +1051,10 @@ pub(super) struct PlannedTransfer {
     // A retry cannot spend that cash a second time.
     #[serde(default)]
     gas_committed: u128,
+    // Relay's request for a `base` transfer: the transfer is only done once Relay has delivered.
+    // None for older intents, which finish when their Solana transaction lands.
+    #[serde(default)]
+    relay_request: Option<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct BaseTopup {
@@ -1372,6 +1380,7 @@ impl MarketState {
                 buy_mint: None,
                 gas_request_id: None,
                 solana_transfer: false,
+                pocket_move: false,
                 transfer: None,
                 base_topup: topup.then_some(BaseTopup {
                     uid: None,
@@ -1520,6 +1529,41 @@ pub(super) fn short_of_gas(currency: &str, rate: u128) -> ApiError {
         format!(
             "Not enough in your balance for this. Add about {} or try a smaller amount.",
             say_money(BASE_GAS_REFILL_USDC, currency, rate)
+        ),
+    )
+}
+// A trade, perps margin or prediction is paid from the trading balance only. The app reads
+// "trading balance" and "Add money" and offers to move money in from Spendable.
+pub(super) fn not_enough_trading(cash: u128, currency: &str, rate: u128) -> ApiError {
+    (
+        StatusCode::CONFLICT,
+        format!(
+            "Not enough in your trading balance for this. You have {} to trade. Add money to your trading balance to continue.",
+            say_money(cash, currency, rate)
+        ),
+    )
+}
+// Sending, cashing out and saving are paid from Spendable only. With money in Trading, the app
+// offers to move it back ("move it to spendable"); otherwise to add money.
+pub(super) fn not_enough_spendable(
+    cash: u128,
+    trading: u128,
+    currency: &str,
+    rate: u128,
+) -> ApiError {
+    let next = if trading > 0 {
+        format!(
+            "{} is in your trading balance: move it to spendable to use it here.",
+            say_money(trading, currency, rate)
+        )
+    } else {
+        "Add money to continue.".into()
+    };
+    (
+        StatusCode::CONFLICT,
+        format!(
+            "Not enough spendable for this. You have {} to spend. {next}",
+            say_money(cash, currency, rate)
         ),
     )
 }
@@ -3126,6 +3170,128 @@ async fn move_to_solana(
     ))
 }
 
+// Spendable → Trading: the user's own session signs one gasless USDC authorization (no Base gas)
+// and Relay's solver delivers to their own Solana wallet. `moved` is the Relay quote they reviewed,
+// made for their verified wallets; nothing else is planned. Returns the intent and the step to sign.
+pub(super) async fn plan_move_to_trading(
+    state: &AppState,
+    owner: String,
+    solana: String,
+    moved: engine_execution::relay_link::GaslessMove,
+) -> Result<(String, Vec<Value>), ApiError> {
+    let intent_id = id("intent");
+    let step = gasless::step(&moved.typed_data, "base");
+    state
+        .markets
+        .insert_intent(
+            &intent_id,
+            &StoredIntent {
+                owner,
+                wallet: solana,
+                chain: "solana".into(),
+                expected: Vec::new(),
+                request_id: None,
+                own_swap: None,
+                fee_preview: None,
+                fee_reserve: None,
+                status: IntentStatus {
+                    intent_id: intent_id.clone(),
+                    stage: "validate".into(),
+                    state: "pending".into(),
+                    tx_ids: Vec::new(),
+                    error: None,
+                },
+                trade: None,
+                funding: Some(CashMove {
+                    swap_id: moved.request_id,
+                    amount_units: moved.amount_in_units,
+                    tx_hash: None,
+                    authorization: Some(Authorization {
+                        typed_data: moved.typed_data,
+                        api: moved.api,
+                    }),
+                    relay: true,
+                    source_wallet: None,
+                    source_transaction: None,
+                }),
+                buy_mint: None,
+                gas_request_id: None,
+                solana_transfer: false,
+                pocket_move: true,
+                transfer: None,
+                base_topup: None,
+            },
+        )
+        .await?;
+    Ok((intent_id, vec![step]))
+}
+
+// What leaves Trading so `land` reaches Spendable: Relay's fee, and a SOL top-up from the same cash
+// when the wallet can't pay the Solana fee (kept as SOL for next time). (fee, top-up), USDC units.
+pub(super) async fn move_to_spendable_cost(
+    state: &AppState,
+    solana: &str,
+    evm: &str,
+    land: u128,
+) -> Result<(u128, u128), ApiError> {
+    let moved = state
+        .relay_link
+        .solana_to_base(solana, evm, land, 0)
+        .await
+        .map_err(|error| {
+            eprintln!("move to spendable: Relay didn't quote ({error})");
+            unavailable("Couldn't move your cash right now; try again shortly")
+        })?;
+    let sol = state
+        .solana_mainnet
+        .owner_sol_balance(solana)
+        .await
+        .map_err(unavailable)?;
+    let topup = if sol >= GAS_FLOOR_LAMPORTS {
+        0
+    } else {
+        topup_usdc_for(state, GAS_FLOOR_LAMPORTS - sol).await
+    };
+    Ok((moved.amount_in_units.saturating_sub(land), topup))
+}
+
+// Trading → Spendable: one Solana transaction the engine lands hands `land` plus Relay's fee to
+// Relay, which delivers exactly `land` to the user's own Base wallet; done once Relay has delivered.
+// Refused when what it costs now is more than `cost_limit` (what they reviewed). A retry never
+// buys SOL past the top-up planned here. Returns the intent, what the app signs, and the cost.
+pub(super) async fn plan_move_to_spendable(
+    state: &AppState,
+    owner: String,
+    solana: String,
+    evm: &str,
+    land: u128,
+    cost_limit: u128,
+) -> Result<(String, Vec<Value>, u128), ApiError> {
+    let steps = solana_relay_steps(state, &solana, evm, land, true).await?;
+    let cost = steps.network_fee.saturating_add(steps.topup);
+    if cost > cost_limit {
+        return Err((
+            StatusCode::CONFLICT,
+            "The fee changed. Check the new amount; nothing was moved.".into(),
+        ));
+    }
+    let topup = steps.topup;
+    let (intent_id, transactions, _) = insert_transfer(
+        state,
+        owner,
+        solana,
+        evm,
+        land,
+        true,
+        true,
+        steps,
+        Some(topup),
+        None,
+    )
+    .await?;
+    Ok((intent_id, transactions, cost))
+}
+
 // The gas tank. Every Solana transaction needs a little SOL for its fee unless Jupiter pays it
 // (gasless swaps). Below this, a Solana step gets a top-up first.
 const GAS_FLOOR_LAMPORTS: u128 = 1_000_000; // 0.001 SOL
@@ -3400,6 +3566,7 @@ pub(super) async fn plan_jupiter_swap(
                 buy_mint: None,
                 gas_request_id: gas.as_ref().map(|(id, _)| id.clone()),
                 solana_transfer: false,
+                pocket_move: false,
                 transfer: None,
                 base_topup: None,
             },
@@ -3427,7 +3594,10 @@ pub(super) async fn plan_solana_transfer(
     retry: bool,
 ) -> Result<(String, Vec<Value>, u128), ApiError> {
     let steps = solana_transfer_steps(state, &from, to, amount, true).await?;
-    insert_transfer(state, owner, from, to, amount, retry, false, steps, None).await
+    insert_transfer(
+        state, owner, from, to, amount, retry, false, steps, None, None,
+    )
+    .await
 }
 
 // A direct bank transfer reports only the new USDC it spends: reserve SOL is already owned.
@@ -3456,7 +3626,8 @@ pub(super) async fn plan_solana_bank_transfer(
         true,
         false,
         steps,
-        Some((cash, ngn_per_usdc)),
+        Some(cash),
+        Some(ngn_per_usdc),
     )
     .await
 }
@@ -3481,7 +3652,8 @@ async fn insert_transfer(
     retry: bool,
     base: bool,
     steps: SolanaTransfer,
-    bank_fee: Option<(u128, u128)>,
+    cash_fee_limit: Option<u128>,
+    bank_ngn_per_usdc: Option<u128>,
 ) -> Result<(String, Vec<Value>, u128), ApiError> {
     let SolanaTransfer {
         gas,
@@ -3490,6 +3662,7 @@ async fn insert_transfer(
         lamports,
         kora,
         topup,
+        relay_request,
     } = steps;
     let intent_id = id("intent");
     state
@@ -3517,6 +3690,7 @@ async fn insert_transfer(
                 buy_mint: None,
                 gas_request_id: gas.as_ref().map(|(id, _)| id.clone()),
                 solana_transfer: true,
+                pocket_move: false,
                 transfer: Some(PlannedTransfer {
                     to: to.into(),
                     amount,
@@ -3525,9 +3699,10 @@ async fn insert_transfer(
                     kora,
                     base,
                     topup,
-                    cash_fee_limit: bank_fee.map(|(limit, _)| limit),
-                    bank_ngn_per_usdc: bank_fee.map(|(_, rate)| rate),
+                    cash_fee_limit,
+                    bank_ngn_per_usdc,
                     gas_committed: 0,
+                    relay_request,
                 }),
                 base_topup: None,
             },
@@ -3565,6 +3740,8 @@ pub(super) struct SolanaTransfer {
     kora: Option<engine_execution::kora::Transfer>,
     // Cash the gas top-up turns into SOL (USDC units), 0 without one.
     topup: u128,
+    // Relay's request when the transfer is Relay bridging the USDC to Base.
+    relay_request: Option<String>,
 }
 
 impl SolanaTransfer {
@@ -3630,6 +3807,7 @@ async fn solana_transfer_steps_with_accounting(
             lamports,
             kora: None,
             topup: 0,
+            relay_request: None,
         });
     }
     let usdc = topup_usdc_for(state, lamports - sol).await;
@@ -3642,6 +3820,7 @@ async fn solana_transfer_steps_with_accounting(
                 lamports,
                 kora: None,
                 topup: usdc,
+                relay_request: None,
             });
         }
     }
@@ -3653,6 +3832,7 @@ async fn solana_transfer_steps_with_accounting(
             lamports: 0,
             kora: Some(kora),
             topup: 0,
+            relay_request: None,
         }),
         Err(engine_execution::kora::Error::Cash) => Err(short_of_cash()),
         Err(error) => {
@@ -3745,6 +3925,7 @@ async fn solana_relay_steps(
         lamports: GAS_FLOOR_LAMPORTS,
         kora: None,
         topup,
+        relay_request: Some(moved.request_id),
     })
 }
 
@@ -4484,6 +4665,7 @@ async fn plan_base_with_cash_mode(
                 buy_mint: None,
                 gas_request_id: gas.as_ref().map(|(id, _)| id.clone()),
                 solana_transfer: false,
+                pocket_move: false,
                 transfer: None,
                 base_topup: None,
             },
@@ -4560,6 +4742,7 @@ pub(super) async fn plan_solana_swap_with_base_cash(
                 buy_mint: Some(buy_mint.into()),
                 gas_request_id: None,
                 solana_transfer: false,
+                pocket_move: false,
                 transfer: None,
                 base_topup: None,
             },
@@ -4968,6 +5151,7 @@ async fn execute_quote_inner(
                 buy_mint: None,
                 gas_request_id,
                 solana_transfer: false,
+                pocket_move: false,
                 transfer: None,
                 base_topup,
             },
@@ -5568,6 +5752,10 @@ pub(super) async fn intent_status(
             state.layerswap.swap_state(&cash.swap_id).await.ok()
         };
         let next = match moved {
+            // A move between the user's own balances has nothing after it: done once delivered.
+            Some(engine_execution::layerswap::SwapState::Completed) if current.pocket_move => {
+                Some(("settle", "filled", None))
+            }
             Some(engine_execution::layerswap::SwapState::Completed) => {
                 Some(("sign", "pending", None))
             }
@@ -5692,8 +5880,30 @@ pub(super) async fn intent_status(
             .await
             .map_err(unavailable)?;
         let mut updated = current.clone();
+        let relayed = current
+            .transfer
+            .as_ref()
+            .filter(|t| t.base)
+            .and_then(|t| t.relay_request.clone());
         match landed {
             None => return Ok(Json(updated.status)),
+            // Bridged to Base: done when Relay has delivered, not when it was handed the cash.
+            Some(Ok(())) if relayed.is_some() => {
+                let request = relayed.unwrap_or_default();
+                match state.relay_link.state(&request).await {
+                    Ok(engine_execution::layerswap::SwapState::Completed) => {
+                        updated.status.state = "filled".into();
+                    }
+                    Ok(engine_execution::layerswap::SwapState::Failed(reason)) => {
+                        updated.status.state = "failed".into();
+                        updated.status.error = Some(format!(
+                            "Moving your cash didn't go through ({reason}). It goes back to your balance."
+                        ));
+                    }
+                    // Still moving, or Relay didn't answer this time: ask again on the next poll.
+                    _ => return Ok(Json(updated.status)),
+                }
+            }
             Some(Ok(())) => updated.status.state = "filled".into(),
             Some(Err(error)) => {
                 updated.status.state = "failed".into();
@@ -5879,6 +6089,7 @@ pub(super) async fn next_transactions(
             t.lamports = steps.lamports;
             t.kora = steps.kora.clone();
             t.topup = steps.topup;
+            t.relay_request = steps.relay_request.clone();
         }
         state.markets.save_intent(&intent_id, &intent).await?;
         let mut transactions = Vec::new();
@@ -6442,6 +6653,7 @@ mod tests {
             buy_mint: None,
             gas_request_id: None,
             solana_transfer: false,
+            pocket_move: false,
             transfer: None,
             base_topup: None,
         }
@@ -7142,6 +7354,7 @@ mod tests {
             lamports: NEW_ACCOUNT_FLOOR_LAMPORTS,
             kora: None,
             topup: 0,
+            relay_request: None,
         };
         assert_eq!(steps.cash_charge(), 0);
         steps.topup = 500_000;
@@ -7215,6 +7428,7 @@ mod tests {
             cash_fee_limit: None,
             bank_ngn_per_usdc: None,
             gas_committed: 0,
+            relay_request: None,
         });
         intent.status.stage = "validate".into();
         intent.status.state = "pending".into();

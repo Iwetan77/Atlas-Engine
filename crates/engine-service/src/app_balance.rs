@@ -92,6 +92,11 @@ mod u128_text {
 pub(super) struct AppBalanceResponse {
     total: Money,
     total_usd: String,
+    // The two balances inside `total` that cash moves between: Spendable (USDC in the Base wallet)
+    // pays sends, cash-outs and savings; Trading (USDC in the Solana wallet) pays trades, perps and
+    // predictions.
+    spendable: Money,
+    trading: Money,
     pending: Option<Money>,
     holdings: Vec<Holding>,
     // The gas tanks: what pays network fees on each chain. Not counted in `total`; Profile shows it.
@@ -212,6 +217,7 @@ pub(super) async fn balance(
     let rate = fx_rate(&currency).await?;
     let open = positions::open_positions(&portfolio.trades);
     let mut total = 0u128;
+    let (spendable, trading) = pockets(&portfolio.holdings);
     let mut holdings = Vec::with_capacity(portfolio.holdings.len());
     for h in &portfolio.holdings {
         total = total
@@ -239,11 +245,25 @@ pub(super) async fn balance(
     Ok(Json(AppBalanceResponse {
         total: money(total, &currency, rate)?,
         total_usd: usd(total),
+        spendable: money(spendable, &currency, rate)?,
+        trading: money(trading, &currency, rate)?,
         pending: None,
         holdings,
         gas,
         as_of_unix_ms,
     }))
+}
+
+// Spendable and Trading, in USDC units: the cash in the Base and the Solana wallet.
+fn pockets(holdings: &[Held]) -> (u128, u128) {
+    let cash = |chain: &str| {
+        holdings
+            .iter()
+            .filter(|h| h.kind == "cash" && h.location == "wallet" && h.chain == chain)
+            .map(|h| h.value_usdc)
+            .sum::<u128>()
+    };
+    (cash("base"), cash("solana"))
 }
 
 // Everything the user owns, read once for the balance and the profit and loss alike, so the two
@@ -1389,6 +1409,22 @@ mod tests {
             .iter()
             .all(|h| h.asset_id != deep || h.seen_ms == now - 60_000));
         assert_eq!(settled[0].seen_ms, now);
+    }
+
+    #[test]
+    fn spendable_is_base_wallet_cash_and_trading_is_solana_wallet_cash() {
+        let holdings = [
+            held("wallet", "base", "usdc", "cash", 0),
+            held("wallet", "solana", "usdc", "cash", 0),
+            held("wallet", "solana", "usdc", "cash", 0),
+            // Counted in the balance, but neither can be spent or traded as it is.
+            held("earn", "base", "usdc", "cash", 0),
+            held("perps", "hyperliquid", "usdc", "cash", 0),
+            held("wallet", "arc", "usdc", "cash", 0),
+            held("wallet", "solana", "bonk", "meme", 0),
+        ];
+        assert_eq!(pockets(&holdings), (2_000_000, 4_000_000));
+        assert_eq!(pockets(&[]), (0, 0));
     }
 
     #[test]
