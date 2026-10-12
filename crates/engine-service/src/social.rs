@@ -105,7 +105,7 @@ async fn spend_plan(
         // The plain transfer only: the wallet's ETH pays, and no refill is bought on the side
         // (the quote said this send is free). Once the ETH runs low, sends go through Relay.
         let txs = vec![(tx.to.clone(), tx.data.clone())];
-        let (intent_id, transactions, fee) = markets::plan_base_bank_with_cash(
+        let (intent_id, transactions, fee, gas) = markets::plan_base_bank_with_cash(
             state,
             owner,
             evm.into(),
@@ -116,7 +116,12 @@ async fn spend_plan(
             rate,
         )
         .await?;
-        return Ok((intent_id, transactions, fee.unwrap_or(0)));
+        // A wallet whose ETH pays buys no gas here; anything it did would be on the bill all the same.
+        return Ok((
+            intent_id,
+            transactions,
+            fee.unwrap_or(0).saturating_add(gas),
+        ));
     }
     let moved = markets::base_gasless_payment(state, evm, to, usdc).await?;
     let fee = moved.amount_in_units.saturating_sub(usdc);

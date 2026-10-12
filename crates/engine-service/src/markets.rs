@@ -2984,6 +2984,17 @@ async fn planned_gas_topup(
     usdc
 }
 
+// What a SOL top-up costs (USDC units) when a Solana step needs one because the wallet is below the
+// gas floor; 0 when its SOL pays. Priced the way gas_topup_priced buys it, for quotes to show and
+// count.
+pub(super) async fn sol_topup_cost(state: &AppState, owner: &str) -> u128 {
+    match state.solana_mainnet.owner_sol_balance(owner).await {
+        Ok(lamports) if lamports >= GAS_FLOOR_LAMPORTS => 0,
+        Ok(lamports) => topup_usdc_for(state, GAS_FLOOR_LAMPORTS - lamports).await,
+        Err(_) => GAS_TOPUP_USDC,
+    }
+}
+
 // The SOL top-up a Solana step will buy from Trading's cash (beyond `spends`) when the wallet is
 // below the gas floor: what planned_gas_topup says for a Solana coin. 0 when none is needed or the
 // cash can't carry one (the step then says so).
@@ -3111,11 +3122,7 @@ async fn base_cash_from_solana(
     };
     // The SOL top-up the deposit buys first when the wallet is short of SOL, priced the way the
     // plan will price it (it costs more when SOL is dear), so the quote and the plan agree.
-    let reserve = match state.solana_mainnet.owner_sol_balance(sol).await {
-        Ok(lamports) if lamports >= GAS_FLOOR_LAMPORTS => 0,
-        Ok(lamports) => topup_usdc_for(state, GAS_FLOOR_LAMPORTS - lamports).await,
-        Err(_) => GAS_TOPUP_USDC,
-    };
+    let reserve = sol_topup_cost(state, sol).await;
     if sol_cash < land + gas + reserve {
         return Err(not_enough_trading(sol_cash, currency, rate));
     }
@@ -3811,9 +3818,9 @@ pub(super) async fn solana_usdc_transfer(
     from: &str,
     to: &str,
     amount: u128,
-) -> Result<(Option<(String, String)>, String), ApiError> {
+) -> Result<(Option<(String, String)>, String, u128), ApiError> {
     let steps = solana_transfer_steps(state, from, to, amount, true).await?;
-    Ok((steps.gas, steps.transaction))
+    Ok((steps.gas, steps.transaction, steps.topup))
 }
 
 pub(super) struct SolanaTransfer {
@@ -3937,9 +3944,9 @@ pub(super) async fn solana_relay_transfer(
     from: &str,
     base_to: &str,
     amount: u128,
-) -> Result<(Option<(String, String)>, String, u128), ApiError> {
+) -> Result<(Option<(String, String)>, String, u128, u128), ApiError> {
     let steps = solana_relay_steps(state, from, base_to, amount, true).await?;
-    Ok((steps.gas, steps.transaction, steps.network_fee))
+    Ok((steps.gas, steps.transaction, steps.network_fee, steps.topup))
 }
 
 // Relay's deposit for `amount` to land at `base_to` on Base, and the gas top-up that pays its Solana
@@ -4112,7 +4119,6 @@ async fn account_rent_usd_checked(state: &AppState) -> Option<u128> {
 // cash hops over from Solana anyway.
 // 0.000005 ETH, and 0.00004 ETH.
 const BASE_GAS_FLOOR_WEI: u128 = 5_000_000_000_000;
-const BASE_GAS_REFILL_AT_WEI: u128 = 40_000_000_000_000;
 // A refill: $0.50 of USDC becomes about 0.0002 ETH, enough for dozens of transactions.
 pub(super) const BASE_GAS_REFILL_USDC: u128 = 500_000;
 // What the user reads when the tank couldn't be filled: nothing else happened.
@@ -4133,70 +4139,6 @@ pub(super) async fn wallet_pays_gas(state: &AppState, wallet: &str) -> bool {
     base_eth(state, wallet)
         .await
         .is_some_and(|wei| wei >= BASE_GAS_FLOOR_WEI)
-}
-
-// The Base transactions that refill the gas tank when it's low and the user has USDC to spare beyond
-// `reserve`: approve the router if needed, swap USDC → WETH, unwrap to ETH. Empty otherwise.
-pub(super) async fn base_gas_refill(
-    state: &AppState,
-    wallet: &str,
-    reserve: u128,
-) -> Vec<(String, String)> {
-    // Only while the tank can still pay for its own refill, and only when it's getting low.
-    let Some(eth) = base_eth(state, wallet).await else {
-        return Vec::new();
-    };
-    if !(BASE_GAS_FLOOR_WEI..BASE_GAS_REFILL_AT_WEI).contains(&eth) {
-        return Vec::new();
-    }
-    let usdc = state
-        .markets
-        .base
-        .balance_of(BASE_USDC, wallet)
-        .await
-        .unwrap_or(0);
-    if usdc < reserve.saturating_add(BASE_GAS_REFILL_USDC) {
-        return Vec::new();
-    }
-    let request = BaseSwapRequest {
-        source_token: BASE_USDC.into(),
-        destination_token: BASE_WETH.into(),
-        amount_base_units: BASE_GAS_REFILL_USDC,
-    };
-    let Ok(quote) = state.markets.base.quote_direct(&request).await else {
-        return Vec::new();
-    };
-    let Ok(swap) = state.markets.base.swap_transaction(&quote, wallet, 100) else {
-        return Vec::new();
-    };
-    let mut txs = Vec::new();
-    let allowance = state
-        .markets
-        .base
-        .allowance(BASE_USDC, wallet)
-        .await
-        .unwrap_or(0);
-    if allowance < BASE_GAS_REFILL_USDC {
-        if let Ok(approval) =
-            state
-                .markets
-                .base
-                .approval_transaction(BASE_USDC, wallet, BASE_GAS_REFILL_USDC)
-        {
-            txs.push((
-                approval.to.to_ascii_lowercase(),
-                approval.data.to_ascii_lowercase(),
-            ));
-        }
-    }
-    txs.push((swap.to.to_ascii_lowercase(), swap.data.to_ascii_lowercase()));
-    // WETH.withdraw(the least the swap delivers): the ETH lands natively for gas.
-    let unwrap = quote.amount_out.saturating_mul(99) / 100;
-    txs.push((
-        BASE_WETH.to_ascii_lowercase(),
-        format!("0x2e1a7d4d{unwrap:064x}"),
-    ));
-    txs
 }
 
 // Whether a Base plan should fill an empty tank first: no ETH to pay gas, and USDC to spare beyond
@@ -4461,7 +4403,8 @@ pub(super) async fn spendable_for_solana(
 // Plans Base transactions paid from the unified balance. With enough on Base they go out as they
 // are. Otherwise one Solana transaction moves the shortfall through Relay (Layerswap fallback),
 // and the Base transactions follow once it lands (GET /v1/intents/{id}/next), still one confirm.
-// Returns the intent, what the app signs now, and the fee for moving cash (None when none moves).
+// Returns the intent, what the app signs now, the fee for moving cash (None when none moves), and
+// the cash turned into gas first (0 when none is: it's kept as ETH or SOL and counts in the balance).
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn plan_base_with_cash(
     state: &AppState,
@@ -4472,7 +4415,7 @@ pub(super) async fn plan_base_with_cash(
     needed: u128,
     currency: &str,
     rate: u128,
-) -> Result<(String, Vec<Value>, Option<u128>), ApiError> {
+) -> Result<(String, Vec<Value>, Option<u128>, u128), ApiError> {
     plan_base_with_cash_mode(
         state, owner, evm, solana, txs, needed, currency, rate, false,
     )
@@ -4489,7 +4432,7 @@ pub(super) async fn plan_base_bank_with_cash(
     needed: u128,
     currency: &str,
     rate: u128,
-) -> Result<(String, Vec<Value>, Option<u128>), ApiError> {
+) -> Result<(String, Vec<Value>, Option<u128>, u128), ApiError> {
     plan_base_with_cash_mode(state, owner, evm, solana, txs, needed, currency, rate, true).await
 }
 
@@ -4504,7 +4447,7 @@ async fn plan_base_with_cash_mode(
     currency: &str,
     rate: u128,
     bank: bool,
-) -> Result<(String, Vec<Value>, Option<u128>), ApiError> {
+) -> Result<(String, Vec<Value>, Option<u128>, u128), ApiError> {
     let as_base = |txs: &[(String, String)]| -> Vec<Value> {
         txs.iter()
             .map(
@@ -4512,20 +4455,10 @@ async fn plan_base_with_cash_mode(
             )
             .collect()
     };
-    // A low gas tank refills itself from the user's USDC first; an empty one gets ETH on a hop from
-    // Solana (Layerswap refuel) when there's Solana cash to hop.
-    let refill = if bank {
-        Vec::new()
-    } else {
-        base_gas_refill(state, &evm, needed).await
-    };
-    let txs = if refill.is_empty() {
-        txs
-    } else {
-        refill.iter().cloned().chain(txs).collect()
-    };
-    // An empty tank with Base cash to spare fills itself first: a gasless CoW top-up from the user's
-    // own USDC (a fraction of a cent), then the Base transactions (GET /v1/intents/{id}/next).
+    // Gas is bought only when the tank can't pay at all, never on the side. An empty tank with Base
+    // cash to spare fills itself first: a gasless CoW top-up of the user's own USDC into ETH that
+    // stays theirs (it counts in the balance), then the Base transactions (/next). Its cost is
+    // returned so the confirmation shows it.
     if base_topup_fits(state, &evm, needed).await {
         let intent_id = state
             .markets
@@ -4540,7 +4473,7 @@ async fn plan_base_with_cash_mode(
         let steps = topup_steps(&topup);
         intent.base_topup = Some(topup);
         state.markets.save_intent(&intent_id, &intent).await?;
-        return Ok((intent_id, steps, bank.then_some(BASE_GAS_REFILL_USDC)));
+        return Ok((intent_id, steps, None, BASE_GAS_REFILL_USDC));
     }
     // Otherwise an empty tank gets ETH on the same cash hop from Solana. Atlas never pays gas:
     // with neither, the user is asked for a little more.
@@ -4575,7 +4508,7 @@ async fn plan_base_with_cash_mode(
             .markets
             .register_base_txs(owner, evm, txs, false)
             .await?;
-        return Ok((intent_id, transactions, None));
+        return Ok((intent_id, transactions, None, 0));
     };
     let sol = solana.ok_or((
         StatusCode::CONFLICT,
@@ -4676,11 +4609,7 @@ async fn plan_base_with_cash_mode(
         transactions.push(json!({"chain":"solana","transaction":gas_tx,"submit":"engine"}));
     }
     transactions.push(json!({"chain":"solana","transaction":transaction,"submit":"engine"}));
-    Ok((
-        intent_id,
-        transactions,
-        Some(fee.saturating_add(if bank { source_topup } else { 0 })),
-    ))
+    Ok((intent_id, transactions, Some(fee), source_topup))
 }
 
 // A Solana swap from USDC into `buy_mint` (Earn into Jupiter Lend) paid with Base cash (`send`, `fee`

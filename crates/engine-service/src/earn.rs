@@ -996,7 +996,7 @@ async fn execute_inner(
         .solana_wallet
         .filter(|w| !w.is_empty() && !quote.deposit);
     let needed = if quote.deposit { quote.units } else { 0 };
-    let (intent_id, transactions, fee) = markets::plan_base_with_cash(
+    let (intent_id, transactions, fee, gas) = markets::plan_base_with_cash(
         &state,
         owner,
         wallet,
@@ -1019,10 +1019,20 @@ async fn execute_inner(
     ];
     if let Some(fee) = fee {
         summary.push(json!({"label":"Network fee","value":markets::say_money(fee, &quote.currency, quote.rate)}));
-        // Putting money in: what leaves the balance, the fee included.
-        if quote.deposit && !quote.all {
-            summary.push(json!({"label":"You pay","value":markets::say_money(quote.units + fee, &quote.currency, quote.rate)}));
-        }
+    }
+    // An empty gas tank is filled from the cash first: shown, and kept as ETH in their balance.
+    if gas > 0 {
+        summary.push(json!({"label":"Gas top-up (one time)","value":markets::say_money(gas, &quote.currency, quote.rate)}));
+    }
+    let extra = fee.unwrap_or(0).saturating_add(gas);
+    // What leaves the balance, everything included.
+    if extra > 0 {
+        let pays = if quote.deposit && !quote.all {
+            quote.units + extra
+        } else {
+            extra
+        };
+        summary.push(json!({"label":if quote.deposit {"You pay"} else {"Paid from your cash"},"value":markets::say_money(pays, &quote.currency, quote.rate)}));
     }
     Ok(Json(json!({
         "intentId":intent_id,

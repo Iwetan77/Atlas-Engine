@@ -2242,6 +2242,7 @@ pub(super) async fn withdraw_execute(
         transactions: steps,
         gas_request_id,
         topup,
+        sol_topup: _,
     } = deposit_steps(
         &state,
         &stored.wallet,
@@ -4028,6 +4029,8 @@ async fn mon_buy_quote(
             "Buying MON costs too much in fees right now. Try a bigger amount, or try later.",
         ));
     }
+    // A SOL top-up the Solana deposit buys first, on the bill (0 when the wallet's SOL pays).
+    let gas = base_gas_topup(&state, &wallet, from_solana).await;
     let quote_id = id("q");
     let expires = now() + 30_000;
     state.near.quotes.lock().map_err(internal)?.insert(
@@ -4053,14 +4056,17 @@ async fn mon_buy_quote(
         },
     );
     let currency = &req.amount.currency;
-    Ok(Json(
-        json!({"quoteId":quote_id,"assetId":req.asset_id,"side":"buy",
-        "pay":{"amount":markets::format_units(amount,6),"symbol":"USDC","value":money(amount,currency,rate)},
+    let total = amount + gas;
+    let mut quote = json!({"quoteId":quote_id,"assetId":req.asset_id,"side":"buy",
+        "pay":{"amount":markets::format_units(total,6),"symbol":"USDC","value":money(total,currency,rate)},
         "receive":{"amount":markets::format_units(swap.expected_out_units,token.decimals),"symbol":token.symbol,
             "value":money(worth,currency,rate)},
         "price":unit_price(amount,swap.expected_out_units,token.decimals,currency,rate),
-        "fee":money(amount.saturating_sub(worth),currency,rate),"expiresAtUnixMs":expires}),
-    ))
+        "fee":money(amount.saturating_sub(worth) + gas,currency,rate),"expiresAtUnixMs":expires});
+    if gas > 0 {
+        quote["gasTopup"] = money(gas, currency, rate);
+    }
+    Ok(Json(quote))
 }
 // Where MON is paid from, and Relay's quote for it: Trading, the Solana wallet's cash, like every buy.
 // Returns the paying wallet and whether it's Solana's.
@@ -4079,7 +4085,10 @@ async fn mon_route(
         None => 0,
     };
     if let Some(s) = solana {
-        if solana_cash >= amount && markets::solana_can_send(state, s, amount).await {
+        let topup = markets::sol_topup_cost(state, s).await;
+        if solana_cash >= amount.saturating_add(topup)
+            && markets::solana_can_send(state, s, amount).await
+        {
             let swap = state
                 .relay_link
                 .solana_to_mon(s, evm, amount)
@@ -4633,8 +4642,12 @@ fn gas_cost(native: u128, paid: u128, got: u128) -> u128 {
 
 // The $0.50 CoW top-up a Base deposit with an empty gas tank starts with (deposit_ready), in USDC
 // units; 0 when the wallet pays its own gas or the cash comes from Solana.
+// The cash a deposit turns into gas first when its wallet can't pay the fee: SOL on Solana, ETH on
+// Base. Shown on the quote and counted in what it costs; kept in the wallet (and the balance).
 async fn base_gas_topup(state: &AppState, wallet: &str, from_solana: bool) -> u128 {
-    if from_solana || markets::wallet_pays_gas(state, wallet).await {
+    if from_solana {
+        markets::sol_topup_cost(state, wallet).await
+    } else if markets::wallet_pays_gas(state, wallet).await {
         0
     } else {
         markets::BASE_GAS_REFILL_USDC
@@ -4728,18 +4741,23 @@ async fn pay_from(
         ));
     }
     if let Some(s) = solana {
+        // The SOL top-up the deposit buys first when the wallet can't pay its fee comes out of the
+        // same cash, so it has to fit too.
+        let topup = markets::sol_topup_cost(state, s).await;
         // From Solana, Relay brings the cash to 1Click's Base deposit address: about 2 cents, where
         // a deposit straight to 1Click's Solana address opens a new account there (~25 cents of rent,
         // checked 6 Oct). The direct deposit stays as the fallback when Relay doesn't answer.
         if let (Some(e), true) = (evm, solana_cash >= amount) {
             if let Ok(moved) = state.relay_link.solana_to_base(s, e, amount, 0).await {
-                if solana_cash >= moved.amount_in_units {
+                if solana_cash >= moved.amount_in_units.saturating_add(topup) {
                     let fee = moved.amount_in_units.saturating_sub(amount);
                     return Ok((s.into(), true, fee, BASE_USDC_1CLICK));
                 }
             }
         }
-        if solana_cash >= amount && markets::solana_can_send(state, s, amount).await {
+        if solana_cash >= amount.saturating_add(topup)
+            && markets::solana_can_send(state, s, amount).await
+        {
             let fee = markets::account_rent_usd(state).await;
             return Ok((s.into(), true, fee, SOLANA_USDC_1CLICK));
         }
@@ -5053,6 +5071,7 @@ async fn execute_mon_buy(
     }
     let mut transactions = Vec::new();
     let mut gas_request_id = None;
+    let mut gas_usdc: u128 = 0;
     let (typed_data, api) = match &swap.pay {
         MonadPay::Solana {
             instructions,
@@ -5064,11 +5083,18 @@ async fn execute_mon_buy(
                 .await
                 .map_err(venue)?;
             // A Solana wallet with no SOL pays the transaction fee from a gasless top-up first.
-            if let Some((gas_id, gas_tx)) =
-                markets::gas_topup(state, &stored.wallet, stored.amount).await
-            {
-                transactions.push(json!({"chain":"solana","transaction":gas_tx,"submit":"engine"}));
-                gas_request_id = Some(gas_id);
+            // Without one the deposit can't land, so nothing is signed.
+            match markets::gas_topup_priced(state, &stored.wallet, stored.amount).await {
+                Some((gas_id, gas_tx, usdc)) => {
+                    transactions
+                        .push(json!({"chain":"solana","transaction":gas_tx,"submit":"engine"}));
+                    gas_request_id = Some(gas_id);
+                    gas_usdc = usdc;
+                }
+                None if markets::sol_topup_cost(state, &stored.wallet).await > 0 => {
+                    return Err(conflict(markets::GAS_NOT_READY));
+                }
+                None => {}
             }
             transactions.push(json!({"chain":"solana","transaction":deposit,"submit":"engine"}));
             (None, String::new())
@@ -5134,13 +5160,16 @@ async fn execute_mon_buy(
         .await?;
     let rate = app_balance::fx_rate(&stored.currency).await?;
     let mut summary = vec![
-        json!({"label":"You pay","value":markets::say_money(stored.amount,&stored.currency,rate)}),
+        json!({"label":"You pay","value":markets::say_money(stored.amount + gas_usdc,&stored.currency,rate)}),
         json!({"label":"You get (about)","value":format!("{} {}",
             markets::format_units(swap.expected_out_units,token.decimals),token.symbol)}),
         json!({"label":"Lands on","value":"Monad"}),
     ];
     if stored.network_fee > 0 {
         summary.push(json!({"label":"Fees","value":markets::say_money(stored.network_fee,&stored.currency,rate)}));
+    }
+    if gas_usdc > 0 {
+        summary.push(json!({"label":"Gas top-up (one time)","value":markets::say_money(gas_usdc,&stored.currency,rate)}));
     }
     Ok(Json(
         json!({"intentId":intent_id,"kind":"buy","summary":summary,
@@ -5312,6 +5341,7 @@ async fn execute_sale_after_gas(
         transactions,
         gas_request_id,
         topup,
+        sol_topup: _,
     } = deposit_steps(
         state,
         &wallet,
@@ -5476,6 +5506,8 @@ struct DepositSteps {
     transactions: Vec<Value>,
     gas_request_id: Option<String>,
     topup: Option<markets::BaseTopup>,
+    // Cash a Solana deposit turns into SOL first for its fee (kept as SOL), 0 without.
+    sol_topup: u128,
 }
 
 // What the app signs to pay `amount` of USDC into a 1Click deposit address: from Solana, [gas
@@ -5503,10 +5535,10 @@ async fn deposit_steps(
     if from_solana {
         // Relay carries the cash from the Solana wallet into 1Click's Base deposit address (one
         // Solana transaction the engine lands); else a plain transfer to a Solana deposit address.
-        let (gas, transfer) = if relayed {
-            let (gas, transaction, _) =
+        let (gas, transfer, sol_topup) = if relayed {
+            let (gas, transaction, _, topup) =
                 markets::solana_relay_transfer(state, wallet, deposit, amount).await?;
-            (gas, transaction)
+            (gas, transaction, topup)
         } else {
             markets::solana_usdc_transfer(state, wallet, deposit, amount).await?
         };
@@ -5521,6 +5553,7 @@ async fn deposit_steps(
             transactions,
             gas_request_id: gas.map(|(id, _)| id),
             topup: None,
+            sol_topup,
         });
     }
     let tx = state
@@ -5543,6 +5576,7 @@ async fn deposit_steps(
         transactions,
         gas_request_id: None,
         topup,
+        sol_topup: 0,
     })
 }
 
@@ -5704,6 +5738,7 @@ pub(super) async fn execute(
         transactions,
         gas_request_id,
         topup: prepared_topup,
+        sol_topup,
     } = deposit_steps(
         &state,
         &stored.wallet,
@@ -5787,7 +5822,7 @@ pub(super) async fn execute(
     let base_gas = if gas_topup {
         markets::BASE_GAS_REFILL_USDC
     } else {
-        0
+        sol_topup
     };
     let gas = stored.then_swap.as_ref().map_or(0, |s| s.gas_usdc) + base_gas;
     let mut summary = vec![

@@ -99,7 +99,8 @@ pub(super) struct AppBalanceResponse {
     trading: Money,
     pending: Option<Money>,
     holdings: Vec<Holding>,
-    // The gas tanks: what pays network fees on each chain. Not counted in `total`; Profile shows it.
+    // The SOL and ETH that pay network fees on each chain. It's the user's money and counts in
+    // `total` (outside Spendable and Trading); Profile lists it.
     gas: Vec<GasTank>,
     as_of_unix_ms: u128,
 }
@@ -237,7 +238,12 @@ pub(super) async fn balance(
             pnl_pct: positions::pnl_pct(h, &open),
         });
     }
-    let gas = gas_tanks(&state, portfolio.gas_sol, &portfolio.evm, &currency, rate).await?;
+    // What pays the network fees is still theirs: bought from their cash, it counts in the total.
+    let (gas, gas_units) =
+        gas_tanks(&state, portfolio.gas_sol, &portfolio.evm, &currency, rate).await?;
+    total = total
+        .checked_add(gas_units)
+        .ok_or((StatusCode::BAD_GATEWAY, "portfolio value overflow".into()))?;
     let as_of_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(internal)?
@@ -719,7 +725,8 @@ async fn solana_coins(
         ]);
         return 0;
     };
-    // Native SOL beyond what they bought is gas: off the asset list and out of the total.
+    // Native SOL beyond what they bought pays network fees: off the asset list, counted in the
+    // total with the rest of what pays fees (see gas_tanks).
     let gas_sol = native_sol.saturating_sub(sol_bought(trades, catalog));
     let native_sol = native_sol - gas_sol;
     if native_sol > 0 {
@@ -967,7 +974,7 @@ async fn gas_tanks(
     evm: &str,
     currency: &str,
     rate: u128,
-) -> Result<Vec<GasTank>, ApiError> {
+) -> Result<(Vec<GasTank>, u128), ApiError> {
     let eth = markets::base_eth(state, evm).await.unwrap_or(0);
     let mints = [markets::SOL_MINT.to_string(), PORTAL_ETH_MINT.to_string()];
     let prices = markets::usd_prices(&state.markets, &mints)
@@ -979,20 +986,27 @@ async fn gas_tanks(
             .map(|(usd, _)| (units as f64 / 10f64.powi(decimals) * usd * 1_000_000.0) as u128)
             .unwrap_or(0)
     };
-    Ok(vec![
-        GasTank {
-            chain: "solana",
-            symbol: "SOL",
-            amount: markets::format_units(sol, 9),
-            value: money(worth(sol, 9, markets::SOL_MINT), currency, rate)?,
-        },
-        GasTank {
-            chain: "base",
-            symbol: "ETH",
-            amount: markets::format_units(eth, 18),
-            value: money(worth(eth, 18, PORTAL_ETH_MINT), currency, rate)?,
-        },
-    ])
+    let (sol_value, eth_value) = (
+        worth(sol, 9, markets::SOL_MINT),
+        worth(eth, 18, PORTAL_ETH_MINT),
+    );
+    Ok((
+        vec![
+            GasTank {
+                chain: "solana",
+                symbol: "SOL",
+                amount: markets::format_units(sol, 9),
+                value: money(sol_value, currency, rate)?,
+            },
+            GasTank {
+                chain: "base",
+                symbol: "ETH",
+                amount: markets::format_units(eth, 18),
+                value: money(eth_value, currency, rate)?,
+            },
+        ],
+        sol_value.saturating_add(eth_value),
+    ))
 }
 
 fn indicative_usdc_value(units: u128, one_dollar_units: u128) -> Result<u128, ApiError> {
