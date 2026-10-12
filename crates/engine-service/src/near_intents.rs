@@ -4309,34 +4309,29 @@ async fn hood_buy_quote(
     } else {
         0
     };
-    // The gas kept for selling comes out of this buy; most of it must still buy the coin.
-    if gas > 0 && amount < gas * 5 {
-        return Err(conflict(&format!(
-            "Your first Robinhood Chain buy needs at least {}: a little of it stays as ETH there, so \
-             you can sell later.",
-            markets::say_money(gas * 5, &req.amount.currency, rate)
-        )));
-    }
+    // The ETH kept for selling later is a gas top-up on top of the buy: all of `amount` still buys
+    // the coin, and the deposit carries both.
+    let deposit = amount + gas;
     let (wallet, from_solana, swap) = hood_route(
         &state,
         &user,
         &evm,
         &contract,
-        amount,
+        deposit,
         gas,
         &req.amount.currency,
         rate,
     )
     .await?;
-    // What it costs beyond the coin and the gas kept; past a tenth of the money, the quote is refused.
+    // What it costs beyond the coin; past a tenth of the money, the quote is refused.
     let worth = worth_of(swap.expected_out_units, price, token.decimals);
-    if worth + gas < amount * 9 / 10 {
+    if worth < amount * 9 / 10 {
         return Err(conflict(&format!(
             "Buying {} costs too much in fees right now. Try a bigger amount, or try later.",
             token.symbol
         )));
     }
-    let fee = amount.saturating_sub(worth + gas);
+    let fee = amount.saturating_sub(worth);
     let quote_id = id("q");
     let expires = now() + 30_000;
     state.near.quotes.lock().map_err(internal)?.insert(
@@ -4346,7 +4341,7 @@ async fn hood_buy_quote(
             wallet,
             recipient: evm,
             asset: token.clone(),
-            amount,
+            amount: deposit,
             minimum_out: swap.minimum_out_units,
             currency: req.amount.currency.clone(),
             expires,
@@ -4364,15 +4359,13 @@ async fn hood_buy_quote(
     );
     let currency = &req.amount.currency;
     let mut answer = json!({"quoteId":quote_id,"assetId":req.asset_id,"side":"buy",
-        "pay":{"amount":markets::format_units(amount,6),"symbol":"USDC","value":money(amount,currency,rate)},
+        "pay":{"amount":markets::format_units(deposit,6),"symbol":"USDC","value":money(deposit,currency,rate)},
         "receive":{"amount":markets::format_units(swap.expected_out_units,token.decimals),"symbol":token.symbol,
             "value":money(worth,currency,rate)},
-        "price":unit_price(amount - gas,swap.expected_out_units,token.decimals,currency,rate),
-        "fee":money(fee,currency,rate),"expiresAtUnixMs":expires});
+        "price":unit_price(amount,swap.expected_out_units,token.decimals,currency,rate),
+        "fee":money(fee + gas,currency,rate),"expiresAtUnixMs":expires});
     if gas > 0 {
-        // Shown like Solana's reserve: ETH that stays in the wallet for its later sales.
-        answer["feeReserve"] = json!({"amount":money(gas,currency,rate),
-            "networkFee":money(0,currency,rate),"kept":money(gas,currency,rate)});
+        answer["gasTopup"] = money(gas, currency, rate);
     }
     Ok(Json(answer))
 }
@@ -5579,7 +5572,7 @@ async fn execute_hood_buy(
         json!({"label":"Lands on","value":"Robinhood Chain"}),
     ];
     if stored.hood_gas > 0 {
-        summary.push(json!({"label":"Kept as ETH for selling later","value":markets::say_money(stored.hood_gas,&stored.currency,rate)}));
+        summary.push(json!({"label":"Gas top-up (one time)","value":markets::say_money(stored.hood_gas,&stored.currency,rate)}));
     }
     if stored.network_fee > 0 {
         summary.push(json!({"label":"Fees","value":markets::say_money(stored.network_fee,&stored.currency,rate)}));
