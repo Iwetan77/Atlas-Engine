@@ -5829,7 +5829,7 @@ async fn execute_hood_buy(
         summary.push(json!({"label":"Gas top-up (one time)","value":markets::say_money(stored.hood_gas + sol_gas,&stored.currency,rate)}));
     }
     if stored.network_fee > 0 {
-        summary.push(json!({"label":"Fees","value":markets::say_money(stored.network_fee,&stored.currency,rate)}));
+        summary.push(json!({"label":"Fee","value":markets::say_money(stored.network_fee,&stored.currency,rate)}));
     }
     Ok(Json(
         json!({"intentId":intent_id,"kind":"buy","summary":summary,
@@ -5942,7 +5942,7 @@ async fn execute_hood_sale(
         json!({"label":"You receive (at least)","value":markets::say_money(swap.minimum_out_units,&stored.currency,rate)}),
     ];
     if stored.network_fee > 0 {
-        summary.push(json!({"label":"Fees","value":markets::say_money(stored.network_fee,&stored.currency,rate)}));
+        summary.push(json!({"label":"Fee","value":markets::say_money(stored.network_fee,&stored.currency,rate)}));
     }
     Ok(Json(
         json!({"intentId":intent_id,"kind":"sell","summary":summary,
