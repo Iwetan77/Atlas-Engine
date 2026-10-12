@@ -1,7 +1,8 @@
 // What the user's wallet may sign on Base in place of a transaction, and nothing wider. Each shape
 // is checked and rebuilt from scratch in Privy's typed-data format, so no unchecked field is signed:
 // - ReceiveWithAuthorization (EIP-3009): a gasless USDC deposit that only a pinned venue receiver
-//   (Relay) can redeem, for exactly the signed amount; the venue pays the gas.
+//   (Relay) can redeem, for exactly the signed amount; the venue pays the gas. The same for the USDG a
+//   Robinhood Chain buy that couldn't finish was refunded in, on its way back to the user's cash.
 // - Permit (EIP-2612): CoW's vault relayer may take at most a gas top-up's worth of USDC.
 // - Order: a CoW sale of at most that much USDC for ETH, paid to the wallet itself.
 import {secp256k1} from '@noble/curves/secp256k1';
@@ -25,6 +26,9 @@ const UINT = /^(0|[1-9][0-9]{0,77})$/;
 const BYTES32 = /^0x[0-9a-fA-F]{64}$/;
 
 const USDC_DOMAIN = {name: 'USD Coin', version: '2', chainId: 8453, verifyingContract: BASE_USDC};
+// Robinhood Chain's Global Dollar: only ever handed to Relay's receiver, to bring a refund back.
+export const ROBINHOOD_USDG = '0x5fc5360d0400a0fd4f2af552add042d716f1d168';
+const USDG_DOMAIN = {name: 'Global Dollar', version: '1', chainId: 4663, verifyingContract: ROBINHOOD_USDG};
 const COW_DOMAIN = {name: 'Gnosis Protocol', version: 'v2', chainId: 8453, verifyingContract: COW_SETTLEMENT};
 const TYPES = {
   ReceiveWithAuthorization: [
@@ -82,7 +86,7 @@ function topUp(value) {
 // Each shape: its domain, and the message rebuilt from checked fields (throws otherwise).
 const SHAPES = {
   ReceiveWithAuthorization: {
-    domain: USDC_DOMAIN,
+    domains: [USDC_DOMAIN, USDG_DOMAIN],
     rebuild(m, wallet) {
       if (lower(m.from) !== wallet) throw new Error('not from this wallet');
       if (!RECEIVERS.has(lower(m.to))) throw new Error('unknown receiver');
@@ -92,7 +96,7 @@ const SHAPES = {
     },
   },
   Permit: {
-    domain: USDC_DOMAIN,
+    domains: [USDC_DOMAIN],
     rebuild(m, wallet, now) {
       if (lower(m.owner) !== wallet) throw new Error('not from this wallet');
       if (lower(m.spender) !== COW_VAULT_RELAYER) throw new Error('unknown spender');
@@ -102,7 +106,7 @@ const SHAPES = {
     },
   },
   Order: {
-    domain: COW_DOMAIN,
+    domains: [COW_DOMAIN],
     rebuild(m, wallet, now) {
       if (lower(m.sellToken) !== BASE_USDC || lower(m.buyToken) !== NATIVE_ETH) {
         throw new Error('not a USDC to ETH order');
@@ -125,13 +129,13 @@ const SHAPES = {
 export function signable(typedData, wallet, now = Math.floor(Date.now() / 1000)) {
   const primary = typedData?.primaryType;
   const shape = Object.hasOwn(SHAPES, primary) ? SHAPES[primary] : null;
-  if (!shape || JSON.stringify(typedData?.types?.[primary]) !== JSON.stringify(TYPES[primary]) ||
-      !sameDomain(typedData?.domain, shape.domain)) {
+  const domain = shape?.domains.find((d) => sameDomain(typedData?.domain, d));
+  if (!shape || JSON.stringify(typedData?.types?.[primary]) !== JSON.stringify(TYPES[primary]) || !domain) {
     throw new Error('not something Atlas signs');
   }
   if (!ADDRESS.test(wallet ?? '')) throw new Error('invalid wallet');
   return {
-    domain: shape.domain,
+    domain,
     types: {[primary]: TYPES[primary]},
     primary_type: primary,
     message: shape.rebuild(typedData.message ?? {}, wallet.toLowerCase(), now),

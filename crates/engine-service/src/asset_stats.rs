@@ -202,7 +202,10 @@ fn positive(value: &Value) -> Option<f64> {
 }
 
 fn matches_token(chain: &str, actual: &str, token: &str) -> bool {
-    if matches!(chain, "base" | "eth" | "arbitrum" | "bsc" | "monad") {
+    if matches!(
+        chain,
+        "base" | "eth" | "arbitrum" | "bsc" | "monad" | "robinhood"
+    ) {
         actual.eq_ignore_ascii_case(token)
     } else if matches!(chain, "sui" | "sui-network") {
         let normalize = |s: &str| -> Option<String> {

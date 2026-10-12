@@ -1,7 +1,7 @@
 use super::*;
 use base64::Engine;
 use engine_execution::near_intents::{AppFee, ChainTx, Client, QuoteRequest, Token};
-use engine_execution::relay_link::{MonadPay, MonadSwap};
+use engine_execution::relay_link::{HoodPay, HoodSwap, MonadPay, MonadSwap};
 use engine_execution::swaps::uniswap::BASE_USDC;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -50,7 +50,37 @@ pub(super) struct NearState {
     listed: Arc<Mutex<Option<(Instant, Arc<Listed>)>>>,
     listed_refresh: Arc<std::sync::atomic::AtomicBool>,
     monad_rpc: reqwest::Url,
+    hood_rpc: reqwest::Url,
     postgres: Option<Arc<tokio_postgres::Client>>,
+}
+// The EVM chains besides Base where Atlas holds coins in the user's own wallet, each read through
+// its own RPC: Monad, and Robinhood Chain (1Click's "hood").
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum EvmChain {
+    Monad,
+    Robinhood,
+}
+impl EvmChain {
+    fn name(self) -> &'static str {
+        match self {
+            EvmChain::Monad => "Monad",
+            EvmChain::Robinhood => "Robinhood Chain",
+        }
+    }
+    // 1Click's name for the chain, on its tokens.
+    fn blockchain(self) -> &'static str {
+        match self {
+            EvmChain::Monad => "monad",
+            EvmChain::Robinhood => "hood",
+        }
+    }
+    // What eth_chainId answers: 143 and 4663.
+    fn id_hex(self) -> &'static str {
+        match self {
+            EvmChain::Monad => "0x8f",
+            EvmChain::Robinhood => "0x1237",
+        }
+    }
 }
 #[derive(Clone)]
 struct StoredQuote {
@@ -77,6 +107,9 @@ struct StoredQuote {
     // A NEAR sale from a wallet short of NEAR for its network fee: USDC (units) swapped into NEAR
     // first, from the user's cash, before the sale itself (see sale_gas).
     gas_first: Option<u128>,
+    // A Robinhood Chain buy into a wallet short of ETH there: USD micros of the payment Relay lands
+    // as ETH for the coin's later sale (kept in the wallet; see HOOD_GAS_FLOOR_WEI).
+    hood_gas: u128,
 }
 #[derive(Clone)]
 struct SuiRecovery {
@@ -220,6 +253,9 @@ struct StoredIntent {
     // USDC (units) a sale turned into NEAR for its fees first, for its receipt.
     #[serde(default)]
     gas_bought: u128,
+    // A Robinhood trade refunded as USDG, on its way back to Trading.
+    #[serde(default)]
+    refund: Option<Refund>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct PendingSale {
@@ -266,6 +302,33 @@ struct RelayLeg {
     api: String,
     // The quoted amount out (MON wei bought, or USDC units a sale brings), for the trade book.
     expected_out: u128,
+    // The user's currency when they confirmed, for what a refund says.
+    #[serde(default)]
+    currency: String,
+}
+// A Robinhood trade Relay couldn't finish and refunded as USDG in the user's wallet there: a buy
+// whose coin swap failed on arrival (the price moved), or a sale's dollars it couldn't pay out.
+// Bringing it back to Trading is the trade's own last step: the phone signs one gasless USDG
+// authorization under the confirmation the trade already has, and Relay lands USDC in Trading.
+#[derive(Clone, Serialize, Deserialize)]
+struct Refund {
+    // When Relay was seen refunding (or a try came back): how long to look for the USDG before
+    // calling it refunded where the trade was paid from.
+    since: u64,
+    // Relay's quote the phone signs (made again when stale), and whether it was handed over.
+    #[serde(default)]
+    moved: Option<RefundMove>,
+    #[serde(default)]
+    handed: bool,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct RefundMove {
+    request_id: String,
+    typed_data: Value,
+    api: String,
+    // The USDG units taken (all the wallet held) and the USDC units that land in Trading.
+    held: u128,
+    back: u128,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct DeviceStep {
@@ -352,6 +415,11 @@ impl NearState {
             listed_refresh: Arc::default(),
             postgres,
             monad_rpc: env_url("ATLAS_MONAD_MAINNET_RPC_URL", "https://rpc.monad.xyz").parse()?,
+            hood_rpc: env_url(
+                "ATLAS_ROBINHOOD_RPC_URL",
+                "https://rpc.mainnet.chain.robinhood.com",
+            )
+            .parse()?,
         })
     }
     pub(super) fn listed_for_search(&self) -> Arc<Listed> {
@@ -503,6 +571,24 @@ impl NearState {
         owner: &str,
         wallet: &str,
     ) -> Result<Vec<(Token, u128)>, ApiError> {
+        self.chain_holdings(EvmChain::Monad, owner, wallet).await
+    }
+    // Robinhood Chain coins bought through Atlas, and with them the ETH kept there for selling's
+    // network fee and any USDG a buy that couldn't finish was refunded in: the user's money too.
+    pub(super) async fn hood_holdings(
+        &self,
+        owner: &str,
+        wallet: &str,
+    ) -> Result<Vec<(Token, u128)>, ApiError> {
+        self.chain_holdings(EvmChain::Robinhood, owner, wallet)
+            .await
+    }
+    async fn chain_holdings(
+        &self,
+        chain: EvmChain,
+        owner: &str,
+        wallet: &str,
+    ) -> Result<Vec<(Token, u128)>, ApiError> {
         let intents: Vec<StoredIntent> = if let Some(pg) = &self.postgres {
             pg.query(
                 "SELECT payload FROM atlas_near_intents WHERE owner=$1",
@@ -525,14 +611,18 @@ impl NearState {
                 .collect()
         };
         let mut assets = HashMap::<String, Token>::new();
+        let mut traded = false;
         for intent in intents {
-            if intent.status.state == "filled" {
-                if let Some(asset) = intent.asset.filter(|a| a.blockchain == "monad") {
+            if let Some(asset) = intent.asset.filter(|a| a.blockchain == chain.blockchain()) {
+                traded = true;
+                if intent.status.state == "filled" {
                     assets.insert(asset.asset_id.clone(), asset);
                 }
             }
         }
-        if assets.is_empty() {
+        // On Robinhood Chain any trade may have left ETH (its gas) or USDG (a refund) behind.
+        let leftovers = chain == EvmChain::Robinhood && traded;
+        if assets.is_empty() && !leftovers {
             return Ok(Vec::new());
         }
         let catalog = self.tokens().await?;
@@ -543,13 +633,29 @@ impl NearState {
                 .ok_or_else(|| venue(format!("no live 1Click price for {}", asset.symbol)))?;
             *asset = fresh.clone();
         }
-        let chain = self.monad_call("eth_chainId", json!([])).await?;
-        if chain.as_str() != Some("0x8f") {
-            return Err(venue("Monad RPC returned a different chain ID"));
+        if leftovers {
+            for token in catalog.iter().filter(|t| {
+                t.blockchain == chain.blockchain()
+                    && (t.contract_address.is_none()
+                        || t.contract_address.as_deref().is_some_and(|c| {
+                            c.eq_ignore_ascii_case(engine_execution::relay_link::ROBINHOOD_USDG)
+                        }))
+            }) {
+                assets
+                    .entry(token.asset_id.clone())
+                    .or_insert_with(|| token.clone());
+            }
+        }
+        let id = self.evm_call(chain, "eth_chainId", json!([])).await?;
+        if id.as_str() != Some(chain.id_hex()) {
+            return Err(venue(format!(
+                "{} RPC returned a different chain ID",
+                chain.name()
+            )));
         }
         let mut result = Vec::new();
         for asset in assets.into_values() {
-            let units = self.monad_balance(&asset, wallet).await?;
+            let units = self.evm_balance(chain, &asset, wallet).await?;
             if units > 0 {
                 result.push((asset, units));
             }
@@ -558,47 +664,111 @@ impl NearState {
     }
     // What `wallet` holds of a Monad coin (native MON, or an ERC-20), in base units.
     async fn monad_balance(&self, asset: &Token, wallet: &str) -> Result<u128, ApiError> {
-        if !is_evm(wallet) {
-            return Err(venue("invalid Monad wallet"));
-        }
-        let value = if let Some(contract) = asset.contract_address.as_deref() {
-            if !is_evm(contract) {
-                return Err(venue("invalid Monad token contract"));
-            }
-            let data = format!("0x70a08231{:0>64}", &wallet[2..].to_ascii_lowercase());
-            self.monad_call("eth_call", json!([{"to":contract,"data":data},"latest"]))
-                .await?
-        } else {
-            self.monad_call("eth_getBalance", json!([wallet, "latest"]))
-                .await?
-        };
-        hex_units(&value).ok_or_else(|| venue("Monad RPC returned no balance"))
+        self.evm_balance(EvmChain::Monad, asset, wallet).await
     }
     // The wallet's next Monad nonce, counting what's still pending.
     async fn monad_nonce(&self, wallet: &str) -> Result<u64, ApiError> {
+        self.evm_nonce(EvmChain::Monad, wallet).await
+    }
+    // What `wallet` holds of a coin on `chain` (its native coin, or an ERC-20), in base units.
+    async fn evm_balance(
+        &self,
+        chain: EvmChain,
+        asset: &Token,
+        wallet: &str,
+    ) -> Result<u128, ApiError> {
+        if !is_evm(wallet) {
+            return Err(venue(format!("invalid {} wallet", chain.name())));
+        }
+        let value = if let Some(contract) = asset.contract_address.as_deref() {
+            if !is_evm(contract) {
+                return Err(venue(format!("invalid {} token contract", chain.name())));
+            }
+            let data = format!("0x70a08231{:0>64}", &wallet[2..].to_ascii_lowercase());
+            self.evm_call(
+                chain,
+                "eth_call",
+                json!([{"to":contract,"data":data},"latest"]),
+            )
+            .await?
+        } else {
+            self.evm_call(chain, "eth_getBalance", json!([wallet, "latest"]))
+                .await?
+        };
+        hex_units(&value).ok_or_else(|| venue(format!("{} RPC returned no balance", chain.name())))
+    }
+    // The wallet's next nonce on `chain`, counting what's still pending.
+    async fn evm_nonce(&self, chain: EvmChain, wallet: &str) -> Result<u64, ApiError> {
         let value = self
-            .monad_call("eth_getTransactionCount", json!([wallet, "pending"]))
+            .evm_call(chain, "eth_getTransactionCount", json!([wallet, "pending"]))
             .await?;
         hex_units(&value)
             .and_then(|n| u64::try_from(n).ok())
-            .ok_or_else(|| venue("Monad RPC returned no nonce"))
+            .ok_or_else(|| venue(format!("{} RPC returned no nonce", chain.name())))
     }
-    async fn monad_call(&self, method: &str, params: Value) -> Result<Value, ApiError> {
+    async fn evm_call(
+        &self,
+        chain: EvmChain,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, ApiError> {
+        let rpc = match chain {
+            EvmChain::Monad => &self.monad_rpc,
+            EvmChain::Robinhood => &self.hood_rpc,
+        };
         let response = self
             .icon_http
-            .post(self.monad_rpc.clone())
+            .post(rpc.clone())
             .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
             .send()
             .await
             .map_err(venue)?;
         if !response.status().is_success() {
-            return Err(venue(format!("Monad RPC HTTP {}", response.status())));
+            return Err(venue(format!(
+                "{} RPC HTTP {}",
+                chain.name(),
+                response.status()
+            )));
         }
         let body: Value = response.json().await.map_err(venue)?;
         if !body["error"].is_null() {
-            return Err(venue("Monad RPC returned an error"));
+            return Err(venue(format!("{} RPC returned an error", chain.name())));
         }
         Ok(body["result"].clone())
+    }
+    // The USDG (6 decimals) `wallet` holds on Robinhood Chain: what a buy there that couldn't finish
+    // was refunded in, until it's brought back to Trading.
+    pub(super) async fn hood_usdg(&self, wallet: &str) -> Result<u128, ApiError> {
+        if !is_evm(wallet) {
+            return Err(venue("invalid Robinhood Chain wallet"));
+        }
+        let data = format!("0x70a08231{:0>64}", &wallet[2..].to_ascii_lowercase());
+        let value = self
+            .evm_call(
+                EvmChain::Robinhood,
+                "eth_call",
+                json!([{"to":engine_execution::relay_link::ROBINHOOD_USDG,"data":data},"latest"]),
+            )
+            .await?;
+        hex_units(&value).ok_or_else(|| venue("Robinhood Chain RPC returned no balance"))
+    }
+    // A JSON-RPC call on Robinhood Chain, for checks that need its own state.
+    pub(super) async fn hood_call(&self, method: &str, params: Value) -> Result<Value, ApiError> {
+        self.evm_call(EvmChain::Robinhood, method, params).await
+    }
+    // The ETH (wei) a wallet holds on Robinhood Chain: its gas there.
+    async fn hood_eth(&self, wallet: &str) -> Result<u128, ApiError> {
+        if !is_evm(wallet) {
+            return Err(venue("invalid Robinhood Chain wallet"));
+        }
+        let value = self
+            .evm_call(
+                EvmChain::Robinhood,
+                "eth_getBalance",
+                json!([wallet, "latest"]),
+            )
+            .await?;
+        hex_units(&value).ok_or_else(|| venue("Robinhood Chain RPC returned no balance"))
     }
     // Sui coins the user bought through Atlas (from settled intents).
     async fn sui_coins(&self, owner: &str) -> Result<Vec<SuiSwap>, ApiError> {
@@ -762,6 +932,13 @@ fn unit_price(
 fn supported(token: &Token) -> bool {
     sell_route(&token.blockchain).is_some()
         && !matches!(token.symbol.as_str(), "USDC" | "USDT" | "USDT0")
+        && (token.blockchain != "hood" || hood_coin(token))
+}
+// On Robinhood Chain, Atlas trades its own coins (its memecoins): not its ETH (the gas kept there),
+// WETH, or its dollars (USDG, USDe), which are cash Atlas already holds elsewhere.
+fn hood_coin(token: &Token) -> bool {
+    token.contract_address.as_deref().is_some_and(is_evm)
+        && !matches!(token.symbol.as_str(), "WETH" | "USDG" | "USDe")
 }
 // How a coin on each chain goes back to cash. A chain without one isn't bought at all.
 fn sell_route(blockchain: &str) -> Option<&'static str> {
@@ -769,6 +946,7 @@ fn sell_route(blockchain: &str) -> Option<&'static str> {
         "near" => Some("1Click from the NEAR wallet, or Ref then 1Click"),
         "monad" => Some("Relay from the Monad wallet, sent by the phone"),
         "sui" => Some("1Click from the Sui wallet, after Cetus for other coins"),
+        "hood" => Some("Relay from the Robinhood Chain wallet, sent by the phone"),
         _ => None,
     }
 }
@@ -782,6 +960,11 @@ fn recipient<'a>(
             .as_deref()
             .filter(|w| is_evm(w))
             .ok_or_else(|| conflict("Privy EVM wallet is required for Monad")),
+        "hood" => user
+            .evm_wallet
+            .as_deref()
+            .filter(|w| is_evm(w))
+            .ok_or_else(|| conflict("Privy EVM wallet is required for Robinhood Chain")),
         "sui" => Err(conflict(
             "A verified Sui wallet is required before buying Sui assets",
         )),
@@ -2297,6 +2480,7 @@ pub(super) async fn withdraw_execute(
                 device: None,
                 then_sell: None,
                 gas_bought: 0,
+                refund: None,
                 relay: None,
                 withdraw: Some(Withdrawal {
                     network: stored.option.label.into(),
@@ -2782,6 +2966,7 @@ async fn sui_quote(
             monad_sale: false,
             relayed: from_solana && origin == BASE_USDC_1CLICK,
             gas_first: None,
+            hood_gas: 0,
         },
     );
     Ok(Json(buy_quote_json(
@@ -2954,6 +3139,7 @@ async fn ref_buy_quote(
             monad_sale: false,
             relayed: from_solana && origin == BASE_USDC_1CLICK,
             gas_first: None,
+            hood_gas: 0,
         },
     );
     Ok(Json(buy_quote_json(
@@ -3260,6 +3446,8 @@ pub(super) async fn chart_token(
         "sui" => "sui-network",
         "near" => "near",
         "monad" => "monad",
+        // GeckoTerminal's name for Robinhood Chain.
+        "hood" => "robinhood",
         "eth" => "eth",
         "base" => "base",
         "arb" => "arbitrum",
@@ -3417,32 +3605,10 @@ async fn search_listed(
     matches.sort_by_key(|(rank, _, _)| *rank);
     let mut out = Vec::new();
     for (_, t, symbol) in matches {
-        let usd = t
-            .price
-            .as_ref()
-            .and_then(|v| {
-                v.as_str()
-                    .map(str::to_owned)
-                    .or_else(|| v.as_f64().map(|p| p.to_string()))
-            })
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or_default();
-        if usd <= 0.0 || !usd.is_finite() {
+        let Some(row) = listed_row(state, t, &symbol, currency, rate) else {
             continue;
-        }
-        let display = usd * (rate as f64 / 1_000_000.0);
-        let icon = state.near.icon_for(t);
-        let name = if symbol == "NEAR" {
-            "NEAR".to_owned()
-        } else {
-            format!("{} on {}", t.symbol, t.blockchain)
         };
-        out.push(
-            json!({"assetId":format!("near:{}", t.asset_id),"symbol":symbol,
-            "name":name,"kind":"crypto","chain":t.blockchain,
-            "price":{"amount":format!("{display:.12}").trim_end_matches('0').trim_end_matches('.'),
-                "currency":currency},"change24hPct":null,"iconUrl":icon,"verified":true}),
-        );
+        out.push(row);
         if out.len() >= 30 {
             break;
         }
@@ -3451,6 +3617,67 @@ async fn search_listed(
         assets: out,
         complete: true,
     })
+}
+// A 1Click-listed coin as a Trade row, priced live in the user's currency; None without a price.
+// Robinhood Chain's coins are its memecoins, and go by the chain's name.
+fn listed_row(
+    state: &AppState,
+    t: &Token,
+    symbol: &str,
+    currency: &str,
+    rate: u128,
+) -> Option<Value> {
+    let usd = t
+        .price
+        .as_ref()
+        .and_then(|v| {
+            v.as_str()
+                .map(str::to_owned)
+                .or_else(|| v.as_f64().map(|p| p.to_string()))
+        })
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or_default();
+    if usd <= 0.0 || !usd.is_finite() {
+        return None;
+    }
+    let display = usd * (rate as f64 / 1_000_000.0);
+    let icon = state.near.icon_for(t);
+    let hood = t.blockchain == "hood";
+    let name = if symbol == "NEAR" {
+        "NEAR".to_owned()
+    } else if hood {
+        format!("{} on Robinhood", t.symbol)
+    } else {
+        format!("{} on {}", t.symbol, t.blockchain)
+    };
+    let (kind, chain) = if hood {
+        ("meme", "robinhood")
+    } else {
+        ("crypto", t.blockchain.as_str())
+    };
+    Some(
+        json!({"assetId":format!("near:{}", t.asset_id),"symbol":symbol,
+        "name":name,"kind":kind,"chain":chain,
+        "price":{"amount":format!("{display:.12}").trim_end_matches('0').trim_end_matches('.'),
+            "currency":currency},"change24hPct":null,"iconUrl":icon,"verified":true}),
+    )
+}
+// Robinhood Chain's memecoins Atlas trades, for the Memes list (and a search that matches them).
+pub(super) async fn hood_memes(
+    state: &AppState,
+    query: &str,
+    currency: &str,
+    rate: u128,
+) -> Vec<Value> {
+    let Ok(list) = state.near.tokens().await else {
+        return Vec::new();
+    };
+    let query = query.trim().to_ascii_lowercase();
+    list.iter()
+        .filter(|t| t.blockchain == "hood" && supported(t))
+        .filter(|t| query.is_empty() || t.symbol.to_ascii_lowercase().contains(&query))
+        .filter_map(|t| listed_row(state, t, &t.symbol, currency, rate))
+        .collect()
 }
 // NEAR is listed as wNEAR (the token form Atlas holds); people know it as NEAR.
 fn display_symbol(t: &Token) -> String {
@@ -3886,6 +4113,7 @@ async fn near_coin_sell_quote(
             monad_sale: false,
             relayed: false,
             gas_first,
+            hood_gas: 0,
         },
     );
     Ok(Json(sale_json(
@@ -3963,6 +4191,7 @@ async fn monad_sell_quote(
             monad_sale: true,
             relayed: false,
             gas_first: None,
+            hood_gas: 0,
         },
     );
     Ok(Json(sale_json(
@@ -4054,6 +4283,7 @@ async fn mon_buy_quote(
             monad_sale: false,
             relayed: false,
             gas_first: None,
+            hood_gas: 0,
         },
     );
     let currency = &req.amount.currency;
@@ -4099,6 +4329,256 @@ async fn mon_route(
         }
     }
     Err(markets::not_enough_trading(solana_cash, currency, rate))
+}
+
+// Robinhood Chain's gas is its ETH: a sale (an approval and Relay's deposit) costs about 0.00001 ETH
+// there. A buy into a wallet below the floor lands a little ETH with the coin, which stays in the
+// wallet for its sales (about five of them) and shows in the balance.
+const HOOD_GAS_FLOOR_WEI: u128 = 20_000_000_000_000;
+const HOOD_SALE_GAS_WEI: u128 = 10_000_000_000_000;
+// USD micros of such a buy that land as ETH: about 0.00004 ETH.
+const HOOD_GAS_TOPUP_USDC: u128 = 100_000;
+
+// Relay's quote for exactly `amount` of the wallet's coin on Robinhood Chain into the user's cash:
+// Solana USDC, or Base USDC without a Solana wallet.
+async fn hood_cash_quote(
+    state: &AppState,
+    user: &app_balance::VerifiedWallets,
+    evm: &str,
+    contract: &str,
+    amount: u128,
+) -> Result<HoodSwap, ApiError> {
+    match user.solana_wallet.as_deref().filter(|w| !w.is_empty()) {
+        Some(solana) => {
+            state
+                .relay_link
+                .hood_to_solana(evm, solana, contract, amount)
+                .await
+        }
+        None => state.relay_link.hood_to_base(evm, contract, amount).await,
+    }
+    .map_err(venue)
+}
+// Where a Robinhood coin is paid from, and Relay's quote for it: Trading, the Solana wallet's cash,
+// like every buy. `gas` (USD micros) of it lands as ETH for later sales. The SOL top-up the deposit
+// may need first has to fit in the same cash.
+#[allow(clippy::too_many_arguments)]
+async fn hood_route(
+    state: &AppState,
+    user: &app_balance::VerifiedWallets,
+    evm: &str,
+    contract: &str,
+    amount: u128,
+    gas: u128,
+    currency: &str,
+    rate: u128,
+) -> Result<(String, bool, HoodSwap), ApiError> {
+    let unavailable = |_| venue("Couldn't price this coin right now; try again shortly");
+    let solana = user.solana_wallet.as_deref().filter(|w| !w.is_empty());
+    let solana_cash = match solana {
+        Some(s) => markets::solana_cash(state, s).await,
+        None => 0,
+    };
+    if let Some(s) = solana {
+        let topup = markets::sol_topup_cost(state, s).await;
+        if solana_cash >= amount.saturating_add(topup)
+            && markets::solana_can_send(state, s, amount).await
+        {
+            let swap = state
+                .relay_link
+                .solana_to_hood(s, evm, contract, amount, gas)
+                .await
+                .map_err(unavailable)?;
+            return Ok((s.into(), true, swap));
+        }
+    }
+    Err(markets::not_enough_trading(solana_cash, currency, rate))
+}
+// Buying a Robinhood Chain coin: through Relay, into the user's own EVM wallet there, where the phone
+// can sell it back. A wallet without ETH there gets a little with its first buy, for those sales.
+async fn hood_buy_quote(
+    state: AppState,
+    req: markets::QuoteRequest,
+    user: app_balance::VerifiedWallets,
+    token: Token,
+) -> Result<Json<Value>, ApiError> {
+    let contract = token
+        .contract_address
+        .clone()
+        .filter(|c| is_evm(c))
+        .ok_or_else(|| bad("Atlas can't buy this coin"))?;
+    let evm = user
+        .evm_wallet
+        .clone()
+        .filter(|w| is_evm(w))
+        .ok_or_else(|| conflict("Your wallet is still being set up. Try again in a moment."))?;
+    let rate = app_balance::fx_rate(&req.amount.currency).await?;
+    let amount = markets::parse_micros(&req.amount.amount)?
+        .checked_mul(1_000_000)
+        .ok_or_else(|| bad("amount too large"))?
+        / rate;
+    markets::check_limits(amount, &req.amount.currency, rate)?;
+    let price = token_usd(&token);
+    // Atlas won't buy a coin it can't sell back to cash.
+    let back = units_worth(amount, price, token.decimals);
+    if back == 0
+        || hood_cash_quote(&state, &user, &evm, &contract, back)
+            .await
+            .is_err()
+    {
+        return Err(conflict(&format!(
+            "Atlas can't sell {} back to cash right now, so it won't buy it. Try again later.",
+            token.symbol
+        )));
+    }
+    let gas = if state.near.hood_eth(&evm).await? < HOOD_GAS_FLOOR_WEI {
+        HOOD_GAS_TOPUP_USDC
+    } else {
+        0
+    };
+    // The ETH kept for selling later is a gas top-up on top of the buy: all of `amount` still buys
+    // the coin, and the deposit carries both.
+    let deposit = amount + gas;
+    let (wallet, from_solana, swap) = hood_route(
+        &state,
+        &user,
+        &evm,
+        &contract,
+        deposit,
+        gas,
+        &req.amount.currency,
+        rate,
+    )
+    .await?;
+    // What it costs beyond the coin; past a tenth of the money, the quote is refused.
+    let worth = worth_of(swap.expected_out_units, price, token.decimals);
+    if worth < amount * 9 / 10 {
+        return Err(conflict(&format!(
+            "Buying {} costs too much in fees right now. Try a bigger amount, or try later.",
+            token.symbol
+        )));
+    }
+    let fee = amount.saturating_sub(worth);
+    // The SOL the Solana deposit may buy first for its fee (0 when the wallet's SOL pays).
+    let sol_gas = base_gas_topup(&state, &wallet, from_solana).await;
+    let quote_id = id("q");
+    let expires = now() + 30_000;
+    state.near.quotes.lock().map_err(internal)?.insert(
+        quote_id.clone(),
+        StoredQuote {
+            owner: user.user_id.clone(),
+            wallet,
+            recipient: evm,
+            asset: token.clone(),
+            amount: deposit,
+            minimum_out: swap.minimum_out_units,
+            currency: req.amount.currency.clone(),
+            expires,
+            then_swap: None,
+            sell_sui: false,
+            sale: None,
+            from_solana,
+            network_fee: fee,
+            asset_id: req.asset_id.clone(),
+            monad_sale: false,
+            relayed: false,
+            gas_first: None,
+            hood_gas: gas,
+        },
+    );
+    let currency = &req.amount.currency;
+    let total = deposit + sol_gas;
+    let mut answer = json!({"quoteId":quote_id,"assetId":req.asset_id,"side":"buy",
+        "pay":{"amount":markets::format_units(total,6),"symbol":"USDC","value":money(total,currency,rate)},
+        "receive":{"amount":markets::format_units(swap.expected_out_units,token.decimals),"symbol":token.symbol,
+            "value":money(worth,currency,rate)},
+        "price":unit_price(amount,swap.expected_out_units,token.decimals,currency,rate),
+        "fee":money(fee + gas + sol_gas,currency,rate),"expiresAtUnixMs":expires});
+    if gas + sol_gas > 0 {
+        answer["gasTopup"] = money(gas + sol_gas, currency, rate);
+    }
+    Ok(Json(answer))
+}
+// Selling a Robinhood Chain coin back to cash: the phone sends it to Relay from its wallet there,
+// paying the network fee in the ETH kept for it.
+async fn hood_sell_quote(
+    state: AppState,
+    req: markets::QuoteRequest,
+    user: app_balance::VerifiedWallets,
+    token: Token,
+) -> Result<Json<Value>, ApiError> {
+    let contract = token
+        .contract_address
+        .clone()
+        .filter(|c| is_evm(c))
+        .ok_or_else(|| bad("Atlas can't sell this coin"))?;
+    let wallet = user
+        .evm_wallet
+        .clone()
+        .filter(|w| is_evm(w))
+        .ok_or_else(|| conflict("Your wallet is still being set up. Try again in a moment."))?;
+    let held = state
+        .near
+        .evm_balance(EvmChain::Robinhood, &token, &wallet)
+        .await?;
+    if state.near.hood_eth(&wallet).await? < HOOD_SALE_GAS_WEI {
+        return Err(conflict(
+            "Selling needs a little ETH on Robinhood Chain for the network fee (about 0.00001 ETH).",
+        ));
+    }
+    let price = token_usd(&token);
+    let rate = app_balance::fx_rate(&req.amount.currency).await?;
+    let desired = markets::parse_micros(&req.amount.amount)?
+        .checked_mul(1_000_000)
+        .ok_or_else(|| bad("Amount too large"))?
+        / rate;
+    let amount = sale_units(held, desired, price, token.decimals, req.all)?;
+    let value = worth_of(amount, price, token.decimals);
+    markets::check_limits(value, &req.amount.currency, rate)?;
+    let swap = hood_cash_quote(&state, &user, &wallet, &contract, amount)
+        .await
+        .map_err(|_| {
+            conflict(&format!(
+                "{} can't be sold to cash right now. Try again later.",
+                token.symbol
+            ))
+        })?;
+    let receive = swap.expected_out_units;
+    let quote_id = id("q");
+    let expires = now() + 30_000;
+    state.near.quotes.lock().map_err(internal)?.insert(
+        quote_id.clone(),
+        StoredQuote {
+            owner: user.user_id.clone(),
+            wallet: wallet.clone(),
+            recipient: wallet,
+            asset: token.clone(),
+            amount,
+            minimum_out: swap.minimum_out_units,
+            currency: req.amount.currency.clone(),
+            expires,
+            then_swap: None,
+            sell_sui: false,
+            from_solana: false,
+            network_fee: value.saturating_sub(receive),
+            sale: None,
+            asset_id: req.asset_id.clone(),
+            monad_sale: true,
+            relayed: false,
+            gas_first: None,
+            hood_gas: 0,
+        },
+    );
+    Ok(Json(sale_json(
+        &quote_id,
+        &req.asset_id,
+        (amount, token.decimals, &token.symbol),
+        value,
+        receive,
+        &req.amount.currency,
+        rate,
+        expires,
+    )))
 }
 
 async fn sui_coin_sell_quote(
@@ -4251,6 +4731,7 @@ async fn sui_coin_sell_quote(
             monad_sale: false,
             relayed: false,
             gas_first: None,
+            hood_gas: 0,
         },
     );
     Ok(Json(
@@ -4408,6 +4889,7 @@ async fn ref_sell_quote(
             monad_sale: false,
             relayed: false,
             gas_first,
+            hood_gas: 0,
         },
     );
     Ok(Json(
@@ -4612,6 +5094,7 @@ async fn sui_sell_quote(
             monad_sale: false,
             relayed: false,
             gas_first: None,
+            hood_gas: 0,
         },
     );
     Ok(Json(json!({
@@ -4816,6 +5299,7 @@ pub(super) async fn quote(
         return match (token.blockchain.as_str(), sell_route(&token.blockchain)) {
             ("near", Some(_)) => near_coin_sell_quote(state, headers, req, user, token).await,
             ("monad", Some(_)) => monad_sell_quote(state, req, user, token).await,
+            ("hood", Some(_)) => hood_sell_quote(state, req, user, token).await,
             ("sui", Some(_)) => sui_sell_quote(state, headers, req, user).await,
             _ => Err(bad("Atlas can't sell this coin")),
         };
@@ -4835,6 +5319,9 @@ pub(super) async fn quote(
         .ok_or((StatusCode::NOT_FOUND, "1Click asset not found".into()))?;
     if token.blockchain == "monad" {
         return mon_buy_quote(state, req, user, token).await;
+    }
+    if token.blockchain == "hood" {
+        return hood_buy_quote(state, req, user, token).await;
     }
     let destination = destination(&state, &headers, &token, &user).await?;
     let rate = app_balance::fx_rate(&req.amount.currency).await?;
@@ -4933,6 +5420,7 @@ pub(super) async fn quote(
             monad_sale: false,
             relayed: from_solana && origin == BASE_USDC_1CLICK,
             gas_first: None,
+            hood_gas: 0,
         },
     );
     Ok(Json(buy_quote_json(
@@ -5011,12 +5499,14 @@ async fn execute_monad_sale(
                 device: None,
                 then_sell: None,
                 gas_bought: 0,
+                refund: None,
                 withdraw: None,
                 relay: Some(RelayLeg {
                     request_id: swap.request_id,
                     typed_data: None,
                     api: String::new(),
                     expected_out: swap.expected_out_units,
+                    currency: String::new(),
                 }),
             },
         )
@@ -5154,12 +5644,14 @@ async fn execute_mon_buy(
                 device: None,
                 then_sell: None,
                 gas_bought: 0,
+                refund: None,
                 withdraw: None,
                 relay: Some(RelayLeg {
                     request_id: swap.request_id,
                     typed_data,
                     api,
                     expected_out: swap.expected_out_units,
+                    currency: String::new(),
                 }),
             },
         )
@@ -5179,6 +5671,281 @@ async fn execute_mon_buy(
     }
     Ok(Json(
         json!({"intentId":intent_id,"kind":"buy","summary":summary,
+        "transactions":transactions,"expiresAtUnixMs":expires}),
+    ))
+}
+// A Robinhood Chain buy's plan, as with MON: from Solana, [gas top-up?, Relay deposit] that the
+// engine lands; from Base, the one authorization the phone signs, which the engine checks and hands
+// to Relay. The coin (and any ETH for its gas) lands in the user's own wallet there.
+async fn execute_hood_buy(
+    state: &AppState,
+    user: &app_balance::VerifiedWallets,
+    stored: StoredQuote,
+) -> Result<Json<Value>, ApiError> {
+    let unavailable =
+        |_| venue("Couldn't price this coin right now; nothing was spent. Try again.");
+    let contract = stored
+        .asset
+        .contract_address
+        .clone()
+        .filter(|c| is_evm(c))
+        .ok_or_else(|| bad("Atlas can't buy this coin"))?;
+    let swap = if stored.from_solana {
+        state
+            .relay_link
+            .solana_to_hood(
+                &stored.wallet,
+                &stored.recipient,
+                &contract,
+                stored.amount,
+                stored.hood_gas,
+            )
+            .await
+    } else {
+        state
+            .relay_link
+            .base_to_hood(&stored.recipient, &contract, stored.amount, stored.hood_gas)
+            .await
+    }
+    .map_err(unavailable)?;
+    if swap.minimum_out_units < stored.minimum_out {
+        return Err(conflict("route price changed; request a fresh quote"));
+    }
+    let balance = if stored.from_solana {
+        markets::solana_cash(state, &stored.wallet).await
+    } else {
+        state
+            .markets
+            .base
+            .balance_of(BASE_USDC, &stored.wallet)
+            .await
+            .map_err(venue)?
+    };
+    if balance < stored.amount {
+        return Err(markets::short_of_cash());
+    }
+    let mut transactions = Vec::new();
+    let mut gas_request_id = None;
+    let mut sol_gas: u128 = 0;
+    // The Solana deposit planned, bound when it's signed (empty for a Base authorization).
+    let mut planned_deposit = String::new();
+    let (typed_data, api) = match &swap.pay {
+        HoodPay::Solana {
+            instructions,
+            lookup_tables,
+        } => {
+            let deposit = state
+                .solana_mainnet
+                .v0_transaction(&stored.wallet, instructions, lookup_tables)
+                .await
+                .map_err(venue)?;
+            // A Solana wallet with no SOL pays the transaction fee from a gasless top-up first.
+            // Without one the deposit can't land, so nothing is signed.
+            match markets::gas_topup_priced(state, &stored.wallet, stored.amount).await {
+                Some((gas_id, gas_tx, usdc)) => {
+                    transactions
+                        .push(json!({"chain":"solana","transaction":gas_tx,"submit":"engine"}));
+                    gas_request_id = Some(gas_id);
+                    sol_gas = usdc;
+                }
+                None if markets::sol_topup_cost(state, &stored.wallet).await > 0 => {
+                    return Err(conflict(markets::GAS_NOT_READY));
+                }
+                None => {}
+            }
+            transactions.push(json!({"chain":"solana","transaction":deposit,"submit":"engine"}));
+            planned_deposit = deposit;
+            (None, String::new())
+        }
+        HoodPay::Base { typed_data, api } => {
+            transactions.push(gasless::step(typed_data, "base"));
+            (Some(typed_data.clone()), api.clone())
+        }
+        HoodPay::Robinhood { .. } => return Err(venue("Relay returned an unsupported payment")),
+    };
+    let intent_id = id("intent");
+    let expires = now() + 120_000;
+    let token = stored.asset.clone();
+    state
+        .near
+        .insert_intent(
+            &intent_id,
+            StoredIntent {
+                owner: user.user_id.clone(),
+                wallet: stored.wallet.clone(),
+                expected_to: String::new(),
+                expected_data: planned_deposit,
+                deposit_address: String::new(),
+                deposit_memo: None,
+                asset: Some(token.clone()),
+                expires,
+                status: markets::IntentStatus {
+                    intent_id: intent_id.clone(),
+                    stage: "validate".into(),
+                    state: "pending".into(),
+                    tx_ids: Vec::new(),
+                    error: None,
+                },
+                then_swap: None,
+                sell_sui: false,
+                amount: stored.amount,
+                minimum_out: swap.minimum_out_units,
+                sui_wallet: None,
+                from_solana: stored.from_solana,
+                gas_request_id,
+                gas_topup: false,
+                gas_order: None,
+                topup: None,
+                sale: None,
+                sale_permission_used: false,
+                ref_wallet: Some(stored.recipient.clone()),
+                asset_id: stored.asset_id.clone(),
+                origin_chain: String::new(),
+                expected_value: String::new(),
+                handed_nonce: None,
+                device: None,
+                then_sell: None,
+                gas_bought: 0,
+                refund: None,
+                withdraw: None,
+                relay: Some(RelayLeg {
+                    request_id: swap.request_id,
+                    typed_data,
+                    api,
+                    expected_out: swap.expected_out_units,
+                    currency: stored.currency.clone(),
+                }),
+            },
+        )
+        .await?;
+    let rate = app_balance::fx_rate(&stored.currency).await?;
+    let mut summary = vec![
+        json!({"label":"You pay","value":markets::say_money(stored.amount + sol_gas,&stored.currency,rate)}),
+        json!({"label":"You get (about)","value":format!("{} {}",
+            markets::format_units(swap.expected_out_units,token.decimals),token.symbol)}),
+        json!({"label":"Lands on","value":"Robinhood Chain"}),
+    ];
+    if stored.hood_gas + sol_gas > 0 {
+        summary.push(json!({"label":"Gas top-up (one time)","value":markets::say_money(stored.hood_gas + sol_gas,&stored.currency,rate)}));
+    }
+    if stored.network_fee > 0 {
+        summary.push(json!({"label":"Fee","value":markets::say_money(stored.network_fee,&stored.currency,rate)}));
+    }
+    Ok(Json(
+        json!({"intentId":intent_id,"kind":"buy","summary":summary,
+        "transactions":transactions,"expiresAtUnixMs":expires}),
+    ))
+}
+// A Robinhood Chain sale's plan: what the phone sends from its wallet there (an exact approval of
+// Relay's router when it needs one, then the router's deposit), as with a Monad sale. The wallet's
+// nonce is kept, so a plan nobody reports can still be told apart from one that went out.
+async fn execute_hood_sale(
+    state: &AppState,
+    user: &app_balance::VerifiedWallets,
+    stored: StoredQuote,
+) -> Result<Json<Value>, ApiError> {
+    let token = stored.asset.clone();
+    let contract = token
+        .contract_address
+        .clone()
+        .filter(|c| is_evm(c))
+        .ok_or_else(|| bad("Atlas can't sell this coin"))?;
+    let held = state
+        .near
+        .evm_balance(EvmChain::Robinhood, &token, &stored.wallet)
+        .await?;
+    if held < stored.amount {
+        return Err(conflict(&format!(
+            "You no longer hold that much {}.",
+            token.symbol
+        )));
+    }
+    if state.near.hood_eth(&stored.wallet).await? < HOOD_SALE_GAS_WEI {
+        return Err(conflict(
+            "Selling needs a little ETH on Robinhood Chain for the network fee (about 0.00001 ETH).",
+        ));
+    }
+    let swap = hood_cash_quote(state, user, &stored.wallet, &contract, stored.amount).await?;
+    if swap.minimum_out_units < stored.minimum_out {
+        return Err(conflict("route price changed; request a fresh quote"));
+    }
+    let HoodPay::Robinhood { transactions } = swap.pay else {
+        return Err(venue("Relay returned an unsupported deposit"));
+    };
+    // The deposit is the plan's last transaction; it's the one whose landing is checked.
+    let deposit = transactions
+        .last()
+        .ok_or_else(|| venue("Relay returned no deposit"))?;
+    let to = deposit["to"].as_str().unwrap_or_default().to_owned();
+    let data = deposit["data"].as_str().unwrap_or_default().to_owned();
+    let nonce = state
+        .near
+        .evm_nonce(EvmChain::Robinhood, &stored.wallet)
+        .await?;
+    let intent_id = id("intent");
+    let expires = now() + 120_000;
+    state
+        .near
+        .insert_intent(
+            &intent_id,
+            StoredIntent {
+                owner: user.user_id.clone(),
+                wallet: stored.wallet.clone(),
+                expected_to: to.clone(),
+                expected_data: data,
+                deposit_address: to,
+                deposit_memo: None,
+                asset: Some(token.clone()),
+                expires,
+                status: markets::IntentStatus {
+                    intent_id: intent_id.clone(),
+                    stage: "validate".into(),
+                    state: "pending".into(),
+                    tx_ids: Vec::new(),
+                    error: None,
+                },
+                then_swap: None,
+                sell_sui: false,
+                amount: stored.amount,
+                minimum_out: swap.minimum_out_units,
+                sui_wallet: None,
+                from_solana: false,
+                gas_request_id: None,
+                gas_topup: false,
+                gas_order: None,
+                topup: None,
+                sale: None,
+                sale_permission_used: false,
+                ref_wallet: None,
+                asset_id: stored.asset_id.clone(),
+                origin_chain: "robinhood".into(),
+                expected_value: "0x0".into(),
+                handed_nonce: Some(nonce),
+                device: None,
+                then_sell: None,
+                gas_bought: 0,
+                refund: None,
+                withdraw: None,
+                relay: Some(RelayLeg {
+                    request_id: swap.request_id,
+                    typed_data: None,
+                    api: String::new(),
+                    expected_out: swap.expected_out_units,
+                    currency: stored.currency.clone(),
+                }),
+            },
+        )
+        .await?;
+    let rate = app_balance::fx_rate(&stored.currency).await?;
+    let mut summary = vec![
+        json!({"label":"You sell","value":format!("{} {}",markets::format_units(stored.amount,token.decimals),token.symbol)}),
+        json!({"label":"You receive (at least)","value":markets::say_money(swap.minimum_out_units,&stored.currency,rate)}),
+    ];
+    if stored.network_fee > 0 {
+        summary.push(json!({"label":"Fee","value":markets::say_money(stored.network_fee,&stored.currency,rate)}));
+    }
+    Ok(Json(
+        json!({"intentId":intent_id,"kind":"sell","summary":summary,
         "transactions":transactions,"expiresAtUnixMs":expires}),
     ))
 }
@@ -5276,6 +6043,7 @@ async fn execute_sui_sell(
                 relay: None,
                 then_sell: None,
                 gas_bought: 0,
+                refund: None,
             },
         )
         .await?;
@@ -5424,6 +6192,7 @@ async fn execute_sale_after_gas(
                     sale: quote.sale,
                 }),
                 gas_bought: 0,
+                refund: None,
             },
         )
         .await?;
@@ -5700,8 +6469,15 @@ pub(super) async fn execute(
     if stored.sell_sui {
         return execute_sui_sell(&state, &headers, &user, stored).await;
     }
+    // A sale the phone sends from its own EVM wallet: on Robinhood Chain, or on Monad.
+    if stored.monad_sale && stored.asset.blockchain == "hood" {
+        return execute_hood_sale(&state, &user, stored).await;
+    }
     if stored.monad_sale {
         return execute_monad_sale(&state, &user, stored).await;
+    }
+    if stored.asset.blockchain == "hood" {
+        return execute_hood_buy(&state, &user, stored).await;
     }
     if stored.asset.blockchain == "monad" {
         return execute_mon_buy(&state, &user, stored).await;
@@ -5810,6 +6586,7 @@ pub(super) async fn execute(
                 relay: None,
                 then_sell: None,
                 gas_bought: 0,
+                refund: None,
             },
         )
         .await?;
@@ -6174,6 +6951,15 @@ pub(super) async fn signed(
             .await
             .map(Json);
     }
+    // A refunded Robinhood trade's last step: the phone's approval of bringing it back.
+    if current.refund.is_some()
+        && current.status.stage == "sign"
+        && current.status.state == "pending"
+    {
+        return refund_signed(&state, &headers, &id, current, body)
+            .await
+            .map(Json);
+    }
     // After a gas top-up, the Base transfer is reported from the sign stage.
     let second_step = current.gas_topup && current.status.stage == "sign";
     if current.status.stage != "validate" && !second_step {
@@ -6238,6 +7024,25 @@ pub(super) async fn signed(
                 current.status.error = Some(NOT_SENT.into());
             }
         }
+        let result = current.status.clone();
+        state.near.save_intent(&id, current).await?;
+        return Ok(Json(result));
+    }
+    // A Robinhood Chain sale: the phone sent its approval (when it needed one) and Relay's deposit.
+    // The deposit goes first among the ids: its landing is what's checked, then Relay is followed.
+    if current.origin_chain == "robinhood" {
+        if !body.signed.is_empty()
+            || body.sent.is_empty()
+            || body.sent.len() > 2
+            || body
+                .sent
+                .iter()
+                .any(|s| s.chain != "robinhood" || !valid_hash(&s.id))
+        {
+            return Err(bad("signed report does not match the sale plan"));
+        }
+        current.status.stage = "settle".into();
+        current.status.tx_ids = body.sent.iter().rev().map(|s| s.id.clone()).collect();
         let result = current.status.clone();
         state.near.save_intent(&id, current).await?;
         return Ok(Json(result));
@@ -6366,7 +7171,9 @@ pub(super) async fn status(
         ));
     }
     if let Some(leg) = current.relay.clone() {
-        return relay_status(&state, &id, current, leg).await.map(Json);
+        return relay_status(&state, &user, &id, current, leg)
+            .await
+            .map(Json);
     }
     let mut result = current.status.clone();
     if current.sell_sui && result.state == "pending" {
@@ -6592,6 +7399,7 @@ pub(super) async fn status(
 // filled. A sale nobody reported is followed by its wallet nonce, as with 1Click.
 async fn relay_status(
     state: &AppState,
+    user: &app_balance::VerifiedWallets,
     id: &str,
     mut current: StoredIntent,
     leg: RelayLeg,
@@ -6600,7 +7408,16 @@ async fn relay_status(
     if result.state != "pending" {
         return Ok(result);
     }
-    let sale = current.origin_chain == "monad";
+    if current.refund.is_some() {
+        return refund_status(state, id, current).await;
+    }
+    // A sale the phone sent from its own wallet on Monad or Robinhood Chain.
+    let chain = match current.origin_chain.as_str() {
+        "monad" => Some(EvmChain::Monad),
+        "robinhood" => Some(EvmChain::Robinhood),
+        _ => None,
+    };
+    let sale = chain.is_some();
     let symbol = current
         .asset
         .as_ref()
@@ -6611,11 +7428,13 @@ async fn relay_status(
             if now() <= current.expires {
                 return Ok(result);
             }
-            let moved = match (sale, current.handed_nonce) {
-                (true, Some(handed)) => state.near.monad_nonce(&current.wallet).await? > handed,
-                (true, None) => true,
+            let moved = match (chain, current.handed_nonce) {
+                (Some(chain), Some(handed)) => {
+                    state.near.evm_nonce(chain, &current.wallet).await? > handed
+                }
+                (Some(_), None) => true,
                 // A buy's payment goes out only through /signed, which moves the stage first.
-                (false, _) => false,
+                (None, _) => false,
             };
             if !moved {
                 result.state = "failed".into();
@@ -6676,6 +7495,24 @@ async fn relay_status(
         }
         engine_execution::layerswap::SwapState::Failed(reason) => {
             eprintln!("intent {id}: Relay {reason}");
+            let robinhood = chain == Some(EvmChain::Robinhood)
+                || current
+                    .asset
+                    .as_ref()
+                    .is_some_and(|a| a.blockchain == "hood");
+            // Relay may refund a Robinhood trade as USDG in the wallet there: the trade then brings
+            // it back to Trading as its last step.
+            if robinhood && trading_wallet(user).is_some() {
+                current.refund = Some(Refund {
+                    since: now(),
+                    moved: None,
+                    handed: false,
+                });
+                result.stage = "refund".into();
+                result.error = None;
+                current.status = result;
+                return refund_status(state, id, current).await;
+            }
             result.state = "failed".into();
             result.error = Some(if sale {
                 format!("The sale didn't go through. Relay returns your {symbol} to your wallet.")
@@ -6687,6 +7524,233 @@ async fn relay_status(
     current.status = result.clone();
     state.near.save_intent(id, current).await?;
     Ok(result)
+}
+
+// How long to look for a refund's USDG in the wallet once Relay says it refunded. Relay reports a
+// refund once it's paid, so it's normally there at the first look; none by then means Relay refunded
+// where the trade was paid from.
+const REFUND_LOOK_MS: u64 = 30_000;
+const REFUNDED: &str =
+    "The price moved, so this buy was refunded. Your money is back in your trading balance.";
+
+// The wallet a Robinhood trade's refund lands in: the buy's recipient there, or the selling wallet.
+fn refund_wallet(current: &StoredIntent) -> &str {
+    if current.origin_chain == "robinhood" {
+        &current.wallet
+    } else {
+        current.ref_wallet.as_deref().unwrap_or_default()
+    }
+}
+// Trading: the user's Solana wallet, where a refund comes back to.
+fn trading_wallet(user: &app_balance::VerifiedWallets) -> Option<&str> {
+    user.solana_wallet.as_deref().filter(|w| !w.is_empty())
+}
+// Seconds an EIP-3009 authorization still has before its deadline.
+fn signable_for(typed_data: &Value) -> u64 {
+    let deadline = &typed_data["message"]["validBefore"];
+    deadline
+        .as_str()
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| deadline.as_u64())
+        .unwrap_or(0)
+        .saturating_sub(now() / 1000)
+}
+
+// A refunded Robinhood trade: look for its USDG (stage refund), wait for the phone's approval
+// (stage sign, handed out by /next), then follow Relay until the USDC is in Trading. A try that
+// doesn't move it (Relay gives up, or never used the approval before its deadline) looks again.
+async fn refund_status(
+    state: &AppState,
+    id: &str,
+    mut current: StoredIntent,
+) -> Result<markets::IntentStatus, ApiError> {
+    let mut result = current.status.clone();
+    let Some(mut refund) = current.refund.clone() else {
+        return Ok(result);
+    };
+    if result.state != "pending" || result.stage != "refund" {
+        return Ok(result);
+    }
+    let sale = current.origin_chain == "robinhood";
+    if let Some(moved) = refund.moved.clone().filter(|_| refund.handed) {
+        match state
+            .relay_link
+            .state(&moved.request_id)
+            .await
+            .map_err(venue)?
+        {
+            engine_execution::layerswap::SwapState::Completed => {
+                if sale {
+                    // The coin was sold into those dollars: it's a sale, for what reached Trading.
+                    result.state = "filled".into();
+                    result.error = None;
+                    let tx = result.tx_ids.first().cloned();
+                    record_fill(state, id, &current, "sell", current.amount, moved.back, tx).await;
+                } else {
+                    result.state = "failed".into();
+                    result.error = Some(refunded(&current, moved.back).await);
+                }
+                current.status = result.clone();
+                state.near.save_intent(id, current).await?;
+                return Ok(result);
+            }
+            engine_execution::layerswap::SwapState::Waiting
+                if !markets::typed_authorization_dead(state, &moved.typed_data).await =>
+            {
+                return Ok(result);
+            }
+            _ => {
+                eprintln!(
+                    "intent {id}: refund {} didn't move; looking again",
+                    moved.request_id
+                );
+                refund.handed = false;
+                refund.moved = None;
+                refund.since = now();
+            }
+        }
+    }
+    if state.near.hood_usdg(refund_wallet(&current)).await? > 0 {
+        result.stage = "sign".into();
+    } else if now() >= refund.since.saturating_add(REFUND_LOOK_MS) {
+        let symbol = current.asset.as_ref().map_or("coin", |a| a.symbol.as_str());
+        result.state = "failed".into();
+        result.error = Some(if sale {
+            format!("The sale didn't go through, so your {symbol} is back in your wallet.")
+        } else {
+            REFUNDED.into()
+        });
+    }
+    current.refund = Some(refund);
+    current.status = result.clone();
+    state.near.save_intent(id, current).await?;
+    Ok(result)
+}
+// What a refunded Robinhood buy says once its money is back in Trading.
+async fn refunded(current: &StoredIntent, back: u128) -> String {
+    let currency = current
+        .relay
+        .as_ref()
+        .map(|l| l.currency.as_str())
+        .filter(|c| !c.is_empty())
+        .unwrap_or("USD");
+    match app_balance::fx_rate(currency).await {
+        Ok(rate) => format!(
+            "The price moved, so this buy was refunded. {} is back in your trading balance.",
+            markets::say_money(back, currency, rate)
+        ),
+        Err(_) => REFUNDED.into(),
+    }
+}
+// Relay's quote for bringing back all the USDG the wallet holds, kept while it has two minutes or
+// more to be signed in; asking after that makes a fresh one.
+async fn refund_move(
+    state: &AppState,
+    user: &app_balance::VerifiedWallets,
+    current: &mut StoredIntent,
+) -> Result<RefundMove, ApiError> {
+    let mut refund = current
+        .refund
+        .clone()
+        .ok_or_else(|| conflict("nothing to sign for this intent"))?;
+    if let Some(moved) = refund
+        .moved
+        .clone()
+        .filter(|m| signable_for(&m.typed_data) >= 120)
+    {
+        return Ok(moved);
+    }
+    let solana = trading_wallet(user)
+        .ok_or_else(|| conflict("Your wallet is still being set up. Try again in a moment."))?;
+    let evm = refund_wallet(current).to_owned();
+    let held = state.near.hood_usdg(&evm).await?;
+    if held == 0 {
+        // Already moved by another try: back to looking, which settles what happened.
+        refund.moved = None;
+        refund.since = now();
+        current.refund = Some(refund);
+        current.status.stage = "refund".into();
+        return Err(conflict("Your refund is already on its way back."));
+    }
+    let quote = state
+        .relay_link
+        .hood_usdg_to_solana(&evm, solana, held)
+        .await
+        .map_err(|error| {
+            eprintln!("refund: Relay didn't quote ({error})");
+            venue("Couldn't bring your refund back right now. It's safe; try again shortly.")
+        })?;
+    let moved = RefundMove {
+        request_id: quote.request_id,
+        typed_data: quote.typed_data,
+        api: quote.api,
+        held,
+        back: quote.amount_out_units,
+    };
+    refund.moved = Some(moved.clone());
+    current.refund = Some(refund);
+    Ok(moved)
+}
+// The phone's approval of bringing a refund back: checked against the quote it was given, then
+// handed to Relay. Handed first, so a repeated report can't hand it over twice; an unanswered
+// hand-off is followed through Relay and the approval's deadline.
+async fn refund_signed(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+    mut current: StoredIntent,
+    body: markets::Submission,
+) -> Result<markets::IntentStatus, ApiError> {
+    let mut refund = current
+        .refund
+        .clone()
+        .ok_or_else(|| conflict("nothing to sign for this intent"))?;
+    let moved = refund
+        .moved
+        .clone()
+        .ok_or_else(|| conflict("nothing to sign for this intent"))?;
+    let [approval] = body.signed.as_slice() else {
+        return Err(bad("signed report does not match the refund plan"));
+    };
+    if !body.sent.is_empty() || approval.index != 0 {
+        return Err(bad("signed report does not match the refund plan"));
+    }
+    let signature = gasless::verify(
+        state,
+        headers,
+        refund_wallet(&current),
+        &moved.typed_data,
+        &approval.transaction,
+    )
+    .await
+    .map_err(|reason| {
+        eprintln!("intent {id}: refund approval refused: {reason}");
+        bad("That approval doesn't match your refund. Try again.")
+    })?;
+    refund.handed = true;
+    current.refund = Some(refund.clone());
+    current.status.stage = "refund".into();
+    state.near.save_intent(id, current.clone()).await?;
+    match state
+        .relay_link
+        .submit(&moved.request_id, &moved.api, &signature)
+        .await
+    {
+        Ok(()) => {}
+        // Relay said no: it won't use this approval, so look again (a fresh quote to sign).
+        Err(engine_execution::relay_link::RelayError::Rejected { status, reason })
+            if status.is_client_error() =>
+        {
+            eprintln!("intent {id}: Relay refused the refund ({status}: {reason})");
+            refund.handed = false;
+            refund.moved = None;
+            refund.since = now();
+            current.refund = Some(refund);
+            state.near.save_intent(id, current.clone()).await?;
+        }
+        Err(error) => eprintln!("intent {id}: refund hand-off unanswered: {error}"),
+    }
+    Ok(current.status)
 }
 
 // What 1Click says reached the recipient, once settled.
@@ -6740,8 +7804,12 @@ async fn deposit_landed(
             },
         );
     }
-    if current.origin_chain == "monad" {
-        return monad_deposit_landed(state, current, hash).await;
+    match current.origin_chain.as_str() {
+        "monad" => return chain_deposit_landed(state, current, hash, EvmChain::Monad).await,
+        "robinhood" => {
+            return chain_deposit_landed(state, current, hash, EvmChain::Robinhood).await
+        }
+        _ => {}
     }
     let tx = markets::base_rpc(&state.markets, "eth_getTransactionByHash", json!([hash])).await?;
     if tx.is_null() {
@@ -6771,28 +7839,30 @@ async fn deposit_landed(
     Ok(Ok(true))
 }
 
-// A Monad sale's transfer: exactly the planned one (from the wallet, to, data and value, on chain
-// 143), and it succeeded.
-async fn monad_deposit_landed(
+// A sale's transfer on Monad or Robinhood Chain: exactly the planned one (from the wallet, to, data
+// and value, on that chain), and it succeeded. On Robinhood Chain that's Relay's deposit, which
+// can't succeed without the approval before it.
+async fn chain_deposit_landed(
     state: &AppState,
     current: &StoredIntent,
     hash: &str,
+    chain: EvmChain,
 ) -> Result<Result<bool, String>, ApiError> {
     let tx = state
         .near
-        .monad_call("eth_getTransactionByHash", json!([hash]))
+        .evm_call(chain, "eth_getTransactionByHash", json!([hash]))
         .await?;
     if tx.is_null() {
         return Ok(Ok(false));
     }
-    if !monad_tx_matches(&tx, current) {
+    if !chain_tx_matches(&tx, current, chain) {
         return Ok(Err(
             "reported transaction does not match the sale plan".into()
         ));
     }
     let receipt = state
         .near
-        .monad_call("eth_getTransactionReceipt", json!([hash]))
+        .evm_call(chain, "eth_getTransactionReceipt", json!([hash]))
         .await?;
     if receipt.is_null() {
         return Ok(Ok(false));
@@ -6805,7 +7875,11 @@ async fn monad_deposit_landed(
     }
     Ok(Ok(true))
 }
+#[cfg(test)]
 fn monad_tx_matches(tx: &Value, current: &StoredIntent) -> bool {
+    chain_tx_matches(tx, current, EvmChain::Monad)
+}
+fn chain_tx_matches(tx: &Value, current: &StoredIntent, chain: EvmChain) -> bool {
     let field = |name: &str, want: &str| {
         tx[name]
             .as_str()
@@ -6818,7 +7892,7 @@ fn monad_tx_matches(tx: &Value, current: &StoredIntent) -> bool {
             || (current.expected_data == "0x" && tx["input"].as_str() == Some("0x")))
         && value.is_some()
         && value == hex_units(&json!(current.expected_value))
-        && tx["chainId"].as_str() == Some("0x8f")
+        && tx["chainId"].as_str() == Some(chain.id_hex())
 }
 // The Base transfer to 1Click once an empty gas tank has been topped up (GET /v1/intents/{id}/next).
 pub(super) async fn next(
@@ -6850,6 +7924,19 @@ pub(super) async fn next(
                 json!({"transactions":markets::topup_steps(current.topup.as_ref().expect("topup"))}),
             ));
         }
+    }
+    // A refunded Robinhood trade: the one USDG approval that brings it back to Trading, signed
+    // under the trade's confirmation.
+    if current.status.stage == "sign"
+        && current.status.state == "pending"
+        && current.refund.is_some()
+    {
+        let moved = refund_move(&state, &user, &mut current).await;
+        state.near.save_intent(&id, current.clone()).await?;
+        let moved = moved?;
+        return Ok(Json(
+            json!({"transactions":[gasless::step(&moved.typed_data, "robinhood")]}),
+        ));
     }
     if current.status.stage == "sign"
         && current.status.state == "pending"
@@ -6913,7 +8000,8 @@ pub(super) async fn pending_rows(
         .await?
         .into_iter()
         .filter(|i| {
-            i.status.state == "pending" && matches!(i.status.stage.as_str(), "fund" | "settle")
+            i.status.state == "pending"
+                && matches!(i.status.stage.as_str(), "fund" | "settle" | "refund")
         })
         .take(16)
     {
@@ -6950,7 +8038,7 @@ pub(super) async fn pending_rows(
             .or_else(|| intent.asset.as_ref().map(|a| a.symbol.as_str()))
             .unwrap_or("Coin");
         rows.push(json!({"intentId":intent.status.intent_id,"assetId":intent.asset_id,"symbol":symbol,
-            "kind":if intent.sell_sui{"sell"}else if intent.withdraw.is_some(){"withdraw"}else{"buy"},"stage":intent.status.stage,"error":intent.status.error}));
+            "kind":if intent.refund.is_some(){"refund"}else if intent.sell_sui{"sell"}else if intent.withdraw.is_some(){"withdraw"}else{"buy"},"stage":intent.status.stage,"error":intent.status.error}));
     }
     Ok(rows)
 }
@@ -7042,6 +8130,25 @@ pub(super) async fn resume(
     } else {
         drop(_step);
         let next = next(state.clone(), headers.clone(), id.clone()).await?.0;
+        // A refund waiting on Robinhood Chain: what comes back to Trading, and Relay's few cents.
+        let refund = state.near.get_intent(&id).await?.and_then(|i| {
+            let currency = i.relay.map(|l| l.currency).filter(|c| !c.is_empty());
+            i.refund.and_then(|r| r.moved).map(|m| (m, currency))
+        });
+        if let Some((moved, currency)) = refund {
+            let currency = currency.unwrap_or_else(|| "USD".into());
+            let rate = app_balance::fx_rate(&currency).await?;
+            let say = |units| markets::say_money(units, &currency, rate);
+            let expires = (now() + 120_000)
+                .min((now() / 1000 + signable_for(&moved.typed_data)).saturating_sub(10) * 1000);
+            return Ok(Json(
+                json!({"intentId":id,"stage":"sign","kind":"move","summary":[
+                    {"label":"You move","value":say(moved.held)},
+                    {"label":"Arrives in Trading","value":say(moved.back)},
+                    {"label":"Fee","value":say(moved.held.saturating_sub(moved.back))}],
+                "transactions":next["transactions"],"expiresAtUnixMs":expires}),
+            ));
+        }
         let (kind, finish, value) = match &intent.withdraw {
             Some(w) => (
                 "withdraw",
@@ -7079,6 +8186,37 @@ pub(super) async fn resume(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_refund_comes_from_the_robinhood_wallet_that_holds_it() {
+        // Intents saved before refunds existed read back with none.
+        let buy: super::StoredIntent = serde_json::from_value(serde_json::json!({
+            "owner":"u","wallet":"SolanaWallet","expected_to":"","expected_data":"",
+            "deposit_address":"","deposit_memo":null,"expires":0,"ref_wallet":"0xbuyer",
+            "status":{"intentId":"i","stage":"settle","state":"pending","txIds":[],"error":null},
+            "relay":{"request_id":"0x1","expected_out":1}}))
+        .unwrap();
+        assert!(buy.refund.is_none());
+        assert_eq!(buy.relay.as_ref().unwrap().currency, "");
+        // A buy's refund is in the wallet it bought into; a sale's in the wallet it sold from.
+        assert_eq!(super::refund_wallet(&buy), "0xbuyer");
+        let mut sale = buy.clone();
+        sale.origin_chain = "robinhood".into();
+        sale.wallet = "0xseller".into();
+        assert_eq!(super::refund_wallet(&sale), "0xseller");
+    }
+
+    #[test]
+    fn a_refund_approval_is_signable_only_before_its_deadline() {
+        let now = super::now() / 1000;
+        let at = |deadline: serde_json::Value| {
+            super::signable_for(&serde_json::json!({"message":{"validBefore":deadline}}))
+        };
+        assert!(at(serde_json::json!((now + 300).to_string())) >= 299);
+        assert!(at(serde_json::json!(now + 300)) >= 299);
+        assert_eq!(at(serde_json::json!(now - 1)), 0);
+        assert_eq!(super::signable_for(&serde_json::json!({})), 0);
+    }
+
     #[test]
     fn a_relay_deposit_cannot_exceed_the_reviewed_fee() {
         assert!(super::confirmed_relay_fee(20_000, Some(80_000)).is_err());
@@ -7607,6 +8745,85 @@ mod tests {
         }
         intent.expected_value = "0x0".into();
         assert!(!monad_tx_matches(&tx, &intent));
+    }
+    #[test]
+    fn a_reported_robinhood_deposit_must_be_exactly_the_plan_on_its_chain() {
+        let intent: StoredIntent = serde_json::from_value(json!({
+            "owner":"o","wallet":"0xd8da6bf26964af9d7eed9e03e53415d37aa96045",
+            "expected_to":"0xccc88a9d1b4ed6b0eaba998850414b24f1c315be",
+            "expected_data":"0xf9e4bab4aa","deposit_address":"0xccc88a9d1b4ed6b0eaba998850414b24f1c315be",
+            "deposit_memo":null,"expires":0,
+            "status":{"intentId":"i","stage":"settle","state":"pending","txIds":[],"error":null},
+            "origin_chain":"robinhood","expected_value":"0x0"}))
+        .unwrap();
+        let tx = json!({"from":"0xD8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
+            "to":"0xccc88a9d1b4ed6b0eaba998850414b24f1c315be","input":"0xf9e4bab4aa",
+            "value":"0x0","chainId":"0x1237"});
+        assert!(chain_tx_matches(&tx, &intent, EvmChain::Robinhood));
+        // The same transaction on Monad's chain id is not this plan.
+        assert!(!chain_tx_matches(&tx, &intent, EvmChain::Monad));
+        for (field, value) in [
+            ("to", "0x2222222222222222222222222222222222222222"),
+            ("value", "0x1"),
+            ("chainId", "0x2105"),
+            ("from", "0x0000000000000000000000000000000000000001"),
+            ("input", "0xf9e4bab4bb"),
+        ] {
+            let mut changed = tx.clone();
+            changed[field] = json!(value);
+            assert!(
+                !chain_tx_matches(&changed, &intent, EvmChain::Robinhood),
+                "{field}"
+            );
+        }
+    }
+    #[test]
+    fn robinhood_chain_trades_its_memecoins_not_its_gas_or_dollars() {
+        let pons = token(
+            "hood",
+            "PONS",
+            Some("0x39dbed3a2bd333467115de45665cc57f813c4571"),
+            18,
+            0.36,
+        );
+        let cashcat = token(
+            "hood",
+            "CASHCAT",
+            Some("0x020bfc650a365f8bb26819deaabf3e21291018b4"),
+            18,
+            0.11,
+        );
+        assert!(supported(&pons) && supported(&cashcat));
+        assert_eq!(
+            sell_route("hood"),
+            Some("Relay from the Robinhood Chain wallet, sent by the phone")
+        );
+        for refused in [
+            token("hood", "ETH", None, 18, 2500.0),
+            token(
+                "hood",
+                "WETH",
+                Some("0x0bd7d308f8e1639fab988df18a8011f41eacad73"),
+                18,
+                2500.0,
+            ),
+            token(
+                "hood",
+                "USDG",
+                Some("0x5fc5360d0400a0fd4f2af552add042d716f1d168"),
+                6,
+                1.0,
+            ),
+            token(
+                "hood",
+                "USDe",
+                Some("0x5d3a1ff2b6bab83b63cd9ad0787074081a52ef34"),
+                18,
+                1.0,
+            ),
+        ] {
+            assert!(!supported(&refused), "{}", refused.symbol);
+        }
     }
     #[test]
     fn a_captured_near_coin_sale_quote_reads_its_minimum_and_deposit() {

@@ -127,3 +127,18 @@ test('a link secret signs only a payout from its own escrow to a pinned receiver
   assert.throws(() => escrowKey('0x12'), /secret/);
   assert.throws(() => escrowKey('0x' + '00'.repeat(32)), /secret/);
 });
+
+test('a Robinhood USDG refund can only go back through Relay, signed by this wallet', () => {
+  const usdg = {name: 'Global Dollar', version: '1', chainId: 4663,
+    verifyingContract: '0x5fc5360d0400a0fd4f2af552add042d716f1d168'};
+  const typed = signable({...deposit(), domain: usdg}, wallet, NOW);
+  assert.equal(typed.domain.chainId, 4663);
+  assert.equal(typed.message.to, '0xccc88a9d1b4ed6b0eaba998850414b24f1c315be');
+  checkSignature(typed, sign(typed), wallet);
+  // Another receiver, another token on that chain, or USDG's name on another chain: refused.
+  assert.throws(() => signable({...deposit({to: '0x0000000000000000000000000000000000000bad'}), domain: usdg}, wallet, NOW));
+  assert.throws(() => signable({...deposit(), domain: {...usdg, verifyingContract: '0x0000000000000000000000000000000000000001'}}, wallet, NOW));
+  assert.throws(() => signable({...deposit(), domain: {...usdg, chainId: 8453}}, wallet, NOW));
+  // USDG may never be handed to CoW the way a Base gas top-up permit is.
+  assert.throws(() => signable({...permit(), domain: usdg}, wallet, NOW));
+});
