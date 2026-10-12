@@ -507,16 +507,7 @@ pub(super) async fn quote(
     if input.side == "buy" && cash < number(&q, "maximumSpend")? {
         // Keep the whole user budget: the bridge fee comes out before the order, never on top.
         let shortfall = requested.saturating_sub(cash);
-        let evm = user
-            .evm_wallet
-            .as_deref()
-            .ok_or_else(|| conflict("Your Atlas wallet is not ready"))?;
-        let base = state
-            .markets
-            .base
-            .balance_of(BASE_USDC, evm)
-            .await
-            .map_err(internal)?;
+        // Predictions are paid from Trading (the Solana wallet's cash), never from Spendable.
         let sol = if let Some(sol) = user.solana_wallet.as_deref() {
             markets::solana_cash(&state, sol).await
         } else {
@@ -531,10 +522,8 @@ pub(super) async fn quote(
         };
         let from = if user.solana_wallet.is_some() && sol >= shortfall + sol_reserve {
             "solana"
-        } else if base >= shortfall + funding_reserve(&state, &user, "base").await? {
-            "base"
         } else {
-            return Err(markets::not_enough_cash(base + sol + cash, currency, rate));
+            return Err(markets::not_enough_trading(sol, currency, rate));
         };
         let reserve = funding_reserve(&state, &user, from).await?;
         // What the order alone needs, for when the cash that's left after the move falls short.
@@ -1026,14 +1015,9 @@ async fn too_small(
     let spend = if cash >= order_budget && least_move == 0 {
         order_budget
     } else {
+        // Paid from Trading, like the purchase itself.
         let from = if user.solana_wallet.is_some() {
-            let sol =
-                markets::solana_cash(state, user.solana_wallet.as_deref().unwrap_or("")).await;
-            if sol >= order_budget.saturating_sub(cash) {
-                "solana"
-            } else {
-                "base"
-            }
+            "solana"
         } else {
             "base"
         };
@@ -1096,7 +1080,7 @@ async fn funding(
             return Err(conflict("Deposit address unavailable"));
         }
         let transfer = format!("0xa9059cbb{:0>64}{:064x}", &recipient[2..], amount);
-        let (child, steps, _) = markets::plan_base_with_cash(
+        let (child, steps, _, _) = markets::plan_base_with_cash(
             state,
             user.user_id,
             evm,

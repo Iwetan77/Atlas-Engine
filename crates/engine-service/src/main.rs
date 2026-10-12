@@ -16,6 +16,7 @@ mod near_intents;
 mod notifications;
 mod pending;
 mod pin;
+mod pockets;
 mod positions;
 mod predictions;
 mod price_alerts;
@@ -251,6 +252,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/onramp/bank", post(daya::onramp_open))
         .route("/v1/onramp/bank/{id}", get(daya::onramp_status))
         .route("/v1/daya/webhook", post(daya::webhook))
+        .route("/v1/moves/quote", post(pockets::quote))
+        .route(
+            "/v1/moves/quotes/{quote_id}/execute",
+            post(pockets::execute),
+        )
         .route("/v1/sends/quote", post(social::send_quote))
         .route(
             "/v1/sends/quote/{quote_id}/execute",
@@ -323,6 +329,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             state.clone(),
             pin::plan_gate,
         ))
+        .layer(axum::middleware::from_fn(pockets::client_gate))
         .with_state(state);
     if let Some(cors) = configured_cors()? {
         app = app.layer(cors);
@@ -475,6 +482,7 @@ fn configured_cors() -> Result<Option<CorsLayer>, Box<dyn std::error::Error>> {
                 header::HeaderName::from_static("privy-id-token"),
                 header::HeaderName::from_static("x-atlas-pin-authorization"),
                 header::HeaderName::from_static("x-atlas-payment-pin"),
+                header::HeaderName::from_static(pockets::CLIENT_HEADER),
             ]),
     ))
 }

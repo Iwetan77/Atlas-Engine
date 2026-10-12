@@ -9,7 +9,9 @@ as bounded transactions and device signatures for the user's **own** wallets, an
 - **API and website:** https://justatlas.xyz (`GET /health` shows the deployed commit and RPC hosts)
 - **App:** [Iwetan77/Atlas](https://github.com/Iwetan77/Atlas) (Expo: iOS, Android, web)
 
-Money is shown in the user's selected currency (₦ first). Under the hood, cash is USDC on Solana and Base.
+Money is shown in the user's selected currency (₦ first). The one balance holds two kinds of cash:
+**Spendable** (USDC in the user's Base wallet) pays sends, cash-outs and savings; **Trading** (USDC in their
+Solana wallet) pays trades, perps margin and predictions.
 Network details are shown when needed to choose a deposit or withdrawal route.
 
 ---
@@ -19,9 +21,11 @@ Network details are shown when needed to choose a deposit or withdrawal route.
 1. **Sign in** with Google or email. Privy creates an embedded EVM wallet and a Solana wallet the user owns;
    the engine adds Sui and NEAR receiving wallets under the same login the first time they're needed.
 2. **Add money.**
-   - USDC on Solana or Base goes straight into the user's own wallet.
+   - USDC on Base goes straight into the user's own wallet (Spendable); USDC sent on Solana lands in
+     Trading.
    - Other supported coins and networks (USDT on Tron and BNB Chain, USDC on Sui, SOL, BTC, ETH…)
-     receive a one-off deposit address from NEAR Intents 1Click. The quote fixes the USDC output and
+     receive a one-off deposit address from NEAR Intents 1Click, delivering USDC to Spendable. The quote
+     fixes the USDC output and
      shows the total to send. The most used options are flagged `featured`.
    - Bank top-ups create a one-time Nigerian bank account through Daya and deliver USDC to the
      user's Base wallet. The quote shows the requested balance amount, fees and transfer total.
@@ -33,11 +37,19 @@ Network details are shown when needed to choose a deposit or withdrawal route.
    - The app signs transactions, checked typed data and one-use device approvals after the one confirmation;
      the engine lands them and reports each stage:
      `validate → fund → sign → execute → settle`.
-5. **Unified cash.** If the cash is on the other chain, the plan moves the shortfall first and finishes
-   the action once it lands, still behind that one confirm:
-   - Base → Solana and Solana → Base through **Relay**, using the quoted shortfall;
-   - existing **Layerswap** funding intents remain supported;
-   - perps margin into **Hyperliquid** through Relay (gasless from Base, or one Solana transaction).
+5. **Spendable and Trading.** Every action draws on one of the two, never quietly on the other:
+   - Sends to friends, Atlas Links, bank cash-outs, withdrawals to a wallet and savings take from
+     Spendable. A wallet with ETH sends a plain transfer; one without sends through Relay gaslessly
+     (about 2 cents, on top), so no send ever buys ETH first. Received money (friends, links) lands in
+     Spendable.
+   - Buys of any coin, perps margin (into Hyperliquid through Relay) and predictions take from Trading.
+     A Base coin's price moves over from Trading inside the same confirm. Sales, perps closes and
+     predictions cash come back to Trading (a Base coin's sale lands in Spendable).
+   - Short in the one an action uses, the error says so in the user's currency, and what the other
+     holds, so the app can offer to move money across.
+   - `POST /v1/moves/quote` → `/v1/moves/quotes/{id}/execute` moves cash between the user's own two
+     wallets through Relay: Spendable → Trading is one gasless USDC authorization; Trading → Spendable is
+     one Solana transaction the engine lands. Done once Relay has delivered.
 6. **Gas is never Atlas's.** The user pays from their own USDC, and Privy sponsorship is never used:
    - Solana swaps simulate the user's own transaction first, including fees and account rent.
      If it can pay, Jupiter V2 `/build` is used with no gasless minimum. Otherwise an executable
@@ -166,7 +178,8 @@ out is in the user's display currency.
 | Method | Route | Purpose |
 |---|---|---|
 | GET | `/health` | Liveness, deployed commit, RPC hosts |
-| GET | `/v1/balance?currency=` | The one balance and its holdings |
+| GET | `/v1/balance?currency=` | The one balance, its Spendable and Trading cash, and its holdings |
+| POST | `/v1/moves/quote` → `/v1/moves/quotes/{id}/execute` | Move cash between Spendable and Trading `{direction: to_trading\|to_spendable, amount, all?}`: the amount is what arrives, the fee goes on top |
 | GET | `/v1/assets?category=popular\|crypto\|stocks\|memes&q=` | Trade list (popular = trending) and search, incl. pasted addresses |
 | GET | `/v1/assets/{id}/chart?range=1D\|1W\|1M\|1Y` | Price history (spot, 1Click coins and `*-PERP` markets) |
 | POST | `/v1/quotes` → `/v1/quotes/{id}/execute` | Buy/sell quote, then its plan |

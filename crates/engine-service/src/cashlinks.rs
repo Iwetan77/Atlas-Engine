@@ -403,9 +403,10 @@ pub(super) async fn claim(
     Ok(Json(status_of(&done, "pending", None)))
 }
 
-// The larger guaranteed payout is the cheaper route. Quotes always spend the full
-// escrow so spare delivery reserve reaches the recipient. Principal is USDC, not the
-// displayed local-currency amount, which follows FX after the link was created.
+// Money received lands in Spendable (the Base wallet), so Base pays out whenever it keeps the gift
+// whole; Solana (Trading) only when Base can't. Quotes always spend the full escrow so spare
+// delivery reserve reaches the recipient. Principal is USDC, not the displayed local-currency
+// amount, which follows FX after the link was created.
 fn cheapest_payout(
     principal: u128,
     held: u128,
@@ -413,21 +414,13 @@ fn cheapest_payout(
     solana: Option<engine_execution::relay_link::GaslessMove>,
 ) -> Result<engine_execution::relay_link::GaslessMove, ApiError> {
     let available = base.is_some() || solana.is_some();
-    // Base wins a tie, since it avoids an unnecessary cross-chain move.
-    base.into_iter()
-        .chain(solana)
-        .filter(|quote| {
-            quote.amount_in_units == held
-                && quote.amount_out_units > 0
-                && quote.amount_out_units >= principal
-        })
-        .reduce(|best, candidate| {
-            if candidate.amount_out_units > best.amount_out_units {
-                candidate
-            } else {
-                best
-            }
-        })
+    let keeps_gift = |quote: &engine_execution::relay_link::GaslessMove| {
+        quote.amount_in_units == held
+            && quote.amount_out_units > 0
+            && quote.amount_out_units >= principal
+    };
+    base.filter(keeps_gift)
+        .or_else(|| solana.filter(keeps_gift))
         .ok_or_else(|| conflict(if available {
             "Claim delivery is too expensive right now. Your gift has not moved. Try again later or ask the sender to take it back."
         } else {
@@ -571,8 +564,9 @@ mod tests {
     }
 
     #[test]
-    fn the_cheapest_claim_returns_unused_reserve_and_pins_the_escrow_spend() {
+    fn a_claim_lands_in_spendable_and_pins_the_escrow_spend() {
         let held = 1_060_000;
+        // Received money goes to Spendable even when Trading would get a few cents more.
         let chosen = cheapest_payout(
             1_000_000,
             held,
@@ -580,8 +574,17 @@ mod tests {
             Some(payout(held, 1_039_000, "solana-existing-account")),
         )
         .unwrap();
-        assert_eq!(chosen.request_id, "solana-existing-account");
+        assert_eq!(chosen.request_id, "base");
         assert!(chosen.amount_out_units > 1_000_000);
+        // Base can't keep the gift whole: Solana does.
+        let chosen = cheapest_payout(
+            1_000_000,
+            held,
+            Some(payout(held, 990_000, "base-too-dear")),
+            Some(payout(held, 1_039_000, "solana-existing-account")),
+        )
+        .unwrap();
+        assert_eq!(chosen.request_id, "solana-existing-account");
         assert!(cheapest_payout(
             1_000_000,
             held,

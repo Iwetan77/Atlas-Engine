@@ -242,6 +242,14 @@ struct HlQuote {
     take_profit_pct: Option<f64>,
     #[serde(default)]
     stop_loss_pct: Option<f64>,
+    // Margin moving from Trading when the Solana wallet can't pay the transaction's fee: the cash
+    // turned into SOL first (kept as SOL, counted in the balance). 0 when none is needed.
+    #[serde(default)]
+    gas_units: u128,
+    #[serde(default)]
+    currency: Option<String>,
+    #[serde(default)]
+    currency_rate: Option<u128>,
     expires: u64,
 }
 
@@ -788,32 +796,25 @@ pub(super) async fn quote(
         };
         (dex_units, short_units)
     };
-    let (funding_units, funding_from_solana) = if short_units == 0 {
-        (0, false)
+    // Margin is paid from Trading (the Solana wallet's cash), never from Spendable. When the wallet
+    // can't pay the move's Solana fee, a SOL top-up comes out of the same cash first, on the bill.
+    let (funding_units, funding_from_solana, gas_units) = if short_units == 0 {
+        (0, false, 0)
     } else {
-        let base_cash = state
-            .markets
-            .base
-            .balance_of(engine_execution::swaps::uniswap::BASE_USDC, &wallet)
-            .await
-            .unwrap_or(0);
         let solana = user.solana_wallet.as_deref().filter(|w| !w.is_empty());
-        let solana_cash = match solana {
-            Some(owner) => markets::solana_cash(&state, owner).await,
-            None => 0,
+        let (solana_cash, gas_units) = match solana {
+            Some(owner) => (
+                markets::solana_cash(&state, owner).await,
+                markets::sol_topup_cost(&state, owner).await,
+            ),
+            None => (0, 0),
         };
         // Relay's fee is a few cents: leave room for it.
         let with_fee = short_units + short_units / 50 + 100_000;
-        if base_cash >= with_fee {
-            (short_units, false)
-        } else if solana_cash >= with_fee {
-            (short_units, true)
+        if solana.is_some() && solana_cash >= with_fee + gas_units {
+            (short_units, true, gas_units)
         } else {
-            return Err(markets::not_enough_cash(
-                base_cash + solana_cash,
-                &currency,
-                rate,
-            ));
+            return Err(markets::not_enough_trading(solana_cash, &currency, rate));
         }
     };
     let quote_id = format!("hlq-{:x}-{:x}", now(), rand_suffix());
@@ -833,6 +834,9 @@ pub(super) async fn quote(
             close: false,
             funding_units,
             funding_from_solana,
+            gas_units,
+            currency: Some(currency.clone()),
+            currency_rate: Some(rate),
             receive_usd: 0.0,
             dex: m.dex.clone(),
             dex_units,
@@ -847,11 +851,12 @@ pub(super) async fn quote(
     } else {
         Value::Null
     };
+    let gas_topup = (gas_units > 0).then(|| money(gas_units as f64 / 1_000_000.0, &currency, rate));
     Ok(Json(
         json!({"quoteId":quote_id,"marketId":req.market_id,"side":req.side,
         "leverage":req.leverage,"funding":funding,"margin":money(margin,&currency,rate),
         "size":size,"notional":money(notional,&currency,rate),"entryPrice":money(m.mark,&currency,rate),
-        "liquidationPrice":null,"fee":money(fee,&currency,rate),
+        "liquidationPrice":null,"fee":money(fee,&currency,rate),"gasTopup":gas_topup,
         "takeProfitPrice":req.take_profit_pct.map(|p| money(tpsl_price(m.mark, long, req.leverage, p),&currency,rate)),
         "stopLossPrice":req.stop_loss_pct.map(|p| money(tpsl_price(m.mark, long, req.leverage, -p),&currency,rate)),
         "expiresAtUnixMs":expires}),
@@ -933,6 +938,9 @@ pub(super) async fn close_quote(
             close: true,
             funding_units: 0,
             funding_from_solana: false,
+            gas_units: 0,
+            currency: Some(currency.clone()),
+            currency_rate: Some(rate),
             receive_usd: freed,
             dex: m.dex.clone(),
             dex_units: 0,
@@ -1015,6 +1023,9 @@ async fn execute_inner(
         });
         transactions.push(gasless::step(&typed, "hyperliquid"));
     }
+    // What moving the margin costs beyond it: Relay's fee, and any SOL top-up first.
+    let mut moving_fee: u128 = 0;
+    let mut gas_bought: u128 = 0;
     let funding = if quote.funding_units == 0 {
         None
     } else if quote.funding_from_solana {
@@ -1035,17 +1046,32 @@ async fn execute_inner(
             .v0_transaction(&owner, &deposit.instructions, &deposit.lookup_tables)
             .await
             .map_err(venue)?;
-        let gas = markets::gas_topup(&state, &owner, deposit.amount_in_units).await;
-        if let Some((_, gas_tx)) = &gas {
-            transactions.push(json!({"chain":"solana","transaction":gas_tx,"submit":"engine"}));
+        // The SOL the move's fee needs, bought from the same cash, never more than quoted. Without
+        // it the move can't land, so nothing is signed.
+        let gas = markets::gas_topup_priced(&state, &owner, deposit.amount_in_units).await;
+        match &gas {
+            Some((_, _, usdc)) if *usdc > quote.gas_units => {
+                return Err(conflict(
+                    "The network fee changed. Check a fresh quote; nothing was moved.",
+                ));
+            }
+            None if markets::sol_topup_cost(&state, &owner).await > 0 => {
+                return Err(conflict(markets::GAS_NOT_READY));
+            }
+            _ => {}
         }
+        if let Some((_, gas_tx, usdc)) = &gas {
+            transactions.push(json!({"chain":"solana","transaction":gas_tx,"submit":"engine"}));
+            gas_bought = *usdc;
+        }
+        moving_fee = deposit.amount_in_units.saturating_sub(quote.funding_units);
         let main_index = transactions.len();
         transactions.push(json!({"chain":"solana","transaction":tx,"submit":"engine"}));
         Some(Funding {
             request_id: deposit.request_id,
             base_typed_data: None,
             base_api: None,
-            gas_request_id: gas.map(|(id, _)| id),
+            gas_request_id: gas.map(|(id, _, _)| id),
             main_index,
         })
     } else {
@@ -1090,10 +1116,7 @@ async fn execute_inner(
             json!({"label":"Stop loss","value":format!("−{} at {}", say_pct(pct), say_usd(price))}),
         );
     }
-    if quote.funding_units > 0 {
-        summary.push(json!({"label":"Margin moved to Hyperliquid",
-            "value":format!("${:.2}", quote.funding_units as f64 / 1_000_000.0)}));
-    }
+    summary.extend(funding_summary(&quote, moving_fee, gas_bought));
     let intent = HlIntent {
         status: markets::IntentStatus {
             intent_id: intent_id.clone(),
@@ -1113,6 +1136,25 @@ async fn execute_inner(
         json!({"intentId":intent_id,"kind":if intent.quote.close {"perp_close"} else {"perp_open"},
         "summary":summary,"transactions":transactions,"expiresAtUnixMs":intent.expires}),
     ))
+}
+
+fn funding_summary(quote: &HlQuote, moving_fee: u128, gas_bought: u128) -> Vec<Value> {
+    // Old saved quotes had dollar confirmations. New quotes keep the reviewed currency and rate.
+    let (currency, rate) = match (quote.currency.as_deref(), quote.currency_rate) {
+        (Some(currency), Some(rate)) if rate > 0 => (currency, rate),
+        _ => ("USD", 1_000_000),
+    };
+    let mut rows = Vec::new();
+    for (label, units) in [
+        ("Margin moved to Hyperliquid", quote.funding_units),
+        ("Network fee", moving_fee),
+        ("Gas top-up (one time)", gas_bought),
+    ] {
+        if units > 0 {
+            rows.push(json!({"label":label,"value":markets::say_money(units, currency, rate)}));
+        }
+    }
+    rows
 }
 
 pub(super) async fn signed(
@@ -2099,6 +2141,30 @@ pub(super) async fn pending_rows(state: &AppState, owner: &str) -> Result<Vec<Va
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn funding_confirmation_keeps_the_quote_currency_and_legacy_defaults() {
+        let legacy = json!({
+            "owner":"user", "wallet":"wallet", "coin":"TEST", "asset":0,
+            "sz_decimals":2, "side":"long", "leverage":2, "size":"1",
+            "mark":10.0, "close":false, "funding_units":10_000_000, "expires":0
+        });
+        let old: HlQuote = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(
+            funding_summary(&old, 120_000, 500_000)[0]["value"],
+            "$10.00"
+        );
+        let mut reviewed = legacy;
+        reviewed["currency"] = json!("NGN");
+        reviewed["currency_rate"] = json!(1_500_000_000u128);
+        let quote: HlQuote = serde_json::from_value(reviewed).unwrap();
+        let restored: HlQuote =
+            serde_json::from_value(serde_json::to_value(&quote).unwrap()).unwrap();
+        let rows = funding_summary(&restored, 120_000, 500_000);
+        assert_eq!(rows[0]["value"], "₦15,000.00");
+        assert_eq!(rows[1]["value"], "₦180.00");
+        assert_eq!(rows[2]["value"], "₦750.00");
+    }
 
     #[test]
     fn market_ids_round_trip() {

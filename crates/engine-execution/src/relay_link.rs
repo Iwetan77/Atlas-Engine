@@ -430,6 +430,18 @@ impl RelayClient {
             .await
     }
 
+    /// Base USDC from `evm` to `recipient` on Base, gasless: Relay's solver pays the gas out of the
+    /// quoted input, so exactly `amount_out_units` lands without the wallet holding any ETH.
+    pub async fn base_to_base(
+        &self,
+        evm: &str,
+        recipient: &str,
+        amount_out_units: u128,
+    ) -> Result<GaslessMove, RelayError> {
+        self.gasless_move(evm, base_dest(recipient), Exact::Out(amount_out_units))
+            .await
+    }
+
     /// Keep a cash-link payout on Base, avoiding a fresh recipient's Solana token-account
     /// setup. The solver pays Base gas out of the quoted input, using the same pinned
     /// EIP-3009 receiver as cross-chain payouts.

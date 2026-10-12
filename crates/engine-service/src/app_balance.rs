@@ -92,9 +92,15 @@ mod u128_text {
 pub(super) struct AppBalanceResponse {
     total: Money,
     total_usd: String,
+    // The two balances inside `total` that cash moves between: Spendable (USDC in the Base wallet)
+    // pays sends, cash-outs and savings; Trading (USDC in the Solana wallet) pays trades, perps and
+    // predictions.
+    spendable: Money,
+    trading: Money,
     pending: Option<Money>,
     holdings: Vec<Holding>,
-    // The gas tanks: what pays network fees on each chain. Not counted in `total`; Profile shows it.
+    // The SOL and ETH that pay network fees on each chain. It's the user's money and counts in
+    // `total` (outside Spendable and Trading); Profile lists it.
     gas: Vec<GasTank>,
     as_of_unix_ms: u128,
 }
@@ -212,6 +218,7 @@ pub(super) async fn balance(
     let rate = fx_rate(&currency).await?;
     let open = positions::open_positions(&portfolio.trades);
     let mut total = 0u128;
+    let (spendable, trading) = pockets(&portfolio.holdings);
     let mut holdings = Vec::with_capacity(portfolio.holdings.len());
     for h in &portfolio.holdings {
         total = total
@@ -231,7 +238,12 @@ pub(super) async fn balance(
             pnl_pct: positions::pnl_pct(h, &open),
         });
     }
-    let gas = gas_tanks(&state, portfolio.gas_sol, &portfolio.evm, &currency, rate).await?;
+    // What pays the network fees is still theirs: bought from their cash, it counts in the total.
+    let (gas, gas_units) =
+        gas_tanks(&state, portfolio.gas_sol, &portfolio.evm, &currency, rate).await?;
+    total = total
+        .checked_add(gas_units)
+        .ok_or((StatusCode::BAD_GATEWAY, "portfolio value overflow".into()))?;
     let as_of_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(internal)?
@@ -239,11 +251,25 @@ pub(super) async fn balance(
     Ok(Json(AppBalanceResponse {
         total: money(total, &currency, rate)?,
         total_usd: usd(total),
+        spendable: money(spendable, &currency, rate)?,
+        trading: money(trading, &currency, rate)?,
         pending: None,
         holdings,
         gas,
         as_of_unix_ms,
     }))
+}
+
+// Spendable and Trading, in USDC units: the cash in the Base and the Solana wallet.
+fn pockets(holdings: &[Held]) -> (u128, u128) {
+    let cash = |chain: &str| {
+        holdings
+            .iter()
+            .filter(|h| h.kind == "cash" && h.location == "wallet" && h.chain == chain)
+            .map(|h| h.value_usdc)
+            .sum::<u128>()
+    };
+    (cash("base"), cash("solana"))
 }
 
 // Everything the user owns, read once for the balance and the profit and loss alike, so the two
@@ -699,7 +725,8 @@ async fn solana_coins(
         ]);
         return 0;
     };
-    // Native SOL beyond what they bought is gas: off the asset list and out of the total.
+    // Native SOL beyond what they bought pays network fees: off the asset list, counted in the
+    // total with the rest of what pays fees (see gas_tanks).
     let gas_sol = native_sol.saturating_sub(sol_bought(trades, catalog));
     let native_sol = native_sol - gas_sol;
     if native_sol > 0 {
@@ -947,7 +974,7 @@ async fn gas_tanks(
     evm: &str,
     currency: &str,
     rate: u128,
-) -> Result<Vec<GasTank>, ApiError> {
+) -> Result<(Vec<GasTank>, u128), ApiError> {
     let eth = markets::base_eth(state, evm).await.unwrap_or(0);
     let mints = [markets::SOL_MINT.to_string(), PORTAL_ETH_MINT.to_string()];
     let prices = markets::usd_prices(&state.markets, &mints)
@@ -959,20 +986,27 @@ async fn gas_tanks(
             .map(|(usd, _)| (units as f64 / 10f64.powi(decimals) * usd * 1_000_000.0) as u128)
             .unwrap_or(0)
     };
-    Ok(vec![
-        GasTank {
-            chain: "solana",
-            symbol: "SOL",
-            amount: markets::format_units(sol, 9),
-            value: money(worth(sol, 9, markets::SOL_MINT), currency, rate)?,
-        },
-        GasTank {
-            chain: "base",
-            symbol: "ETH",
-            amount: markets::format_units(eth, 18),
-            value: money(worth(eth, 18, PORTAL_ETH_MINT), currency, rate)?,
-        },
-    ])
+    let (sol_value, eth_value) = (
+        worth(sol, 9, markets::SOL_MINT),
+        worth(eth, 18, PORTAL_ETH_MINT),
+    );
+    Ok((
+        vec![
+            GasTank {
+                chain: "solana",
+                symbol: "SOL",
+                amount: markets::format_units(sol, 9),
+                value: money(sol_value, currency, rate)?,
+            },
+            GasTank {
+                chain: "base",
+                symbol: "ETH",
+                amount: markets::format_units(eth, 18),
+                value: money(eth_value, currency, rate)?,
+            },
+        ],
+        sol_value.saturating_add(eth_value),
+    ))
 }
 
 fn indicative_usdc_value(units: u128, one_dollar_units: u128) -> Result<u128, ApiError> {
@@ -1389,6 +1423,22 @@ mod tests {
             .iter()
             .all(|h| h.asset_id != deep || h.seen_ms == now - 60_000));
         assert_eq!(settled[0].seen_ms, now);
+    }
+
+    #[test]
+    fn spendable_is_base_wallet_cash_and_trading_is_solana_wallet_cash() {
+        let holdings = [
+            held("wallet", "base", "usdc", "cash", 0),
+            held("wallet", "solana", "usdc", "cash", 0),
+            held("wallet", "solana", "usdc", "cash", 0),
+            // Counted in the balance, but neither can be spent or traded as it is.
+            held("earn", "base", "usdc", "cash", 0),
+            held("perps", "hyperliquid", "usdc", "cash", 0),
+            held("wallet", "arc", "usdc", "cash", 0),
+            held("wallet", "solana", "bonk", "meme", 0),
+        ];
+        assert_eq!(pockets(&holdings), (2_000_000, 4_000_000));
+        assert_eq!(pockets(&[]), (0, 0));
     }
 
     #[test]

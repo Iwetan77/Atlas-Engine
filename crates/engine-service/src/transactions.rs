@@ -269,6 +269,8 @@ pub(super) fn title(kind: &str, symbol: &str) -> String {
         "onramp" => "Add money",
         "offramp" => "Cash out",
         "withdraw" => "Withdraw",
+        "move_to_trading" => "Moved to trading",
+        "move_to_spendable" => "Moved to spendable",
         _ => "Transaction",
     };
     if symbol.is_empty() {
