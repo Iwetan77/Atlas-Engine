@@ -44,6 +44,9 @@ pub(super) struct NearState {
     tokens: Arc<Mutex<Option<(Instant, Vec<Token>)>>>,
     icons: Arc<Mutex<HashMap<String, String>>>,
     icon_http: reqwest::Client,
+    // Robinhood Chain coins beyond 1Click's list, by contract, as GeckoTerminal last priced them
+    // (None: not tradable here), with when.
+    hood_coins: Arc<Mutex<HashMap<String, (Instant, Option<HoodCoin>)>>>,
     // The tokens CoinGecko has reviewed and lists, per chain Atlas supports (lowercase addresses),
     // refreshed daily: a token found by search counts as verified only when it's among them, so a
     // look-alike with the same name never does. Held with the time it's good until.
@@ -408,6 +411,7 @@ impl NearState {
             intents: Arc::new(Mutex::new(HashMap::new())),
             tokens: Arc::new(Mutex::new(None)),
             icons: Arc::new(Mutex::new(HashMap::new())),
+            hood_coins: Arc::new(Mutex::new(HashMap::new())),
             icon_http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(6))
                 .build()?,
@@ -627,11 +631,16 @@ impl NearState {
         }
         let catalog = self.tokens().await?;
         for asset in assets.values_mut() {
-            let fresh = catalog
-                .iter()
-                .find(|t| t.asset_id == asset.asset_id)
-                .ok_or_else(|| venue(format!("no live 1Click price for {}", asset.symbol)))?;
-            *asset = fresh.clone();
+            // A Robinhood coin beyond 1Click's list is priced from its pools.
+            let fresh = match asset.asset_id.strip_prefix("hood:") {
+                Some(address) => self.hood_dex_coin(address).await.map(|c| c.token),
+                None => catalog
+                    .iter()
+                    .find(|t| t.asset_id == asset.asset_id)
+                    .cloned(),
+            }
+            .ok_or_else(|| venue(format!("no live price for {}", asset.symbol)))?;
+            *asset = fresh;
         }
         if leftovers {
             for token in catalog.iter().filter(|t| {
@@ -825,6 +834,10 @@ impl NearState {
     }
 
     pub(super) fn icon_for(&self, asset: &Token) -> Option<String> {
+        if let Some(address) = asset.asset_id.strip_prefix("hood:") {
+            let held = self.hood_coins.lock().ok()?;
+            return held.get(address)?.1.as_ref()?.icon.clone();
+        }
         asset.coingecko_id.as_deref()
             .and_then(|id| self.icons.lock().ok().and_then(|m|m.get(id).cloned()))
             .or_else(||match asset.coingecko_id.as_deref() {
@@ -3411,13 +3424,7 @@ pub(super) async fn chart_quote(state: &AppState, asset_id: &str) -> Option<(Str
         return Some((symbol, price));
     }
     let id = asset_id.strip_prefix("near:")?;
-    let token = state
-        .near
-        .tokens()
-        .await
-        .ok()?
-        .into_iter()
-        .find(|t| t.asset_id == id)?;
+    let token = token_by_id(state, id).await.ok()??;
     let price = token_usd(&token);
     (price > 0.0).then_some((token.symbol, price))
 }
@@ -3433,13 +3440,7 @@ pub(super) async fn chart_token(
     let Some(id) = asset_id.strip_prefix("near:") else {
         return Ok(None);
     };
-    let Some(token) = state
-        .near
-        .tokens()
-        .await?
-        .into_iter()
-        .find(|t| t.asset_id == id)
-    else {
+    let Some(token) = token_by_id(state, id).await? else {
         return Ok(None);
     };
     let network = match token.blockchain.as_str() {
@@ -3662,7 +3663,319 @@ fn listed_row(
             "currency":currency},"change24hPct":null,"iconUrl":icon,"verified":true}),
     )
 }
-// Robinhood Chain's memecoins Atlas trades, for the Memes list (and a search that matches them).
+// Robinhood Chain coins beyond 1Click's few: any coin with real liquidity in its pools there, found
+// by its contract (pasted) or its name. Relay trades them both ways like 1Click's, so they go by
+// `hood:<contract>` ("near:hood:<contract>" in the app), priced from GeckoTerminal.
+const GECKO_HOOD: &str = "https://api.geckoterminal.com/api/v2/networks/robinhood/";
+// Pasted: tradable with at least this much in its pools and no honeypot flag, like a Base coin.
+const HOOD_PASTED_LIQUIDITY_USD: f64 = 5_000.0;
+// Found by name: listed by CoinGecko and at least this deep (look-alikes share the name, not this).
+const HOOD_SEARCH_LIQUIDITY_USD: f64 = 25_000.0;
+// Memecoins move fast: a price is kept a minute.
+const HOOD_PRICE_TTL: Duration = Duration::from_secs(60);
+
+#[derive(Clone)]
+pub(super) struct HoodCoin {
+    token: Token,
+    name: String,
+    icon: Option<String>,
+    // CoinGecko lists this exact contract: the app shows it as verified.
+    listed: bool,
+}
+fn gecko_amount(value: &Value) -> f64 {
+    value
+        .as_str()
+        .and_then(|v| v.parse().ok())
+        .or_else(|| value.as_f64())
+        .filter(|v: &f64| v.is_finite())
+        .unwrap_or(0.0)
+}
+// A Robinhood coin from GeckoTerminal's token fields, or None for what isn't traded here: cash
+// (dollars), its ETH, or no price.
+fn hood_dex_coin_from(address: &str, at: &Value, price_usd: f64) -> Option<HoodCoin> {
+    let symbol = at["symbol"].as_str()?.trim().to_owned();
+    let upper = symbol.to_ascii_uppercase();
+    let decimals = u32::try_from(at["decimals"].as_u64()?).ok()?;
+    if symbol.is_empty()
+        || upper.contains("USD")
+        || matches!(upper.as_str(), "ETH" | "WETH")
+        || address.eq_ignore_ascii_case(engine_execution::relay_link::ROBINHOOD_USDG)
+        || !price_usd.is_finite()
+        || price_usd <= 0.0
+        || decimals > 30
+    {
+        return None;
+    }
+    let coingecko = at["coingecko_coin_id"].as_str().map(str::to_owned);
+    Some(HoodCoin {
+        token: Token {
+            asset_id: format!("hood:{address}"),
+            blockchain: "hood".into(),
+            symbol,
+            decimals,
+            contract_address: Some(address.to_owned()),
+            price: Some(json!(price_usd)),
+            coingecko_id: coingecko.clone(),
+        },
+        name: at["name"].as_str().unwrap_or_default().trim().to_owned(),
+        icon: at["image_url"]
+            .as_str()
+            .filter(|u| u.starts_with("https://") && !u.contains("missing"))
+            .map(str::to_owned),
+        listed: coingecko.is_some(),
+    })
+}
+impl NearState {
+    async fn gecko_hood(&self, path: &str) -> Option<Value> {
+        self.get_json(reqwest::Url::parse(&format!("{GECKO_HOOD}{path}")).ok()?)
+            .await
+    }
+    async fn get_json(&self, url: reqwest::Url) -> Option<Value> {
+        self.icon_http
+            .get(url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .timeout(Duration::from_secs(6))
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()
+    }
+    // A Robinhood Chain coin by its contract, priced now: None when it isn't tradable here (too
+    // little in its pools, flagged a honeypot, cash or gas), or GeckoTerminal can't say right now.
+    pub(super) async fn hood_dex_coin(&self, address: &str) -> Option<HoodCoin> {
+        let address = address.trim().to_ascii_lowercase();
+        if !is_evm(&address) {
+            return None;
+        }
+        if let Some((at, coin)) = self.hood_coins.lock().ok()?.get(&address) {
+            if at.elapsed() < HOOD_PRICE_TTL {
+                return coin.clone();
+            }
+        }
+        let (token_path, info_path) = (
+            format!("tokens/{address}"),
+            format!("tokens/{address}/info"),
+        );
+        let (token, info) = tokio::join!(self.gecko_hood(&token_path), self.gecko_hood(&info_path));
+        // Not answered (its free limit is often spent): DexScreener says instead.
+        let Some(token) = token else {
+            let coin = self.hood_dexscreener_coin(&address).await;
+            if let (Some(coin), Ok(mut held)) = (&coin, self.hood_coins.lock()) {
+                held.insert(address, (Instant::now(), Some(coin.clone())));
+            }
+            return coin;
+        };
+        let at = &token["data"]["attributes"];
+        let honeypot = info
+            .as_ref()
+            .is_some_and(|i| i["data"]["attributes"]["is_honeypot"].as_bool() == Some(true));
+        let coin = (!honeypot
+            && gecko_amount(&at["total_reserve_in_usd"]) >= HOOD_PASTED_LIQUIDITY_USD)
+            .then(|| hood_dex_coin_from(&address, at, gecko_amount(&at["price_usd"])))
+            .flatten();
+        if let Ok(mut held) = self.hood_coins.lock() {
+            held.insert(address, (Instant::now(), coin.clone()));
+        }
+        coin
+    }
+    // The coin from its deepest DexScreener pool, with its decimals read from the chain. DexScreener
+    // has no honeypot flag or CoinGecko id, so it's never shown as verified this way.
+    async fn hood_dexscreener_coin(&self, address: &str) -> Option<HoodCoin> {
+        let url = reqwest::Url::parse(&format!(
+            "https://api.dexscreener.com/tokens/v1/robinhood/{address}"
+        ))
+        .ok()?;
+        let pairs = self.get_json(url).await?;
+        let pair = pairs
+            .as_array()?
+            .iter()
+            .filter(|p| {
+                p["chainId"] == "robinhood"
+                    && p["baseToken"]["address"]
+                        .as_str()
+                        .is_some_and(|a| a.eq_ignore_ascii_case(address))
+            })
+            .max_by(|a, b| {
+                gecko_amount(&a["liquidity"]["usd"])
+                    .total_cmp(&gecko_amount(&b["liquidity"]["usd"]))
+            })?;
+        if gecko_amount(&pair["liquidity"]["usd"]) < HOOD_PASTED_LIQUIDITY_USD {
+            return None;
+        }
+        let decimals = self.hood_decimals(address).await?;
+        let at = json!({"symbol":pair["baseToken"]["symbol"],"name":pair["baseToken"]["name"],
+            "decimals":decimals,"image_url":pair["info"]["imageUrl"],"coingecko_coin_id":null});
+        hood_dex_coin_from(address, &at, gecko_amount(&pair["priceUsd"]))
+    }
+    // An ERC-20's decimals on Robinhood Chain, from the contract.
+    async fn hood_decimals(&self, address: &str) -> Option<u32> {
+        let answer = self
+            .evm_call(
+                EvmChain::Robinhood,
+                "eth_call",
+                json!([{"to":address,"data":"0x313ce567"},"latest"]),
+            )
+            .await
+            .ok()?;
+        u32::try_from(hex_units(&answer)?).ok().filter(|d| *d <= 30)
+    }
+}
+// Name search when GeckoTerminal is busy: DexScreener's Robinhood pools for it, only deep ones (it
+// can't say which CoinGecko lists), a few at most.
+async fn hood_search_dexscreener(near: &NearState, query: &str) -> Vec<HoodCoin> {
+    let needle = query.trim().to_ascii_lowercase();
+    let Ok(body) = dex_search(&near.icon_http, query).await else {
+        return Vec::new();
+    };
+    let mut best: HashMap<String, (f64, &Value)> = HashMap::new();
+    for pair in body["pairs"].as_array().into_iter().flatten() {
+        let token = &pair["baseToken"];
+        let Some(address) = token["address"].as_str().map(str::to_ascii_lowercase) else {
+            continue;
+        };
+        let liquidity = gecko_amount(&pair["liquidity"]["usd"]);
+        let matches = [&token["symbol"], &token["name"]].iter().any(|v| {
+            v.as_str()
+                .is_some_and(|t| t.to_ascii_lowercase().contains(&needle))
+        });
+        if pair["chainId"] != "robinhood" || !is_evm(&address) || liquidity < 100_000.0 || !matches
+        {
+            continue;
+        }
+        let entry = best.entry(address).or_insert((0.0, pair));
+        if liquidity > entry.0 {
+            *entry = (liquidity, pair);
+        }
+    }
+    let mut found: Vec<_> = best.into_iter().collect();
+    found.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0));
+    let mut coins = Vec::new();
+    for (address, (_, pair)) in found.into_iter().take(5) {
+        let Some(decimals) = near.hood_decimals(&address).await else {
+            continue;
+        };
+        let at = json!({"symbol":pair["baseToken"]["symbol"],"name":pair["baseToken"]["name"],
+            "decimals":decimals,"image_url":pair["info"]["imageUrl"],"coingecko_coin_id":null});
+        if let Some(coin) = hood_dex_coin_from(&address, &at, gecko_amount(&pair["priceUsd"])) {
+            coins.push(coin);
+        }
+    }
+    coins
+}
+// Robinhood coins whose name or symbol matches a search, beyond 1Click's: only ones CoinGecko lists
+// with real pools (look-alikes share a name, not those), most liquid first, a few at most.
+async fn hood_search_coins(near: &NearState, query: &str) -> Vec<HoodCoin> {
+    let needle = query.trim().to_ascii_lowercase();
+    if needle.len() < 2 {
+        return Vec::new();
+    }
+    let Ok(url) = reqwest::Url::parse_with_params(
+        "https://api.geckoterminal.com/api/v2/search/pools",
+        &[
+            ("query", query.trim()),
+            ("network", "robinhood"),
+            ("include", "base_token"),
+            ("page", "1"),
+        ],
+    ) else {
+        return Vec::new();
+    };
+    let Some(body) = near.get_json(url).await else {
+        return hood_search_dexscreener(near, query).await;
+    };
+    let tokens: HashMap<&str, &Value> = body["included"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(|t| Some((t["id"].as_str()?, &t["attributes"])))
+                .collect()
+        })
+        .unwrap_or_default();
+    // Each coin once: its pools' depth added up, priced from its deepest pool.
+    let mut found: HashMap<String, (f64, f64, f64, &Value)> = HashMap::new();
+    for pool in body["data"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
+        let at = &pool["attributes"];
+        let Some(token) = pool["relationships"]["base_token"]["data"]["id"]
+            .as_str()
+            .and_then(|id| tokens.get(id))
+        else {
+            continue;
+        };
+        let Some(address) = token["address"].as_str().map(str::to_ascii_lowercase) else {
+            continue;
+        };
+        let reserve = gecko_amount(&at["reserve_in_usd"]);
+        let entry = found.entry(address).or_insert((0.0, 0.0, 0.0, *token));
+        entry.0 += reserve;
+        if reserve > entry.1 {
+            entry.1 = reserve;
+            entry.2 = gecko_amount(&at["base_token_price_usd"]);
+        }
+    }
+    let mut coins: Vec<(f64, HoodCoin)> = found
+        .into_iter()
+        .filter(|(_, (total, _, _, token))| {
+            *total >= HOOD_SEARCH_LIQUIDITY_USD
+                && token["coingecko_coin_id"].as_str().is_some()
+                && [&token["symbol"], &token["name"]].iter().any(|v| {
+                    v.as_str()
+                        .is_some_and(|t| t.to_ascii_lowercase().contains(&needle))
+                })
+        })
+        .filter_map(|(address, (total, _, price, token))| {
+            Some((total, hood_dex_coin_from(&address, token, price)?))
+        })
+        .collect();
+    coins.sort_by(|a, b| b.0.total_cmp(&a.0));
+    coins.truncate(5);
+    let coins: Vec<HoodCoin> = coins.into_iter().map(|(_, coin)| coin).collect();
+    if let Ok(mut held) = near.hood_coins.lock() {
+        for coin in &coins {
+            let address = coin.token.contract_address.clone().unwrap_or_default();
+            held.insert(address, (Instant::now(), Some(coin.clone())));
+        }
+    }
+    coins
+}
+// A Robinhood coin as a Trade row: by its own name, flagged unless CoinGecko lists it.
+fn hood_row(state: &AppState, coin: &HoodCoin, currency: &str, rate: u128) -> Option<Value> {
+    let mut row = listed_row(state, &coin.token, &coin.token.symbol, currency, rate)?;
+    if !coin.name.is_empty() {
+        row["name"] = json!(coin.name);
+    }
+    row["iconUrl"] = json!(coin.icon);
+    row["verified"] = json!(coin.listed);
+    Some(row)
+}
+// 1Click's coin with this contract on Robinhood Chain: it keeps 1Click's id, so a coin is one asset.
+fn hood_listed<'a>(list: &'a [Token], address: &str) -> Option<&'a Token> {
+    list.iter().find(|t| {
+        t.blockchain == "hood"
+            && supported(t)
+            && t.contract_address
+                .as_deref()
+                .is_some_and(|c| c.eq_ignore_ascii_case(address))
+    })
+}
+// A coin by its Atlas id (without "near:"): 1Click's, or a Robinhood coin by its contract, priced now.
+async fn token_by_id(state: &AppState, id: &str) -> Result<Option<Token>, ApiError> {
+    if let Some(address) = id.strip_prefix("hood:") {
+        return Ok(state.near.hood_dex_coin(address).await.map(|c| c.token));
+    }
+    Ok(state
+        .near
+        .tokens()
+        .await?
+        .into_iter()
+        .find(|t| t.asset_id == id && supported(t)))
+}
+
+// Robinhood Chain's memecoins Atlas trades, for the Memes list (and a search that matches them). A
+// pasted contract finds that coin, listed by 1Click or not.
 pub(super) async fn hood_memes(
     state: &AppState,
     query: &str,
@@ -3673,10 +3986,41 @@ pub(super) async fn hood_memes(
         return Vec::new();
     };
     let query = query.trim().to_ascii_lowercase();
+    if is_evm(&query) {
+        if let Some(listed) = hood_listed(&list, &query) {
+            return listed_row(state, listed, &listed.symbol, currency, rate)
+                .into_iter()
+                .collect();
+        }
+        return match state.near.hood_dex_coin(&query).await {
+            Some(coin) => hood_row(state, &coin, currency, rate).into_iter().collect(),
+            None => Vec::new(),
+        };
+    }
     list.iter()
         .filter(|t| t.blockchain == "hood" && supported(t))
         .filter(|t| query.is_empty() || t.symbol.to_ascii_lowercase().contains(&query))
         .filter_map(|t| listed_row(state, t, &t.symbol, currency, rate))
+        .collect()
+}
+// Robinhood coins found by name beyond 1Click's list, as Trade rows.
+pub(super) async fn hood_search(
+    state: &AppState,
+    query: &str,
+    currency: &str,
+    rate: u128,
+) -> Vec<Value> {
+    let list = state.near.tokens().await.unwrap_or_default();
+    hood_search_coins(&state.near, query)
+        .await
+        .iter()
+        .filter(|c| {
+            c.token
+                .contract_address
+                .as_deref()
+                .is_none_or(|a| hood_listed(&list, a).is_none())
+        })
+        .filter_map(|c| hood_row(state, c, currency, rate))
         .collect()
 }
 // NEAR is listed as wNEAR (the token form Atlas holds); people know it as NEAR.
@@ -5289,13 +5633,12 @@ pub(super) async fn quote(
             }
             return sui_sell_quote(state, headers, req, user).await;
         }
-        let token = state
-            .near
-            .tokens()
-            .await?
-            .into_iter()
-            .find(|t| format!("near:{}", t.asset_id) == req.asset_id && supported(t))
-            .ok_or((StatusCode::NOT_FOUND, "1Click asset not found".into()))?;
+        let token = token_by_id(
+            &state,
+            req.asset_id.strip_prefix("near:").unwrap_or_default(),
+        )
+        .await?
+        .ok_or((StatusCode::NOT_FOUND, "1Click asset not found".into()))?;
         return match (token.blockchain.as_str(), sell_route(&token.blockchain)) {
             ("near", Some(_)) => near_coin_sell_quote(state, headers, req, user, token).await,
             ("monad", Some(_)) => monad_sell_quote(state, req, user, token).await,
@@ -5310,13 +5653,12 @@ pub(super) async fn quote(
     if let Some(coin) = req.asset_id.strip_prefix("near:sui:").map(str::to_owned) {
         return sui_quote(state, headers, req, user, &coin).await;
     }
-    let token = state
-        .near
-        .tokens()
-        .await?
-        .into_iter()
-        .find(|t| format!("near:{}", t.asset_id) == req.asset_id && supported(t))
-        .ok_or((StatusCode::NOT_FOUND, "1Click asset not found".into()))?;
+    let token = token_by_id(
+        &state,
+        req.asset_id.strip_prefix("near:").unwrap_or_default(),
+    )
+    .await?
+    .ok_or((StatusCode::NOT_FOUND, "1Click asset not found".into()))?;
     if token.blockchain == "monad" {
         return mon_buy_quote(state, req, user, token).await;
     }
@@ -8187,6 +8529,83 @@ pub(super) async fn resume(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_robinhood_coin_is_a_meme_never_its_cash_or_gas() {
+        let at = |symbol: &str, decimals: u64, coingecko: Option<&str>| {
+            serde_json::json!({"symbol":symbol,"name":"Commander Vrax","decimals":decimals,
+                "image_url":"https://coin-images.coingecko.com/x.png","coingecko_coin_id":coingecko})
+        };
+        let vrax = "0x94641b97010608c3827fb058074889f19868ff33";
+        let coin =
+            super::hood_dex_coin_from(vrax, &at("VRAX", 18, Some("commander-vrax-2")), 0.0024)
+                .unwrap();
+        assert_eq!(coin.token.asset_id, format!("hood:{vrax}"));
+        assert_eq!(
+            (coin.token.blockchain.as_str(), coin.token.decimals),
+            ("hood", 18)
+        );
+        assert!(coin.listed && super::supported(&coin.token));
+        assert_eq!(super::token_usd(&coin.token), 0.0024);
+        // Unlisted is fine (flagged), but cash, gas and unpriced coins aren't coins here.
+        assert!(
+            !super::hood_dex_coin_from(vrax, &at("VRAX", 18, None), 0.0024)
+                .unwrap()
+                .listed
+        );
+        for symbol in ["USDG", "USDe", "xUSD", "WETH", "ETH"] {
+            assert!(super::hood_dex_coin_from(vrax, &at(symbol, 18, None), 1.0).is_none());
+        }
+        assert!(super::hood_dex_coin_from(vrax, &at("VRAX", 18, None), 0.0).is_none());
+        assert!(super::hood_dex_coin_from(
+            engine_execution::relay_link::ROBINHOOD_USDG,
+            &at("GDOLLAR", 6, None),
+            1.0
+        )
+        .is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "reads live GeckoTerminal, DexScreener and Robinhood Chain; no signing"]
+    async fn a_pasted_robinhood_contract_or_its_name_finds_the_coin() {
+        let near = super::NearState::new().await.unwrap();
+        let vrax = "0x94641b97010608C3827fB058074889f19868FF33";
+        let coin = near
+            .hood_dex_coin(vrax)
+            .await
+            .expect("VRAX by its contract");
+        assert_eq!(
+            (coin.token.symbol.as_str(), coin.token.decimals),
+            ("VRAX", 18)
+        );
+        assert_eq!(
+            coin.token.asset_id,
+            format!("hood:{}", vrax.to_ascii_lowercase())
+        );
+        assert!(coin.listed && super::token_usd(&coin.token) > 0.0);
+        // When GeckoTerminal is busy, DexScreener and the chain say the same.
+        let backup = near
+            .hood_dexscreener_coin(&vrax.to_ascii_lowercase())
+            .await
+            .expect("VRAX from DexScreener");
+        assert_eq!(
+            (backup.token.symbol.as_str(), backup.token.decimals),
+            ("VRAX", 18)
+        );
+        assert!(!backup.listed);
+        // Cash isn't a coin here.
+        assert!(near
+            .hood_dex_coin(engine_execution::relay_link::ROBINHOOD_USDG)
+            .await
+            .is_none());
+        // By name: the real one, not the look-alikes.
+        let found = super::hood_search_coins(&near, "vrax").await;
+        assert_eq!(
+            found.first().and_then(|c| c.token.contract_address.clone()),
+            Some(vrax.to_ascii_lowercase())
+        );
+        assert!(found.iter().all(|c| c.listed));
+    }
+
+    #[test]
     fn a_refund_comes_from_the_robinhood_wallet_that_holds_it() {
         // Intents saved before refunds existed read back with none.
         let buy: super::StoredIntent = serde_json::from_value(serde_json::json!({
@@ -9103,13 +9522,22 @@ pub(super) async fn asset_detail(
     let id = asset_id
         .strip_prefix("near:")
         .ok_or_else(|| bad("invalid asset"))?;
-    let token = state
-        .near
-        .tokens()
+    // A Robinhood coin reads as it does in the list: a meme, by its own name when it has one.
+    if let Some(address) = id.strip_prefix("hood:") {
+        let coin = state
+            .near
+            .hood_dex_coin(address)
+            .await
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "Asset unavailable".into()))?;
+        return hood_row(state, &coin, currency, rate).ok_or_else(|| venue("Price unavailable"));
+    }
+    let token = token_by_id(state, id)
         .await?
-        .into_iter()
-        .find(|t| t.asset_id == id && supported(t))
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Asset unavailable".into()))?;
+    if token.blockchain == "hood" {
+        return listed_row(state, &token, &token.symbol, currency, rate)
+            .ok_or_else(|| venue("Price unavailable"));
+    }
     let usd = token_usd(&token);
     if !usd.is_finite() || usd <= 0.0 {
         return Err(venue("Price unavailable"));
