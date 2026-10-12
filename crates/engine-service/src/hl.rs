@@ -246,6 +246,10 @@ struct HlQuote {
     // turned into SOL first (kept as SOL, counted in the balance). 0 when none is needed.
     #[serde(default)]
     gas_units: u128,
+    #[serde(default)]
+    currency: Option<String>,
+    #[serde(default)]
+    currency_rate: Option<u128>,
     expires: u64,
 }
 
@@ -831,6 +835,8 @@ pub(super) async fn quote(
             funding_units,
             funding_from_solana,
             gas_units,
+            currency: Some(currency.clone()),
+            currency_rate: Some(rate),
             receive_usd: 0.0,
             dex: m.dex.clone(),
             dex_units,
@@ -933,6 +939,8 @@ pub(super) async fn close_quote(
             funding_units: 0,
             funding_from_solana: false,
             gas_units: 0,
+            currency: Some(currency.clone()),
+            currency_rate: Some(rate),
             receive_usd: freed,
             dex: m.dex.clone(),
             dex_units: 0,
@@ -1108,18 +1116,7 @@ async fn execute_inner(
             json!({"label":"Stop loss","value":format!("−{} at {}", say_pct(pct), say_usd(price))}),
         );
     }
-    if quote.funding_units > 0 {
-        summary.push(json!({"label":"Margin moved to Hyperliquid",
-            "value":format!("${:.2}", quote.funding_units as f64 / 1_000_000.0)}));
-    }
-    if moving_fee > 0 {
-        summary.push(json!({"label":"Network fee",
-            "value":format!("${:.2}", moving_fee as f64 / 1_000_000.0)}));
-    }
-    if gas_bought > 0 {
-        summary.push(json!({"label":"Gas top-up (one time)",
-            "value":format!("${:.2}", gas_bought as f64 / 1_000_000.0)}));
-    }
+    summary.extend(funding_summary(&quote, moving_fee, gas_bought));
     let intent = HlIntent {
         status: markets::IntentStatus {
             intent_id: intent_id.clone(),
@@ -1139,6 +1136,25 @@ async fn execute_inner(
         json!({"intentId":intent_id,"kind":if intent.quote.close {"perp_close"} else {"perp_open"},
         "summary":summary,"transactions":transactions,"expiresAtUnixMs":intent.expires}),
     ))
+}
+
+fn funding_summary(quote: &HlQuote, moving_fee: u128, gas_bought: u128) -> Vec<Value> {
+    // Old saved quotes had dollar confirmations. New quotes keep the reviewed currency and rate.
+    let (currency, rate) = match (quote.currency.as_deref(), quote.currency_rate) {
+        (Some(currency), Some(rate)) if rate > 0 => (currency, rate),
+        _ => ("USD", 1_000_000),
+    };
+    let mut rows = Vec::new();
+    for (label, units) in [
+        ("Margin moved to Hyperliquid", quote.funding_units),
+        ("Network fee", moving_fee),
+        ("Gas top-up (one time)", gas_bought),
+    ] {
+        if units > 0 {
+            rows.push(json!({"label":label,"value":markets::say_money(units, currency, rate)}));
+        }
+    }
+    rows
 }
 
 pub(super) async fn signed(
@@ -2125,6 +2141,30 @@ pub(super) async fn pending_rows(state: &AppState, owner: &str) -> Result<Vec<Va
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn funding_confirmation_keeps_the_quote_currency_and_legacy_defaults() {
+        let legacy = json!({
+            "owner":"user", "wallet":"wallet", "coin":"TEST", "asset":0,
+            "sz_decimals":2, "side":"long", "leverage":2, "size":"1",
+            "mark":10.0, "close":false, "funding_units":10_000_000, "expires":0
+        });
+        let old: HlQuote = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(
+            funding_summary(&old, 120_000, 500_000)[0]["value"],
+            "$10.00"
+        );
+        let mut reviewed = legacy;
+        reviewed["currency"] = json!("NGN");
+        reviewed["currency_rate"] = json!(1_500_000_000u128);
+        let quote: HlQuote = serde_json::from_value(reviewed).unwrap();
+        let restored: HlQuote =
+            serde_json::from_value(serde_json::to_value(&quote).unwrap()).unwrap();
+        let rows = funding_summary(&restored, 120_000, 500_000);
+        assert_eq!(rows[0]["value"], "₦15,000.00");
+        assert_eq!(rows[1]["value"], "₦180.00");
+        assert_eq!(rows[2]["value"], "₦750.00");
+    }
 
     #[test]
     fn market_ids_round_trip() {
