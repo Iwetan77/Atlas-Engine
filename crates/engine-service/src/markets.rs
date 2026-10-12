@@ -1948,7 +1948,21 @@ pub(super) async fn assets(
             Ok((Vec::new(), true))
         }
     };
-    let (listed, found, base_found) = tokio::join!(listed, other_chains, base_by_name);
+    // Robinhood coins found by name beyond 1Click's few (a pasted contract is looked up with the list).
+    let hood_by_name = async {
+        if want_other
+            && raw.len() >= 2
+            && !looks_like_evm_address(raw)
+            && !looks_like_mint(raw)
+            && kind.is_none_or(|k| k == "meme")
+        {
+            near_intents::hood_search(&state, raw, &currency, rate).await
+        } else {
+            Vec::new()
+        }
+    };
+    let (listed, found, base_found, hood_found) =
+        tokio::join!(listed, other_chains, base_by_name, hood_by_name);
     let (mut result, mut search_complete) = listed?;
     if let Some(found) = found {
         search_complete &= found.complete;
@@ -1965,12 +1979,18 @@ pub(super) async fn assets(
             result.push(row);
         }
     }
-    // Robinhood Chain's memecoins join Memes and Trending (and a search that matches them).
-    if want_listed && kind.is_none_or(|k| k == "meme") {
+    // Robinhood Chain's memecoins join Memes and Trending (and a search that matches them), and a
+    // pasted contract finds that coin there whatever chip is selected.
+    if want_listed && (looks_like_evm_address(raw) || kind.is_none_or(|k| k == "meme")) {
         for row in near_intents::hood_memes(&state, raw, &currency, rate).await {
             if !result.iter().any(|r| r["assetId"] == row["assetId"]) {
                 result.push(row);
             }
+        }
+    }
+    for row in hood_found {
+        if !result.iter().any(|r| r["assetId"] == row["assetId"]) {
+            result.push(row);
         }
     }
     let answer = json!({"assets":result,"searchComplete":search_complete});
