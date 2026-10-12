@@ -1112,6 +1112,10 @@ struct PlannedTrade {
     // past it, those transactions went out, and no fresh swap is handed out again.
     #[serde(default)]
     handed_nonce: Option<u64>,
+    // Savings moved over from Spendable: the SOL top-up confirmed (and moved over with them). The
+    // most the step after the move may turn into SOL; 0 means it may buy none.
+    #[serde(default)]
+    gas_budget: u128,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2984,6 +2988,9 @@ async fn planned_gas_topup(
     usdc
 }
 
+// A savings deposit whose SOL fee changed after it was confirmed: nothing is bought from Trading.
+const SAVINGS_FEE_CHANGED: &str = "Your savings deposit stopped because its network fee changed after you confirmed. The money is in your trading balance: move it back to Spendable or try again.";
+
 // What a SOL top-up costs (USDC units) when a Solana step needs one because the wallet is below the
 // gas floor; 0 when its SOL pays. Priced the way gas_topup_priced buys it, for quotes to show and
 // count.
@@ -4625,6 +4632,7 @@ pub(super) async fn plan_solana_swap_with_base_cash(
     amount: u128,
     send: u128,
     fee: u128,
+    gas_budget: u128,
 ) -> Result<(String, Vec<Value>), ApiError> {
     let intent_id = id("intent");
     let (cash, transfer) = move_to_solana(state, evm, &solana, send, fee, &intent_id).await?;
@@ -4666,6 +4674,7 @@ pub(super) async fn plan_solana_swap_with_base_cash(
                     get_units: 0,
                     receive_token: String::new(),
                     handed_nonce: None,
+                    gas_budget,
                 }),
                 funding: Some(cash),
                 buy_mint: Some(buy_mint.into()),
@@ -5074,6 +5083,7 @@ async fn execute_quote_inner(
                         BASE_USDC.to_ascii_lowercase()
                     },
                     handed_nonce: None,
+                    gas_budget: 0,
                 }),
                 funding,
                 buy_mint: None,
@@ -6207,12 +6217,34 @@ pub(super) async fn next_transactions(
         StatusCode::BAD_GATEWAY,
         "Jupiter returned no signable transaction".into(),
     ))?;
-    // Savings moved over from Spendable brought the SOL top-up its wallet needed with them: it's
-    // bought as confirmed whenever the wallet is still short, even if the swap itself is gasless.
-    let savings_short = intent.buy_mint.is_some()
-        && own_swap.is_none()
-        && sol_topup_cost(&state, &intent.wallet).await > 0;
-    let gas = if (order.gasless || own_swap.is_some()) && !savings_short {
+    // Savings moved over from Spendable brought the SOL top-up they confirmed: it's bought whenever
+    // the wallet is still short (even for a gasless swap), and never past what was confirmed. With
+    // none confirmed, the wallet's cash (Trading) is never used to buy one: the step stops instead.
+    let gas = if intent.buy_mint.is_some() {
+        let budget = intent.trade.as_ref().map_or(0, |t| t.gas_budget);
+        let short = own_swap.is_none() && sol_topup_cost(&state, &intent.wallet).await > 0;
+        let stop = |reason: &str| reason.to_string();
+        let planned = if !short || (budget == 0 && order.gasless) {
+            Ok(None)
+        } else if budget == 0 {
+            Err(stop(SAVINGS_FEE_CHANGED))
+        } else {
+            match gas_topup_priced(&state, &intent.wallet, amount).await {
+                Some((gas_id, gas_tx, usdc)) if usdc <= budget => Ok(Some((gas_id, gas_tx))),
+                Some(_) => Err(stop(SAVINGS_FEE_CHANGED)),
+                None => Err(stop(GAS_NOT_READY)),
+            }
+        };
+        match planned {
+            Ok(gas) => gas,
+            Err(reason) => {
+                intent.status.state = "failed".into();
+                intent.status.error = Some(reason.clone());
+                state.markets.save_intent(&intent_id, &intent).await?;
+                return Err((StatusCode::CONFLICT, reason));
+            }
+        }
+    } else if order.gasless || own_swap.is_some() {
         None
     } else {
         gas_topup(&state, &intent.wallet, amount).await
@@ -6718,6 +6750,7 @@ mod tests {
                 get_units: get,
                 receive_token: String::new(),
                 handed_nonce: None,
+                gas_budget: 0,
             }),
             funding: None,
             buy_mint: None,
