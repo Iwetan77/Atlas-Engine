@@ -97,6 +97,9 @@ pub(super) struct AppBalanceResponse {
     // predictions.
     spendable: Money,
     trading: Money,
+    // A refund waiting to come back to Trading (USDG on Robinhood Chain): counted in `total`, not in
+    // Trading until it's brought back (POST /v1/moves/quote with direction "recover").
+    refund: Option<Money>,
     pending: Option<Money>,
     holdings: Vec<Holding>,
     // The SOL and ETH that pay network fees on each chain. It's the user's money and counts in
@@ -253,11 +256,24 @@ pub(super) async fn balance(
         total_usd: usd(total),
         spendable: money(spendable, &currency, rate)?,
         trading: money(trading, &currency, rate)?,
+        refund: match refunds(&portfolio.holdings) {
+            0 => None,
+            units => Some(money(units, &currency, rate)?),
+        },
         pending: None,
         holdings,
         gas,
         as_of_unix_ms,
     }))
+}
+
+// Cash waiting to come back to Trading, in USDC units.
+fn refunds(holdings: &[Held]) -> u128 {
+    holdings
+        .iter()
+        .filter(|h| h.location == "refund")
+        .map(|h| h.value_usdc)
+        .sum()
 }
 
 // Spendable and Trading, in USDC units: the cash in the Base and the Solana wallet.
@@ -615,18 +631,31 @@ async fn hood_coins(state: &AppState, owner: &str, evm: &str) -> Found {
         Ok(coins) => {
             for (asset, units) in coins {
                 let id = format!("near:{}", asset.asset_id);
-                // Its memecoins are memes; the ETH kept for gas and a refund's USDG are money.
-                let meme = asset.contract_address.as_deref().is_some_and(|c| {
-                    !c.eq_ignore_ascii_case(engine_execution::relay_link::ROBINHOOD_USDG)
+                // Its memecoins are memes and its ETH is the gas kept there. USDG is what a buy that
+                // couldn't finish was refunded in: cash on its way back to Trading, not a coin.
+                let refund = asset.contract_address.as_deref().is_some_and(|c| {
+                    c.eq_ignore_ascii_case(engine_execution::relay_link::ROBINHOOD_USDG)
                 });
+                let meme = !refund && asset.contract_address.is_some();
                 match priced_units(&id, asset.price.as_ref(), units, asset.decimals) {
                     Some(value_usdc) => found.read.push(Held {
                         asset_id: id,
                         symbol: asset.symbol.clone(),
-                        name: format!("{} on Robinhood", asset.symbol),
-                        kind: if meme { "meme" } else { "crypto" }.into(),
+                        name: if refund {
+                            "Refund on Robinhood Chain".into()
+                        } else {
+                            format!("{} on Robinhood", asset.symbol)
+                        },
+                        kind: if refund {
+                            "cash"
+                        } else if meme {
+                            "meme"
+                        } else {
+                            "crypto"
+                        }
+                        .into(),
                         chain: "robinhood".into(),
-                        location: "wallet".into(),
+                        location: if refund { "refund" } else { "wallet" }.into(),
                         icon_url: state.near.icon_for(&asset),
                         amount: markets::format_units(units, asset.decimals),
                         units,

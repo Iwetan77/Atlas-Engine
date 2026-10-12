@@ -589,6 +589,35 @@ impl RelayClient {
             .await
     }
 
+    /// All `amount_in` of the USDG a Robinhood buy that couldn't finish was refunded in, from `evm`
+    /// on Robinhood Chain back into `solana_owner`'s USDC, gasless: the wallet signs one EIP-3009
+    /// authorization to Relay's receiver and Relay's solver pays the gas (no ETH needed there).
+    pub async fn hood_usdg_to_solana(
+        &self,
+        evm: &str,
+        solana_owner: &str,
+        amount_in: u128,
+    ) -> Result<GaslessMove, RelayError> {
+        let url = self
+            .base
+            .join("quote/v2")
+            .map_err(|_| RelayError::InvalidResponse("URL"))?;
+        let response = self
+            .with_key(self.http.post(url))
+            .json(&json!({
+                "user":evm,"recipient":solana_owner,"refundTo":evm,
+                "originChainId":ROBINHOOD_CHAIN_ID,"destinationChainId":SOLANA_CHAIN_ID,
+                "originCurrency":ROBINHOOD_USDG,"destinationCurrency":MAINNET_USDC_MINT,
+                "amount":amount_in.to_string(),"tradeType":"EXACT_INPUT","usePermit":true,
+                // Dollars into dollars: half a percent is plenty.
+                "slippageTolerance":"50"
+            }))
+            .send()
+            .await?;
+        let body = checked(response).await?;
+        parse_usdg_recovery(&body, evm, solana_owner, amount_in)
+    }
+
     /// Keep a cash-link payout on Base, avoiding a fresh recipient's Solana token-account
     /// setup. The solver pays Base gas out of the quoted input, using the same pinned
     /// EIP-3009 receiver as cross-chain payouts.
@@ -707,6 +736,41 @@ fn lands_at(details: &Value, dest: Dest<'_>) -> bool {
         }
 }
 
+// A USDG refund's way back: exactly `amount_in` of USDG on Robinhood Chain from `evm`, landing as
+// USDC with the user's own Solana wallet, for at most 5% and 10 cents, through one authorization.
+fn parse_usdg_recovery(
+    body: &Value,
+    evm: &str,
+    solana_owner: &str,
+    amount_in: u128,
+) -> Result<GaslessMove, RelayError> {
+    let invalid = RelayError::InvalidResponse;
+    let details = &body["details"];
+    let (money_in, money_out) = (&details["currencyIn"], &details["currencyOut"]);
+    if text(&money_in["currency"]["chainId"]) != ROBINHOOD_CHAIN_ID.to_string()
+        || text(&money_in["currency"]["address"]) != ROBINHOOD_USDG
+        || !lands_at(details, solana_dest(solana_owner))
+    {
+        return Err(invalid("not USDG on Robinhood back to this wallet"));
+    }
+    if units(&money_in["amount"]) != Some(amount_in) {
+        return Err(invalid("amount sent differs from the quote"));
+    }
+    let least_out = units(&money_out["minimumAmount"]).ok_or(invalid("amount out"))?;
+    if least_out == 0 || least_out.saturating_add(amount_in / 20 + 100_000) < amount_in {
+        return Err(invalid("fee too high"));
+    }
+    let (request_id, typed_data, api) =
+        eip3009_authorization(body, evm, amount_in, ROBINHOOD_CHAIN_ID, ROBINHOOD_USDG)?;
+    Ok(GaslessMove {
+        request_id,
+        amount_in_units: amount_in,
+        amount_out_units: least_out,
+        typed_data,
+        api,
+    })
+}
+
 fn parse_gasless_move(
     body: &Value,
     evm: &str,
@@ -819,6 +883,18 @@ fn base_authorization(
     evm: &str,
     amount: u128,
 ) -> Result<(String, Value, String), RelayError> {
+    eip3009_authorization(body, evm, amount, BASE_CHAIN_ID, BASE_USDC)
+}
+
+// Relay's one gasless step: an EIP-3009 ReceiveWithAuthorization of exactly `amount` of `token` on
+// `chain`, from `evm` to Relay's pinned receiver, posted back to Relay with its request id.
+fn eip3009_authorization(
+    body: &Value,
+    evm: &str,
+    amount: u128,
+    chain: u64,
+    token: &str,
+) -> Result<(String, Value, String), RelayError> {
     let invalid = RelayError::InvalidResponse;
     let [step] = body["steps"].as_array().map(Vec::as_slice).unwrap_or(&[]) else {
         return Err(invalid("expected one step"));
@@ -846,10 +922,10 @@ fn base_authorization(
         .ok_or(invalid("flow"))?;
     let domain = &sign["domain"];
     if sign["primaryType"].as_str() != Some("ReceiveWithAuthorization")
-        || text(&domain["chainId"]) != BASE_CHAIN_ID.to_string()
-        || text(&domain["verifyingContract"]) != BASE_USDC.to_ascii_lowercase()
+        || text(&domain["chainId"]) != chain.to_string()
+        || text(&domain["verifyingContract"]) != token.to_ascii_lowercase()
     {
-        return Err(invalid("not a Base USDC authorization"));
+        return Err(invalid("not an authorization of this token on this chain"));
     }
     let message = &sign["value"];
     if text(&message["from"]) != evm.to_ascii_lowercase()
@@ -1689,6 +1765,61 @@ fn parse_state(body: &Value) -> SwapState {
         "success" => SwapState::Completed,
         status @ ("refund" | "failure") => SwapState::Failed(status.into()),
         _ => SwapState::Waiting,
+    }
+}
+
+#[cfg(test)]
+mod usdg_recovery_tests {
+    use super::*;
+
+    const USER: &str = "0x3304e22ddaa22bcdc5fca2269b418046ae7b566a";
+    const SOLANA: &str = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM";
+
+    fn fixture() -> Value {
+        serde_json::from_str(include_str!("fixtures/relay-hood-usdg-solana.json")).unwrap()
+    }
+
+    #[test]
+    fn a_usdg_refund_goes_back_gasless_to_the_users_own_solana_wallet() {
+        let moved = parse_usdg_recovery(&fixture(), USER, SOLANA, 2_500_000).unwrap();
+        assert_eq!(moved.amount_in_units, 2_500_000);
+        assert!(moved.amount_out_units > 2_400_000 && moved.amount_out_units < 2_500_000);
+        assert_eq!(moved.typed_data["domain"]["chainId"].as_u64(), Some(4663));
+        assert_eq!(moved.typed_data["message"]["to"], RECEIVER);
+        assert_eq!(moved.typed_data["message"]["value"], "2500000");
+    }
+
+    #[test]
+    fn a_usdg_refund_quote_that_pays_anyone_else_or_differs_is_refused() {
+        // Another wallet, or a different amount.
+        assert!(parse_usdg_recovery(
+            &fixture(),
+            USER,
+            "Other1111111111111111111111111111111111111",
+            2_500_000
+        )
+        .is_err());
+        assert!(parse_usdg_recovery(
+            &fixture(),
+            "0x0000000000000000000000000000000000000001",
+            SOLANA,
+            2_500_000
+        )
+        .is_err());
+        assert!(parse_usdg_recovery(&fixture(), USER, SOLANA, 2_400_000).is_err());
+        // A tampered authorization: another receiver or another token.
+        let mut body = fixture();
+        body["steps"][0]["items"][0]["data"]["sign"]["value"]["to"] =
+            json!("0x0000000000000000000000000000000000000bad");
+        assert!(parse_usdg_recovery(&body, USER, SOLANA, 2_500_000).is_err());
+        let mut body = fixture();
+        body["steps"][0]["items"][0]["data"]["sign"]["domain"]["verifyingContract"] =
+            json!(BASE_USDC);
+        assert!(parse_usdg_recovery(&body, USER, SOLANA, 2_500_000).is_err());
+        // Far less landing than went in.
+        let mut body = fixture();
+        body["details"]["currencyOut"]["minimumAmount"] = json!("1000000");
+        assert!(parse_usdg_recovery(&body, USER, SOLANA, 2_500_000).is_err());
     }
 }
 

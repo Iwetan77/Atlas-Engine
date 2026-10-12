@@ -72,6 +72,9 @@ const ROUNDING_UNITS: u128 = 10_000;
 enum Direction {
     ToTrading,
     ToSpendable,
+    // A refund that landed as USDG on Robinhood Chain (a buy there that couldn't finish), back into
+    // Trading, where the buy was paid from.
+    Recover,
 }
 
 impl Direction {
@@ -79,6 +82,7 @@ impl Direction {
         match text {
             "to_trading" => Some(Self::ToTrading),
             "to_spendable" => Some(Self::ToSpendable),
+            "recover" => Some(Self::Recover),
             _ => None,
         }
     }
@@ -86,12 +90,14 @@ impl Direction {
         match self {
             Self::ToTrading => "to_trading",
             Self::ToSpendable => "to_spendable",
+            Self::Recover => "recover",
         }
     }
     fn labels(self) -> (&'static str, &'static str) {
         match self {
             Self::ToTrading => ("Spendable balance", "Trading balance"),
             Self::ToSpendable => ("Trading balance", "Spendable balance"),
+            Self::Recover => ("Refund on Robinhood Chain", "Trading balance"),
         }
     }
 }
@@ -262,6 +268,26 @@ pub(super) async fn quote(
             }
             (land, fee, None, cash)
         }
+        // All of the refund comes back, whatever `amount` says: one gasless authorization of the
+        // USDG, so no ETH is needed on Robinhood Chain; Relay lands the USDC in Trading.
+        Direction::Recover => {
+            let held = state.near.hood_usdg(&evm).await?;
+            if held == 0 {
+                return Err(conflict("There's no refund to bring back."));
+            }
+            let moved = state
+                .relay_link
+                .hood_usdg_to_solana(&evm, &solana, held)
+                .await
+                .map_err(|error| {
+                    eprintln!("refund recovery: Relay didn't quote ({error})");
+                    conflict(
+                        "Couldn't bring this refund back right now. It's safe; try again shortly.",
+                    )
+                })?;
+            let land = moved.amount_out_units;
+            (land, held.saturating_sub(land), Some(moved), held)
+        }
     };
     if land == 0 {
         return Err(conflict("That's too small to move."));
@@ -338,7 +364,7 @@ pub(super) async fn execute(
     }
     let (rate, currency) = (quote.rate, quote.currency.as_str());
     let (intent_id, transactions, fee) = match quote.direction {
-        Direction::ToTrading => {
+        Direction::ToTrading | Direction::Recover => {
             let moved = quote.gasless.clone().ok_or_else(not_moving)?;
             let (intent_id, steps) = markets::plan_relay_move(
                 &state,
@@ -431,9 +457,18 @@ mod tests {
 
     #[test]
     fn directions_round_trip_and_name_both_balances() {
-        for d in [Direction::ToTrading, Direction::ToSpendable] {
+        for d in [
+            Direction::ToTrading,
+            Direction::ToSpendable,
+            Direction::Recover,
+        ] {
             assert_eq!(Direction::parse(d.name()), Some(d));
         }
+        // A Robinhood refund always comes back to Trading, where the buy was paid from.
+        assert_eq!(
+            Direction::Recover.labels(),
+            ("Refund on Robinhood Chain", "Trading balance")
+        );
         assert_eq!(Direction::parse("to_someone_else"), None);
         assert_eq!(
             Direction::ToTrading.labels(),

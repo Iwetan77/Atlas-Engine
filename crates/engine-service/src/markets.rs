@@ -3245,26 +3245,37 @@ async fn authorization_dead(state: &AppState, cash: &CashMove) -> bool {
     if from.len() != 40 || nonce.len() != 64 {
         return false;
     }
-    // Only against a finalized Base block past the deadline: every block that could still have
-    // used it is final then, and no later one can.
-    let Ok(block) = base_rpc(
-        &state.markets,
-        "eth_getBlockByNumber",
-        json!(["finalized", false]),
-    )
-    .await
-    else {
+    // Read on the token's own chain: USDC on Base, or a refund's USDG on Robinhood Chain.
+    let domain = &auth.typed_data["domain"];
+    let chain = domain["chainId"]
+        .as_u64()
+        .or_else(|| domain["chainId"].as_str().and_then(|c| c.parse().ok()));
+    let token = domain["verifyingContract"]
+        .as_str()
+        .unwrap_or(BASE_USDC)
+        .to_ascii_lowercase();
+    let call = |method: &'static str, params: Value| async move {
+        match chain {
+            Some(8453) | None => base_rpc(&state.markets, method, params).await,
+            Some(engine_execution::relay_link::ROBINHOOD_CHAIN_ID) => {
+                state.near.hood_call(method, params).await
+            }
+            Some(_) => Err(unavailable("unknown chain")),
+        }
+    };
+    // Only against a finalized block past the deadline: every block that could still have used
+    // it is final then, and no later one can.
+    let Ok(block) = call("eth_getBlockByNumber", json!(["finalized", false])).await else {
         return false;
     };
     let Some(number) = expired_authorization_block(&block, deadline) else {
         return false;
     };
-    // USDC's authorizationState(authorizer, nonce) at that same block: true once it was used. A
-    // node that can't answer for that block leaves it unknown.
-    let used = base_rpc(
-        &state.markets,
+    // The token's authorizationState(authorizer, nonce) at that same block: true once it was used.
+    // A node that can't answer for that block leaves it unknown.
+    let used = call(
         "eth_call",
-        json!([{"to":BASE_USDC,"data":format!("0xe94a0102{from:0>64}{nonce}")},number]),
+        json!([{"to":token,"data":format!("0xe94a0102{from:0>64}{nonce}")},number]),
     )
     .await;
     match used.ok().as_ref().and_then(Value::as_str) {

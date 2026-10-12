@@ -706,6 +706,26 @@ impl NearState {
         }
         Ok(body["result"].clone())
     }
+    // The USDG (6 decimals) `wallet` holds on Robinhood Chain: what a buy there that couldn't finish
+    // was refunded in, until it's brought back to Trading.
+    pub(super) async fn hood_usdg(&self, wallet: &str) -> Result<u128, ApiError> {
+        if !is_evm(wallet) {
+            return Err(venue("invalid Robinhood Chain wallet"));
+        }
+        let data = format!("0x70a08231{:0>64}", &wallet[2..].to_ascii_lowercase());
+        let value = self
+            .evm_call(
+                EvmChain::Robinhood,
+                "eth_call",
+                json!([{"to":engine_execution::relay_link::ROBINHOOD_USDG,"data":data},"latest"]),
+            )
+            .await?;
+        hex_units(&value).ok_or_else(|| venue("Robinhood Chain RPC returned no balance"))
+    }
+    // A JSON-RPC call on Robinhood Chain, for checks that need its own state.
+    pub(super) async fn hood_call(&self, method: &str, params: Value) -> Result<Value, ApiError> {
+        self.evm_call(EvmChain::Robinhood, method, params).await
+    }
     // The ETH (wei) a wallet holds on Robinhood Chain: its gas there.
     async fn hood_eth(&self, wallet: &str) -> Result<u128, ApiError> {
         if !is_evm(wallet) {
