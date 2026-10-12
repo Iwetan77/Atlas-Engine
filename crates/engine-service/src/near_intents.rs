@@ -4751,7 +4751,9 @@ async fn pay_from(
         if let (Some(e), true) = (evm, solana_cash >= amount) {
             if let Ok(moved) = state.relay_link.solana_to_base(s, e, amount, 0).await {
                 if solana_cash >= moved.amount_in_units.saturating_add(topup) {
-                    let fee = moved.amount_in_units.saturating_sub(amount);
+                    // With room for Relay's price moving a hair before the confirmation, which
+                    // charges the exact fee and never more than this.
+                    let fee = markets::fee_room(moved.amount_in_units.saturating_sub(amount));
                     return Ok((s.into(), true, fee, BASE_USDC_1CLICK));
                 }
             }
