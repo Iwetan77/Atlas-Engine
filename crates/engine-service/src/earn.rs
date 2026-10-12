@@ -1095,6 +1095,7 @@ async fn execute_lend(
             quote.units,
             send,
             fee,
+            topup,
         )
         .await?;
         let mut summary = vec![
