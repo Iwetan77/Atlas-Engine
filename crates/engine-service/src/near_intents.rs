@@ -5451,13 +5451,21 @@ async fn deposit_ready(
             .await
             .map_err(venue)?
     };
+    // Short in the balance that pays (Trading for Solana cash, Spendable for Base): it says which.
+    let short = |held: u128| async move {
+        let rate = app_balance::fx_rate(currency).await?;
+        Ok::<ApiError, ApiError>(if from_solana {
+            markets::not_enough_trading(held, currency, rate)
+        } else {
+            markets::not_enough_spendable(held, 0, currency, rate)
+        })
+    };
     if balance < amount {
-        return Err(markets::short_of_cash());
+        return Err(short(balance).await?);
     }
     let gas_topup = !from_solana && markets::base_topup_fits(state, wallet, amount).await;
     if !from_solana && !gas_topup && !markets::wallet_pays_gas(state, wallet).await {
-        let rate = app_balance::fx_rate(currency).await?;
-        return Err(markets::short_of_gas(currency, rate));
+        return Err(short(balance).await?);
     }
     Ok(gas_topup)
 }
