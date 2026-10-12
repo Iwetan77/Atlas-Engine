@@ -3110,7 +3110,13 @@ async fn base_cash_from_solana(
     } else {
         BASE_GAS_BY_RELAY_USDC
     };
-    let reserve = solana_fee_reserve(state, sol).await;
+    // The SOL top-up the deposit buys first when the wallet is short of SOL, priced the way the
+    // plan will price it (it costs more when SOL is dear), so the quote and the plan agree.
+    let reserve = match state.solana_mainnet.owner_sol_balance(sol).await {
+        Ok(lamports) if lamports >= GAS_FLOOR_LAMPORTS => 0,
+        Ok(lamports) => topup_usdc_for(state, GAS_FLOOR_LAMPORTS - lamports).await,
+        Err(_) => GAS_TOPUP_USDC,
+    };
     if sol_cash < land + gas + reserve {
         return Err(not_enough_trading(sol_cash, currency, rate));
     }
