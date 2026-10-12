@@ -3081,7 +3081,7 @@ fn spot_summary(
         ]
     };
     if let Some(fee) = moving {
-        lines.push(json!({"label":"Network fee","value":say_money(fee.max(1), currency, rate)}));
+        lines.push(json!({"label":"Fee","value":say_money(fee.max(1), currency, rate)}));
     }
     if gas > 0 {
         let label = if side == "buy" {
@@ -7362,7 +7362,7 @@ mod tests {
         );
         assert_eq!(
             text(&lines)[2],
-            format!("Network fee={}", say_money(20_000, "NGN", rate))
+            format!("Fee={}", say_money(20_000, "NGN", rate))
         );
         assert_eq!(
             text(&lines)[3],

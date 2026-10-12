@@ -5027,7 +5027,7 @@ async fn execute_monad_sale(
         json!({"label":"You receive (at least)","value":markets::say_money(swap.minimum_out_units,&stored.currency,rate)}),
     ];
     if stored.network_fee > 0 {
-        summary.push(json!({"label":"Fees","value":markets::say_money(stored.network_fee,&stored.currency,rate)}));
+        summary.push(json!({"label":"Fee","value":markets::say_money(stored.network_fee,&stored.currency,rate)}));
     }
     Ok(Json(
         json!({"intentId":intent_id,"kind":"sell","summary":summary,
@@ -5172,7 +5172,7 @@ async fn execute_mon_buy(
         json!({"label":"Lands on","value":"Monad"}),
     ];
     if stored.network_fee > 0 {
-        summary.push(json!({"label":"Fees","value":markets::say_money(stored.network_fee,&stored.currency,rate)}));
+        summary.push(json!({"label":"Fee","value":markets::say_money(stored.network_fee,&stored.currency,rate)}));
     }
     if gas_usdc > 0 {
         summary.push(json!({"label":"Gas top-up (one time)","value":markets::say_money(gas_usdc,&stored.currency,rate)}));
@@ -5850,7 +5850,7 @@ pub(super) async fn execute(
             "value":markets::say_money(gas,&stored.currency,rate)}));
     }
     if network_fee > 0 {
-        summary.push(json!({"label":"Network fee",
+        summary.push(json!({"label":"Fee",
             "value":markets::say_money(network_fee,&stored.currency,rate)}));
     }
     Ok(Json(

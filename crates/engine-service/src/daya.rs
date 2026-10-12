@@ -1494,13 +1494,16 @@ pub(super) async fn onramp_quote(
     }
     let currency = body.currency.as_deref().unwrap_or("NGN");
     markets::checked_currency(currency)?;
-    let ((pay, fee, usdc, rate, fees), fx) = tokio::try_join!(
+    let ((pay, fee, usdc, rate, fees), fx, ngn_fx) = tokio::try_join!(
         onramp_amounts(&state.daya, &body.amount, body.receive),
-        app_balance::fx_rate(currency)
+        app_balance::fx_rate(currency),
+        app_balance::fx_rate("NGN")
     )?;
     Ok(Json(json!({
         "pay": naira(pay),
         "fee": naira(fee),
+        // Everything that doesn't land, as one fee in naira, whatever currency the rest is in.
+        "totalFee": naira(pay.saturating_sub(usdc * ngn_fx / 1_000_000)),
         "networkFee": markets::say_money(fees.usdc_payout_fee, currency, fx),
         "receive": {"amount": markets::format_units(usdc * fx / 1_000_000, 6), "currency": currency},
         "rate": format!("{} per $1", markets::say_micros(rate.ngn_per_usdc, "NGN")),
