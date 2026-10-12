@@ -6207,7 +6207,12 @@ pub(super) async fn next_transactions(
         StatusCode::BAD_GATEWAY,
         "Jupiter returned no signable transaction".into(),
     ))?;
-    let gas = if order.gasless || own_swap.is_some() {
+    // Savings moved over from Spendable brought the SOL top-up its wallet needed with them: it's
+    // bought as confirmed whenever the wallet is still short, even if the swap itself is gasless.
+    let savings_short = intent.buy_mint.is_some()
+        && own_swap.is_none()
+        && sol_topup_cost(&state, &intent.wallet).await > 0;
+    let gas = if (order.gasless || own_swap.is_some()) && !savings_short {
         None
     } else {
         gas_topup(&state, &intent.wallet, amount).await

@@ -794,11 +794,16 @@ pub(super) async fn quote(
         let solana = user.solana_wallet.filter(|w| !w.is_empty());
         let evm = user.evm_wallet.filter(|w| !w.is_empty());
         if lend_option {
+            // The SOL the Solana wallet needs for the deposit's fee moves over with it.
+            let topup = match solana.as_deref() {
+                Some(owner) => markets::sol_topup_cost(&state, owner).await,
+                None => 0,
+            };
             markets::spendable_for_solana(
                 &state,
                 evm.as_deref(),
                 solana.as_deref(),
-                units,
+                units + topup,
                 &currency,
                 rate,
             )
@@ -1064,11 +1069,15 @@ async fn execute_lend(
             .await?
             .evm_wallet
             .filter(|w| !w.is_empty());
+        // A Solana wallet that can't pay the deposit's fee gets its SOL top-up from Spendable too:
+        // it moves over with the deposit and is bought just before it (kept as SOL, counted in the
+        // balance), never out of Trading.
+        let topup = markets::sol_topup_cost(state, &wallet).await;
         let (send, fee) = markets::spendable_for_solana(
             state,
             evm.as_deref(),
             Some(&wallet),
-            quote.units,
+            quote.units + topup,
             &quote.currency,
             quote.rate,
         )
@@ -1088,14 +1097,21 @@ async fn execute_lend(
             fee,
         )
         .await?;
+        let mut summary = vec![
+            json!({"label":if share_mint == JITO_MINT {"Stake SOL"} else {"Put in savings"},
+                "value":markets::say_money(quote.units, &quote.currency, quote.rate)}),
+            json!({"label":"Where","value":if share_mint == JITO_MINT {"Jito"} else {"Jupiter Lend"}}),
+            json!({"label":"Network fee","value":markets::say_money(fee, &quote.currency, quote.rate)}),
+        ];
+        if topup > 0 {
+            summary.push(json!({"label":"Gas top-up (one time)",
+                "value":markets::say_money(topup, &quote.currency, quote.rate)}));
+        }
+        summary.push(json!({"label":"You pay",
+            "value":markets::say_money(quote.units + fee + topup, &quote.currency, quote.rate)}));
         return Ok(Json(json!({
             "intentId":intent_id,"kind":"earn_deposit",
-            "summary":[
-                {"label":if share_mint == JITO_MINT {"Stake SOL"} else {"Put in savings"},
-                 "value":markets::say_money(quote.units, &quote.currency, quote.rate)},
-                {"label":"Where","value":if share_mint == JITO_MINT {"Jito"} else {"Jupiter Lend"}},
-                {"label":"Network fee","value":markets::say_money(fee, &quote.currency, quote.rate)}
-            ],
+            "summary":summary,
             "transactions":transactions,
             "expiresAtUnixMs":now() + 120_000
         })));
