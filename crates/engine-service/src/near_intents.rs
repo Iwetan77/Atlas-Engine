@@ -2243,6 +2243,7 @@ pub(super) async fn withdraw_execute(
         gas_request_id,
         topup,
         sol_topup: _,
+        relay_fee: _,
     } = deposit_steps(
         &state,
         &stored.wallet,
@@ -5342,6 +5343,7 @@ async fn execute_sale_after_gas(
         gas_request_id,
         topup,
         sol_topup: _,
+        relay_fee: _,
     } = deposit_steps(
         state,
         &wallet,
@@ -5508,6 +5510,7 @@ struct DepositSteps {
     topup: Option<markets::BaseTopup>,
     // Cash a Solana deposit turns into SOL first for its fee (kept as SOL), 0 without.
     sol_topup: u128,
+    relay_fee: Option<u128>,
 }
 
 // What the app signs to pay `amount` of USDC into a 1Click deposit address: from Solana, [gas
@@ -5535,12 +5538,14 @@ async fn deposit_steps(
     if from_solana {
         // Relay carries the cash from the Solana wallet into 1Click's Base deposit address (one
         // Solana transaction the engine lands); else a plain transfer to a Solana deposit address.
-        let (gas, transfer, sol_topup) = if relayed {
-            let (gas, transaction, _, topup) =
+        let (gas, transfer, sol_topup, relay_fee) = if relayed {
+            let (gas, transaction, fee, topup) =
                 markets::solana_relay_transfer(state, wallet, deposit, amount).await?;
-            (gas, transaction, topup)
+            (gas, transaction, topup, Some(fee))
         } else {
-            markets::solana_usdc_transfer(state, wallet, deposit, amount).await?
+            let (gas, transaction, topup) =
+                markets::solana_usdc_transfer(state, wallet, deposit, amount).await?;
+            (gas, transaction, topup, None)
         };
         let mut transactions = Vec::new();
         if let Some((_, gas_tx)) = &gas {
@@ -5554,6 +5559,7 @@ async fn deposit_steps(
             gas_request_id: gas.map(|(id, _)| id),
             topup: None,
             sol_topup,
+            relay_fee,
         });
     }
     let tx = state
@@ -5577,6 +5583,7 @@ async fn deposit_steps(
         gas_request_id: None,
         topup,
         sol_topup: 0,
+        relay_fee: None,
     })
 }
 
@@ -5739,6 +5746,7 @@ pub(super) async fn execute(
         gas_request_id,
         topup: prepared_topup,
         sol_topup,
+        relay_fee,
     } = deposit_steps(
         &state,
         &stored.wallet,
@@ -5750,6 +5758,7 @@ pub(super) async fn execute(
         stored.amount,
     )
     .await?;
+    let network_fee = confirmed_relay_fee(stored.network_fee, relay_fee)?;
     let intent_id = id("intent");
     let status = markets::IntentStatus {
         intent_id: intent_id.clone(),
@@ -5826,7 +5835,7 @@ pub(super) async fn execute(
     };
     let gas = stored.then_swap.as_ref().map_or(0, |s| s.gas_usdc) + base_gas;
     let mut summary = vec![
-        json!({"label":"You pay","value":markets::say_money(stored.amount + base_gas + stored.network_fee,&stored.currency,rate)}),
+        json!({"label":"You pay","value":markets::say_money(stored.amount + base_gas + network_fee,&stored.currency,rate)}),
         json!({"label":"You get (about)","value":get}),
         json!({"label":"Lands on","value":chain}),
     ];
@@ -5834,14 +5843,24 @@ pub(super) async fn execute(
         summary.push(json!({"label":"Gas top-up (one time)",
             "value":markets::say_money(gas,&stored.currency,rate)}));
     }
-    if stored.network_fee > 0 {
+    if network_fee > 0 {
         summary.push(json!({"label":"Network fee",
-            "value":markets::say_money(stored.network_fee,&stored.currency,rate)}));
+            "value":markets::say_money(network_fee,&stored.currency,rate)}));
     }
     Ok(Json(
         json!({"intentId":intent_id,"kind":"buy","summary":summary,
         "transactions":transactions,"expiresAtUnixMs":expires}),
     ))
+}
+
+fn confirmed_relay_fee(quoted: u128, actual: Option<u128>) -> Result<u128, ApiError> {
+    let fee = actual.unwrap_or(quoted);
+    if fee > quoted {
+        return Err(conflict(
+            "The network fee changed. Check a fresh quote; nothing was moved.",
+        ));
+    }
+    Ok(fee)
 }
 
 fn prepared_step(body: &Value, commit_path: &str, kind: &str) -> Result<DeviceStep, ApiError> {
@@ -7003,6 +7022,20 @@ pub(super) async fn resume(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_relay_deposit_cannot_exceed_the_reviewed_fee() {
+        assert!(super::confirmed_relay_fee(20_000, Some(80_000)).is_err());
+        assert!(super::confirmed_relay_fee(0, Some(1)).is_err());
+        assert_eq!(
+            super::confirmed_relay_fee(20_000, Some(20_000)).unwrap(),
+            20_000
+        );
+        assert_eq!(
+            super::confirmed_relay_fee(20_000, Some(15_000)).unwrap(),
+            15_000
+        );
+        assert_eq!(super::confirmed_relay_fee(20_000, None).unwrap(), 20_000);
+    }
 
     #[test]
     fn wallet_withdrawal_fees_go_on_top_of_the_requested_payout() {
