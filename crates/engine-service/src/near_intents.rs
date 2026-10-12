@@ -5075,6 +5075,8 @@ async fn execute_mon_buy(
     let mut transactions = Vec::new();
     let mut gas_request_id = None;
     let mut gas_usdc: u128 = 0;
+    // The Solana deposit planned (empty for a Base authorization), bound when it's signed.
+    let mut planned_deposit = String::new();
     let (typed_data, api) = match &swap.pay {
         MonadPay::Solana {
             instructions,
@@ -5100,6 +5102,7 @@ async fn execute_mon_buy(
                 None => {}
             }
             transactions.push(json!({"chain":"solana","transaction":deposit,"submit":"engine"}));
+            planned_deposit = deposit;
             (None, String::new())
         }
         MonadPay::Base { typed_data, api } => {
@@ -5119,7 +5122,7 @@ async fn execute_mon_buy(
                 owner: user.user_id.clone(),
                 wallet: stored.wallet.clone(),
                 expected_to: String::new(),
-                expected_data: String::new(),
+                expected_data: planned_deposit,
                 deposit_address: String::new(),
                 deposit_memo: None,
                 asset: Some(token.clone()),
@@ -5554,9 +5557,10 @@ async fn deposit_steps(
             transactions.push(json!({"chain":"solana","transaction":gas_tx,"submit":"engine"}));
         }
         transactions.push(json!({"chain":"solana","transaction":transfer,"submit":"engine"}));
+        // The exact transaction planned, so only it (signed by this wallet) is ever sent.
         return Ok(DepositSteps {
             expected_to: deposit.into(),
-            expected_data: String::new(),
+            expected_data: transfer,
             transactions,
             gas_request_id: gas.map(|(id, _)| id),
             topup: None,
@@ -6184,6 +6188,20 @@ pub(super) async fn signed(
         {
             return Err(bad("signed report does not match 1Click deposit plan"));
         }
+        // Only the exact payment planned, signed by this wallet, before anything is landed. Plans
+        // from before this was kept carry none and are sent as before.
+        let bound = if current.expected_data.is_empty() {
+            None
+        } else {
+            Some(
+                engine_execution::solana::checked_signed_transfer(
+                    &current.expected_data,
+                    &body.signed[main].transaction,
+                    &current.wallet,
+                )
+                .map_err(|_| bad("signed payment does not match your plan"))?,
+            )
+        };
         // The stage moves first, so a repeated report can't land it twice.
         current.status.stage = "execute".into();
         state.near.save_intent(&id, current.clone()).await?;
@@ -6191,12 +6209,29 @@ pub(super) async fn signed(
             markets::land_gas_topup(&state, gas_id, &body.signed[0].transaction).await;
         }
         current.status.stage = "settle".into();
+        // Its signature is known before it's sent and kept first: a lost answer from the network is
+        // then followed (1Click or Relay sees the payment) instead of being called nothing sent.
+        if let Some(signature) = &bound {
+            current.status.tx_ids = vec![signature.clone()];
+            state.near.save_intent(&id, current.clone()).await?;
+        }
         match state
             .solana_mainnet
             .send_signed(&body.signed[main].transaction)
             .await
         {
             Ok(signature) => current.status.tx_ids = vec![signature],
+            // The network refused it outright: it can't land.
+            Err(engine_execution::solana::SolanaPreflightError::Rpc(reason))
+                if !reason.contains("already been processed") =>
+            {
+                eprintln!("intent {id}: 1Click deposit from Solana refused: {reason}");
+                current.status.state = "failed".into();
+                current.status.error = Some(NOT_SENT.into());
+            }
+            Err(error) if bound.is_some() => {
+                eprintln!("intent {id}: 1Click deposit from Solana unresolved: {error}");
+            }
             Err(error) => {
                 eprintln!("intent {id}: 1Click deposit from Solana not sent: {error}");
                 current.status.state = "failed".into();
@@ -6679,7 +6714,27 @@ async fn deposit_landed(
                 .await
                 .map_err(venue)?
             {
-                None => Ok(false),
+                // Not seen: it can still land, unless Solana has finalized past the last block
+                // its blockhash allowed with no trace of it (known while this server holds that
+                // block, from when the payment was planned). Any doubt keeps waiting.
+                None => {
+                    let gone = match state
+                        .solana_mainnet
+                        .last_valid_height(&current.expected_data)
+                    {
+                        Some(last) => state
+                            .solana_mainnet
+                            .never_landed(hash, last)
+                            .await
+                            .unwrap_or(false),
+                        None => false,
+                    };
+                    if gone {
+                        Err(NOT_SENT.into())
+                    } else {
+                        Ok(false)
+                    }
+                }
                 Some(Ok(())) => Ok(true),
                 Some(Err(_)) => Err(NOT_SENT.into()),
             },

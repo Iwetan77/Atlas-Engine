@@ -951,6 +951,43 @@ pub fn checked_swap_signature(
     Ok(tx.signatures[0].to_string())
 }
 
+/// The transaction id of `signed` when it is exactly the planned `unsigned` message, carrying a
+/// valid signature from `wallet` as one of its required signers, and every other signature the plan
+/// already had (a fee payer that signed first) unchanged. Works for one signer or several.
+pub fn checked_signed_transfer(
+    unsigned: &str,
+    signed: &str,
+    wallet: &str,
+) -> Result<String, SolanaPreflightError> {
+    use solana_sdk::transaction::VersionedTransaction;
+    let invalid = || SolanaPreflightError::InvalidResponse;
+    let decode = |s: &str| -> Result<VersionedTransaction, SolanaPreflightError> {
+        bincode::deserialize(&STANDARD.decode(s).map_err(|_| invalid())?).map_err(|_| invalid())
+    };
+    let planned = decode(unsigned)?;
+    let tx = decode(signed)?;
+    let owner = Pubkey::from_str(wallet).map_err(|_| invalid())?;
+    let required = usize::from(tx.message.header().num_required_signatures);
+    let keys = tx.message.static_account_keys();
+    if planned.message != tx.message || tx.signatures.len() != required || required == 0 {
+        return Err(invalid());
+    }
+    let Some(index) = keys.iter().take(required).position(|k| *k == owner) else {
+        return Err(invalid());
+    };
+    let message = tx.message.serialize();
+    if !tx.signatures[index].verify(owner.as_ref(), &message) {
+        return Err(invalid());
+    }
+    for (i, signature) in tx.signatures.iter().enumerate() {
+        let kept = planned.signatures.get(i).copied().unwrap_or_default();
+        if i != index && (signature != &kept || !signature.verify(keys[i].as_ref(), &message)) {
+            return Err(invalid());
+        }
+    }
+    Ok(tx.signatures[0].to_string())
+}
+
 fn swap_amounts(
     tx: &Value,
     wallet: &str,
@@ -1161,6 +1198,86 @@ mod tests {
         let mut changed = signed;
         changed.message.set_recent_blockhash(Hash::new_unique());
         assert!(checked_swap_signature(
+            &encoded(&planned),
+            &encoded(&changed),
+            &wallet.pubkey().to_string()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_signed_transfer_is_the_plan_signed_by_the_wallet_with_the_fee_payer_kept() {
+        use solana_sdk::{
+            instruction::{AccountMeta, Instruction},
+            message::{Message, VersionedMessage},
+            signature::{Keypair, Signer as _},
+            transaction::VersionedTransaction,
+        };
+        let encoded = |tx: &VersionedTransaction| STANDARD.encode(bincode::serialize(tx).unwrap());
+        let wallet = Keypair::new();
+        let payer = Keypair::new();
+        let other = Keypair::new();
+        // One signer: the wallet pays its own fee.
+        let single = VersionedMessage::Legacy(Message::new(&[], Some(&wallet.pubkey())));
+        let planned = VersionedTransaction {
+            signatures: vec![Default::default()],
+            message: single.clone(),
+        };
+        let signed = VersionedTransaction::try_new(single, &[&wallet]).unwrap();
+        let id = checked_signed_transfer(
+            &encoded(&planned),
+            &encoded(&signed),
+            &wallet.pubkey().to_string(),
+        )
+        .unwrap();
+        assert_eq!(id, signed.signatures[0].to_string());
+        assert!(checked_signed_transfer(
+            &encoded(&planned),
+            &encoded(&planned),
+            &wallet.pubkey().to_string()
+        )
+        .is_err());
+        assert!(checked_signed_transfer(
+            &encoded(&planned),
+            &encoded(&signed),
+            &other.pubkey().to_string()
+        )
+        .is_err());
+        // Two signers: a fee payer signed the plan first; the wallet adds its own signature.
+        let touch = Instruction::new_with_bytes(
+            Pubkey::new_unique(),
+            &[],
+            vec![AccountMeta::new_readonly(wallet.pubkey(), true)],
+        );
+        let pair = Message::new(&[touch], Some(&payer.pubkey()));
+        let message = VersionedMessage::Legacy(pair);
+        let bytes = message.serialize();
+        let payer_signature = payer.sign_message(&bytes);
+        let planned = VersionedTransaction {
+            signatures: vec![payer_signature, Default::default()],
+            message: message.clone(),
+        };
+        let mut signed = planned.clone();
+        signed.signatures[1] = wallet.sign_message(&bytes);
+        let id = checked_signed_transfer(
+            &encoded(&planned),
+            &encoded(&signed),
+            &wallet.pubkey().to_string(),
+        )
+        .unwrap();
+        assert_eq!(id, payer_signature.to_string());
+        // The fee payer's signature can't be swapped out, and the message can't change.
+        let mut forged = signed.clone();
+        forged.signatures[0] = other.sign_message(&bytes);
+        assert!(checked_signed_transfer(
+            &encoded(&planned),
+            &encoded(&forged),
+            &wallet.pubkey().to_string()
+        )
+        .is_err());
+        let mut changed = signed;
+        changed.message.set_recent_blockhash(Hash::new_unique());
+        assert!(checked_signed_transfer(
             &encoded(&planned),
             &encoded(&changed),
             &wallet.pubkey().to_string()
