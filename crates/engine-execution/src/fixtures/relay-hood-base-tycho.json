@@ -1,0 +1,289 @@
+{
+  "requestId": "0x1791737170cef5b051ff1ad87783d3f717aa680b056a49859f3fb6174c11e3bc",
+  "steps": [
+    {
+      "id": "approve",
+      "action": "Confirm transaction in your wallet",
+      "description": "Sign an approval for PONS",
+      "kind": "transaction",
+      "items": [
+        {
+          "status": "incomplete",
+          "data": {
+            "from": "0xd8da6bf26964af9d7eed9e03e53415d37aa96045",
+            "to": "0x39dbed3a2bd333467115de45665cc57f813c4571",
+            "data": "0x095ea7b3000000000000000000000000ccc88a9d1b4ed6b0eaba998850414b24f1c315be0000000000000000000000000000000000000000000000004563918244f40000",
+            "value": "0",
+            "chainId": 4663,
+            "gas": "64139",
+            "maxFeePerGas": "28422800",
+            "maxPriorityFeePerGas": "0"
+          }
+        }
+      ],
+      "requestId": "0x1791737170cef5b051ff1ad87783d3f717aa680b056a49859f3fb6174c11e3bc"
+    },
+    {
+      "id": "deposit",
+      "action": "Confirm transaction in your wallet",
+      "description": "Depositing funds to the relayer to execute the swap for USDC",
+      "kind": "transaction",
+      "items": [
+        {
+          "status": "incomplete",
+          "data": {
+            "from": "0xd8da6bf26964af9d7eed9e03e53415d37aa96045",
+            "to": "0xccc88a9d1b4ed6b0eaba998850414b24f1c315be",
+            "data": "0xf9e4bab400000000000000000000000000000000000000000000000000000000000000c000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000140000000000000000000000000f70da97812cb96acdf810712aa562db8dfa3dbef000000000000000000000000f70da97812cb96acdf810712aa562db8dfa3dbef00000000000000000000000000000000000000000000000000000000000008a0000000000000000000000000000000000000000000000000000000000000000100000000000000000000000039dbed3a2bd333467115de45665cc57f813c457100000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000004563918244f40000000000000000000000000000000000000000000000000000000000000000000300000000000000000000000000000000000000000000000000000000000000600000000000000000000000000000000000000000000000000000000000000160000000000000000000000000000000000000000000000000000000000000046000000000000000000000000039dbed3a2bd333467115de45665cc57f813c45710000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000044095ea7b300000000000000000000000009215a470bd585e59eb3f4b612fbd2678131ff9e0000000000000000000000000000000000000000000000004563918244f400000000000000000000000000000000000000000000000000000000000000000000000000000000000009215a470bd585e59eb3f4b612fbd2678131ff9e00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000000000000002530c1a0ee70000000000000000000000000000000000000000000000004563918244f4000000000000000000000000000039dbed3a2bd333467115de45665cc57f813c45710000000000000000000000005fc5360d0400a0fd4f2af552add042d716f1d16800000000000000000000000000000000000000000000000000000000001bccb700000000000000000000000000000000000000000000000000000000001af737000000000000000000000000b92fe925dc43a0ecde6c8b1a2709c170ec4fff4f000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000001c0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff00000000000000000000000000000000000000000000000000000000000000a00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005433e8602fedd1215cb04c865c66648dba5b81fb7539dbed3a2bd333467115de45665cc57f813c45715fc5360d0400a0fd4f2af552add042d716f1d1680001f456000f3980200d0f39a9f2eefd5233b2196b44450100000000000000000000000070726f70656c6c65722f52656c617900000000000000000000000000000000000000000000000000b92fe925dc43a0ecde6c8b1a2709c170ec4fff4f000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000080000000000000000000000000000000000000000000000000000000000000022473b7bb2f000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000000000000000c0000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000001e000000000000000000000000000000000000000000000000000000000000000010000000000000000000000005fc5360d0400a0fd4f2af552add042d716f1d16800000000000000000000000000000000000000000000000000000000000000010000000000000000000000004cd00e387622c35bddb9b4c962c136462338bc310000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000645a1ee3ac000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa960450000000000000000000000005fc5360d0400a0fd4f2af552add042d716f1d168a9eb1ed8430667a8c9f9dbdd8e8b429a4073d5e41d48f2c8f7d198fc86ed62930000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000021cb3e11c4716bf3f95894a650b086aa717f3d38778da1ff150b5fec07173719710000000000000000000000000000000000000000000000000000000000000000a9eb1ed8430667a8c9f9dbdd8e8b429a4073d5e41d48f2c8f7d198fc86ed6293",
+            "value": "0",
+            "chainId": 4663,
+            "gas": "582184",
+            "maxFeePerGas": "28422800",
+            "maxPriorityFeePerGas": "0"
+          },
+          "check": {
+            "endpoint": "/intents/status/v3?requestId=0x1791737170cef5b051ff1ad87783d3f717aa680b056a49859f3fb6174c11e3bc",
+            "method": "GET"
+          }
+        }
+      ],
+      "requestId": "0x1791737170cef5b051ff1ad87783d3f717aa680b056a49859f3fb6174c11e3bc",
+      "depositAddress": ""
+    }
+  ],
+  "details": {
+    "operation": "swap",
+    "sender": "0xd8da6bf26964af9d7eed9e03e53415d37aa96045",
+    "recipient": "0xd8da6bf26964af9d7eed9e03e53415d37aa96045",
+    "currencyIn": {
+      "currency": {
+        "chainId": 4663,
+        "address": "0x39dbed3a2bd333467115de45665cc57f813c4571",
+        "symbol": "PONS",
+        "name": "Pons",
+        "decimals": 18,
+        "metadata": {
+          "logoURI": "https://assets.geckoterminal.com/jhitvkisdq8fhxvimdkpcw7y3dx5",
+          "verified": false
+        }
+      },
+      "amount": "5000000000000000000",
+      "amountFormatted": "5.0",
+      "amountUsd": "1.829230",
+      "minimumAmount": "5000000000000000000"
+    },
+    "currencyOut": {
+      "currency": {
+        "chainId": 8453,
+        "address": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+        "symbol": "USDC",
+        "name": "USD Coin",
+        "decimals": 6,
+        "metadata": {
+          "logoURI": "https://coin-images.coingecko.com/coins/images/6319/large/usdc.png?1696506694",
+          "verified": true
+        }
+      },
+      "amount": "1796845",
+      "amountFormatted": "1.796845",
+      "amountUsd": "1.796635",
+      "minimumAmount": "1742940"
+    },
+    "refundCurrency": {
+      "currency": {
+        "chainId": 4663,
+        "address": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+        "symbol": "USDG",
+        "name": "Global Dollar",
+        "decimals": 6,
+        "metadata": {
+          "logoURI": "https://assets.coingecko.com/coins/images/51281/standard/GDN_USDG_Token_200x200.png",
+          "verified": true
+        }
+      },
+      "amount": "1821879",
+      "amountFormatted": "1.821879",
+      "amountUsd": "1.821628",
+      "minimumAmount": "1767222"
+    },
+    "totalImpact": {
+      "usd": "-0.032595",
+      "percent": "-1.78"
+    },
+    "swapImpact": {
+      "usd": "-0.008462",
+      "percent": "-0.46"
+    },
+    "expandedPriceImpact": {
+      "swap": {
+        "usd": "-0.008814"
+      },
+      "execution": {
+        "usd": "-0.021038"
+      },
+      "relay": {
+        "usd": "-0.002743"
+      },
+      "app": {
+        "usd": "0"
+      },
+      "sponsored": {
+        "usd": "0"
+      }
+    },
+    "rate": "0.359369",
+    "slippageTolerance": {
+      "total": "300",
+      "origin": {
+        "usd": "0.054649",
+        "value": "54657",
+        "percent": "3.00"
+      },
+      "destination": {
+        "usd": "0.053719",
+        "value": "53905",
+        "percent": "2.99"
+      }
+    },
+    "timeEstimate": 2,
+    "userBalance": "0",
+    "isFixedRate": false,
+    "route": {
+      "origin": {
+        "inputCurrency": {
+          "currency": {
+            "chainId": 4663,
+            "address": "0x39dbed3a2bd333467115de45665cc57f813c4571",
+            "symbol": "PONS",
+            "name": "Pons",
+            "decimals": 18,
+            "metadata": {
+              "logoURI": "https://assets.geckoterminal.com/jhitvkisdq8fhxvimdkpcw7y3dx5",
+              "verified": false
+            }
+          },
+          "amount": "5000000000000000000",
+          "amountFormatted": "5.0",
+          "amountUsd": "1.829230",
+          "minimumAmount": "5000000000000000000"
+        },
+        "outputCurrency": {
+          "currency": {
+            "chainId": 4663,
+            "address": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+            "symbol": "USDG",
+            "name": "Global Dollar",
+            "decimals": 6,
+            "metadata": {
+              "logoURI": "https://assets.coingecko.com/coins/images/51281/standard/GDN_USDG_Token_200x200.png",
+              "verified": true
+            }
+          },
+          "amount": "1821879",
+          "amountFormatted": "1.821879",
+          "amountUsd": "1.821628",
+          "minimumAmount": "1767222"
+        },
+        "router": "fynd-hosted"
+      },
+      "destination": {
+        "inputCurrency": {
+          "currency": {
+            "chainId": 8453,
+            "address": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+            "symbol": "USDC",
+            "name": "USD Coin",
+            "decimals": 6,
+            "metadata": {
+              "logoURI": "https://coin-images.coingecko.com/coins/images/6319/large/usdc.png?1696506694",
+              "verified": true
+            }
+          },
+          "amount": "1796845",
+          "amountFormatted": "1.796845",
+          "amountUsd": "1.796635",
+          "minimumAmount": "1742940"
+        },
+        "outputCurrency": {
+          "currency": {
+            "chainId": 8453,
+            "address": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+            "symbol": "USDC",
+            "name": "USD Coin",
+            "decimals": 6,
+            "metadata": {
+              "logoURI": "https://coin-images.coingecko.com/coins/images/6319/large/usdc.png?1696506694",
+              "verified": true
+            }
+          },
+          "amount": "1796845",
+          "amountFormatted": "1.796845",
+          "amountUsd": "1.796635",
+          "minimumAmount": "1742940"
+        },
+        "router": "relay"
+      }
+    }
+  },
+  "protocol": {
+    "v2": {
+      "orderId": "0xa9eb1ed8430667a8c9f9dbdd8e8b429a4073d5e41d48f2c8f7d198fc86ed6293",
+      "hubType": "onchain",
+      "orderData": {
+        "version": "v1",
+        "solverChainId": "base",
+        "solver": "0xf70da97812cb96acdf810712aa562db8dfa3dbef",
+        "salt": "0xf943b6dd6b3108a441dd89262f2e8d7a49eaa048b040f528608d016f6e0a887f",
+        "inputs": [
+          {
+            "payment": {
+              "chainId": "robinhood",
+              "currency": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+              "amount": "1821879",
+              "weight": "1"
+            },
+            "refunds": [
+              {
+                "chainId": "robinhood",
+                "recipient": "0xd8da6bf26964af9d7eed9e03e53415d37aa96045",
+                "currency": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+                "minimumAmount": "0",
+                "deadline": 1792341971,
+                "extraData": "0x000000000000000000000000b92fe925dc43a0ecde6c8b1a2709c170ec4fff4f"
+              },
+              {
+                "chainId": "base",
+                "recipient": "0xd8da6bf26964af9d7eed9e03e53415d37aa96045",
+                "currency": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+                "minimumAmount": "0",
+                "deadline": 1792341971,
+                "extraData": "0x000000000000000000000000b92fe925dc43a0ecde6c8b1a2709c170ec4fff4f"
+              }
+            ]
+          }
+        ],
+        "output": {
+          "chainId": "base",
+          "payments": [
+            {
+              "recipient": "0xd8da6bf26964af9d7eed9e03e53415d37aa96045",
+              "currency": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+              "minimumAmount": "1742940",
+              "expectedAmount": "1796845"
+            }
+          ],
+          "calls": [],
+          "deadline": 1792341971,
+          "extraData": "0x000000000000000000000000b92fe925dc43a0ecde6c8b1a2709c170ec4fff4f"
+        },
+        "fees": []
+      },
+      "paymentDetails": {
+        "chainId": "robinhood",
+        "depository": "0x4cd00e387622c35bddb9b4c962c136462338bc31",
+        "currency": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+        "amount": "1821879"
+      }
+    }
+  }
+}

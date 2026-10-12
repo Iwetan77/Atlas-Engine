@@ -1304,7 +1304,14 @@ fn parse_hood_swap(
             }
         }
         _ => HoodPay::Robinhood {
-            transactions: hood_sale_transactions(steps, from, amount_in, order_id)?,
+            transactions: hood_sale_transactions(
+                steps,
+                from,
+                amount_in,
+                order_id,
+                units(&body["protocol"]["v2"]["paymentDetails"]["amount"])
+                    .ok_or(invalid("deposit amount"))?,
+            )?,
         },
     };
     Ok(HoodSwap {
@@ -1326,6 +1333,7 @@ fn hood_sale_transactions(
     from: Origin<'_>,
     amount_in: u128,
     order_id: &str,
+    deposit_amount: u128,
 ) -> Result<Vec<Value>, RelayError> {
     let invalid = RelayError::InvalidResponse;
     let word = |address: &str| {
@@ -1357,6 +1365,14 @@ fn hood_sale_transactions(
             && if last {
                 step["id"] == "deposit"
                     && same(ROBINHOOD_CHAIN_ID, &tx["to"], RECEIVER)
+                    && hood_sale_input(
+                        &data,
+                        from.currency,
+                        from.wallet,
+                        amount_in,
+                        order_id,
+                        deposit_amount,
+                    )
                     && deposit_marks
                         .iter()
                         .all(|mark| data.contains(mark.as_str()))
@@ -1376,6 +1392,191 @@ fn hood_sale_transactions(
         transactions.push(json!({"chain":"robinhood","chainId":ROBINHOOD_CHAIN_ID,"to":to,"data":data,"value":"0"}));
     }
     Ok(transactions)
+}
+
+// Validate the approval proxy's actual transferAndMulticall input, rather than trusting the
+// quote metadata or finding an order id somewhere in opaque calldata. Existing approvals must
+// never let a changed payload pull another token or more than the confirmed sale amount.
+fn hood_sale_input(
+    data: &str,
+    token: &str,
+    wallet: &str,
+    amount: u128,
+    order_id: &str,
+    deposit_amount: u128,
+) -> bool {
+    let checked = || -> Option<()> {
+        let args = data.strip_prefix("0xf9e4bab4")?;
+        if args.len() > 131_072
+            || args.len() % 2 != 0
+            || !args.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        let word = |offset: usize| {
+            let start = offset.checked_mul(2)?;
+            args.get(start..start.checked_add(64)?)
+        };
+        let offset = |at: usize| -> Option<usize> {
+            let n = usize::from_str_radix(word(at)?, 16).ok()?;
+            (n >= 192 && n % 32 == 0 && n < args.len() / 2).then_some(n)
+        };
+        let tokens = offset(0)?;
+        let amounts = offset(32)?;
+        let calls = offset(64)?;
+        let metadata = offset(160)?;
+        // Canonical, disjoint input arrays, followed by the calls and metadata.
+        if tokens != 192 || amounts != 256 || calls != 320 || metadata <= calls {
+            return None;
+        }
+        let one = format!("{:064x}", 1);
+        let token_word = format!("{:0>64}", token.strip_prefix("0x")?.to_ascii_lowercase());
+        if word(tokens)? != one
+            || word(tokens + 32)? != token_word
+            || word(amounts)? != one
+            || word(amounts + 32)? != format!("{amount:064x}")
+        {
+            return None;
+        }
+        // The router cannot silently skip a failed call or attach native value. Offsets and
+        // lengths are checked before slicing, including malformed provider responses.
+        let count = usize::from_str_radix(word(calls)?, 16).ok()?;
+        if count != 3 {
+            return None;
+        }
+        let zero = format!("{:064x}", 0);
+        let mut routed = Vec::new();
+        for i in 0..count {
+            let relative = usize::from_str_radix(word(calls + 32 + i * 32)?, 16).ok()?;
+            if relative % 32 != 0 || relative < count * 32 {
+                return None;
+            }
+            let start = calls.checked_add(32)?.checked_add(relative)?;
+            if start >= metadata || word(start + 32)? != zero || word(start + 64)? != zero {
+                return None;
+            }
+            let bytes = usize::from_str_radix(word(start + 96)?, 16).ok()?;
+            if bytes != 128 {
+                return None;
+            }
+            let bytes = start.checked_add(bytes)?;
+            let len = usize::from_str_radix(word(bytes)?, 16).ok()?;
+            if bytes.checked_add(32)?.checked_add(len)? > metadata {
+                return None;
+            }
+            let encoded = args.get((bytes + 32) * 2..(bytes + 32 + len) * 2)?;
+            routed.push((word(start)?, encoded));
+        }
+        // These addresses are the Relay multicall router and IceCreamSwap guard on Robinhood.
+        // Bind the three calls: exact approval, swap into USDG held by Relay, then this deposit.
+        let router = "0xb92fe925dc43a0ecde6c8b1a2709c170ec4fff4f";
+        let ice = "0x603206d6105217dd972e4ab30676a220ca393346";
+        let allowance = "0x0000000000001ff3684f28c67538d4d072c22734";
+        let tycho = "0x09215a470bd585e59eb3f4b612fbd2678131ff9e";
+        let settler = "0x6aa80dbbed9ae5ab45fbf61f9644fada3b29326e";
+        let address_word = |a: &str| format!("{:0>64}", a.trim_start_matches("0x"));
+        let guard = if routed[1].0 == address_word(ice) {
+            ice
+        } else if routed[1].0 == address_word(allowance) {
+            allowance
+        } else if routed[1].0 == address_word(tycho) {
+            tycho
+        } else {
+            return None;
+        };
+        let approve = format!("095ea7b3{}{amount:064x}", address_word(guard));
+        if routed[0] != (token_word.as_str(), approve.as_str())
+            || routed[2].0 != address_word(router)
+            || deposit_amount == 0
+        {
+            return None;
+        }
+        // The origin swap's confirmed 3% tolerance, in USDG micros. Both supported guards enforce
+        // a positive USDG credit to Relay before the subsequent deposit can run.
+        let minimum = deposit_amount.checked_mul(97)? / 100;
+        let swap = routed[1].1;
+        fn at(body: &str, offset: usize) -> Option<&str> {
+            body.get(offset.checked_mul(2)?..offset.checked_add(32)?.checked_mul(2)?)
+        }
+        if guard == ice {
+            // Official AggregatorGuard.sol decodes these fixed packed offsets and checks the
+            // recipient's balance increase. Source: IceCreamSwapCom/IceCreamSwap-smart-contracts.
+            if !swap.starts_with("3f0bde25")
+                || swap.get(26 * 2..42 * 2)? != format!("{amount:032x}")
+                || u128::from_str_radix(swap.get(42 * 2..58 * 2)?, 16).ok()? < minimum
+                || swap.get(79 * 2..99 * 2)? != &router[2..]
+                || swap.get(99 * 2..119 * 2)? != &token[2..].to_ascii_lowercase()
+                || swap.get(119 * 2..139 * 2)? != &ROBINHOOD_USDG[2..]
+            {
+                return None;
+            }
+        } else if guard == allowance {
+            // 0x AllowanceHolder.exec(operator, token, amount, target, data), calling its pinned
+            // Settler.execute((recipient, buyToken, minAmountOut), actions, metadata).
+            // Sources: 0xProject/0x-settler, IAllowanceHolder.sol and Settler.sol.
+            let outer = swap.strip_prefix("2213bc0b")?;
+            if at(outer, 0)? != address_word(settler)
+                || at(outer, 32)? != token_word
+                || at(outer, 64)? != format!("{amount:064x}")
+                || at(outer, 96)? != address_word(settler)
+                || at(outer, 128)? != format!("{:064x}", 160)
+            {
+                return None;
+            }
+            let len = usize::from_str_radix(at(outer, 160)?, 16).ok()?;
+            let inner = outer.get(384..384usize.checked_add(len.checked_mul(2)?)?)?;
+            let inner = inner.strip_prefix("1fff991f")?;
+            if at(inner, 0)? != address_word(router)
+                || at(inner, 32)? != address_word(ROBINHOOD_USDG)
+                || u128::from_str_radix(at(inner, 64)?, 16).ok()? < minimum
+                || at(inner, 96)? != format!("{:064x}", 160)
+            {
+                return None;
+            }
+        }
+        if guard == tycho {
+            // Verified Robinhood deployment: TychoRouterV3.singleSwap. Its matched source
+            // enforces minAmountOut after fees. See Sourcify chain 4663 / 0x09215a470...131ff9e.
+            let body = swap.strip_prefix("0c1a0ee7")?;
+            if at(body, 0)? != format!("{amount:064x}")
+                || at(body, 32)? != token_word
+                || at(body, 64)? != address_word(ROBINHOOD_USDG)
+                || u128::from_str_radix(at(body, 128)?, 16).ok()? < minimum
+                || at(body, 160)? != address_word(router)
+                || at(body, 192)? != format!("{:064x}", 256)
+                || at(body, 256)? != zero
+                || at(body, 288)? != zero
+                || at(body, 320)? != zero
+                || at(body, 384)? != format!("{:064x}", 160)
+                || at(body, 416)? != zero
+            {
+                return None;
+            }
+        }
+        let deposit = format!(
+            "5a1ee3ac{}{}{}",
+            address_word(&wallet.to_ascii_lowercase()),
+            address_word(ROBINHOOD_USDG),
+            order_id.strip_prefix("0x")?,
+        );
+        // cleanupErc20sViaCall([USDG], [DEPOSITORY], [depositErc20(wallet, USDG, id)], [0]).
+        // Zero sweeps the actual swap output; the preceding guard requires a positive credit.
+        let cleanup = format!(
+            "73b7bb2f{a:064x}{b:064x}{c:064x}{d:064x}{one}{usd}{one}{to}{one}{offset:064x}{len:064x}{deposit}{padding}{one}{zero}",
+            a = 128, b = 192, c = 256, d = 480,
+            usd = address_word(ROBINHOOD_USDG), to = address_word(DEPOSITORY),
+            offset = 32, len = 100, padding = "0".repeat(56),
+        );
+        if routed[2].1 != cleanup {
+            return None;
+        }
+        let len = usize::from_str_radix(word(metadata)?, 16).ok()?;
+        if metadata.checked_add(32)?.checked_add(len)? > args.len() / 2 {
+            return None;
+        }
+        Some(())
+    };
+    checked().is_some()
 }
 
 // Relay's order for a Robinhood swap: paid into Relay's depository from the user's wallet (on
@@ -1927,6 +2128,7 @@ mod tests {
             "base" => include_str!("fixtures/relay-base-hood.json"),
             "solana" => include_str!("fixtures/relay-solana-hood.json"),
             "to-base" => include_str!("fixtures/relay-hood-base.json"),
+            "tycho" => include_str!("fixtures/relay-hood-base-tycho.json"),
             _ => include_str!("fixtures/relay-hood-solana.json"),
         })
         .unwrap()
@@ -2048,10 +2250,137 @@ mod tests {
     }
 
     #[test]
+    fn robinhood_sale_calldata_cannot_pull_more_even_with_an_existing_approval() {
+        for (name, dest) in [
+            ("to-base", base_dest(HOOD_EVM)),
+            ("to-solana", solana_dest(SOLANA)),
+            ("tycho", base_dest(HOOD_EVM)),
+        ] {
+            let mut body = hood_quote(name);
+            // Relay may omit approve when this wallet already gave the proxy an allowance.
+            body["steps"].as_array_mut().unwrap().remove(0);
+            assert!(parse_hood_swap(&body, from_hood(), dest, PONS_IN).is_ok());
+            let original = body["steps"][0]["items"][0]["data"]["data"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            // The input token and amount are encoded after two single-element array lengths.
+            for (word, replacement) in [
+                (7, format!("{:0>64}", &OTHER[2..])),
+                (9, format!("{:064x}", PONS_IN + 1)),
+                (0, "f".repeat(64)),
+                (1, format!("{:064x}", 192)),
+            ] {
+                let mut bad = body.clone();
+                let mut changed = original.clone();
+                let start = 10 + word * 64;
+                changed.replace_range(start..start + 64, &replacement);
+                bad["steps"][0]["items"][0]["data"]["data"] = json!(changed);
+                assert!(
+                    parse_hood_swap(&bad, from_hood(), dest, PONS_IN).is_err(),
+                    "{name}, word {word}"
+                );
+            }
+            let mut bad = body.clone();
+            bad["steps"][0]["items"][0]["data"]["data"] =
+                json!(original.replacen("0xf9e4bab4", "0x00000000", 1));
+            assert!(parse_hood_swap(&bad, from_hood(), dest, PONS_IN).is_err());
+        }
+    }
+
+    #[test]
+    fn malformed_robinhood_proxy_calldata_fails_closed() {
+        let fixture = hood_quote("to-base");
+        let order = fixture["protocol"]["v2"]["orderId"].as_str().unwrap();
+        let paid = units(&fixture["protocol"]["v2"]["paymentDetails"]["amount"]).unwrap();
+        for data in ["", "0x", "0xf9e4bab4", "0xf9e4bab4zz", "0xf9e4bab4f"] {
+            assert!(!hood_sale_input(data, PONS, HOOD_EVM, PONS_IN, order, paid));
+        }
+        let fixture = hood_quote("to-base");
+        let data = fixture["steps"][1]["items"][0]["data"]["data"]
+            .as_str()
+            .unwrap();
+        assert!(hood_sale_input(data, PONS, HOOD_EVM, PONS_IN, order, paid));
+        let metadata = usize::from_str_radix(&data[330..394], 16).unwrap();
+        let length_at = 10 + metadata * 2;
+        let length = usize::from_str_radix(&data[length_at..length_at + 64], 16).unwrap();
+        let required = length_at + 64 + length * 2;
+        for len in 10..required {
+            assert!(
+                !hood_sale_input(&data[..len], PONS, HOOD_EVM, PONS_IN, order, paid),
+                "truncated at {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn robinhood_swap_and_deposit_cannot_redirect_or_skip_the_confirmed_proceeds() {
+        for (name, dest) in [
+            ("to-base", base_dest(HOOD_EVM)),
+            ("to-solana", solana_dest(SOLANA)),
+            ("tycho", base_dest(HOOD_EVM)),
+        ] {
+            let body = hood_quote(name);
+            let original = body["steps"][1]["items"][0]["data"]["data"]
+                .as_str()
+                .unwrap();
+            let deposit = original.find("5a1ee3ac").unwrap();
+            let mut edits = vec![
+                (deposit + 8, deposit + 72, format!("{:0>64}", &OTHER[2..])),
+                (deposit + 136, deposit + 200, "f".repeat(64)),
+            ];
+            if let Some(swap) = original.find("3f0bde25") {
+                edits.extend([
+                    (
+                        swap + 26 * 2,
+                        swap + 42 * 2,
+                        format!("{:032x}", PONS_IN + 1),
+                    ),
+                    (swap + 42 * 2, swap + 58 * 2, "0".repeat(32)),
+                    (swap + 79 * 2, swap + 99 * 2, OTHER[2..].to_owned()),
+                    (swap + 99 * 2, swap + 119 * 2, OTHER[2..].to_owned()),
+                    (swap + 119 * 2, swap + 139 * 2, OTHER[2..].to_owned()),
+                ]);
+            } else if original.contains("2213bc0b") {
+                let outer = original.find("2213bc0b").unwrap();
+                let inner = original.find("1fff991f").unwrap();
+                edits.extend([
+                    (outer + 8, outer + 72, format!("{:0>64}", &OTHER[2..])),
+                    (outer + 136, outer + 200, format!("{:064x}", PONS_IN + 1)),
+                    (outer + 200, outer + 264, format!("{:0>64}", &OTHER[2..])),
+                    (inner + 8, inner + 72, format!("{:0>64}", &OTHER[2..])),
+                    (inner + 72, inner + 136, format!("{:0>64}", &OTHER[2..])),
+                    (inner + 136, inner + 200, "0".repeat(64)),
+                ]);
+            } else {
+                let swap = original.find("0c1a0ee7").unwrap();
+                edits.extend([
+                    (swap + 8, swap + 72, format!("{:064x}", PONS_IN + 1)),
+                    (swap + 72, swap + 136, format!("{:0>64}", &OTHER[2..])),
+                    (swap + 136, swap + 200, format!("{:0>64}", &OTHER[2..])),
+                    (swap + 264, swap + 328, "0".repeat(64)),
+                    (swap + 328, swap + 392, format!("{:0>64}", &OTHER[2..])),
+                ]);
+            }
+            for (start, end, value) in edits {
+                let mut bad = body.clone();
+                let mut changed = original.to_owned();
+                changed.replace_range(start..end, &value);
+                bad["steps"][1]["items"][0]["data"]["data"] = json!(changed);
+                assert!(
+                    parse_hood_swap(&bad, from_hood(), dest, PONS_IN).is_err(),
+                    "{name}, at {start}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_robinhood_sale_approves_exactly_the_coin_sold_then_deposits_its_order() {
         for (name, dest) in [
             ("to-base", base_dest(HOOD_EVM)),
             ("to-solana", solana_dest(SOLANA)),
+            ("tycho", base_dest(HOOD_EVM)),
         ] {
             let body = hood_quote(name);
             let swap = parse_hood_swap(&body, from_hood(), dest, PONS_IN).unwrap();

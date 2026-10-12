@@ -1038,6 +1038,15 @@ pub(super) struct PlannedTransfer {
     // Cash the planned gas top-up turns into SOL (USDC units), for the receipt once it lands.
     #[serde(default)]
     topup: u128,
+    // New bank plans cap additional USDC across retries. None keeps older transfers compatible.
+    #[serde(default)]
+    cash_fee_limit: Option<u128>,
+    #[serde(default)]
+    bank_ngn_per_usdc: Option<u128>,
+    // A submitted gas purchase keeps its budget across an unresolved provider response.
+    // A retry cannot spend that cash a second time.
+    #[serde(default)]
+    gas_committed: u128,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct BaseTopup {
@@ -3179,10 +3188,15 @@ async fn note_gas_topup(state: &AppState, owner: &str, intent_id: &str, usdc: u1
 // with "insufficient funds for rent", so it isn't sent.
 async fn transfer_fee_ready(
     state: &AppState,
-    intent: &StoredIntent,
+    intent: &mut StoredIntent,
     signed: &[Signed],
 ) -> Result<(), String> {
     if let (Some(request_id), Some(tx)) = (&intent.gas_request_id, signed.first()) {
+        if let Some(transfer) = intent.transfer.as_mut() {
+            if transfer.cash_fee_limit.is_some() {
+                transfer.gas_committed = transfer.topup;
+            }
+        }
         state
             .markets
             .jupiter
@@ -3344,23 +3358,48 @@ pub(super) async fn plan_solana_transfer(
     retry: bool,
 ) -> Result<(String, Vec<Value>, u128), ApiError> {
     let steps = solana_transfer_steps(state, &from, to, amount, true).await?;
-    insert_transfer(state, owner, from, to, amount, retry, false, steps).await
+    insert_transfer(state, owner, from, to, amount, retry, false, steps, None).await
 }
 
-// USDC from a Solana wallet to an address on Base, bridged by Relay straight there (a bank payout
-// address): about two cents and two seconds, with no new token account to pay rent for (opening one
-// on Solana costs about 0.002 SOL, ten times as much). The phone signs one Solana transaction, the
-// engine lands it, and Relay delivers exactly `amount`. Returns the intent, what the app signs, and
-// what the network costs the sender (USDC units).
-pub(super) async fn plan_solana_relay(
+// A direct bank transfer reports only the new USDC it spends: reserve SOL is already owned.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn plan_solana_bank_transfer(
     state: &AppState,
     owner: String,
     from: String,
-    base_to: &str,
+    to: &str,
     amount: u128,
+    quoted_network: u128,
+    ngn_per_usdc: u128,
 ) -> Result<(String, Vec<Value>, u128), ApiError> {
-    let steps = solana_relay_steps(state, &from, base_to, amount, true).await?;
-    insert_transfer(state, owner, from, base_to, amount, true, true, steps).await
+    let mut steps =
+        solana_transfer_steps_with_accounting(state, &from, to, amount, true, true).await?;
+    let cash = steps.cash_charge();
+    checked_transfer_cash_fee(Some(quoted_network), 0, cash)?;
+    steps.network_fee = cash;
+    // Cap retries at what the final confirmation actually shows, even if the quote allowed more.
+    insert_transfer(
+        state,
+        owner,
+        from,
+        to,
+        amount,
+        true,
+        false,
+        steps,
+        Some((cash, ngn_per_usdc)),
+    )
+    .await
+}
+
+fn checked_transfer_cash_fee(limit: Option<u128>, paid: u128, next: u128) -> Result<(), ApiError> {
+    if limit.is_some_and(|limit| paid.checked_add(next).is_none_or(|total| total > limit)) {
+        return Err((
+            StatusCode::CONFLICT,
+            "The network fee changed. Check a fresh quote before sending.".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3373,6 +3412,7 @@ async fn insert_transfer(
     retry: bool,
     base: bool,
     steps: SolanaTransfer,
+    bank_fee: Option<(u128, u128)>,
 ) -> Result<(String, Vec<Value>, u128), ApiError> {
     let SolanaTransfer {
         gas,
@@ -3416,6 +3456,9 @@ async fn insert_transfer(
                     kora,
                     base,
                     topup,
+                    cash_fee_limit: bank_fee.map(|(limit, _)| limit),
+                    bank_ngn_per_usdc: bank_fee.map(|(_, rate)| rate),
+                    gas_committed: 0,
                 }),
                 base_topup: None,
             },
@@ -3455,6 +3498,13 @@ pub(super) struct SolanaTransfer {
     topup: u128,
 }
 
+impl SolanaTransfer {
+    fn cash_charge(&self) -> u128 {
+        self.topup
+            .saturating_add(self.kora.as_ref().map_or(0, |k| u128::from(k.fee_units)))
+    }
+}
+
 // The transfer, paid for one way or another and never by asking anyone for gas: the wallet's own
 // SOL; else a gasless top-up from its cash (Jupiter, asked a few times), which leaves SOL for next
 // time; else Kora, whose fee payer fronts the SOL and rent inside the transfer for a little USDC.
@@ -3467,6 +3517,17 @@ async fn solana_transfer_steps(
     to: &str,
     amount: u128,
     topup: bool,
+) -> Result<SolanaTransfer, ApiError> {
+    solana_transfer_steps_with_accounting(state, from, to, amount, topup, false).await
+}
+
+async fn solana_transfer_steps_with_accounting(
+    state: &AppState,
+    from: &str,
+    to: &str,
+    amount: u128,
+    topup: bool,
+    cash_only: bool,
 ) -> Result<SolanaTransfer, ApiError> {
     let (transaction, creates) = state
         .solana_mainnet
@@ -3482,7 +3543,7 @@ async fn solana_transfer_steps(
     } else {
         GAS_FLOOR_LAMPORTS
     };
-    let rent = if creates {
+    let rent = if creates && !cash_only {
         account_rent_usd(state).await
     } else {
         0
@@ -3697,42 +3758,28 @@ pub(super) async fn solana_transfer_fee_estimate(state: &AppState, to: &str) -> 
     }
 }
 
-// The direct Solana bank quote must include a fresh recipient's rent. Unknown SOL prices are
-// unavailable quotes, not a zero fee that would accidentally beat Relay.
+// Cost a fresh Daya recipient conservatively, but do not convert existing SOL into a USDC fee.
 pub(super) async fn solana_bank_transfer_estimate(
     state: &AppState,
     owner: &str,
     cash: u128,
     amount: u128,
-) -> Option<u128> {
-    let (rent, sol) = tokio::join!(
-        account_rent_usd_checked(state),
-        state.solana_mainnet.owner_sol_balance(owner),
-    );
-    let rent = rent?;
-    let sol = sol.ok()?;
+) -> Result<Option<u128>, ApiError> {
+    let sol = state
+        .solana_mainnet
+        .owner_sol_balance(owner)
+        .await
+        .map_err(unavailable)?;
     if sol >= NEW_ACCOUNT_FLOOR_LAMPORTS {
-        Some(rent)
-    } else if cash >= amount.saturating_add(KORA_FEE_GUESS_USDC.max(rent)) {
-        // Kora can repay its fee payer in USDC if a gasless top-up isn't available. The actual fee
-        // is checked against this quote before signing; it can never quietly expand the charge.
-        Some(rent.max(KORA_FEE_GUESS_USDC))
+        return Ok(Some(0));
+    }
+    let topup = topup_usdc_for(state, NEW_ACCOUNT_FLOOR_LAMPORTS - sol).await;
+    let network = if cash >= amount.saturating_add(topup) {
+        topup
     } else {
-        None
-    }
-}
-
-pub(super) async fn solana_transfer_fee_estimate_checked(
-    state: &AppState,
-    to: &str,
-) -> Result<u128, ApiError> {
-    match state.solana_mainnet.has_usdc_account(to).await {
-        Ok(true) => Ok(0),
-        Ok(false) => account_rent_usd_checked(state).await.ok_or_else(|| {
-            unavailable("Couldn't price this transfer's network fee. Try again shortly.")
-        }),
-        Err(error) => Err(unavailable(error)),
-    }
+        KORA_FEE_GUESS_USDC
+    };
+    Ok((cash >= amount.saturating_add(network)).then_some(network))
 }
 
 // That rent in USD micros at SOL's live price (0 for older callers when it is unavailable).
@@ -3782,6 +3829,46 @@ pub(super) async fn wallet_pays_gas(state: &AppState, wallet: &str) -> bool {
     base_eth(state, wallet)
         .await
         .is_some_and(|wei| wei >= BASE_GAS_FLOOR_WEI)
+}
+
+// Bank sends consume the existing ETH reserve before purchasing any more.
+fn base_bank_cash_fee(eth: u128, cash: u128, amount: u128) -> Option<u128> {
+    if eth >= BASE_GAS_FLOOR_WEI {
+        Some(0)
+    } else {
+        (cash >= amount.saturating_add(BASE_GAS_REFILL_USDC)).then_some(BASE_GAS_REFILL_USDC)
+    }
+}
+
+pub(super) async fn base_bank_transfer_estimate(
+    state: &AppState,
+    wallet: &str,
+    cash: u128,
+    amount: u128,
+) -> Result<Option<u128>, ApiError> {
+    let eth = base_eth(state, wallet)
+        .await
+        .ok_or_else(|| unavailable("Couldn't check this transfer's network fee. Try again."))?;
+    Ok(base_bank_cash_fee(eth, cash, amount))
+}
+
+pub(super) async fn bank_hop_source_fee(
+    state: &AppState,
+    solana: Option<&str>,
+) -> Result<u128, ApiError> {
+    let Some(wallet) = solana else {
+        return Ok(0);
+    };
+    let sol = state
+        .solana_mainnet
+        .owner_sol_balance(wallet)
+        .await
+        .map_err(unavailable)?;
+    Ok(if sol >= GAS_FLOOR_LAMPORTS {
+        0
+    } else {
+        topup_usdc_for(state, GAS_FLOOR_LAMPORTS - sol).await
+    })
 }
 
 // The Base transactions that refill the gas tank when it's low and the user has USDC to spare beyond
@@ -3978,7 +4065,29 @@ pub(super) async fn cash_for_base(
 struct BaseFundingQuote {
     send: u128,
     fee: u128,
+    // Layerswap refuel buys ETH separately; Relay already includes destination gas in its fee.
+    gas_cash: u128,
     relay: Option<engine_execution::relay_link::SolanaMove>,
+}
+impl BaseFundingQuote {
+    fn bank_fee(&self) -> u128 {
+        self.fee.saturating_add(self.gas_cash)
+    }
+}
+
+pub(super) async fn cash_for_bank_base(
+    state: &AppState,
+    evm: &str,
+    solana: Option<&str>,
+    needed: u128,
+    currency: &str,
+    rate: u128,
+) -> Result<Option<(u128, u128)>, ApiError> {
+    Ok(
+        base_funding_quote(state, evm, solana, needed, currency, rate, false)
+            .await?
+            .map(|quote| (quote.send, quote.bank_fee())),
+    )
 }
 
 fn relay_base_funding_amounts(held: u128, needed: u128, refuel: bool) -> (u128, u128) {
@@ -4026,6 +4135,7 @@ async fn base_funding_quote(
                 return Ok(Some(BaseFundingQuote {
                     send: moved.amount_in_units,
                     fee: moved.amount_in_units.saturating_sub(land),
+                    gas_cash: 0,
                     relay: Some(moved),
                 }));
             }
@@ -4046,6 +4156,7 @@ async fn base_funding_quote(
     Ok(Some(BaseFundingQuote {
         send,
         fee,
+        gas_cash: refuel_cost,
         relay: None,
     }))
 }
@@ -4112,6 +4223,38 @@ pub(super) async fn plan_base_with_cash(
     currency: &str,
     rate: u128,
 ) -> Result<(String, Vec<Value>, Option<u128>), ApiError> {
+    plan_base_with_cash_mode(
+        state, owner, evm, solana, txs, needed, currency, rate, false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn plan_base_bank_with_cash(
+    state: &AppState,
+    owner: String,
+    evm: String,
+    solana: Option<String>,
+    txs: Vec<(String, String)>,
+    needed: u128,
+    currency: &str,
+    rate: u128,
+) -> Result<(String, Vec<Value>, Option<u128>), ApiError> {
+    plan_base_with_cash_mode(state, owner, evm, solana, txs, needed, currency, rate, true).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn plan_base_with_cash_mode(
+    state: &AppState,
+    owner: String,
+    evm: String,
+    solana: Option<String>,
+    txs: Vec<(String, String)>,
+    needed: u128,
+    currency: &str,
+    rate: u128,
+    bank: bool,
+) -> Result<(String, Vec<Value>, Option<u128>), ApiError> {
     let as_base = |txs: &[(String, String)]| -> Vec<Value> {
         txs.iter()
             .map(
@@ -4121,7 +4264,11 @@ pub(super) async fn plan_base_with_cash(
     };
     // A low gas tank refills itself from the user's USDC first; an empty one gets ETH on a hop from
     // Solana (Layerswap refuel) when there's Solana cash to hop.
-    let refill = base_gas_refill(state, &evm, needed).await;
+    let refill = if bank {
+        Vec::new()
+    } else {
+        base_gas_refill(state, &evm, needed).await
+    };
     let txs = if refill.is_empty() {
         txs
     } else {
@@ -4143,7 +4290,7 @@ pub(super) async fn plan_base_with_cash(
         let steps = topup_steps(&topup);
         intent.base_topup = Some(topup);
         state.markets.save_intent(&intent_id, &intent).await?;
-        return Ok((intent_id, steps, None));
+        return Ok((intent_id, steps, bank.then_some(BASE_GAS_REFILL_USDC)));
     }
     // Otherwise an empty tank gets ETH on the same cash hop from Solana. Atlas never pays gas:
     // with neither, the user is asked for a little more.
@@ -4186,7 +4333,11 @@ pub(super) async fn plan_base_with_cash(
     ))?;
     let intent_id = id("intent");
     let send = funding_quote.send;
-    let fee = funding_quote.fee;
+    let fee = if bank {
+        funding_quote.bank_fee()
+    } else {
+        funding_quote.fee
+    };
     let (request, amount, transaction, relay) = if let Some(moved) = funding_quote.relay {
         let transaction = state
             .solana_mainnet
@@ -4213,11 +4364,13 @@ pub(super) async fn plan_base_with_cash(
         .owner_sol_balance(&sol)
         .await
         .map_err(unavailable)?;
+    let mut source_topup = 0;
     let gas = if source_sol < GAS_FLOOR_LAMPORTS {
         let topup_units = topup_usdc_for(state, GAS_FLOOR_LAMPORTS - source_sol).await;
         if !base_funding_cost_fits(solana_cash(state, &sol).await, amount, topup_units) {
             return Err(short_of_cash());
         }
+        source_topup = topup_units;
         Some(
             gasless_topup_order(state, &sol, topup_units)
                 .await
@@ -4272,7 +4425,11 @@ pub(super) async fn plan_base_with_cash(
         transactions.push(json!({"chain":"solana","transaction":gas_tx,"submit":"engine"}));
     }
     transactions.push(json!({"chain":"solana","transaction":transaction,"submit":"engine"}));
-    Ok((intent_id, transactions, Some(fee)))
+    Ok((
+        intent_id,
+        transactions,
+        Some(fee.saturating_add(if bank { source_topup } else { 0 })),
+    ))
 }
 
 // A Solana swap from USDC into `buy_mint` (Earn into Jupiter Lend) paid with Base cash (`send`, `fee`
@@ -5130,7 +5287,7 @@ pub(super) async fn signed(
                 Some(kora) => {
                     kora_transfer_ready(&state, kora, &updated.wallet, &body.signed).await
                 }
-                None => transfer_fee_ready(&state, &updated, &body.signed).await,
+                None => transfer_fee_ready(&state, &mut updated, &body.signed).await,
             };
             if let Err(reason) = ready {
                 eprintln!(
@@ -5149,7 +5306,12 @@ pub(super) async fn signed(
                 state.markets.save_intent(&intent_id, &updated).await?;
                 return Ok(Json(updated.status));
             }
-            if updated.gas_request_id.is_some() {
+            if updated.gas_request_id.is_some()
+                && updated
+                    .transfer
+                    .as_ref()
+                    .is_none_or(|t| t.cash_fee_limit.is_none())
+            {
                 let usdc = updated.transfer.as_ref().map_or(0, |t| t.topup);
                 note_gas_topup(&state, &updated.owner, &intent_id, usdc).await;
             }
@@ -5606,8 +5768,24 @@ pub(super) async fn next_transactions(
         let fresh = if planned.base {
             solana_relay_steps(&state, &intent.wallet, &planned.to, planned.amount, false).await
         } else {
-            solana_transfer_steps(&state, &intent.wallet, &planned.to, planned.amount, false).await
+            solana_transfer_steps_with_accounting(
+                &state,
+                &intent.wallet,
+                &planned.to,
+                planned.amount,
+                false,
+                planned.cash_fee_limit.is_some(),
+            )
+            .await
         };
+        let fresh = fresh.and_then(|steps| {
+            checked_transfer_cash_fee(
+                planned.cash_fee_limit,
+                planned.gas_committed,
+                steps.cash_charge(),
+            )?;
+            Ok(steps)
+        });
         let steps = match fresh {
             Ok(steps) => steps,
             Err((code, reason)) => {
@@ -5619,6 +5797,15 @@ pub(super) async fn next_transactions(
                 return Err((code, reason));
             }
         };
+        if let Some(rate) = planned.bank_ngn_per_usdc {
+            if let Some(mut receipt) = state.history.find(&intent.owner, &intent_id).await? {
+                receipt.set_bank_network_fee(
+                    planned.gas_committed.saturating_add(steps.cash_charge()),
+                    rate,
+                );
+                state.history.put(&receipt).await?;
+            }
+        }
         intent.gas_request_id = steps.gas.as_ref().map(|(id, _)| id.clone());
         if let Some(t) = intent.transfer.as_mut() {
             t.lamports = steps.lamports;
@@ -6796,6 +6983,87 @@ mod tests {
         assert!(old.fee_preview.is_none() && old.fee_reserve.is_none());
     }
     #[test]
+    fn bank_consolidation_counts_refuel_once_and_does_not_charge_retained_cash_as_fees() {
+        let quote = BaseFundingQuote {
+            send: 2_080_000,
+            fee: 30_000,
+            gas_cash: BASE_REFUEL_USDC,
+            relay: None,
+        };
+        assert_eq!(quote.bank_fee(), 530_000);
+        // Delivery fees exclude the retained funding cushion in send.
+        assert!(quote.bank_fee() < quote.send - 1_000_000);
+        let no_refuel = BaseFundingQuote {
+            gas_cash: 0,
+            ..quote
+        };
+        assert_eq!(no_refuel.bank_fee(), 30_000);
+    }
+
+    #[test]
+    fn base_bank_sends_use_existing_gas_without_a_proactive_cash_refill() {
+        assert_eq!(
+            base_bank_cash_fee(BASE_GAS_FLOOR_WEI, 1_100_000, 1_100_000),
+            Some(0)
+        );
+        assert_eq!(
+            base_bank_cash_fee(BASE_GAS_REFILL_AT_WEI - 1, 1_600_000, 1_100_000),
+            Some(0)
+        );
+        assert_eq!(base_bank_cash_fee(0, 1_600_000, 1_100_000), Some(500_000));
+        assert_eq!(base_bank_cash_fee(0, 1_100_000, 1_100_000), None);
+    }
+
+    #[test]
+    fn bank_reserve_sol_is_not_an_extra_usdc_charge_even_for_new_account_rent() {
+        let mut steps = SolanaTransfer {
+            gas: None,
+            transaction: "native".into(),
+            network_fee: 300_000,
+            lamports: NEW_ACCOUNT_FLOOR_LAMPORTS,
+            kora: None,
+            topup: 0,
+        };
+        assert_eq!(steps.cash_charge(), 0);
+        steps.topup = 500_000;
+        assert_eq!(steps.cash_charge(), 500_000); // Count the USDC refill once, not refill plus rent.
+        steps.topup = 0;
+        steps.kora = Some(engine_execution::kora::Transfer {
+            transaction: "sponsored".into(),
+            payer: "payer".into(),
+            payment: "USDC".into(),
+            fee_units: 302_000,
+            last_valid_block_height: 100,
+        });
+        assert_eq!(steps.cash_charge(), 302_000);
+    }
+
+    #[test]
+    fn bank_retry_cannot_add_cash_to_a_free_network_fee_or_double_spend_a_refill() {
+        assert!(checked_transfer_cash_fee(Some(0), 0, 0).is_ok());
+        assert!(checked_transfer_cash_fee(Some(0), 0, 1).is_err());
+        assert!(checked_transfer_cash_fee(Some(500_000), 500_000, 0).is_ok());
+        assert!(checked_transfer_cash_fee(Some(500_000), 500_000, 302_000).is_err());
+        assert!(checked_transfer_cash_fee(Some(500_000), 0, 302_000).is_ok());
+        assert!(checked_transfer_cash_fee(Some(u128::MAX), u128::MAX, 1).is_err());
+        assert!(checked_transfer_cash_fee(None, 500_000, 302_000).is_ok()); // Legacy plans.
+    }
+
+    #[test]
+    fn stored_relay_transfers_keep_their_route_and_load_without_new_bank_fields() {
+        let legacy = serde_json::json!({
+            "to":"0xbase-payout", "amount":1_100_000, "lamports":1_000_000,
+            "retry":true, "base":true, "topup":0,
+        });
+        let planned: PlannedTransfer = serde_json::from_value(legacy).unwrap();
+        assert!(planned.base);
+        assert!(planned.retry);
+        assert!(planned.cash_fee_limit.is_none());
+        assert!(planned.bank_ngn_per_usdc.is_none());
+        assert_eq!(planned.gas_committed, 0);
+    }
+
+    #[test]
     fn a_top_up_covers_a_new_accounts_rent_at_any_sol_price() {
         // 6 Oct, SOL $121: the usual $0.50 buys ~4.1M lamports, more than the 3M a new account needs.
         assert_eq!(
@@ -6825,6 +7093,9 @@ mod tests {
             kora: None,
             base: false,
             topup: 0,
+            cash_fee_limit: None,
+            bank_ngn_per_usdc: None,
+            gas_committed: 0,
         });
         intent.status.stage = "validate".into();
         intent.status.state = "pending".into();

@@ -5474,7 +5474,7 @@ async fn execute_hood_buy(
             .await
     }
     .map_err(unavailable)?;
-    if swap.minimum_out_units < stored.minimum_out.saturating_mul(99) / 100 {
+    if swap.minimum_out_units < stored.minimum_out {
         return Err(conflict("route price changed; request a fresh quote"));
     }
     let balance = if stored.from_solana {
@@ -5619,7 +5619,7 @@ async fn execute_hood_sale(
         ));
     }
     let swap = hood_cash_quote(state, user, &stored.wallet, &contract, stored.amount).await?;
-    if swap.minimum_out_units < stored.minimum_out.saturating_mul(99) / 100 {
+    if swap.minimum_out_units < stored.minimum_out {
         return Err(conflict("route price changed; request a fresh quote"));
     }
     let HoodPay::Robinhood { transactions } = swap.pay else {
