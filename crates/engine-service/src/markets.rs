@@ -2823,8 +2823,11 @@ pub(super) async fn quote(
     let (actual_in, actual_out, fee_units) =
         venue_quote(&state.markets, &a, &req.side, input).await?;
     // A top-up the confirm will add for an empty gas tank: a fee on top of the trade, never inside it.
+    // A Base buy's cash leaves from Solana, so that's the tank it may need to fill.
     let gas_topup_units = if reserve_cash > 0 {
         reserve_cash
+    } else if req.side == "buy" && a.chain == "base" {
+        solana_gas_topup_estimate(&state, &user, actual_in).await
     } else {
         planned_gas_topup(
             &state,
@@ -2856,40 +2859,16 @@ pub(super) async fn quote(
     }
     let mut funding_units = 0;
     let mut funding_fee = 0;
-    if let Some(held) = spot_available(&state, &a, &req.side, &user).await {
-        if held < cash_needed && req.side == "buy" && a.chain == "base" {
-            (funding_units, funding_fee) =
-                base_cash_from_solana(&state, &user, held, cash_needed, &req.amount.currency, rate)
-                    .await?;
-        } else if held < cash_needed && req.side == "buy" && a.chain == "solana" {
-            let base_cash = match user.evm_wallet.as_deref().filter(|w| !w.is_empty()) {
-                Some(evm) => state
-                    .markets
-                    .base
-                    .balance_of(BASE_USDC, evm)
-                    .await
-                    .unwrap_or(0),
-                None => 0,
-            };
-            let (send, fee) = funding_for(
-                &state,
-                user.evm_wallet.as_deref().filter(|w| !w.is_empty()),
-                user.solana_wallet.as_deref().filter(|w| !w.is_empty()),
-                cash_needed - held,
-            )
-            .await?;
-            if base_cash < send {
-                return Err(not_enough_cash(
-                    held + base_cash,
-                    &req.amount.currency,
-                    rate,
-                ));
-            }
-            funding_units = send;
-            funding_fee = fee;
-        } else if held < cash_needed {
+    if req.side == "buy" && a.chain == "base" {
+        // Buys are paid from Trading (the Solana wallet's cash), so a Base coin's whole price comes
+        // over from there first, whatever Spendable holds.
+        (funding_units, funding_fee) =
+            base_cash_from_solana(&state, &user, 0, cash_needed, &req.amount.currency, rate)
+                .await?;
+    } else if let Some(held) = spot_available(&state, &a, &req.side, &user).await {
+        if held < cash_needed {
             return Err(if req.side == "buy" {
-                short_of_cash()
+                not_enough_trading(held, &req.amount.currency, rate)
             } else {
                 let worth = mul_div_units(held, stable_units, asset_units);
                 (
@@ -2981,6 +2960,30 @@ async fn planned_gas_topup(
             0
         };
     }
+    let Some(owner) = user.solana_wallet.as_deref().filter(|w| !w.is_empty()) else {
+        return 0;
+    };
+    let Ok(sol) = state.solana_mainnet.owner_sol_balance(owner).await else {
+        return 0;
+    };
+    if sol >= GAS_FLOOR_LAMPORTS {
+        return 0;
+    }
+    let usdc = topup_usdc_for(state, GAS_FLOOR_LAMPORTS - sol).await;
+    if solana_cash(state, owner).await < spends.saturating_add(usdc) {
+        return 0;
+    }
+    usdc
+}
+
+// The SOL top-up a Solana step will buy from Trading's cash (beyond `spends`) when the wallet is
+// below the gas floor: what planned_gas_topup says for a Solana coin. 0 when none is needed or the
+// cash can't carry one (the step then says so).
+async fn solana_gas_topup_estimate(
+    state: &AppState,
+    user: &app_balance::VerifiedWallets,
+    spends: u128,
+) -> u128 {
     let Some(owner) = user.solana_wallet.as_deref().filter(|w| !w.is_empty()) else {
         return 0;
     };
@@ -3092,7 +3095,7 @@ async fn base_cash_from_solana(
         return Err(short_of_cash());
     };
     let sol_cash = solana_cash(state, sol).await;
-    let land = needed - held + 10_000;
+    let land = needed.saturating_sub(held) + 10_000;
     let gas = if wallet_pays_gas(state, evm).await {
         0
     } else {
@@ -3100,7 +3103,7 @@ async fn base_cash_from_solana(
     };
     let reserve = solana_fee_reserve(state, sol).await;
     if sol_cash < land + gas + reserve {
-        return Err(not_enough_cash(held + sol_cash, currency, rate));
+        return Err(not_enough_trading(sol_cash, currency, rate));
     }
     let moved = state
         .relay_link
@@ -3108,7 +3111,7 @@ async fn base_cash_from_solana(
         .await
         .map_err(|_| unavailable("Couldn't move your cash right now; try again shortly"))?;
     if sol_cash < moved.amount_in_units + reserve {
-        return Err(not_enough_cash(held + sol_cash, currency, rate));
+        return Err(not_enough_trading(sol_cash, currency, rate));
     }
     Ok((moved.amount_in_units, moved.amount_in_units - land))
 }
@@ -3600,38 +3603,6 @@ pub(super) async fn plan_solana_transfer(
     .await
 }
 
-// A direct bank transfer reports only the new USDC it spends: reserve SOL is already owned.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn plan_solana_bank_transfer(
-    state: &AppState,
-    owner: String,
-    from: String,
-    to: &str,
-    amount: u128,
-    quoted_network: u128,
-    ngn_per_usdc: u128,
-) -> Result<(String, Vec<Value>, u128), ApiError> {
-    let mut steps =
-        solana_transfer_steps_with_accounting(state, &from, to, amount, true, true).await?;
-    let cash = steps.cash_charge();
-    checked_transfer_cash_fee(Some(quoted_network), 0, cash)?;
-    steps.network_fee = cash;
-    // Cap retries at what the final confirmation actually shows, even if the quote allowed more.
-    insert_transfer(
-        state,
-        owner,
-        from,
-        to,
-        amount,
-        true,
-        false,
-        steps,
-        Some(cash),
-        Some(ngn_per_usdc),
-    )
-    .await
-}
-
 fn checked_transfer_cash_fee(limit: Option<u128>, paid: u128, next: u128) -> Result<(), ApiError> {
     if limit.is_some_and(|limit| paid.checked_add(next).is_none_or(|total| total > limit)) {
         return Err((
@@ -3999,39 +3970,6 @@ pub(super) async fn solana_can_send(state: &AppState, owner: &str, amount: u128)
         || solana_cash(state, owner).await >= amount.saturating_add(KORA_FEE_GUESS_USDC)
 }
 
-// What a Solana transfer to `to` should cost the sender, for a quote: the rent for opening its USDC
-// account when it has none (a top-up's SOL otherwise stays in the wallet).
-pub(super) async fn solana_transfer_fee_estimate(state: &AppState, to: &str) -> u128 {
-    match state.solana_mainnet.has_usdc_account(to).await {
-        Ok(false) => account_rent_usd(state).await,
-        _ => 0,
-    }
-}
-
-// Cost a fresh Daya recipient conservatively, but do not convert existing SOL into a USDC fee.
-pub(super) async fn solana_bank_transfer_estimate(
-    state: &AppState,
-    owner: &str,
-    cash: u128,
-    amount: u128,
-) -> Result<Option<u128>, ApiError> {
-    let sol = state
-        .solana_mainnet
-        .owner_sol_balance(owner)
-        .await
-        .map_err(unavailable)?;
-    if sol >= NEW_ACCOUNT_FLOOR_LAMPORTS {
-        return Ok(Some(0));
-    }
-    let topup = topup_usdc_for(state, NEW_ACCOUNT_FLOOR_LAMPORTS - sol).await;
-    let network = if cash >= amount.saturating_add(topup) {
-        topup
-    } else {
-        KORA_FEE_GUESS_USDC
-    };
-    Ok((cash >= amount.saturating_add(network)).then_some(network))
-}
-
 // That rent in USD micros at SOL's live price (0 for older callers when it is unavailable).
 pub(super) async fn account_rent_usd(state: &AppState) -> u128 {
     account_rent_usd_checked(state).await.unwrap_or(0)
@@ -4100,25 +4038,6 @@ pub(super) async fn base_bank_transfer_estimate(
         .await
         .ok_or_else(|| unavailable("Couldn't check this transfer's network fee. Try again."))?;
     Ok(base_bank_cash_fee(eth, cash, amount))
-}
-
-pub(super) async fn bank_hop_source_fee(
-    state: &AppState,
-    solana: Option<&str>,
-) -> Result<u128, ApiError> {
-    let Some(wallet) = solana else {
-        return Ok(0);
-    };
-    let sol = state
-        .solana_mainnet
-        .owner_sol_balance(wallet)
-        .await
-        .map_err(unavailable)?;
-    Ok(if sol >= GAS_FLOOR_LAMPORTS {
-        0
-    } else {
-        topup_usdc_for(state, GAS_FLOOR_LAMPORTS - sol).await
-    })
 }
 
 // The Base transactions that refill the gas tank when it's low and the user has USDC to spare beyond
@@ -4296,18 +4215,35 @@ pub(super) async fn solana_cash(state: &AppState, owner: &str) -> u128 {
         .unwrap_or(0)
 }
 
-// The unified balance for something paid on Base: None when Base cash covers `needed`, else how
-// much USDC to move from Solana first (Layerswap's fee and a cushion included). Short on both: the
-// error says what each chain holds.
-pub(super) async fn cash_for_base(
+// Something paid on Base from Spendable alone: the Base wallet's cash covers `needed`, plus the
+// gasless top-up a wallet with no ETH buys first. Short there: the error says what Trading holds.
+pub(super) async fn spendable_for_base(
     state: &AppState,
     evm: &str,
     solana: Option<&str>,
     needed: u128,
     currency: &str,
     rate: u128,
-) -> Result<Option<(u128, u128)>, ApiError> {
-    cash_for_base_with(state, evm, solana, needed, currency, rate, false).await
+) -> Result<(), ApiError> {
+    let cash = state
+        .markets
+        .base
+        .balance_of(BASE_USDC, evm)
+        .await
+        .map_err(unavailable)?;
+    let topup = if wallet_pays_gas(state, evm).await {
+        0
+    } else {
+        BASE_GAS_REFILL_USDC
+    };
+    if cash >= needed.saturating_add(topup) {
+        return Ok(());
+    }
+    let trading = match solana {
+        Some(owner) => solana_cash(state, owner).await,
+        None => 0,
+    };
+    Err(not_enough_spendable(cash, trading, currency, rate))
 }
 
 // A reviewed cross-chain funding quote. Relay delivers the exact shortfall plus a cent,
@@ -4323,21 +4259,6 @@ impl BaseFundingQuote {
     fn bank_fee(&self) -> u128 {
         self.fee.saturating_add(self.gas_cash)
     }
-}
-
-pub(super) async fn cash_for_bank_base(
-    state: &AppState,
-    evm: &str,
-    solana: Option<&str>,
-    needed: u128,
-    currency: &str,
-    rate: u128,
-) -> Result<Option<(u128, u128)>, ApiError> {
-    Ok(
-        base_funding_quote(state, evm, solana, needed, currency, rate, false)
-            .await?
-            .map(|quote| (quote.send, quote.bank_fee())),
-    )
 }
 
 fn relay_base_funding_amounts(held: u128, needed: u128, refuel: bool) -> (u128, u128) {
@@ -4411,37 +4332,17 @@ async fn base_funding_quote(
     }))
 }
 
-// The same quote as confirmation uses. With refuel, the exact Relay move also carries ETH.
-pub(super) async fn cash_for_base_with(
-    state: &AppState,
-    evm: &str,
-    solana: Option<&str>,
-    needed: u128,
-    currency: &str,
-    rate: u128,
-    refuel: bool,
-) -> Result<Option<(u128, u128)>, ApiError> {
-    Ok(
-        base_funding_quote(state, evm, solana, needed, currency, rate, refuel)
-            .await?
-            .map(|quote| (quote.send, quote.fee)),
-    )
-}
-
-// Base USDC to send so at least `needed` is on Solana (see funding_for); None when Solana already
-// has it. Short on both: the error says what each chain holds.
-pub(super) async fn cash_for_solana(
+// Base USDC to send from Spendable so `needed` lands on Solana for something paid from Spendable
+// there (savings on Solana), and the fee in it. All of it moves, whatever Trading holds. Short in
+// Spendable: the error says what Trading holds.
+pub(super) async fn spendable_for_solana(
     state: &AppState,
     evm: Option<&str>,
     solana: Option<&str>,
-    held_on_solana: u128,
     needed: u128,
     currency: &str,
     rate: u128,
-) -> Result<Option<(u128, u128)>, ApiError> {
-    if held_on_solana >= needed {
-        return Ok(None);
-    }
+) -> Result<(u128, u128), ApiError> {
     let base_cash = match evm {
         Some(evm) => state
             .markets
@@ -4451,11 +4352,15 @@ pub(super) async fn cash_for_solana(
             .unwrap_or(0),
         None => 0,
     };
-    let (send, fee) = funding_for(state, evm, solana, needed - held_on_solana).await?;
+    let (send, fee) = funding_for(state, evm, solana, needed).await?;
     if base_cash < send {
-        return Err(not_enough_cash(held_on_solana + base_cash, currency, rate));
+        let trading = match solana {
+            Some(owner) => solana_cash(state, owner).await,
+            None => 0,
+        };
+        return Err(not_enough_spendable(base_cash, trading, currency, rate));
     }
-    Ok(Some((send, fee)))
+    Ok((send, fee))
 }
 
 // Plans Base transactions paid from the unified balance. With enough on Base they go out as they
@@ -4859,13 +4764,8 @@ async fn execute_quote_inner(
             StatusCode::CONFLICT,
             "Privy Solana wallet is not ready".into(),
         ))?;
-        let base_cash = state
-            .markets
-            .base
-            .balance_of(BASE_USDC, &wallet)
-            .await
-            .map_err(unavailable)?;
-        let land = stored.input_units.saturating_sub(base_cash) + 10_000;
+        // Paid from Trading: all of it moves, whatever Spendable holds.
+        let land = stored.input_units + 10_000;
         let gas = if wallet_pays_gas(&state, &wallet).await {
             0
         } else {
@@ -4876,8 +4776,10 @@ async fn execute_quote_inner(
             .solana_to_base(&sol, &wallet, land, gas)
             .await
             .map_err(|_| unavailable("Couldn't move your cash right now; try again shortly"))?;
-        if solana_cash(&state, &sol).await < moved.amount_in_units {
-            return Err(short_of_cash());
+        let sol_cash = solana_cash(&state, &sol).await;
+        if sol_cash < moved.amount_in_units {
+            let rate = app_balance::fx_rate(&stored.currency).await?;
+            return Err(not_enough_trading(sol_cash, &stored.currency, rate));
         }
         let deposit = state
             .solana_mainnet

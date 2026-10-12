@@ -43,8 +43,6 @@ struct SendQuote {
     owner: String,
     sender_wallet: String,
     recipient_wallet: String,
-    sender_solana: Option<String>,
-    recipient_solana: Option<String>,
     label: String,
     currency: String,
     usdc_units: u128,
@@ -58,63 +56,17 @@ struct SendQuote {
     bank: Option<(daya::Payout, u128, u128)>,
     // Additional USDC charged for delivery, separately from the bank payout fee.
     network_units: u128,
-    // Bank confirmations keep the costed route, rather than assuming a new bridge unconditionally.
-    bank_route: Option<BankRoute>,
 }
-// Keep cash on its current chain. A Solana-funded payout goes straight to Daya on Solana;
-// only a balance split across chains needs the existing consolidation route.
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum BankRoute {
-    Base,
-    Solana,
-    Hop,
-}
-
-fn same_chain_bank_route(
-    base_fee: Option<u128>,
-    solana_fee: Option<u128>,
-) -> Option<(BankRoute, u128)> {
-    match (base_fee, solana_fee) {
-        (Some(base), Some(solana)) if solana < base => Some((BankRoute::Solana, solana)),
-        (Some(base), _) => Some((BankRoute::Base, base)),
-        (_, Some(solana)) => Some((BankRoute::Solana, solana)),
-        _ => None,
-    }
-}
-
-async fn bank_route(
-    state: &AppState,
-    evm: &str,
-    solana: Option<&str>,
-    usdc: u128,
-    base_cash: u128,
-) -> Result<(BankRoute, u128), ApiError> {
-    let base_fee = if base_cash >= usdc {
-        markets::base_bank_transfer_estimate(state, evm, base_cash, usdc).await?
+// Sends, bank cash-outs and Atlas Links are paid from Spendable (USDC in the Base wallet) only.
+// What must be there: the amount, its network fee, and when the wallet has no ETH yet the gasless
+// top-up a Base send buys first (a bank quote's fee already counts it).
+fn spend_requirement(usdc: u128, network: u128, bank: bool, pays_gas: bool) -> u128 {
+    let topup = if bank || pays_gas {
+        0
     } else {
-        None
+        markets::BASE_GAS_REFILL_USDC
     };
-    if base_fee == Some(0) {
-        return Ok((BankRoute::Base, 0));
-    }
-    let mut fully_funded = base_cash >= usdc;
-    let mut solana_fee = None;
-    if let Some(from) = solana {
-        let cash = markets::solana_cash(state, from).await;
-        if cash >= usdc {
-            fully_funded = true;
-            solana_fee = markets::solana_bank_transfer_estimate(state, from, cash, usdc).await?;
-        }
-    }
-    if let Some(route) = same_chain_bank_route(base_fee, solana_fee) {
-        return Ok(route);
-    }
-    if fully_funded {
-        return Err(bad(
-            "Not enough USDC for this transfer and its network fee.",
-        ));
-    }
-    Ok((BankRoute::Hop, 0))
+    usdc.saturating_add(network).saturating_add(topup)
 }
 
 fn checked_bank_network_fee(quoted: u128, actual: u128) -> Result<(), ApiError> {
@@ -618,7 +570,7 @@ pub(super) async fn send_quote(
     ))?;
     let mut link: Option<(String, Option<String>)> = None;
     let mut bank: Option<daya::Payout> = None;
-    let (recipient, recipient_solana, label) = match req.destination {
+    let (recipient, label) = match req.destination {
         Destination::Atlas { handle } => {
             let record = state
                 .social
@@ -629,11 +581,7 @@ pub(super) async fn send_quote(
             if record.user_id == user.user_id {
                 return Err(bad("cannot send to yourself"));
             }
-            (
-                record.evm_wallet.clone(),
-                record.solana_wallet.clone(),
-                format!("@{}", record.handle),
-            )
+            (record.evm_wallet.clone(), format!("@{}", record.handle))
         }
         // Paid to Daya's one-time address, opened when the user confirms.
         Destination::Bank {
@@ -643,7 +591,7 @@ pub(super) async fn send_quote(
             let payout = state.daya.payout_to(&bank_code, &account_number).await?;
             let label = payout.label.clone();
             bank = Some(payout);
-            (String::new(), None, label)
+            (String::new(), label)
         }
         Destination::Cashlink { message, escrow } => {
             let escrow = escrow
@@ -657,7 +605,7 @@ pub(super) async fn send_quote(
                 .map(|m| m.trim().chars().take(80).collect::<String>())
                 .filter(|m| !m.is_empty());
             link = Some((escrow.clone(), note));
-            (escrow, None, "Atlas Link".to_string())
+            (escrow, "Atlas Link".to_string())
         }
     };
     if !DISPLAY_CURRENCIES.contains(&req.amount.currency.as_str()) {
@@ -693,73 +641,35 @@ pub(super) async fn send_quote(
         0
     };
     let usdc_units = gift_units + fee_units;
-    // One balance. Friends are paid on the chain the cash is on: Base, or Solana straight to their
-    // Solana wallet. Only when neither chain holds it all does cash move first; short on both, say so.
+    // Paid from Spendable only. Short there, the error says what Trading holds, so the app can offer
+    // to move it back first.
     let base_cash = state
         .markets
         .base
         .balance_of(BASE_USDC, &wallet)
         .await
-        .unwrap_or(0);
-    // Daya takes USDC on Solana as well as Base.
-    let route = match bank {
-        Some(_) => {
-            Some(bank_route(&state, &wallet, solana.as_deref(), usdc_units, base_cash).await?)
-        }
-        None => None,
-    };
-    let solana_covers = match (&solana, &recipient_solana) {
-        (Some(from), Some(_)) => markets::solana_cash(&state, from).await >= usdc_units,
-        (Some(_), None) => matches!(route, Some((BankRoute::Solana, _))),
-        _ => false,
-    };
-    let mut hop_fee = 0;
-    if base_cash < usdc_units && !solana_covers {
-        let funding = if bank.is_some() {
-            markets::cash_for_bank_base(
-                &state,
-                &wallet,
-                solana.as_deref(),
-                usdc_units,
-                &req.amount.currency,
-                rate,
-            )
+        .map_err(markets::unavailable)?;
+    // A bank payout's network fee: nothing with ETH in the wallet, else the gasless top-up it buys.
+    let network_units = if bank.is_some() {
+        markets::base_bank_transfer_estimate(&state, &wallet, base_cash, usdc_units)
             .await?
-        } else {
-            markets::cash_for_base(
-                &state,
-                &wallet,
-                solana.as_deref(),
-                usdc_units,
-                &req.amount.currency,
-                rate,
-            )
-            .await?
-        };
-        if let Some((_, fee)) = funding {
-            hop_fee = fee;
-            if bank.is_some() {
-                hop_fee = hop_fee
-                    .saturating_add(markets::bank_hop_source_fee(&state, solana.as_deref()).await?);
-            }
-        }
-    }
-    // A friend send's network fee, shown from the quote on: opening the friend's USDC account on
-    // Solana when they have none, or hopping cash to Base.
-    let network_units = if let Some((route, estimate)) = route {
-        if route == BankRoute::Hop {
-            hop_fee
-        } else {
-            estimate
-        }
-    } else if base_cash < usdc_units && solana_covers {
-        match &recipient_solana {
-            Some(to) => markets::solana_transfer_fee_estimate(&state, to).await,
-            None => 0,
-        }
+            .unwrap_or(markets::BASE_GAS_REFILL_USDC)
     } else {
-        hop_fee
+        0
     };
+    let pays_gas = markets::wallet_pays_gas(&state, &wallet).await;
+    if base_cash < spend_requirement(usdc_units, network_units, bank.is_some(), pays_gas) {
+        let trading = match solana.as_deref() {
+            Some(owner) => markets::solana_cash(&state, owner).await,
+            None => 0,
+        };
+        return Err(markets::not_enough_spendable(
+            base_cash,
+            trading,
+            &req.amount.currency,
+            rate,
+        ));
+    }
     let quote_id = format!(
         "send-{:x}-{:x}",
         now(),
@@ -772,8 +682,6 @@ pub(super) async fn send_quote(
             owner: user.user_id,
             sender_wallet: wallet,
             recipient_wallet: recipient,
-            sender_solana: solana,
-            recipient_solana,
             label: label.clone(),
             currency: req.amount.currency.clone(),
             usdc_units,
@@ -785,7 +693,6 @@ pub(super) async fn send_quote(
                 .as_ref()
                 .map(|(payout, _, fee)| (payout.clone(), amount, *fee)),
             network_units,
-            bank_route: route.map(|(route, _)| route),
         },
     );
     // Fee is Daya's bank payout charge. Only a new USDC debit appears as Network fee;
@@ -899,47 +806,18 @@ async fn execute_send_inner(
     {
         return Ok(Json(plan));
     }
-    // Same chain first: Base if it holds the amount, else Solana to the friend's Solana wallet;
-    // only then move cash across.
-    let base_cash = state
-        .markets
-        .base
-        .balance_of(BASE_USDC, &quote.sender_wallet)
-        .await
-        .unwrap_or(0);
-    let solana_route = match (&quote.sender_solana, &quote.recipient_solana) {
-        (Some(from), Some(to))
-            if base_cash < quote.usdc_units
-                && markets::solana_cash(&state, from).await >= quote.usdc_units =>
-        {
-            Some((from.clone(), to.clone()))
-        }
-        _ => None,
-    };
-    let (intent_id, transactions, fee) = if let Some((from, to)) = solana_route {
-        let (intent_id, transactions, network) = markets::plan_solana_transfer(
-            &state,
-            user.user_id.clone(),
-            from,
-            &to,
-            quote.usdc_units,
-            true,
-        )
-        .await?;
-        (intent_id, transactions, Some(network).filter(|n| *n > 0))
-    } else {
-        markets::plan_base_with_cash(
-            &state,
-            user.user_id.clone(),
-            quote.sender_wallet.clone(),
-            user.solana_wallet.clone().filter(|w| !w.is_empty()),
-            vec![(tx.to.clone(), tx.data.clone())],
-            quote.usdc_units,
-            &quote.currency,
-            rate,
-        )
-        .await?
-    };
+    // From Spendable only: the cash is never moved over from Trading behind the user's back.
+    let (intent_id, transactions, fee) = markets::plan_base_with_cash(
+        &state,
+        user.user_id.clone(),
+        quote.sender_wallet.clone(),
+        None,
+        vec![(tx.to.clone(), tx.data.clone())],
+        quote.usdc_units,
+        &quote.currency,
+        rate,
+    )
+    .await?;
     // An Atlas Link is recorded once its plan exists (the escrow is its id; a repeat finds it).
     if let Some((escrow, note, gift)) = &quote.link {
         let sender = state.social.find_user(&user.user_id).await?;
@@ -1013,9 +891,8 @@ async fn execute_send_inner(
     stored.plan = Some(plan.clone());
     Ok(Json(plan))
 }
-// A bank withdrawal: Daya opens a one-time USDC address on the chain the cash is on (Base, or
-// Solana when only Solana holds it), and the phone sends the USDC there. Daya's idempotency key is
-// the quote, so a retried execute gets the same address.
+// A bank withdrawal from Spendable: Daya opens a one-time USDC address on Base, and the phone sends
+// the USDC there. Daya's idempotency key is the quote, so a retried execute gets the same address.
 async fn bank_plan(
     state: &AppState,
     user: &app_balance::VerifiedWallets,
@@ -1026,58 +903,26 @@ async fn bank_plan(
     fee: u128,
 ) -> Result<(Value, String, u64), ApiError> {
     let rate = app_balance::fx_rate(&quote.currency).await?;
-    let route = quote
-        .bank_route
-        .ok_or_else(|| bad("bank route was not quoted"))?;
-    if route == BankRoute::Solana && user.solana_wallet.as_deref() != quote.sender_solana.as_deref()
-    {
-        return Err((
-            StatusCode::CONFLICT,
-            "The wallet changed. Check a fresh quote.".into(),
-        ));
-    }
-    let chain = if route == BankRoute::Solana {
-        "SOLANA"
-    } else {
-        "BASE"
-    };
     let (funding_account, address, expires) = state
         .daya
-        .open_payout(user, payout, chain, &format!("atlas-{quote_id}"))
+        .open_payout(user, payout, "BASE", &format!("atlas-{quote_id}"))
         .await?;
-    let (intent_id, transactions, network_fee) = match (&quote.sender_solana, route) {
-        (Some(from), BankRoute::Solana) => {
-            let (intent_id, transactions, network) = markets::plan_solana_bank_transfer(
-                state,
-                user.user_id.clone(),
-                from.clone(),
-                &address,
-                quote.usdc_units,
-                quote.network_units,
-                rate,
-            )
-            .await?;
-            (intent_id, transactions, Some(network))
-        }
-        _ => {
-            let tx = state
-                .markets
-                .base
-                .transfer_transaction(BASE_USDC, &quote.sender_wallet, &address, quote.usdc_units)
-                .map_err(internal)?;
-            markets::plan_base_bank_with_cash(
-                state,
-                user.user_id.clone(),
-                quote.sender_wallet.clone(),
-                user.solana_wallet.clone().filter(|w| !w.is_empty()),
-                vec![(tx.to.clone(), tx.data.clone())],
-                quote.usdc_units,
-                &quote.currency,
-                rate,
-            )
-            .await?
-        }
-    };
+    let tx = state
+        .markets
+        .base
+        .transfer_transaction(BASE_USDC, &quote.sender_wallet, &address, quote.usdc_units)
+        .map_err(internal)?;
+    let (intent_id, transactions, network_fee) = markets::plan_base_bank_with_cash(
+        state,
+        user.user_id.clone(),
+        quote.sender_wallet.clone(),
+        None,
+        vec![(tx.to.clone(), tx.data.clone())],
+        quote.usdc_units,
+        &quote.currency,
+        rate,
+    )
+    .await?;
     let network = network_fee.unwrap_or(0);
     // A reserve can change between quoting and confirmation. Never give the phone a plan
     // that spends more USDC for its network fee than the person reviewed.
@@ -1094,7 +939,10 @@ async fn bank_plan(
         json!({"label":"Rate","value":all_in_rate(get.saturating_add(fee), quote.usdc_units)}),
         json!({"label":"Bank payout","value":"Waiting for your USDC"}),
     ];
-    eprintln!("bank withdrawal {quote_id}: route={route:?} quoted_network_usdc={} prepared_network_usdc={network}", quote.network_units);
+    eprintln!(
+        "bank withdrawal {quote_id}: quoted_network_usdc={} prepared_network_usdc={network}",
+        quote.network_units
+    );
     let plan = json!({"intentId":intent_id,"kind":"send","summary":summary,"transactions":transactions,"expiresAtUnixMs":now()+120_000});
     Ok((plan, funding_account, expires))
 }
@@ -1113,28 +961,19 @@ fn near(quoted: u128, actual: u128) -> bool {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn funded_bank_routes_use_native_reserves_without_a_bridge() {
+    fn spending_needs_the_amount_its_fee_and_a_first_gas_top_up_in_spendable() {
+        // A wallet that pays its own gas needs just the amount and its fee.
+        assert_eq!(spend_requirement(1_000_000, 0, false, true), 1_000_000);
+        assert_eq!(spend_requirement(1_000_000, 22_006, true, true), 1_022_006);
+        // An empty tank: a friend send buys its gasless top-up first; a bank quote's fee counts it.
         assert_eq!(
-            same_chain_bank_route(None, Some(0)),
-            Some((BankRoute::Solana, 0))
+            spend_requirement(1_000_000, 0, false, false),
+            1_000_000 + markets::BASE_GAS_REFILL_USDC
         );
         assert_eq!(
-            same_chain_bank_route(Some(0), Some(0)),
-            Some((BankRoute::Base, 0))
+            spend_requirement(1_000_000, markets::BASE_GAS_REFILL_USDC, true, false),
+            1_000_000 + markets::BASE_GAS_REFILL_USDC
         );
-        assert_eq!(
-            same_chain_bank_route(Some(500_000), Some(0)),
-            Some((BankRoute::Solana, 0))
-        );
-        assert_eq!(
-            same_chain_bank_route(Some(0), Some(500_000)),
-            Some((BankRoute::Base, 0))
-        );
-        assert_eq!(
-            same_chain_bank_route(None, Some(500_000)),
-            Some((BankRoute::Solana, 500_000))
-        );
-        assert_eq!(same_chain_bank_route(None, None), None); // Only split cash requires consolidation.
     }
 
     #[test]

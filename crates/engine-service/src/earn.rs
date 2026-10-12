@@ -787,25 +787,24 @@ pub(super) async fn quote(
     if all {
         units = available;
     }
-    // Putting cash in draws on the whole balance: short on this option's chain, the rest moves over
-    // from the other chain first (checked, and the error names both, before anything is signed).
+    // Savings are paid from Spendable (the Base wallet's cash). A Solana option gets all of it moved
+    // over first, inside the same confirm; short in Spendable, the error says what Trading holds.
     let cash_ok = if deposit {
         let user = app_balance::verified_wallets(&state, &headers).await?;
         let solana = user.solana_wallet.filter(|w| !w.is_empty());
         let evm = user.evm_wallet.filter(|w| !w.is_empty());
         if lend_option {
-            markets::cash_for_solana(
+            markets::spendable_for_solana(
                 &state,
                 evm.as_deref(),
                 solana.as_deref(),
-                available,
                 units,
                 &currency,
                 rate,
             )
             .await?;
         } else {
-            markets::cash_for_base(&state, &wallet, solana.as_deref(), units, &currency, rate)
+            markets::spendable_for_base(&state, &wallet, solana.as_deref(), units, &currency, rate)
                 .await?;
         }
         true
@@ -990,12 +989,12 @@ async fn execute_inner(
         }
         ("Aave, on Base".to_string(), "Variable, set by Aave")
     };
+    // A deposit is paid from Spendable alone. A withdrawal only needs gas, paid from the wallet's own
+    // ETH (topped up first when the tank is empty, from Trading's cash if Spendable has none).
     let solana = app_balance::verified_wallets(&state, &headers)
         .await?
         .solana_wallet
-        .filter(|w| !w.is_empty());
-    // A deposit may need Solana cash moved over first; a withdrawal only needs gas, paid from the
-    // wallet's own ETH (topped up first when the tank is empty).
+        .filter(|w| !w.is_empty() && !quote.deposit);
     let needed = if quote.deposit { quote.units } else { 0 };
     let (intent_id, transactions, fee) = markets::plan_base_with_cash(
         &state,
@@ -1049,54 +1048,47 @@ async fn execute_lend(
     } else {
         (share_mint, markets::SOL_USDC_MINT, quote.shares)
     };
-    // Short of cash on Solana: Base cash moves over first, and the deposit is made once it lands.
+    // Paid from Spendable: the Base cash moves over first, and the deposit is made once it lands.
     if quote.deposit {
-        let held = shares_of(
-            &solana_wallet(state, &wallet).await?,
-            markets::SOL_USDC_MINT,
-        );
         let evm = app_balance::verified_wallets(state, headers)
             .await?
             .evm_wallet
             .filter(|w| !w.is_empty());
-        if let Some((send, fee)) = markets::cash_for_solana(
+        let (send, fee) = markets::spendable_for_solana(
             state,
             evm.as_deref(),
             Some(&wallet),
-            held,
             quote.units,
             &quote.currency,
             quote.rate,
         )
-        .await?
-        {
-            let evm = evm.ok_or((
-                StatusCode::CONFLICT,
-                "Privy Base wallet is not ready".into(),
-            ))?;
-            let (intent_id, transactions) = markets::plan_solana_swap_with_base_cash(
-                state,
-                owner,
-                wallet,
-                &evm,
-                share_mint,
-                quote.units,
-                send,
-                fee,
-            )
-            .await?;
-            return Ok(Json(json!({
-                "intentId":intent_id,"kind":"earn_deposit",
-                "summary":[
-                    {"label":if share_mint == JITO_MINT {"Stake SOL"} else {"Put in savings"},
-                     "value":markets::say_money(quote.units, &quote.currency, quote.rate)},
-                    {"label":"Where","value":if share_mint == JITO_MINT {"Jito"} else {"Jupiter Lend"}},
-                    {"label":"Network fee","value":markets::say_money(fee, &quote.currency, quote.rate)}
-                ],
-                "transactions":transactions,
-                "expiresAtUnixMs":now() + 120_000
-            })));
-        }
+        .await?;
+        let evm = evm.ok_or((
+            StatusCode::CONFLICT,
+            "Privy Base wallet is not ready".into(),
+        ))?;
+        let (intent_id, transactions) = markets::plan_solana_swap_with_base_cash(
+            state,
+            owner,
+            wallet,
+            &evm,
+            share_mint,
+            quote.units,
+            send,
+            fee,
+        )
+        .await?;
+        return Ok(Json(json!({
+            "intentId":intent_id,"kind":"earn_deposit",
+            "summary":[
+                {"label":if share_mint == JITO_MINT {"Stake SOL"} else {"Put in savings"},
+                 "value":markets::say_money(quote.units, &quote.currency, quote.rate)},
+                {"label":"Where","value":if share_mint == JITO_MINT {"Jito"} else {"Jupiter Lend"}},
+                {"label":"Network fee","value":markets::say_money(fee, &quote.currency, quote.rate)}
+            ],
+            "transactions":transactions,
+            "expiresAtUnixMs":now() + 120_000
+        })));
     }
     let asset = market_for_mint(state, share_mint).await?.asset;
     if amount == 0 {

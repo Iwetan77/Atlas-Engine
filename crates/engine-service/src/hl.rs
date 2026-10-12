@@ -788,15 +788,10 @@ pub(super) async fn quote(
         };
         (dex_units, short_units)
     };
+    // Margin is paid from Trading (the Solana wallet's cash), never from Spendable.
     let (funding_units, funding_from_solana) = if short_units == 0 {
         (0, false)
     } else {
-        let base_cash = state
-            .markets
-            .base
-            .balance_of(engine_execution::swaps::uniswap::BASE_USDC, &wallet)
-            .await
-            .unwrap_or(0);
         let solana = user.solana_wallet.as_deref().filter(|w| !w.is_empty());
         let solana_cash = match solana {
             Some(owner) => markets::solana_cash(&state, owner).await,
@@ -804,16 +799,10 @@ pub(super) async fn quote(
         };
         // Relay's fee is a few cents: leave room for it.
         let with_fee = short_units + short_units / 50 + 100_000;
-        if base_cash >= with_fee {
-            (short_units, false)
-        } else if solana_cash >= with_fee {
+        if solana.is_some() && solana_cash >= with_fee {
             (short_units, true)
         } else {
-            return Err(markets::not_enough_cash(
-                base_cash + solana_cash,
-                &currency,
-                rate,
-            ));
+            return Err(markets::not_enough_trading(solana_cash, &currency, rate));
         }
     };
     let quote_id = format!("hlq-{:x}-{:x}", now(), rand_suffix());
