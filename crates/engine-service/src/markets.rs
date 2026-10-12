@@ -6192,11 +6192,6 @@ pub(super) async fn next_transactions(
                 .as_deref()
                 .and_then(|tx| state.solana_mainnet.last_valid_height(tx))
                 .unwrap_or(0);
-            t.last_valid_height = t
-                .transaction
-                .as_deref()
-                .and_then(|tx| state.solana_mainnet.last_valid_height(tx))
-                .unwrap_or(0);
         }
         state.markets.save_intent(&intent_id, &intent).await?;
         let mut transactions = Vec::new();
