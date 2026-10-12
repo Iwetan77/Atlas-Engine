@@ -2693,7 +2693,7 @@ pub(super) async fn quote(
         .ok_or_else(|| bad("amount too large"))?
         / rate;
     check_limits(usdc_units, &req.amount.currency, rate)?;
-    let mut input = if req.side == "buy" {
+    let input = if req.side == "buy" {
         usdc_units
     } else if req.all {
         // Everything held; SOL keeps its gas tank (0.01 SOL) for the fees ahead.
@@ -2776,11 +2776,20 @@ pub(super) async fn quote(
         None
     };
     let reserve_cash = fee_preview.as_ref().map_or(0, |p| p.cash());
-    if req.side == "buy" {
-        input = purchase_input(usdc_units, fee_preview.as_ref(), &req.amount.currency, rate)?;
-    }
     let (actual_in, actual_out, fee_units) =
         venue_quote(&state.markets, &a, &req.side, input).await?;
+    // A top-up the confirm will add for an empty gas tank: a fee on top of the trade, never inside it.
+    let gas_topup_units = if reserve_cash > 0 {
+        reserve_cash
+    } else {
+        planned_gas_topup(
+            &state,
+            &a,
+            &user,
+            if req.side == "buy" { actual_in } else { 0 },
+        )
+        .await
+    };
     let (asset_units, stable_units) = if req.side == "buy" {
         (actual_out, actual_in)
     } else {
@@ -2859,8 +2868,9 @@ pub(super) async fn quote(
         rate,
     )?;
     let (pay, receive) = if req.side == "buy" {
-        // Everything that leaves the balance: moving cash between chains first costs its fee too.
-        let total = cash_needed + funding_fee;
+        // Everything that leaves the balance: moving cash between chains first costs its fee too, and
+        // a gas top-up the reserve doesn't already count.
+        let total = cash_needed + funding_fee + (gas_topup_units - reserve_cash);
         (
             json!({"amount":format_units(total,6),"symbol":"USDC","value":money_from_usdc(total,&req.amount.currency,rate)?}),
             json!({"amount":format_units(actual_out,a.decimals),"symbol":a.symbol,"value":money_from_usdc(actual_in,&req.amount.currency,rate)?}),
@@ -2900,31 +2910,47 @@ pub(super) async fn quote(
         },
     );
     Ok(Json(
-        json!({"quoteId":quote_id,"assetId":a.id,"side":req.side,"pay":pay,"receive":receive,"price":price,"fee":money_from_usdc(fee_usdc + funding_fee + fee_preview.as_ref().map_or(0, |p| p.network_fee()),&req.amount.currency,rate)?,
+        json!({"quoteId":quote_id,"assetId":a.id,"side":req.side,"pay":pay,"receive":receive,"price":price,"fee":money_from_usdc(fee_usdc + funding_fee + gas_topup_units,&req.amount.currency,rate)?,
+            "gasTopup":if gas_topup_units > 0 {money_from_usdc(gas_topup_units,&req.amount.currency,rate).ok()} else {None},
             "funding":if funding_units > 0 {json!({"from":if a.chain == "base" {"Solana"} else {"Base"},"to":if a.chain == "base" {"Base"} else {"Solana"},"amount":money_from_usdc(funding_units,&req.amount.currency,rate)?,"fee":money_from_usdc(funding_fee,&req.amount.currency,rate)?})} else {Value::Null},
             "feeReserve":fee_preview.as_ref().map(|p| json!({"amount":money_from_usdc(p.cash(),&req.amount.currency,rate).ok(),"networkFee":money_from_usdc(p.network_fee(),&req.amount.currency,rate).ok(),"kept":money_from_usdc(p.gas_value,&req.amount.currency,rate).ok()})),
             "expiresAtUnixMs":expires}),
     ))
 }
 
-fn purchase_input(
-    total: u128,
-    preview: Option<&solana_fees::Preview>,
-    currency: &str,
-    rate: u128,
-) -> Result<u128, ApiError> {
-    let reserve = preview.map_or(0, |p| p.cash());
-    let trade = total.saturating_sub(reserve);
-    if trade < MIN_USDC {
-        return Err((
-            StatusCode::CONFLICT,
-            format!(
-                "This purchase needs at least {}.",
-                say_money(reserve + MIN_USDC, currency, rate)
-            ),
-        ));
+// The gas top-up the confirm will add for this trade when the wallet's tank is empty, in USDC
+// units (0 when none): the same checks gas_topup and base_topup_fits make. Shown with the quote so
+// "You pay" doesn't grow between the quote and the confirm.
+async fn planned_gas_topup(
+    state: &AppState,
+    a: &Asset,
+    user: &app_balance::VerifiedWallets,
+    spends: u128,
+) -> u128 {
+    if a.chain == "base" {
+        let Some(evm) = user.evm_wallet.as_deref().filter(|w| !w.is_empty()) else {
+            return 0;
+        };
+        return if base_topup_fits(state, evm, spends).await {
+            BASE_GAS_REFILL_USDC
+        } else {
+            0
+        };
     }
-    Ok(trade)
+    let Some(owner) = user.solana_wallet.as_deref().filter(|w| !w.is_empty()) else {
+        return 0;
+    };
+    let Ok(sol) = state.solana_mainnet.owner_sol_balance(owner).await else {
+        return 0;
+    };
+    if sol >= GAS_FLOOR_LAMPORTS {
+        return 0;
+    }
+    let usdc = topup_usdc_for(state, GAS_FLOOR_LAMPORTS - sol).await;
+    if solana_cash(state, owner).await < spends.saturating_add(usdc) {
+        return 0;
+    }
+    usdc
 }
 
 // How much Base USDC to send so at least `shortfall` lands on Solana, and the fee in it. Relay lands
@@ -2955,6 +2981,45 @@ async fn funding_for(
 // ETH that rides along when cash moves to Base and the gas tank is empty: dollars (6 decimals).
 // About 0.00005 ETH, dozens of Base transactions (selling what was bought, for one).
 const BASE_GAS_BY_RELAY_USDC: u128 = 150_000;
+
+// The confirm sheet for a spot trade. A buy spends all of `trade` on the coin; a gas top-up the
+// wallet needs first is its own line, "Gas top-up (one time)", and is added to what they pay (a sale
+// pays it from their cash). `moving` is the network fee for bringing cash over from the other chain.
+#[allow(clippy::too_many_arguments)]
+fn spot_summary(
+    side: &str,
+    trade: u128,
+    sold: &str,
+    get: &str,
+    moving: Option<u128>,
+    gas: u128,
+    currency: &str,
+    rate: u128,
+) -> Vec<Value> {
+    let mut lines = if side == "buy" {
+        vec![
+            json!({"label":"You pay","value":say_money(trade + moving.unwrap_or(0) + gas, currency, rate)}),
+            json!({"label":"You get (about)","value":get}),
+        ]
+    } else {
+        vec![
+            json!({"label":"You sell","value":sold}),
+            json!({"label":"You get (about)","value":get}),
+        ]
+    };
+    if let Some(fee) = moving {
+        lines.push(json!({"label":"Network fee","value":say_money(fee.max(1), currency, rate)}));
+    }
+    if gas > 0 {
+        let label = if side == "buy" {
+            "Gas top-up (one time)"
+        } else {
+            "Gas top-up (one time, from your cash)"
+        };
+        lines.push(json!({"label":label,"value":say_money(gas, currency, rate)}));
+    }
+    lines
+}
 
 // A Solana wallet with too little SOL for its transaction fee pays a $0.50 top-up first (gas_topup).
 async fn solana_fee_reserve(state: &AppState, owner: &str) -> u128 {
@@ -3076,6 +3141,16 @@ pub(super) async fn gas_topup(
     owner: &str,
     reserve: u128,
 ) -> Option<(String, String)> {
+    gas_topup_priced(state, owner, reserve)
+        .await
+        .map(|(id, tx, _)| (id, tx))
+}
+// The same, with the USDC it turns into SOL, for a confirm sheet that shows it.
+pub(super) async fn gas_topup_priced(
+    state: &AppState,
+    owner: &str,
+    reserve: u128,
+) -> Option<(String, String, u128)> {
     gas_topup_below(state, owner, reserve, GAS_FLOOR_LAMPORTS).await
 }
 
@@ -3085,7 +3160,7 @@ async fn gas_topup_below(
     owner: &str,
     reserve: u128,
     floor: u128,
-) -> Option<(String, String)> {
+) -> Option<(String, String, u128)> {
     let sol = state.solana_mainnet.owner_sol_balance(owner).await.ok()?;
     if sol >= floor {
         return None;
@@ -3094,7 +3169,9 @@ async fn gas_topup_below(
     if solana_cash(state, owner).await < reserve.saturating_add(usdc) {
         return None;
     }
-    gasless_topup_order(state, owner, usdc).await
+    gasless_topup_order(state, owner, usdc)
+        .await
+        .map(|(id, tx)| (id, tx, usdc))
 }
 
 // What a top-up that adds `missing` lamports costs: the usual $0.50, or more when SOL is dear
@@ -3166,7 +3243,7 @@ async fn note_gas_topup(state: &AppState, owner: &str, intent_id: &str, usdc: u1
     }
     if let Ok(Some(mut receipt)) = state.history.find(owner, intent_id).await {
         receipt.set_line(
-            "Gas top-up (kept as SOL)",
+            "Gas top-up (one time)",
             format!("${}", format_units(usdc, 6)),
         );
         if let Err((_, error)) = state.history.put(&receipt).await {
@@ -4586,6 +4663,8 @@ async fn execute_quote_inner(
     let mut funding = None;
     let mut gas_request_id = None;
     let mut base_topup = None;
+    // Cash turned into gas before the trade, shown as its own fee and added to what they pay.
+    let mut gas_topup_units: u128 = 0;
     let intent_id = id("intent");
     let output: u128;
     let mut network_fee = stored.funding_fee;
@@ -4623,7 +4702,10 @@ async fn execute_quote_inner(
             .await
             .map_err(unavailable)?;
         // A Solana wallet with no SOL pays the transaction fee from a gasless top-up first.
-        if let Some((gas_id, gas_tx)) = gas_topup(&state, &sol, moved.amount_in_units).await {
+        if let Some((gas_id, gas_tx, usdc)) =
+            gas_topup_priced(&state, &sol, moved.amount_in_units).await
+        {
+            gas_topup_units += usdc;
             transactions.push(json!({"chain":"solana","transaction":gas_tx,"submit":"engine"}));
             gas_request_id = Some(gas_id);
         }
@@ -4690,6 +4772,7 @@ async fn execute_quote_inner(
         };
         if base_topup_fits(&state, &wallet, spends).await {
             base_topup = Some(prepare_base_topup(&state, &wallet).await?);
+            gas_topup_units += BASE_GAS_REFILL_USDC;
             transactions = topup_steps(base_topup.as_ref().expect("prepared"));
         } else if !wallet_pays_gas(&state, &wallet).await {
             let rate = app_balance::fx_rate(&stored.currency).await?;
@@ -4761,6 +4844,7 @@ async fn execute_quote_inner(
             }
         }
         let reserve = solana_fees::prepare(&state, &wallet, preview, required).await?;
+        gas_topup_units += preview.cash();
         transactions.push(solana_fees::step(&reserve));
         fee_reserve = Some(reserve);
         output = stored.output_units;
@@ -4810,7 +4894,8 @@ async fn execute_quote_inner(
             } else {
                 0
             };
-            if let Some((gas_id, gas_tx)) = gas_topup(&state, &wallet, spends).await {
+            if let Some((gas_id, gas_tx, usdc)) = gas_topup_priced(&state, &wallet, spends).await {
+                gas_topup_units += usdc;
                 transactions.push(json!({"chain":"solana","transaction":gas_tx,"submit":"engine"}));
                 gas_request_id = Some(gas_id);
             }
@@ -4827,34 +4912,25 @@ async fn execute_quote_inner(
         };
     // The confirm sheet speaks their currency: cash as money, the asset as tokens.
     let rate = app_balance::fx_rate(&stored.currency).await?;
-    let mut summary = if funding.is_some() {
-        // "You pay" is everything that leaves the balance, the network fee for moving cash included.
-        json!([
-            {"label":"You pay","value":say_money(stored.input_units + stored.fee_preview.as_ref().map_or(0,|p| p.cash()) + network_fee, &stored.currency, rate)},
-            {"label":"You get (about)","value":format!("{} {}", format_units(output, a.decimals), a.symbol)},
-            {"label":"Network fee","value":say_money(network_fee.max(1), &stored.currency, rate)},
-        ])
-    } else if stored.side == "buy" {
-        json!([
-            {"label":"You pay","value":say_money(stored.input_units + stored.fee_preview.as_ref().map_or(0,|p| p.cash()), &stored.currency, rate)},
-            {"label":"You get (about)","value":format!("{} {}", format_units(output, a.decimals), a.symbol)},
-        ])
+    let get = if stored.side == "buy" {
+        format!("{} {}", format_units(output, a.decimals), a.symbol)
     } else {
-        json!([
-            {"label":"You sell","value":format!("{} {}", format_units(stored.input_units, a.decimals), a.symbol)},
-            {"label":"You get (about)","value":say_money(output, &stored.currency, rate)},
-        ])
+        say_money(output, &stored.currency, rate)
     };
-    if let Some(p) = &stored.fee_preview {
-        let lines = summary.as_array_mut().expect("summary array");
-        if stored.side == "sell" {
-            lines.push(
-                json!({"label":"From your cash","value":say_money(p.cash(),&stored.currency,rate)}),
-            );
-        }
-        lines.push(json!({"label":"Kept for future network fees","value":format!("About {}",say_money(p.gas_value,&stored.currency,rate))}));
-        lines.push(json!({"label":"Reserve transfer fee","value":say_money(p.network_fee(),&stored.currency,rate)}));
-    }
+    let summary = spot_summary(
+        &stored.side,
+        stored.input_units,
+        &format!(
+            "{} {}",
+            format_units(stored.input_units, a.decimals),
+            a.symbol
+        ),
+        &get,
+        funding.is_some().then_some(network_fee),
+        gas_topup_units,
+        &stored.currency,
+        rate,
+    );
     let status = IntentStatus {
         intent_id: intent_id.clone(),
         stage: "validate".into(),
@@ -6919,24 +6995,75 @@ mod tests {
         assert_eq!(&order[6..], &["down", "flat"]);
     }
     #[test]
-    fn reserve_is_inside_the_buy_budget_and_small_buys_stop_before_payment() {
-        let preview = solana_fees::Preview {
-            amount: 500_000,
-            fee: 302_746,
-            gas_value: 487_000,
-            min_lamports: 3_955_581,
+    fn a_gas_top_up_is_a_fee_on_top_of_the_buy_not_taken_from_it() {
+        let rate = 1_358_000_000; // ₦1,358 per dollar
+        let text = |lines: &[Value]| {
+            lines
+                .iter()
+                .map(|l| {
+                    format!(
+                        "{}={}",
+                        l["label"].as_str().unwrap(),
+                        l["value"].as_str().unwrap()
+                    )
+                })
+                .collect::<Vec<_>>()
         };
+        // The ₦1,200 buy that bought ₦150 of STRK: now all ₦1,200 buys the coin and the top-up is
+        // added on top.
+        let lines = spot_summary("buy", 883_652, "", "8.1 STRK", None, 771_978, "NGN", rate);
+        assert_eq!(text(&lines)[1], "You get (about)=8.1 STRK");
         assert_eq!(
-            purchase_input(10_000_000, Some(&preview), "USD", 1_000_000).unwrap(),
-            9_197_254
+            text(&lines)[2],
+            format!("Gas top-up (one time)={}", say_money(771_978, "NGN", rate))
         );
         assert_eq!(
-            purchase_input(10_000_000, None, "USD", 1_000_000).unwrap(),
-            10_000_000
+            text(&lines)[0],
+            format!("You pay={}", say_money(883_652 + 771_978, "NGN", rate))
         );
-        let error = purchase_input(800_000, Some(&preview), "NGN", 1_504_690_000).unwrap_err();
-        assert!(error.1.contains("₦"));
-        assert!(!error.1.contains("USDC") && !error.1.contains("USD"));
+        // A funded wallet: no top-up line at all.
+        let lines = spot_summary("buy", 883_652, "", "8.1 STRK", None, 0, "NGN", rate);
+        assert_eq!(
+            text(&lines),
+            [
+                format!("You pay={}", say_money(883_652, "NGN", rate)),
+                "You get (about)=8.1 STRK".into()
+            ]
+        );
+        // Cash moved over from Base first: its network fee is in "You pay" and has its own line.
+        let lines = spot_summary(
+            "buy",
+            883_652,
+            "",
+            "8.1 STRK",
+            Some(20_000),
+            500_000,
+            "NGN",
+            rate,
+        );
+        assert_eq!(
+            text(&lines)[0],
+            format!("You pay={}", say_money(1_403_652, "NGN", rate))
+        );
+        assert_eq!(
+            text(&lines)[2],
+            format!("Network fee={}", say_money(20_000, "NGN", rate))
+        );
+        assert_eq!(
+            text(&lines)[3],
+            format!("Gas top-up (one time)={}", say_money(500_000, "NGN", rate))
+        );
+        // A sale pays its top-up from cash, and says so.
+        let lines = spot_summary("sell", 0, "8.1 STRK", "₦1,100", None, 500_000, "NGN", rate);
+        assert_eq!(text(&lines)[0], "You sell=8.1 STRK");
+        assert_eq!(
+            text(&lines)[2],
+            format!(
+                "Gas top-up (one time, from your cash)={}",
+                say_money(500_000, "NGN", rate)
+            )
+        );
+        assert_eq!(lines.len(), 3);
     }
     #[tokio::test]
     async fn stale_next_and_poll_cannot_replace_a_sent_fee_step() {

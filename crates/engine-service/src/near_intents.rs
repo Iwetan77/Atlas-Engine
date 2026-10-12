@@ -128,10 +128,13 @@ struct SuiSwap {
     // SUI (MIST) to swap, after keeping SUI_GAS_RESERVE for gas.
     sui_in: u128,
     expected_out: u128,
-    // NEAR: what's kept back for gas, only what the wallet was missing of NEAR_GAS_RESERVE (older
-    // plans, without it, kept the whole reserve).
+    // What's kept back for gas: only what the wallet was missing of its reserve (NEAR_GAS_RESERVE or
+    // SUI_GAS_RESERVE). Older plans, without it, kept the whole reserve.
     #[serde(default)]
     keep: Option<u128>,
+    // The cash (USDC units) that bought `keep`, paid on top of the coin: "Gas top-up (one time)".
+    #[serde(default)]
+    gas_usdc: u128,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SuiSale {
@@ -633,6 +636,7 @@ impl NearState {
                         sui_in: 0,
                         expected_out: 0,
                         keep: None,
+                        gas_usdc: 0,
                     },
                 );
             }
@@ -2670,12 +2674,40 @@ async fn sui_quote(
         &deadline,
         true,
     );
-    let q = state.near.client.quote(&request).await.map_err(venue)?;
+    let first = state.near.client.quote(&request).await.map_err(venue)?;
+    // SUI for gas is a top-up on top of the buy: only what the wallet is missing of its reserve,
+    // delivered with the coin's SUI in the same deposit, so all of `amount` still buys the coin.
+    let keep = SUI_GAS_RESERVE.saturating_sub(
+        sui_native(&state, &headers, &destination)
+            .await
+            .unwrap_or(0),
+    );
+    let gas_usdc = gas_cost(keep, amount, first.amount_out.parse().map_err(internal)?);
+    let (wallet, from_solana, network_fee, origin, q) = if gas_usdc == 0 {
+        (wallet, from_solana, network_fee, origin, first)
+    } else {
+        let total = amount + gas_usdc;
+        let (wallet, from_solana, network_fee, origin) =
+            pay_from(&state, &user, total, &req.amount.currency, rate).await?;
+        let units = total.to_string();
+        let request = QuoteRequest::exact_input(
+            origin,
+            &sui.asset_id,
+            &units,
+            &destination,
+            refund_to(&user, &wallet, origin),
+            &deadline,
+            true,
+        );
+        let q = state.near.client.quote(&request).await.map_err(venue)?;
+        (wallet, from_solana, network_fee, origin, q)
+    };
     let sui_out: u128 = q.amount_out.parse().map_err(internal)?;
-    if sui_out <= SUI_GAS_RESERVE * 2 {
+    if sui_out <= keep + SUI_GAS_RESERVE {
         return Err(bad("That's too small to buy on Sui. Try a bigger amount."));
     }
-    let sui_in = sui_out - SUI_GAS_RESERVE;
+    let sui_in = sui_out - keep;
+    let base_gas = base_gas_topup(&state, &wallet, from_solana).await;
     let (symbol, name, decimals, icon_url) = sui_meta(&state, coin)
         .await
         .ok_or_else(|| venue("Sui coin details unavailable"))?;
@@ -2708,7 +2740,7 @@ async fn sui_quote(
             wallet,
             recipient: destination,
             asset: sui,
-            amount,
+            amount: amount + gas_usdc,
             minimum_out: minimum,
             currency: req.amount.currency.clone(),
             expires,
@@ -2725,7 +2757,8 @@ async fn sui_quote(
                 icon_url,
                 sui_in,
                 expected_out,
-                keep: None,
+                keep: Some(keep),
+                gas_usdc,
             }),
             asset_id: req.asset_id.clone(),
             monad_sale: false,
@@ -2733,14 +2766,16 @@ async fn sui_quote(
             gas_first: None,
         },
     );
-    Ok(Json(
-        json!({"quoteId":quote_id,"assetId":req.asset_id,"side":"buy",
-        "pay":{"amount":markets::format_units(amount,6),"symbol":"USDC","value":money(amount,&req.amount.currency,rate)},
-        "receive":{"amount":markets::format_units(expected_out,decimals),"symbol":symbol,
-            "value":money(value_usd,&req.amount.currency,rate)},
-        "price":unit_price(amount,expected_out,decimals,&req.amount.currency,rate),
-        "fee":money(network_fee,&req.amount.currency,rate),"expiresAtUnixMs":expires}),
-    ))
+    Ok(Json(buy_quote_json(
+        &quote_id,
+        &req,
+        amount,
+        gas_usdc + base_gas,
+        network_fee,
+        (expected_out, &symbol, decimals, value_usd),
+        rate,
+        expires,
+    )))
 }
 
 async fn ref_buy_quote(
@@ -2780,7 +2815,39 @@ async fn ref_buy_quote(
         &deadline,
         true,
     );
-    let q = state.near.client.quote(&request).await.map_err(venue)?;
+    let first = state.near.client.quote(&request).await.map_err(venue)?;
+    // NEAR kept back for this coin's later sale: only what the wallet is missing of the reserve, so
+    // repeat buys don't pile NEAR up. It's bought on top of the coin, never out of `amount`.
+    let keep = NEAR_GAS_RESERVE.saturating_sub(near_native(&state, &destination).await?);
+    let gas_usdc = gas_cost(
+        keep,
+        amount,
+        first
+            .min_amount_out
+            .as_deref()
+            .unwrap_or(&first.amount_out)
+            .parse()
+            .map_err(internal)?,
+    );
+    let (wallet, from_solana, network_fee, origin, q) = if gas_usdc == 0 {
+        (wallet, from_solana, network_fee, origin, first)
+    } else {
+        let total = amount + gas_usdc;
+        let (wallet, from_solana, network_fee, origin) =
+            pay_from(&state, &user, total, &req.amount.currency, rate).await?;
+        let units = total.to_string();
+        let request = QuoteRequest::exact_input(
+            origin,
+            &sui.asset_id,
+            &units,
+            &destination,
+            refund_to(&user, &wallet, origin),
+            &deadline,
+            true,
+        );
+        let q = state.near.client.quote(&request).await.map_err(venue)?;
+        (wallet, from_solana, network_fee, origin, q)
+    };
     let sui_out: u128 = q.amount_out.parse().map_err(internal)?;
     let minimum: u128 = q
         .min_amount_out
@@ -2788,9 +2855,7 @@ async fn ref_buy_quote(
         .unwrap_or(&q.amount_out)
         .parse()
         .map_err(internal)?;
-    // NEAR kept back for this coin's later sale: only what the wallet is missing of the reserve, so
-    // repeat buys don't pile NEAR up.
-    let keep = NEAR_GAS_RESERVE.saturating_sub(near_native(&state, &destination).await?);
+    let base_gas = base_gas_topup(&state, &wallet, from_solana).await;
     if minimum <= keep + NEAR_GAS_RESERVE || minimum > sui_out {
         return Err(bad("That amount is too small to buy. Try a bigger amount."));
     }
@@ -2833,7 +2898,7 @@ async fn ref_buy_quote(
             wallet,
             recipient: destination,
             asset: sui,
-            amount,
+            amount: amount + gas_usdc,
             minimum_out: minimum,
             currency: req.amount.currency.clone(),
             expires,
@@ -2851,6 +2916,7 @@ async fn ref_buy_quote(
                 sui_in,
                 expected_out,
                 keep: Some(keep),
+                gas_usdc,
             }),
             asset_id: req.asset_id.clone(),
             monad_sale: false,
@@ -2858,14 +2924,16 @@ async fn ref_buy_quote(
             gas_first: None,
         },
     );
-    Ok(Json(
-        json!({"quoteId":quote_id,"assetId":req.asset_id,"side":"buy",
-        "pay":{"amount":markets::format_units(amount,6),"symbol":"USDC","value":money(amount,&req.amount.currency,rate)},
-        "receive":{"amount":markets::format_units(expected_out,decimals),"symbol":symbol,
-            "value":money(value_usd,&req.amount.currency,rate)},
-        "price":unit_price(amount,expected_out,decimals,&req.amount.currency,rate),
-        "fee":money(network_fee,&req.amount.currency,rate),"expiresAtUnixMs":expires}),
-    ))
+    Ok(Json(buy_quote_json(
+        &quote_id,
+        &req,
+        amount,
+        gas_usdc + base_gas,
+        network_fee,
+        (expected_out, &symbol, decimals, value_usd),
+        rate,
+        expires,
+    )))
 }
 
 const NEAR_GAS_RESERVE: u128 = 50_000_000_000_000_000_000_000;
@@ -4538,6 +4606,68 @@ async fn sui_sell_quote(
 // gas tank fills itself first), else Solana (gas topped up gaslessly, but 1Click's one-off deposit
 // address needs its USDC account opened, about 0.002 SOL of rent, shown as the network fee).
 // Returns the paying wallet, whether it's Solana, the network fee (USD micros) and 1Click's asset.
+// What `native` more of the coin 1Click delivers costs at the rate it quoted (`paid` USDC units for
+// `got`), with 5% room for the price moving before the deposit lands; 0 when nothing is missing.
+fn gas_cost(native: u128, paid: u128, got: u128) -> u128 {
+    if native == 0 || got == 0 {
+        return 0;
+    }
+    native
+        .saturating_mul(paid)
+        .div_ceil(got)
+        .saturating_mul(105)
+        .div_ceil(100)
+}
+
+// The $0.50 CoW top-up a Base deposit with an empty gas tank starts with (deposit_ready), in USDC
+// units; 0 when the wallet pays its own gas or the cash comes from Solana.
+async fn base_gas_topup(state: &AppState, wallet: &str, from_solana: bool) -> u128 {
+    if from_solana || markets::wallet_pays_gas(state, wallet).await {
+        0
+    } else {
+        markets::BASE_GAS_REFILL_USDC
+    }
+}
+
+// SUI already in the user's Sui wallet (MIST), so a buy only tops up what its gas reserve is
+// missing. None when the bridge can't say; the buy then keeps the whole reserve.
+async fn sui_native(state: &AppState, headers: &HeaderMap, owner: &str) -> Option<u128> {
+    let balance = bridge(state, headers, "/sui/balance", json!({}))
+        .await
+        .ok()?;
+    if balance["address"].as_str() != Some(owner) {
+        return None;
+    }
+    balance["result"]["totalBalance"].as_str()?.parse().ok()
+}
+
+// A buy quote: "pay" is everything that leaves the balance (the coin, its gas top-up and the network
+// fee), and "fee" is everything in it that isn't the coin.
+#[allow(clippy::too_many_arguments)]
+fn buy_quote_json(
+    quote_id: &str,
+    req: &markets::QuoteRequest,
+    coin: u128,
+    gas: u128,
+    network_fee: u128,
+    (out, symbol, decimals, out_usd): (u128, &str, u32, u128),
+    rate: u128,
+    expires: u64,
+) -> Value {
+    let currency = &req.amount.currency;
+    let total = coin + gas + network_fee;
+    let mut quote = json!({"quoteId":quote_id,"assetId":req.asset_id,"side":"buy",
+        "pay":{"amount":markets::format_units(total,6),"symbol":"USDC","value":money(total,currency,rate)},
+        "receive":{"amount":markets::format_units(out,decimals),"symbol":symbol,
+            "value":money(out_usd,currency,rate)},
+        "price":unit_price(coin,out,decimals,currency,rate),
+        "fee":money(gas + network_fee,currency,rate),"expiresAtUnixMs":expires});
+    if gas > 0 {
+        quote["gasTopup"] = money(gas, currency, rate);
+    }
+    quote
+}
+
 async fn pay_from(
     state: &AppState,
     user: &app_balance::VerifiedWallets,
@@ -4730,6 +4860,7 @@ pub(super) async fn quote(
     if input != amount {
         return Err(venue("1Click changed the exact input amount"));
     }
+    let base_gas = base_gas_topup(&state, &wallet, from_solana).await;
     let quote_id = id("q");
     let expires = now() + 30_000;
     state.near.quotes.lock().map_err(internal)?.insert(
@@ -4754,14 +4885,16 @@ pub(super) async fn quote(
             gas_first: None,
         },
     );
-    Ok(Json(
-        json!({"quoteId":quote_id,"assetId":req.asset_id,"side":"buy",
-        "pay":{"amount":markets::format_units(input,6),"symbol":"USDC","value":money(input,&req.amount.currency,rate)},
-        "receive":{"amount":markets::format_units(output,token.decimals),"symbol":token.symbol,
-            "value":money(output_usd,&req.amount.currency,rate)},
-        "price":unit_price(input,output,token.decimals,&req.amount.currency,rate),
-        "fee":money(network_fee,&req.amount.currency,rate),"expiresAtUnixMs":expires}),
-    ))
+    Ok(Json(buy_quote_json(
+        &quote_id,
+        &req,
+        input,
+        base_gas,
+        network_fee,
+        (output, &token.symbol, token.decimals, output_usd),
+        rate,
+        expires,
+    )))
 }
 // A MON sale's plan: one deposit to Relay's depository on Monad, for the phone to send. The wallet's
 // nonce is noted: once it moves on, the plan may have gone out.
@@ -5613,11 +5746,22 @@ pub(super) async fn execute(
             stored.asset.symbol
         ),
     };
+    // Gas bought on top of the coin: the coin chain's reserve inside the deposit, and Base's tank.
+    let base_gas = if gas_topup {
+        markets::BASE_GAS_REFILL_USDC
+    } else {
+        0
+    };
+    let gas = stored.then_swap.as_ref().map_or(0, |s| s.gas_usdc) + base_gas;
     let mut summary = vec![
-        json!({"label":"You pay","value":markets::say_money(stored.amount,&stored.currency,rate)}),
+        json!({"label":"You pay","value":markets::say_money(stored.amount + base_gas + stored.network_fee,&stored.currency,rate)}),
         json!({"label":"You get (about)","value":get}),
         json!({"label":"Lands on","value":chain}),
     ];
+    if gas > 0 {
+        summary.push(json!({"label":"Gas top-up (one time)",
+            "value":markets::say_money(gas,&stored.currency,rate)}));
+    }
     if stored.network_fee > 0 {
         summary.push(json!({"label":"Network fee",
             "value":markets::say_money(stored.network_fee,&stored.currency,rate)}));
@@ -6246,11 +6390,11 @@ pub(super) async fn status(
                 "SUCCESS" => {
                     let got = delivered(&venue_status).unwrap_or(current.minimum_out);
                     if let Some(swap) = &mut current.then_swap {
-                        let reserve = if swap.network == "near" {
-                            swap.keep.unwrap_or(NEAR_GAS_RESERVE)
+                        let reserve = swap.keep.unwrap_or(if swap.network == "near" {
+                            NEAR_GAS_RESERVE
                         } else {
                             SUI_GAS_RESERVE
-                        };
+                        });
                         swap.sui_in = swap.sui_in.min(got.saturating_sub(reserve));
                     }
                     let hashes = venue_status
@@ -7185,6 +7329,11 @@ mod tests {
     fn a_sale_short_of_near_buys_just_enough_first() {
         // 8 Oct, NEAR $5.13: an empty wallet gets 0.05 NEAR, with room for the swap's price.
         assert_eq!(gas_usdc(NEAR_GAS_RESERVE, 5.13), 294_975);
+        // A buy's gas top-up is priced at the deposit's own rate, plus 5%: 0.02 SUI when ₦1,200
+        // ($0.88) buys 0.25 SUI costs about 7.4 cents, on top of the 88.
+        assert_eq!(gas_cost(20_000_000, 883_652, 250_000_000), 74_228);
+        assert_eq!(gas_cost(0, 883_652, 250_000_000), 0);
+        assert_eq!(gas_cost(20_000_000, 883_652, 0), 0);
         // Nearly there: still 1Click's smallest swap, $0.15.
         assert_eq!(gas_usdc(NEAR_GAS_RESERVE / 50, 5.13), NEAR_GAS_MIN_USDC);
     }
