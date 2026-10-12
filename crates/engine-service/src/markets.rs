@@ -2872,8 +2872,7 @@ pub(super) async fn quote(
         // Buys are paid from Trading (the Solana wallet's cash), so a Base coin's whole price comes
         // over from there first, whatever Spendable holds.
         (funding_units, funding_fee) =
-            base_cash_from_solana(&state, &user, 0, cash_needed, &req.amount.currency, rate)
-                .await?;
+            base_cash_from_solana(&state, &user, 0, actual_in, &req.amount.currency, rate).await?;
     } else if let Some(held) = spot_available(&state, &a, &req.side, &user).await {
         if held < cash_needed {
             return Err(if req.side == "buy" {
@@ -3542,7 +3541,7 @@ async fn transfer_fee_ready(
     if let (Some(request_id), Some(tx)) = (&intent.gas_request_id, signed.first()) {
         if let Some(transfer) = intent.transfer.as_mut() {
             if transfer.cash_fee_limit.is_some() {
-                transfer.gas_committed = transfer.topup;
+                transfer.gas_committed = transfer.gas_committed.max(transfer.topup);
             }
         }
         state
@@ -5558,15 +5557,24 @@ pub(super) async fn signed(
                 None => None,
             };
             let from = current.status.stage.clone();
+            let mut updated = current;
+            if updated.gas_request_id.is_some() {
+                if let Some(t) = updated
+                    .transfer
+                    .as_mut()
+                    .filter(|t| t.cash_fee_limit.is_some())
+                {
+                    t.gas_committed = t.gas_committed.max(t.topup);
+                }
+            }
             if !state
                 .markets
-                .claim_execution(&intent_id, &current, &from)
+                .claim_execution(&intent_id, &updated, &from)
                 .await?
             {
                 let latest = state.markets.get_intent(&intent_id).await?;
-                return Ok(Json(latest.map_or(current.status, |i| i.status)));
+                return Ok(Json(latest.map_or(updated.status, |i| i.status)));
             }
-            let mut updated = current;
             let ready = match updated.transfer.as_ref().and_then(|t| t.kora.as_ref()) {
                 Some(kora) => {
                     kora_transfer_ready(&state, kora, &updated.wallet, &body.signed).await
@@ -6179,6 +6187,11 @@ pub(super) async fn next_transactions(
             t.topup = steps.topup;
             t.relay_request = steps.relay_request.clone();
             t.transaction = steps.kora.is_none().then(|| steps.transaction.clone());
+            t.last_valid_height = t
+                .transaction
+                .as_deref()
+                .and_then(|tx| state.solana_mainnet.last_valid_height(tx))
+                .unwrap_or(0);
             t.last_valid_height = t
                 .transaction
                 .as_deref()
