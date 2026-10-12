@@ -388,7 +388,7 @@ async fn read_portfolio(
     let catalog = markets::catalog(&state.markets).await?;
 
     // Every other source is read at once; one that fails leaves only its own holdings unread.
-    let (cash, perps, predicted, base, (solana, gas_sol), sui, near, monad) = tokio::join!(
+    let (cash, perps, predicted, base, (solana, gas_sol), sui, near, monad, hood) = tokio::join!(
         other_cash(state, &evm),
         perps_margin(state, &evm),
         predictions_held(state, headers, &user.user_id),
@@ -413,8 +413,9 @@ async fn read_portfolio(
         sui_coins(state, headers, user),
         near_coins(state, headers, user),
         monad_coins(state, &user.user_id, &evm),
+        hood_coins(state, &user.user_id, &evm),
     );
-    for found in [cash, perps, predicted, base, solana, sui, near, monad] {
+    for found in [cash, perps, predicted, base, solana, sui, near, monad, hood] {
         read.extend(found.read);
         unsure.extend(found.unsure);
     }
@@ -577,6 +578,41 @@ async fn monad_coins(state: &AppState, owner: &str, evm: &str) -> Found {
             }
         }
         Err(_) => found.unsure.push(Unsure::Coins("monad")),
+    }
+    found
+}
+
+async fn hood_coins(state: &AppState, owner: &str, evm: &str) -> Found {
+    let mut found = Found::default();
+    // Coins bought on Robinhood Chain sit in the user's own EVM wallet there, with its ETH for gas.
+    match state.near.hood_holdings(owner, evm).await {
+        Ok(coins) => {
+            for (asset, units) in coins {
+                let id = format!("near:{}", asset.asset_id);
+                // Its memecoins are memes; the ETH kept for gas and a refund's USDG are money.
+                let meme = asset.contract_address.as_deref().is_some_and(|c| {
+                    !c.eq_ignore_ascii_case(engine_execution::relay_link::ROBINHOOD_USDG)
+                });
+                match priced_units(&id, asset.price.as_ref(), units, asset.decimals) {
+                    Some(value_usdc) => found.read.push(Held {
+                        asset_id: id,
+                        symbol: asset.symbol.clone(),
+                        name: format!("{} on Robinhood", asset.symbol),
+                        kind: if meme { "meme" } else { "crypto" }.into(),
+                        chain: "robinhood".into(),
+                        location: "wallet".into(),
+                        icon_url: state.near.icon_for(&asset),
+                        amount: markets::format_units(units, asset.decimals),
+                        units,
+                        decimals: asset.decimals,
+                        value_usdc,
+                        seen_ms: 0,
+                    }),
+                    None => found.unsure.push(Unsure::One("wallet", "robinhood", id)),
+                }
+            }
+        }
+        Err(_) => found.unsure.push(Unsure::Coins("robinhood")),
     }
     found
 }

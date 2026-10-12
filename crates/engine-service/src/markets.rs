@@ -1908,6 +1908,14 @@ pub(super) async fn assets(
             result.push(row);
         }
     }
+    // Robinhood Chain's memecoins join Memes and Trending (and a search that matches them).
+    if want_listed && kind.is_none_or(|k| k == "meme") {
+        for row in near_intents::hood_memes(&state, raw, &currency, rate).await {
+            if !result.iter().any(|r| r["assetId"] == row["assetId"]) {
+                result.push(row);
+            }
+        }
+    }
     let answer = json!({"assets":result,"searchComplete":search_complete});
     if search_complete {
         state.markets.keep_search(key, &answer);
