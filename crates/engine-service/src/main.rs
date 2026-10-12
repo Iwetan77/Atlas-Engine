@@ -329,6 +329,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             state.clone(),
             pin::plan_gate,
         ))
+        .layer(axum::middleware::from_fn(pockets::client_gate))
         .with_state(state);
     if let Some(cors) = configured_cors()? {
         app = app.layer(cors);
@@ -481,6 +482,7 @@ fn configured_cors() -> Result<Option<CorsLayer>, Box<dyn std::error::Error>> {
                 header::HeaderName::from_static("privy-id-token"),
                 header::HeaderName::from_static("x-atlas-pin-authorization"),
                 header::HeaderName::from_static("x-atlas-payment-pin"),
+                header::HeaderName::from_static(pockets::CLIENT_HEADER),
             ]),
     ))
 }

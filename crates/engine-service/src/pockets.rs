@@ -11,6 +11,43 @@ use std::{
 };
 
 static NEXT_MOVE_ID: AtomicU64 = AtomicU64::new(1);
+
+// Apps that know about Spendable and Trading say so on every request. An older app has no way to
+// move money between them, so its money actions get an update message instead of a shortage it
+// couldn't fix (the same way the payment PIN was rolled out).
+pub(super) const CLIENT_HEADER: &str = "x-atlas-balances";
+const UPDATE_FOR_BALANCES: &str =
+    "Update Atlas to keep trading and sending: your balance now has Spendable and Trading.";
+
+// The quotes that pay from Spendable or Trading. Adding money, closing positions and moves aren't
+// here: they work the same for every app.
+fn needs_pockets(path: &str) -> bool {
+    matches!(
+        path,
+        "/v1/quotes"
+            | "/v1/sends/quote"
+            | "/v1/perps/quotes"
+            | "/v1/predictions/quotes"
+            | "/v1/earn/quotes"
+            | "/v1/withdrawals/quote"
+    )
+}
+
+pub(super) async fn client_gate(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, ApiError> {
+    let knows = request
+        .headers()
+        .get(CLIENT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().parse::<u32>().is_ok_and(|n| n >= 1));
+    if request.method() == axum::http::Method::POST && needs_pockets(request.uri().path()) && !knows
+    {
+        return Err((StatusCode::CONFLICT, UPDATE_FOR_BALANCES.into()));
+    }
+    Ok(next.run(request).await)
+}
 const QUOTE_MS: u64 = 30_000;
 // A cent of room under everything in the balance, so a Max move's next quote still fits.
 const ROUNDING_UNITS: u128 = 10_000;
@@ -336,6 +373,29 @@ pub(super) async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_quotes_that_pay_from_a_balance_need_an_app_that_knows_both() {
+        for path in [
+            "/v1/quotes",
+            "/v1/sends/quote",
+            "/v1/perps/quotes",
+            "/v1/predictions/quotes",
+            "/v1/earn/quotes",
+            "/v1/withdrawals/quote",
+        ] {
+            assert!(needs_pockets(path), "{path}");
+        }
+        for path in [
+            "/v1/moves/quote",
+            "/v1/onramp/bank/quote",
+            "/v1/deposit/quote",
+            "/v1/quotes/q-1/execute",
+            "/v1/balance",
+        ] {
+            assert!(!needs_pockets(path), "{path}");
+        }
+    }
 
     #[test]
     fn directions_round_trip_and_name_both_balances() {
