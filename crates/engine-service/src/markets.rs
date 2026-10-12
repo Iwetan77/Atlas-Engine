@@ -5582,6 +5582,8 @@ pub(super) async fn signed(
             }
             // A bound transfer's signature is known before it's sent: kept first, so a lost answer
             // from the network is followed by that signature instead of being called a failure.
+            // The status poll may settle it while the network is still answering, so afterwards
+            // only a refusal changes it, and only if nothing else has since.
             if let Some(signature) = &bound {
                 updated.status.tx_ids = vec![signature.clone()];
                 updated.status.stage = "settle".into();
@@ -5590,6 +5592,31 @@ pub(super) async fn signed(
                     t.sent_height = height;
                 }
                 state.markets.save_intent(&intent_id, &updated).await?;
+                match state
+                    .solana_mainnet
+                    .send_signed(&body.signed[main].transaction)
+                    .await
+                {
+                    Ok(_) => {}
+                    // The network refused it outright: it can't land.
+                    Err(engine_execution::solana::SolanaPreflightError::Rpc(reason))
+                        if !reason.contains("already been processed") =>
+                    {
+                        let mut failed = updated.clone();
+                        failed.status.state = "failed".into();
+                        failed.status.error =
+                            Some(format!("The transfer didn't go through: {reason}"));
+                        state
+                            .markets
+                            .replace_plan(&intent_id, &updated, &failed)
+                            .await?;
+                    }
+                    Err(error) => {
+                        eprintln!("intent {intent_id}: transfer submission unresolved: {error}");
+                    }
+                }
+                let latest = state.markets.get_intent(&intent_id).await?;
+                return Ok(Json(latest.map_or(updated.status, |i| i.status)));
             }
             match state
                 .solana_mainnet
@@ -5599,18 +5626,6 @@ pub(super) async fn signed(
                 Ok(signature) => {
                     updated.status.tx_ids = vec![signature];
                     updated.status.stage = "settle".into();
-                }
-                // The network refused it outright (it can't land); anything else may have reached it.
-                Err(engine_execution::solana::SolanaPreflightError::Rpc(reason))
-                    if !reason.contains("already been processed") =>
-                {
-                    updated.status.stage = "settle".into();
-                    updated.status.state = "failed".into();
-                    updated.status.error =
-                        Some(format!("The transfer didn't go through: {reason}"));
-                }
-                Err(error) if bound.is_some() => {
-                    eprintln!("intent {intent_id}: transfer submission unresolved: {error}");
                 }
                 Err(error) => {
                     updated.status.stage = "settle".into();
