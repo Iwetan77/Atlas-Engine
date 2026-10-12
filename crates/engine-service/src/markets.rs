@@ -1013,7 +1013,7 @@ struct StoredIntent {
     solana_transfer: bool,
     // Cash Relay moves with nothing to buy or send after it (between the user's own Spendable and
     // Trading balances, or a gasless payment from Spendable): done once Relay has delivered it.
-    #[serde(default)]
+    #[serde(default, alias = "pocket_move")]
     relay_only: bool,
     // Base transactions from a wallet with no ETH: a gasless CoW top-up runs first, then /next hands
     // out `expected`.
@@ -1055,6 +1055,14 @@ pub(super) struct PlannedTransfer {
     // None for older intents, which finish when their Solana transaction lands.
     #[serde(default)]
     relay_request: Option<String>,
+    // The exact transaction planned for the wallet to sign (not through Kora): what's signed must be
+    // this message, from this wallet. None for older intents.
+    #[serde(default)]
+    transaction: Option<String>,
+    // When the signed transfer was handed to the network (ms): one the network never saw is
+    // given up once its blockhash can't be valid any more.
+    #[serde(default)]
+    sent_ms: u64,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct BaseTopup {
@@ -3173,6 +3181,45 @@ async fn move_to_solana(
     ))
 }
 
+// Whether a gasless move's USDC authorization is past its deadline (and a minute more) and was
+// never used on chain, so nothing moved and nothing can. Unknown is never dead.
+async fn authorization_dead(state: &AppState, cash: &CashMove) -> bool {
+    let Some(auth) = &cash.authorization else {
+        return false;
+    };
+    let message = &auth.typed_data["message"];
+    let deadline = message["validBefore"]
+        .as_str()
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| message["validBefore"].as_u64());
+    let (Some(deadline), Some(from), Some(nonce)) = (
+        deadline,
+        message["from"].as_str(),
+        message["nonce"].as_str(),
+    ) else {
+        return false;
+    };
+    if now() / 1000 <= deadline + 60 {
+        return false;
+    }
+    let from = from.trim_start_matches("0x").to_ascii_lowercase();
+    let nonce = nonce.trim_start_matches("0x").to_ascii_lowercase();
+    if from.len() != 40 || nonce.len() != 64 {
+        return false;
+    }
+    // USDC's authorizationState(authorizer, nonce): true once the authorization was used.
+    let used = base_rpc(
+        &state.markets,
+        "eth_call",
+        json!([{"to":BASE_USDC,"data":format!("0xe94a0102{from:0>64}{nonce}")},"latest"]),
+    )
+    .await;
+    match used.ok().as_ref().and_then(Value::as_str) {
+        Some(word) => u128::from_str_radix(word.trim_start_matches("0x"), 16) == Ok(0),
+        None => false,
+    }
+}
+
 // Base cash Relay moves gaslessly with nothing after it: Spendable → Trading (to the user's own
 // Solana wallet), or a payment from Spendable when the wallet has no ETH. The user's own session signs
 // one USDC authorization (no Base gas) and Relay's solver delivers. `moved` is the Relay quote they
@@ -3230,6 +3277,13 @@ pub(super) async fn plan_relay_move(
         )
         .await?;
     Ok((intent_id, vec![step]))
+}
+
+// A Relay fee as quoted to the user: what Relay asks now, with room for it moving by a hair before
+// they confirm (5%, at least a fifth of a cent). Confirmation never charges past this figure, so
+// what they reviewed is the most that can leave; a bigger change asks them to look again.
+pub(super) fn fee_room(fee: u128) -> u128 {
+    fee.saturating_add((fee / 20).max(2_000))
 }
 
 // A gasless payment of exactly `amount` from Spendable to `to` on Base (Relay's solver pays the gas
@@ -3302,7 +3356,7 @@ pub(super) async fn plan_move_to_spendable(
             "The fee changed. Check the new amount; nothing was moved.".into(),
         ));
     }
-    let topup = steps.topup;
+    // Retries stay within the same total: Relay's fee and any SOL top-up together.
     let (intent_id, transactions, _) = insert_transfer(
         state,
         owner,
@@ -3312,12 +3366,16 @@ pub(super) async fn plan_move_to_spendable(
         true,
         true,
         steps,
-        Some(topup),
+        Some(cost_limit),
         None,
     )
     .await?;
     Ok((intent_id, transactions, cost))
 }
+
+// A Solana transaction's blockhash is good for about a minute and a half; three minutes after a
+// signed transfer was sent, one the network still hasn't seen never will.
+const TRANSFER_LANDS_MS: u64 = 180_000;
 
 // The gas tank. Every Solana transaction needs a little SOL for its fee unless Jupiter pays it
 // (gasless swaps). Below this, a Solana step gets a top-up first.
@@ -3660,6 +3718,7 @@ async fn insert_transfer(
         relay_request,
     } = steps;
     let intent_id = id("intent");
+    let planned = kora.is_none().then(|| transfer.clone());
     state
         .markets
         .insert_intent(
@@ -3694,10 +3753,12 @@ async fn insert_transfer(
                     kora,
                     base,
                     topup,
+                    transaction: planned,
                     cash_fee_limit,
                     bank_ngn_per_usdc,
                     gas_committed: 0,
                     relay_request,
+                    sent_ms: 0,
                 }),
                 base_topup: None,
             },
@@ -5253,6 +5314,9 @@ pub(super) async fn signed(
             .as_ref()
             .map(|c| c.swap_id.clone())
             .unwrap_or_default();
+        // Refused (a bad signature, or Relay said no) moved nothing. No answer at all may still
+        // have been taken: the status poll follows Relay's request, and the USDC authorization
+        // itself once it can no longer be used.
         let moved = match gasless::verify(
             &state,
             &headers,
@@ -5262,11 +5326,22 @@ pub(super) async fn signed(
         )
         .await
         {
-            Ok(signature) => state
+            Ok(signature) => match state
                 .relay_link
                 .submit(&request_id, &auth.api, &signature)
                 .await
-                .map_err(|e| e.to_string()),
+            {
+                Ok(()) => Ok(()),
+                Err(engine_execution::relay_link::RelayError::Rejected { status, reason })
+                    if status.is_client_error() =>
+                {
+                    Err(format!("{status}: {reason}"))
+                }
+                Err(error) => {
+                    eprintln!("intent {intent_id}: gasless move unresolved: {error}");
+                    Ok(())
+                }
+            },
             Err(reason) => Err(reason),
         };
         updated.status.stage = "fund".into();
@@ -5430,6 +5505,22 @@ pub(super) async fn signed(
         }
         // A plain USDC transfer: the engine lands it and status follows its signature.
         if current.solana_transfer {
+            // What's signed must be the planned transfer, from this wallet, before anything is landed.
+            let bound = match current
+                .transfer
+                .as_ref()
+                .and_then(|t| t.transaction.as_deref())
+            {
+                Some(planned) => Some(
+                    engine_execution::solana::checked_swap_signature(
+                        planned,
+                        &body.signed[main].transaction,
+                        &current.wallet,
+                    )
+                    .map_err(|_| bad("signed transfer does not match your plan"))?,
+                ),
+                None => None,
+            };
             let from = current.status.stage.clone();
             if !state
                 .markets
@@ -5472,6 +5563,16 @@ pub(super) async fn signed(
                 let usdc = updated.transfer.as_ref().map_or(0, |t| t.topup);
                 note_gas_topup(&state, &updated.owner, &intent_id, usdc).await;
             }
+            // A bound transfer's signature is known before it's sent: kept first, so a lost answer
+            // from the network is followed by that signature instead of being called a failure.
+            if let Some(signature) = &bound {
+                updated.status.tx_ids = vec![signature.clone()];
+                updated.status.stage = "settle".into();
+                if let Some(t) = updated.transfer.as_mut() {
+                    t.sent_ms = now();
+                }
+                state.markets.save_intent(&intent_id, &updated).await?;
+            }
             match state
                 .solana_mainnet
                 .send_signed(&body.signed[main].transaction)
@@ -5480,6 +5581,18 @@ pub(super) async fn signed(
                 Ok(signature) => {
                     updated.status.tx_ids = vec![signature];
                     updated.status.stage = "settle".into();
+                }
+                // The network refused it outright (it can't land); anything else may have reached it.
+                Err(engine_execution::solana::SolanaPreflightError::Rpc(reason))
+                    if !reason.contains("already been processed") =>
+                {
+                    updated.status.stage = "settle".into();
+                    updated.status.state = "failed".into();
+                    updated.status.error =
+                        Some(format!("The transfer didn't go through: {reason}"));
+                }
+                Err(error) if bound.is_some() => {
+                    eprintln!("intent {intent_id}: transfer submission unresolved: {error}");
                 }
                 Err(error) => {
                     updated.status.stage = "settle".into();
@@ -5671,6 +5784,10 @@ pub(super) async fn intent_status(
                     "Moving your cash didn't go through ({reason}). It goes back to your balance."
                 )),
             )),
+            // A gasless authorization Relay never used, now past its deadline, can't move anything.
+            _ if authorization_dead(&state, cash).await => {
+                Some(("fund", "failed", Some(gasless::NOT_MOVED.to_string())))
+            }
             // Still moving, or Layerswap didn't answer this time: ask again on the next poll.
             _ => None,
         };
@@ -5790,7 +5907,18 @@ pub(super) async fn intent_status(
             .as_ref()
             .filter(|t| t.base)
             .and_then(|t| t.relay_request.clone());
+        // Not seen long after it was sent: its blockhash has run out, so it can never land.
+        let expired = current
+            .transfer
+            .as_ref()
+            .is_some_and(|t| t.sent_ms > 0 && now().saturating_sub(t.sent_ms) > TRANSFER_LANDS_MS);
         match landed {
+            None if expired => {
+                updated.status.state = "failed".into();
+                updated.status.error = Some(
+                    "The transfer didn't land, so nothing left your balance. Try again.".into(),
+                );
+            }
             None => return Ok(Json(updated.status)),
             // Bridged to Base: done when Relay has delivered, not when it was handed the cash.
             Some(Ok(())) if relayed.is_some() => {
@@ -5962,11 +6090,13 @@ pub(super) async fn next_transactions(
             .await
         };
         let fresh = fresh.and_then(|steps| {
-            checked_transfer_cash_fee(
-                planned.cash_fee_limit,
-                planned.gas_committed,
-                steps.cash_charge(),
-            )?;
+            // Bridged to Base, Relay's fee is cash spent too: the retry stays within what was confirmed.
+            let charge = if planned.base {
+                steps.cash_charge().saturating_add(steps.network_fee)
+            } else {
+                steps.cash_charge()
+            };
+            checked_transfer_cash_fee(planned.cash_fee_limit, planned.gas_committed, charge)?;
             Ok(steps)
         });
         let steps = match fresh {
@@ -5995,6 +6125,7 @@ pub(super) async fn next_transactions(
             t.kora = steps.kora.clone();
             t.topup = steps.topup;
             t.relay_request = steps.relay_request.clone();
+            t.transaction = steps.kora.is_none().then(|| steps.transaction.clone());
         }
         state.markets.save_intent(&intent_id, &intent).await?;
         let mut transactions = Vec::new();
@@ -6529,6 +6660,21 @@ mod tests {
         );
         assert_eq!(coingecko_coin("solana", "x"), None);
     }
+    #[test]
+    fn a_move_saved_under_its_first_flag_name_still_ends_when_relay_delivers() {
+        let mut saved = serde_json::to_value(spot_intent("buy", 1, 1)).unwrap();
+        let fields = saved.as_object_mut().unwrap();
+        fields.remove("relay_only");
+        fields.insert("pocket_move".into(), json!(true));
+        let intent: StoredIntent = serde_json::from_value(saved).unwrap();
+        assert!(intent.relay_only);
+        // Intents from before either name read as ordinary ones.
+        let mut older = serde_json::to_value(spot_intent("buy", 1, 1)).unwrap();
+        older.as_object_mut().unwrap().remove("relay_only");
+        let intent: StoredIntent = serde_json::from_value(older).unwrap();
+        assert!(!intent.relay_only);
+    }
+
     fn spot_intent(side: &str, pay: u128, get: u128) -> StoredIntent {
         StoredIntent {
             owner: "did:privy:a".into(),
@@ -7320,6 +7466,8 @@ mod tests {
             bank_ngn_per_usdc: None,
             gas_committed: 0,
             relay_request: None,
+            transaction: None,
+            sent_ms: 0,
         });
         intent.status.stage = "validate".into();
         intent.status.state = "pending".into();

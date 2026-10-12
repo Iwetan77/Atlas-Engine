@@ -12,8 +12,8 @@ use std::{
 
 static NEXT_MOVE_ID: AtomicU64 = AtomicU64::new(1);
 const QUOTE_MS: u64 = 30_000;
-// A Relay fee priced again moments later can move by a fraction of a cent: the reviewed figure stands.
-const SAME_FEE_UNITS: u128 = 10_000;
+// A cent of room under everything in the balance, so a Max move's next quote still fits.
+const ROUNDING_UNITS: u128 = 10_000;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Direction {
@@ -120,12 +120,11 @@ async fn all_from_trading(
     let mut land = cash;
     for _ in 0..3 {
         let (fee, topup) = markets::move_to_spendable_cost(state, solana, evm, land).await?;
-        let cost = fee.saturating_add(topup);
+        let cost = markets::fee_room(fee).saturating_add(topup);
         if land.saturating_add(cost) <= cash {
             return Ok((land, cost));
         }
-        // A cent of room so the next quote's rounding still fits.
-        land = cash.saturating_sub(cost).saturating_sub(SAME_FEE_UNITS);
+        land = cash.saturating_sub(cost).saturating_sub(ROUNDING_UNITS);
         if land == 0 {
             break;
         }
@@ -200,7 +199,7 @@ pub(super) async fn quote(
                 markets::check_limits(typed, &currency, rate)?;
                 let (fee, topup) =
                     markets::move_to_spendable_cost(&state, &solana, &evm, typed).await?;
-                (typed, fee.saturating_add(topup))
+                (typed, markets::fee_room(fee).saturating_add(topup))
             };
             if land.saturating_add(fee) > cash {
                 return Err(conflict(format!(
@@ -299,22 +298,18 @@ pub(super) async fn execute(
             (intent_id, steps, quote.fee)
         }
         Direction::ToSpendable => {
-            let (intent_id, steps, cost) = markets::plan_move_to_spendable(
+            // Never more than the fee they reviewed (it has room for Relay's price moving a hair);
+            // that figure is what every screen shows.
+            let (intent_id, steps, _) = markets::plan_move_to_spendable(
                 &state,
                 user.user_id.clone(),
                 quote.solana.clone(),
                 &quote.evm,
                 quote.land,
-                quote.fee + SAME_FEE_UNITS,
+                quote.fee,
             )
             .await?;
-            // The same cost priced moments later keeps the reviewed figure, so the totals match.
-            let fee = if cost.abs_diff(quote.fee) <= SAME_FEE_UNITS {
-                quote.fee
-            } else {
-                cost
-            };
-            (intent_id, steps, fee)
+            (intent_id, steps, quote.fee)
         }
     };
     let (from, to) = quote.direction.labels();
