@@ -728,10 +728,14 @@ impl SolanaAtaPreflight {
                 json!([[signature], {"searchTransactionHistory": true}]),
             )
             .await?;
+        // Absence only from a complete answer: exactly one entry, explicitly empty.
+        let answered_none = statuses["value"]
+            .as_array()
+            .is_some_and(|entries| entries.len() == 1 && entries[0].is_null());
         Ok(statuses["context"]["slot"]
             .as_u64()
             .is_some_and(|seen| seen >= slot)
-            && statuses["value"][0].is_null())
+            && answered_none)
     }
 
     pub async fn block_height(&self) -> Result<u64, SolanaPreflightError> {
