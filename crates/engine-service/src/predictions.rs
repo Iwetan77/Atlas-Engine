@@ -703,7 +703,7 @@ fn plan(id: &str, current: &Value) -> Value {
             .as_str()
             .and_then(|v| v.parse::<u128>().ok())
             .unwrap_or(0);
-    summary.push(json!({"label":"Fees included","value":markets::say_money(fees,currency,rate)}));
+    summary.push(json!({"label":"Fee","value":markets::say_money(fees,currency,rate)}));
     if let Some(reserve) = Some(gas_reserve(q)).filter(|v| *v > 0) {
         summary.push(json!({"label":"Gas top-up (one time)","value":markets::say_money(reserve,currency,rate)}));
     }

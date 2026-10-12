@@ -761,31 +761,23 @@ pub(super) async fn send_quote(
             network_units,
         },
     );
-    // Fee is Daya's bank payout charge. Only a new USDC debit appears as Network fee;
-    // rent or transaction fees paid from the existing SOL reserve add no USDC charge.
+    // One fee: the bank payout charge and any network cost together.
     if let Some((_, _, fee)) = bank {
         let network_ngn = bank_network_naira(network_units, rate);
         let total_fee = fee.saturating_add(network_ngn);
         let naira = |micros: u128| money_usdc(micros, "NGN", 1_000_000);
         return Ok(Json(json!({"quoteId":quote_id,"destinationLabel":label,
                 "send":naira(amount.saturating_add(total_fee))?,"receive":naira(amount)?,
-                "fee":naira(fee)?,"networkFee":naira(network_ngn)?,"feeBreakdown":[],
+                "fee":naira(total_fee)?,"feeBreakdown":[],
                 "eta":"Usually within minutes","expiresAtUnixMs":expires})));
     }
     // The network fee goes on top: in Fee and "You pay" here, as on the confirmation.
     let send = money_usdc(usdc_units + network_units, &req.amount.currency, rate)?;
     let receive = money_usdc(gift_units, &req.amount.currency, rate)?;
     let fee = money_usdc(fee_units + network_units, &req.amount.currency, rate)?;
-    let mut breakdown = Vec::new();
-    if fee_units > 0 {
-        breakdown.push(json!({"label":"Claim delivery reserve","amount":money_usdc(fee_units, &req.amount.currency, rate)?}));
-    }
-    if network_units > 0 {
-        breakdown.push(json!({"label":"Network delivery","amount":money_usdc(network_units, &req.amount.currency, rate)?}));
-    }
     Ok(Json(
         json!({"quoteId":quote_id,"destinationLabel":label,"send":send,"receive":receive,"fee":fee,
-            "feeBreakdown":breakdown,"eta":"After confirmation","expiresAtUnixMs":expires}),
+            "feeBreakdown":[],"eta":"After confirmation","expiresAtUnixMs":expires}),
     ))
 }
 async fn execute_send_inner(
@@ -925,18 +917,21 @@ async fn execute_send_inner(
         json!({"label":"Send to","value":quote.label}),
         json!({"label":"Amount","value":markets::say_money(quote.usdc_units,&quote.currency,rate)}),
     ];
+    // One fee: a cash link's claim delivery and any network cost together.
+    let mut charged = fee.unwrap_or(0);
     if let Some((_, note, gift)) = &quote.link {
         summary[1] =
             json!({"label":"They get","value":markets::say_money(*gift,&quote.currency,rate)});
-        summary.push(json!({"label":"Claim delivery reserve","value":markets::say_money(cashlinks::CLAIM_FEE_UNITS,&quote.currency,rate)}));
+        charged += cashlinks::CLAIM_FEE_UNITS;
         if let Some(note) = note {
             summary.push(json!({"label":"Note","value":note}));
         }
     }
+    if charged > 0 {
+        summary
+            .push(json!({"label":"Fee","value":markets::say_money(charged,&quote.currency,rate)}));
+    }
     if let Some(fee) = fee {
-        summary.push(
-            json!({"label":"Network fee","value":markets::say_money(fee,&quote.currency,rate)}),
-        );
         summary.push(json!({"label":"You pay","value":markets::say_money(quote.usdc_units + fee,&quote.currency,rate)}));
     }
     let plan = json!({"intentId":intent_id,"kind":"send","summary":summary,"transactions":transactions,"expiresAtUnixMs":now()+120_000});
@@ -974,12 +969,11 @@ async fn bank_plan(
     checked_bank_network_fee(quote.network_units, network)?;
     let network_ngn = bank_network_naira(network, rate);
     let total_fee = fee.saturating_add(network_ngn);
-    // Keep the bank charge separate from any fresh USDC spent to fund the network.
+    // One fee: the bank charge and any fresh USDC spent on the network together.
     let summary = vec![
         json!({"label":"Send to","value":quote.label}),
         json!({"label":"Bank gets","value":markets::say_micros(get, "NGN")}),
-        json!({"label":"Fee","value":markets::say_micros(fee, "NGN")}),
-        json!({"label":"Network fee","value":if network == 0 { "Free".into() } else { markets::say_micros(network_ngn, "NGN") }}),
+        json!({"label":"Fee","value":markets::say_micros(total_fee, "NGN")}),
         json!({"label":"You pay","value":markets::say_micros(get.saturating_add(total_fee), "NGN")}),
         json!({"label":"Rate","value":all_in_rate(get.saturating_add(fee), quote.usdc_units)}),
         json!({"label":"Bank payout","value":"Waiting for your USDC"}),

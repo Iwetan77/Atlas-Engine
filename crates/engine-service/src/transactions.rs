@@ -122,6 +122,10 @@ impl Receipt {
     }
     // A refreshed bank signing can cost less; keep its receipt total consistent with the new step.
     pub(super) fn set_bank_network_fee(&mut self, usdc: u128, rate: u128) {
+        // Only older bank receipts keep the network cost on a line of its own to update.
+        if self.line("Network fee").is_none() {
+            return;
+        }
         let ngn = usdc.saturating_mul(rate).div_ceil(1_000_000);
         let amount = |label| {
             self.line(label)
@@ -211,6 +215,7 @@ impl Receipt {
                 line
             })
             .collect();
+        let summary = one_fee(summary);
         let error = self.error.as_deref().map(|e| unbranded(e).unwrap_or(e));
         json!({"id":self.id,"intentId":self.intent_id,"kind":self.kind,"title":self.title,
             "symbol":self.symbol,"assetId":self.asset_id,"iconUrl":self.icon_url,
@@ -218,6 +223,62 @@ impl Receipt {
             "amount":amount,"txIds":self.tx_ids,"error":error,"summary":summary})
     }
 }
+// Every fee shows as one line (a one-time gas top-up keeps its own). Older receipts listed a
+// network fee or a cash link's claim reserve beside the fee: they're added up into it.
+const FEE_PARTS: [&str; 4] = ["Fee", "Fees", "Network fee", "Claim delivery reserve"];
+fn one_fee(mut summary: Vec<Value>) -> Vec<Value> {
+    let parts: Vec<usize> = summary
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l["label"].as_str().is_some_and(|l| FEE_PARTS.contains(&l)))
+        .map(|(i, _)| i)
+        .collect();
+    let Some(&first) = parts.first() else {
+        return summary;
+    };
+    let amounts: Option<Vec<(String, u128)>> = parts
+        .iter()
+        .map(|&i| summary[i]["value"].as_str().and_then(split_money))
+        .collect();
+    // Amounts in one currency ("Free" is nothing in any); anything else stays as it was.
+    let Some(amounts) = amounts else {
+        return summary;
+    };
+    let symbols: Vec<&str> = amounts
+        .iter()
+        .filter(|(symbol, _)| !symbol.is_empty())
+        .map(|(symbol, _)| symbol.as_str())
+        .collect();
+    let symbol = symbols.first().copied().unwrap_or_default();
+    if symbols.iter().any(|s| *s != symbol) {
+        return summary;
+    }
+    let total: u128 = amounts.iter().map(|(_, micros)| micros).sum();
+    let value = if total == 0 {
+        "Free".to_string()
+    } else {
+        format!(
+            "{symbol}{}",
+            markets::say_micros(total, "USD").trim_start_matches('$')
+        )
+    };
+    summary[first] = json!({"label":"Fee","value":value});
+    for &i in parts[1..].iter().rev() {
+        summary.remove(i);
+    }
+    summary
+}
+// "₦1,020.50" → ("₦", 1020500000); "Free" → ("", 0).
+fn split_money(value: &str) -> Option<(String, u128)> {
+    if value == "Free" {
+        return Some((String::new(), 0));
+    }
+    let start = value.find(|c: char| c.is_ascii_digit())?;
+    let (symbol, number) = value.split_at(start);
+    let micros = markets::parse_micros(&number.replace(',', "")).ok()?;
+    Some((symbol.to_owned(), micros))
+}
+
 // Older bank-transfer receipts named the payment partner; receipts just say what happened.
 fn unbranded(text: &str) -> Option<&'static str> {
     Some(match text {
@@ -841,6 +902,54 @@ fn internal(_: impl std::fmt::Display) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_receipt_shows_one_fee_and_keeps_the_one_time_gas_top_up_apart() {
+        let line = |label: &str, value: &str| json!({"label":label,"value":value});
+        let shown = one_fee(vec![
+            line("Bank gets", "₦300.00"),
+            line("Fee", "₦20.00"),
+            line("Network fee", "Free"),
+            line("You pay", "₦320.00"),
+        ]);
+        assert_eq!(
+            shown,
+            vec![
+                line("Bank gets", "₦300.00"),
+                line("Fee", "₦20.00"),
+                line("You pay", "₦320.00")
+            ]
+        );
+        let shown = one_fee(vec![
+            line("They get", "₦5,000.00"),
+            line("Claim delivery reserve", "₦150.00"),
+            line("Network fee", "₦1,020.50"),
+            line("Gas top-up (one time)", "₦750.00"),
+        ]);
+        assert_eq!(shown[1], line("Fee", "₦1,170.50"));
+        assert_eq!(shown[2], line("Gas top-up (one time)", "₦750.00"));
+        assert_eq!(shown.len(), 3);
+        // A lone network fee is just the fee; amounts in two currencies aren't added up.
+        assert_eq!(
+            one_fee(vec![line("Network fee", "KSh 1,000.00")]),
+            vec![line("Fee", "KSh 1,000.00")]
+        );
+        let mixed = vec![line("Fee", "₦20.00"), line("Network fee", "$0.03")];
+        assert_eq!(one_fee(mixed.clone()), mixed);
+    }
+
+    #[test]
+    fn a_new_bank_receipt_has_no_separate_network_fee_to_update() {
+        let mut r = Receipt::plan(
+            "owner",
+            &json!({"intentId":"bank","kind":"send","summary":[
+                {"label":"Bank gets","value":"₦200.00"},{"label":"Fee","value":"₦20.00"},
+                {"label":"You pay","value":"₦220.00"}]}),
+        );
+        r.set_bank_network_fee(20_000, 1_500_000_000);
+        assert_eq!(r.line("Network fee"), None);
+        assert_eq!(r.line("You pay"), Some("₦220.00"));
+    }
 
     #[test]
     fn bank_receipt_keeps_payout_fee_separate_and_updates_network_cost_once() {

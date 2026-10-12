@@ -1023,7 +1023,9 @@ async fn execute_inner(
         json!({"label":"Rate","value":venue.1}),
     ];
     if let Some(fee) = fee {
-        summary.push(json!({"label":"Network fee","value":markets::say_money(fee, &quote.currency, quote.rate)}));
+        summary.push(
+            json!({"label":"Fee","value":markets::say_money(fee, &quote.currency, quote.rate)}),
+        );
     }
     // An empty gas tank is filled from the cash first: shown, and kept as ETH in their balance.
     if gas > 0 {
@@ -1102,7 +1104,7 @@ async fn execute_lend(
             json!({"label":if share_mint == JITO_MINT {"Stake SOL"} else {"Put in savings"},
                 "value":markets::say_money(quote.units, &quote.currency, quote.rate)}),
             json!({"label":"Where","value":if share_mint == JITO_MINT {"Jito"} else {"Jupiter Lend"}}),
-            json!({"label":"Network fee","value":markets::say_money(fee, &quote.currency, quote.rate)}),
+            json!({"label":"Fee","value":markets::say_money(fee, &quote.currency, quote.rate)}),
         ];
         if topup > 0 {
             summary.push(json!({"label":"Gas top-up (one time)",

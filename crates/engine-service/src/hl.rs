@@ -250,6 +250,10 @@ struct HlQuote {
     currency: Option<String>,
     #[serde(default)]
     currency_rate: Option<u128>,
+    // The quoted fee, in dollars: Hyperliquid's trading fee (a close adds its cash-out), shown with
+    // any cost of moving margin as the one fee on the confirmation.
+    #[serde(default)]
+    fee_usd: f64,
     expires: u64,
 }
 
@@ -837,6 +841,7 @@ pub(super) async fn quote(
             gas_units,
             currency: Some(currency.clone()),
             currency_rate: Some(rate),
+            fee_usd: fee,
             receive_usd: 0.0,
             dex: m.dex.clone(),
             dex_units,
@@ -941,6 +946,7 @@ pub(super) async fn close_quote(
             gas_units: 0,
             currency: Some(currency.clone()),
             currency_rate: Some(rate),
+            fee_usd: trade_fee + cashout,
             receive_usd: freed,
             dex: m.dex.clone(),
             dex_units: 0,
@@ -1144,10 +1150,11 @@ fn funding_summary(quote: &HlQuote, moving_fee: u128, gas_bought: u128) -> Vec<V
         (Some(currency), Some(rate)) if rate > 0 => (currency, rate),
         _ => ("USD", 1_000_000),
     };
+    let fee_units = (quote.fee_usd.max(0.0) * 1_000_000.0).round() as u128;
     let mut rows = Vec::new();
     for (label, units) in [
         ("Margin moved to Hyperliquid", quote.funding_units),
-        ("Network fee", moving_fee),
+        ("Fee", fee_units.saturating_add(moving_fee)),
         ("Gas top-up (one time)", gas_bought),
     ] {
         if units > 0 {
@@ -2162,8 +2169,16 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&quote).unwrap()).unwrap();
         let rows = funding_summary(&restored, 120_000, 500_000);
         assert_eq!(rows[0]["value"], "₦15,000.00");
+        assert_eq!(rows[1]["label"], "Fee");
         assert_eq!(rows[1]["value"], "₦180.00");
         assert_eq!(rows[2]["value"], "₦750.00");
+        // The trading fee and the margin move show as one fee.
+        let mut with_fee = restored;
+        with_fee.fee_usd = 0.5;
+        assert_eq!(
+            funding_summary(&with_fee, 120_000, 0)[1]["value"],
+            "₦930.00"
+        );
     }
 
     #[test]
