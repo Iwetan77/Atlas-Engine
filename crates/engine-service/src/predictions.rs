@@ -522,9 +522,16 @@ pub(super) async fn quote(
         } else {
             0
         };
-        let from = if sol >= shortfall && user.solana_wallet.is_some() {
+        // The whole shortfall moves; a gas top-up for an empty tank is paid on top of it, from the
+        // same cash, never out of what the order gets.
+        let sol_reserve = if user.solana_wallet.is_some() {
+            funding_reserve(&state, &user, "solana").await?
+        } else {
+            0
+        };
+        let from = if user.solana_wallet.is_some() && sol >= shortfall + sol_reserve {
             "solana"
-        } else if base >= shortfall {
+        } else if base >= shortfall + funding_reserve(&state, &user, "base").await? {
             "base"
         } else {
             return Err(markets::not_enough_cash(base + sol + cash, currency, rate));
@@ -532,10 +539,7 @@ pub(super) async fn quote(
         let reserve = funding_reserve(&state, &user, from).await?;
         // What the order alone needs, for when the cash that's left after the move falls short.
         let order_budget = number(&q, "maximumSpend")?;
-        let amount = shortfall
-            .checked_sub(reserve)
-            .filter(|v| *v > 0)
-            .ok_or_else(|| markets::short_of_gas(currency, rate))?;
+        let amount = shortfall;
         let mut funding = match bridge_or_minimum(
             &state,
             &headers,
@@ -665,6 +669,13 @@ pub(super) async fn execute(
     state.history.put(&receipt).await?;
     Ok(Json(plan))
 }
+// The gas top-up a funded buy pays on top of its order (0 when the tank was full).
+fn gas_reserve(q: &Value) -> u128 {
+    q["funding"]["gasReserve"]
+        .as_str()
+        .and_then(|v| v.parse::<u128>().ok())
+        .unwrap_or(0)
+}
 fn receipt_amount(q: &Value) -> Result<u128, ApiError> {
     if q["side"] == "buy" {
         number(
@@ -691,7 +702,7 @@ fn plan(id: &str, current: &Value) -> Value {
         let payment = if q["funding"].is_null() {
             number(q, "maximumSpend").unwrap_or(0)
         } else {
-            number(q, "spendBudget").unwrap_or(0)
+            number(q, "spendBudget").unwrap_or(0) + gas_reserve(q)
         };
         summary.push(json!({"label":"You pay","value":markets::say_money(payment,currency,rate)}));
         summary.push(json!({"label":"If your choice wins","value":markets::say_money(number(q,"shares").unwrap_or(0),currency,rate)}));
@@ -704,12 +715,8 @@ fn plan(id: &str, current: &Value) -> Value {
             .and_then(|v| v.parse::<u128>().ok())
             .unwrap_or(0);
     summary.push(json!({"label":"Fees included","value":markets::say_money(fees,currency,rate)}));
-    if let Some(reserve) = q["funding"]["gasReserve"]
-        .as_str()
-        .and_then(|v| v.parse::<u128>().ok())
-        .filter(|v| *v > 0)
-    {
-        summary.push(json!({"label":"Network fee reserve included","value":markets::say_money(reserve,currency,rate)}));
+    if let Some(reserve) = Some(gas_reserve(q)).filter(|v| *v > 0) {
+        summary.push(json!({"label":"Gas top-up (one time)","value":markets::say_money(reserve,currency,rate)}));
     }
     json!({"intentId":id,"kind":current["kind"],"stage":current["status"]["stage"],"summary":summary,
         "transactions":current["approval"]["transactions"],"expiresAtUnixMs":current["approval"]["expiresAtUnixMs"]})

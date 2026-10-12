@@ -473,7 +473,7 @@ fn snapshot(owner: &str, v: &Value, source: &str) -> Receipt {
         // Gas comes up only when cash was actually turned into NEAR for a sale's fees.
         if let Some(gas) = v["gas_bought"].as_u64().filter(|n| *n > 0) {
             r.set_line(
-                "Gas top-up (kept as NEAR)",
+                "Gas top-up (one time)",
                 format!("${}", markets::format_units(u128::from(gas), 6)),
             );
         }
