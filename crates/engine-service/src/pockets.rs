@@ -288,10 +288,11 @@ pub(super) async fn execute(
     let (intent_id, transactions, fee) = match quote.direction {
         Direction::ToTrading => {
             let moved = quote.gasless.clone().ok_or_else(not_moving)?;
-            let (intent_id, steps) = markets::plan_move_to_trading(
+            let (intent_id, steps) = markets::plan_relay_move(
                 &state,
                 user.user_id.clone(),
                 quote.solana.clone(),
+                "solana",
                 moved,
             )
             .await?;
