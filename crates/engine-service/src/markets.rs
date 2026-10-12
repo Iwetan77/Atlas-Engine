@@ -1059,10 +1059,11 @@ pub(super) struct PlannedTransfer {
     // this message, from this wallet. None for older intents.
     #[serde(default)]
     transaction: Option<String>,
-    // When the signed transfer was handed to the network (ms): one the network never saw is
-    // given up once its blockhash can't be valid any more.
+    // Solana's finalized block height when the signed transfer was handed to the network: once the
+    // chain is well past it, the transfer's blockhash can't be valid any more, so one it never saw
+    // never will. 0 when unknown (then it's never given up).
     #[serde(default)]
-    sent_ms: u64,
+    sent_height: u64,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct BaseTopup {
@@ -3181,8 +3182,8 @@ async fn move_to_solana(
     ))
 }
 
-// Whether a gasless move's USDC authorization is past its deadline (and a minute more) and was
-// never used on chain, so nothing moved and nothing can. Unknown is never dead.
+// Whether a gasless move's USDC authorization is past its deadline in a finalized Base block and
+// was never used on chain, so nothing moved and nothing can. Unknown is never dead.
 async fn authorization_dead(state: &AppState, cash: &CashMove) -> bool {
     let Some(auth) = &cash.authorization else {
         return false;
@@ -3199,7 +3200,21 @@ async fn authorization_dead(state: &AppState, cash: &CashMove) -> bool {
     ) else {
         return false;
     };
-    if now() / 1000 <= deadline + 60 {
+    // Only once Base has finalized a block past the deadline: every block that could still have
+    // used it is final then, and no later one can.
+    let finalized = base_rpc(
+        &state.markets,
+        "eth_getBlockByNumber",
+        json!(["finalized", false]),
+    )
+    .await;
+    let past_deadline = finalized
+        .ok()
+        .as_ref()
+        .and_then(|block| block["timestamp"].as_str())
+        .and_then(|t| u64::from_str_radix(t.trim_start_matches("0x"), 16).ok())
+        .is_some_and(|timestamp| timestamp > deadline);
+    if !past_deadline {
         return false;
     }
     let from = from.trim_start_matches("0x").to_ascii_lowercase();
@@ -3338,8 +3353,8 @@ pub(super) async fn move_to_spendable_cost(
 
 // Trading → Spendable: one Solana transaction the engine lands hands `land` plus Relay's fee to
 // Relay, which delivers exactly `land` to the user's own Base wallet; done once Relay has delivered.
-// Refused when what it costs now is more than `cost_limit` (what they reviewed). A retry never
-// buys SOL past the top-up planned here. Returns the intent, what the app signs, and the cost.
+// Refused when what it costs now is more than `cost_limit` (what they reviewed). The cost returned
+// is exactly what the confirmation shows, and a retry never spends past it.
 pub(super) async fn plan_move_to_spendable(
     state: &AppState,
     owner: String,
@@ -3356,7 +3371,7 @@ pub(super) async fn plan_move_to_spendable(
             "The fee changed. Check the new amount; nothing was moved.".into(),
         ));
     }
-    // Retries stay within the same total: Relay's fee and any SOL top-up together.
+    // Retries stay within what this confirmation shows: Relay's fee and any SOL top-up together.
     let (intent_id, transactions, _) = insert_transfer(
         state,
         owner,
@@ -3366,16 +3381,16 @@ pub(super) async fn plan_move_to_spendable(
         true,
         true,
         steps,
-        Some(cost_limit),
+        Some(cost),
         None,
     )
     .await?;
     Ok((intent_id, transactions, cost))
 }
 
-// A Solana transaction's blockhash is good for about a minute and a half; three minutes after a
-// signed transfer was sent, one the network still hasn't seen never will.
-const TRANSFER_LANDS_MS: u64 = 180_000;
+// A blockhash is good for 150 blocks after the block it was read at, which is at most about 32
+// blocks past the finalized height when the transfer was sent: 200 is safely beyond both.
+const TRANSFER_EXPIRY_BLOCKS: u64 = 200;
 
 // The gas tank. Every Solana transaction needs a little SOL for its fee unless Jupiter pays it
 // (gasless swaps). Below this, a Solana step gets a top-up first.
@@ -3758,7 +3773,7 @@ async fn insert_transfer(
                     bank_ngn_per_usdc,
                     gas_committed: 0,
                     relay_request,
-                    sent_ms: 0,
+                    sent_height: 0,
                 }),
                 base_topup: None,
             },
@@ -4860,14 +4875,16 @@ async fn execute_quote_inner(
         }
         transactions.push(json!({"chain":"solana","transaction":deposit,"submit":"engine"}));
         network_fee = moved.amount_in_units - land;
+        // Bound to the exact deposit planned, from this wallet: what's signed must be it, and its
+        // signature is kept before it's sent.
         funding = Some(CashMove {
             swap_id: moved.request_id,
             amount_units: moved.amount_in_units,
             tx_hash: None,
             authorization: None,
             relay: true,
-            source_wallet: None,
-            source_transaction: None,
+            source_wallet: Some(sol.clone()),
+            source_transaction: Some(deposit.clone()),
         });
         output = stored.output_units;
     } else if a.chain == "base" {
@@ -5568,8 +5585,9 @@ pub(super) async fn signed(
             if let Some(signature) = &bound {
                 updated.status.tx_ids = vec![signature.clone()];
                 updated.status.stage = "settle".into();
+                let height = state.solana_mainnet.block_height().await.unwrap_or(0);
                 if let Some(t) = updated.transfer.as_mut() {
-                    t.sent_ms = now();
+                    t.sent_height = height;
                 }
                 state.markets.save_intent(&intent_id, &updated).await?;
             }
@@ -5907,11 +5925,16 @@ pub(super) async fn intent_status(
             .as_ref()
             .filter(|t| t.base)
             .and_then(|t| t.relay_request.clone());
-        // Not seen long after it was sent: its blockhash has run out, so it can never land.
-        let expired = current
-            .transfer
-            .as_ref()
-            .is_some_and(|t| t.sent_ms > 0 && now().saturating_sub(t.sent_ms) > TRANSFER_LANDS_MS);
+        // Not seen after the chain finalized well past where it was sent: its blockhash has run out
+        // (a transaction's lasts 150 blocks from when it was fetched), so it can never land.
+        let sent = current.transfer.as_ref().map_or(0, |t| t.sent_height);
+        let expired = landed.is_none()
+            && sent > 0
+            && state
+                .solana_mainnet
+                .block_height()
+                .await
+                .is_ok_and(|height| height > sent + TRANSFER_EXPIRY_BLOCKS);
         match landed {
             None if expired => {
                 updated.status.state = "failed".into();
@@ -7467,7 +7490,7 @@ mod tests {
             gas_committed: 0,
             relay_request: None,
             transaction: None,
-            sent_ms: 0,
+            sent_height: 0,
         });
         intent.status.stage = "validate".into();
         intent.status.state = "pending".into();

@@ -869,8 +869,8 @@ async fn execute_send_inner(
         rate,
     )
     .await?;
-    // Relay's fee is at most the quoted one, which every screen shows.
-    let fee = (fee > 0).then_some(quote.network_units);
+    // Relay's fee is at most the quoted one; the confirmation and receipt show exactly what leaves.
+    let fee = (fee > 0).then_some(fee);
     // An Atlas Link is recorded once its plan exists (the escrow is its id; a repeat finds it).
     if let Some((escrow, note, gift)) = &quote.link {
         let sender = state.social.find_user(&user.user_id).await?;
@@ -965,8 +965,6 @@ async fn bank_plan(
         rate,
     )
     .await?;
-    // Relay's fee is at most the quoted one, which every screen shows.
-    let network = if network > 0 { quote.network_units } else { 0 };
     // Never give the phone a plan that spends more USDC for its network fee than they reviewed.
     checked_bank_network_fee(quote.network_units, network)?;
     let network_ngn = bank_network_naira(network, rate);

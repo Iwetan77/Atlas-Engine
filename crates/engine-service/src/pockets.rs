@@ -298,9 +298,9 @@ pub(super) async fn execute(
             (intent_id, steps, quote.fee)
         }
         Direction::ToSpendable => {
-            // Never more than the fee they reviewed (it has room for Relay's price moving a hair);
-            // that figure is what every screen shows.
-            let (intent_id, steps, _) = markets::plan_move_to_spendable(
+            // Never more than the fee they reviewed (it has room for Relay's price moving a hair).
+            // The confirmation and receipt show the exact fee that leaves.
+            markets::plan_move_to_spendable(
                 &state,
                 user.user_id.clone(),
                 quote.solana.clone(),
@@ -308,8 +308,7 @@ pub(super) async fn execute(
                 quote.land,
                 quote.fee,
             )
-            .await?;
-            (intent_id, steps, quote.fee)
+            .await?
         }
     };
     let (from, to) = quote.direction.labels();
