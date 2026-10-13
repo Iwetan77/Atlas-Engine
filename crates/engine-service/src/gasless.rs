@@ -61,6 +61,25 @@ pub(super) fn step(typed: &Value, chain: &str) -> Value {
             .remove("primary_type");
         data["primaryType"] = primary;
     }
+    // The domain's own type, spelled out as EIP-712 asks (its fields in the standard order). A signer
+    // that isn't told it can hash the domain as an empty one, and that signature then belongs to
+    // nobody: the approval is refused and the money never moves.
+    if data["types"].get("EIP712Domain").is_none() {
+        let fields: Vec<Value> = [
+            ("name", "string"),
+            ("version", "string"),
+            ("chainId", "uint256"),
+            ("verifyingContract", "address"),
+            ("salt", "bytes32"),
+        ]
+        .into_iter()
+        .filter(|(name, _)| data["domain"].get(name).is_some())
+        .map(|(name, kind)| json!({"name":name,"type":kind}))
+        .collect();
+        if let Some(types) = data["types"].as_object_mut() {
+            types.insert("EIP712Domain".into(), json!(fields));
+        }
+    }
     json!({"chain":chain,"typedData":data})
 }
 
@@ -74,8 +93,36 @@ mod tests {
         let step = step(&typed, "base");
         assert_eq!(step["typedData"]["primaryType"], typed["primary_type"]);
         assert!(step["typedData"].get("primary_type").is_none());
-        for field in ["domain", "types", "message"] {
+        for field in ["domain", "message"] {
             assert_eq!(step["typedData"][field], typed[field]);
         }
+        assert_eq!(
+            step["typedData"]["types"]["TransferWithAuthorization"],
+            typed["types"]["TransferWithAuthorization"]
+        );
+    }
+
+    #[test]
+    fn the_phone_is_told_the_domain_type_it_signs() {
+        let typed = json!({"primaryType":"ReceiveWithAuthorization",
+            "domain":{"name":"USD Coin","version":"2","chainId":8453,
+                "verifyingContract":"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"},
+            "types":{"ReceiveWithAuthorization":[{"name":"value","type":"uint256"}]},
+            "message":{"value":"1"}});
+        let domain = &step(&typed, "base")["typedData"]["types"]["EIP712Domain"];
+        assert_eq!(
+            domain,
+            &json!([{"name":"name","type":"string"},{"name":"version","type":"string"},
+                {"name":"chainId","type":"uint256"},{"name":"verifyingContract","type":"address"}])
+        );
+        // A domain with fewer fields (Hyperliquid-style) gets just those; one already given is kept.
+        let short = json!({"primaryType":"X","domain":{"name":"N","chainId":1},"types":{"X":[]},"message":{}});
+        assert_eq!(
+            step(&short, "base")["typedData"]["types"]["EIP712Domain"],
+            json!([{"name":"name","type":"string"},{"name":"chainId","type":"uint256"}])
+        );
+        let given = json!({"primaryType":"X","domain":{"name":"N"},
+            "types":{"X":[],"EIP712Domain":[{"name":"name","type":"string"}]},"message":{}});
+        assert_eq!(step(&given, "base")["typedData"]["types"], given["types"]);
     }
 }

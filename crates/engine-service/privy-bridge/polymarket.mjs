@@ -278,6 +278,13 @@ export function wrapOrderSignature(typed,signature){
   [keccak256(toHex(type)),...ORDER_FIELDS.map(f=>contents[f.name])]));
  return concatHex([signature,separator,hash,toHex(type),toHex(type.length,{size:2})]);
 }
+// The domain's own type, spelled out as EIP-712 asks (its fields in the standard order). A signer
+// that isn't told it can hash the domain as an empty one, and that signature belongs to nobody.
+const DOMAIN_FIELDS=[['name','string'],['version','string'],['chainId','uint256'],['verifyingContract','address'],['salt','bytes32']];
+export function withDomainType(typed){
+ if(typed.types?.EIP712Domain)return typed;
+ return {...typed,types:{...typed.types,EIP712Domain:DOMAIN_FIELDS.filter(([name])=>typed.domain?.[name]!==undefined).map(([name,type])=>({name,type}))}};
+}
 export class Approvals{
  items=new Map();
  put(owner,userId,intentId,kind,typed,data,expires=Date.now()+180000){
@@ -286,7 +293,7 @@ export class Approvals{
   if(!intentId.startsWith('prediction-')||expires<=Date.now()||expires>Date.now()+180000)throw new Error('Invalid prediction approval');
   const prepareId=randomUUID();
   this.items.set(prepareId,{owner,userId,intentId,kind,typed:structuredClone(typed),data:structuredClone(data),expires});
-  return {prepareId,transactions:[{chain:'polygon',typedData:typed,prediction:{prepareId,intentId,expiresAtUnixMs:expires}}],expiresAtUnixMs:expires};
+  return {prepareId,transactions:[{chain:'polygon',typedData:withDomainType(typed),prediction:{prepareId,intentId,expiresAtUnixMs:expires}}],expiresAtUnixMs:expires};
  }
  async check({prepareId,owner,userId,intentId,signature,report}){
   const item=this.items.get(prepareId);

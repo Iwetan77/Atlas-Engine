@@ -276,3 +276,14 @@ test('HTTP 500 after an order or wallet POST is reconciled instead of allowing a
   await assert.rejects(commit(scope.owner,scope.userId,{intentId:scope.intentId,prepareId:prepared.prepareId,report},store),/used/);
  }
 });
+
+test('a prediction approval tells the phone its domain type, and signs the same either way', async () => {
+  const {withDomainType, authTyped} = await import('./polymarket.mjs');
+  const {privateKeyToAccount, generatePrivateKey} = await import('viem/accounts');
+  const account = privateKeyToAccount(generatePrivateKey());
+  const typed = authTyped(account.address);
+  const told = withDomainType(typed);
+  assert.deepEqual(told.types.EIP712Domain, [{name: 'name', type: 'string'}, {name: 'version', type: 'string'}, {name: 'chainId', type: 'uint256'}]);
+  assert.equal(await account.signTypedData(told), await account.signTypedData(typed));
+  assert.equal(withDomainType(told), told);
+});
