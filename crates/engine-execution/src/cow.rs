@@ -254,8 +254,9 @@ fn parse_gas_quote(
     }
     let sell = units(&quote["sellAmount"]).ok_or(invalid("sell amount"))?;
     let fee = units(&quote["feeAmount"]).ok_or(invalid("fee"))?;
-    // The fee comes out of what's sold: the two add up to the top-up, and the fee is small.
-    if sell + fee != sell_units || fee > sell_units / 10 {
+    // The fee comes out of what's sold: the two add up to the top-up, and the fee is small (a
+    // tenth of it, or a cent on a small one: CoW's is about a third of a cent on Base).
+    if sell + fee != sell_units || fee > (sell_units / 10).max(10_000) {
         return Err(invalid("amounts differ from the top-up"));
     }
     let buy = units(&quote["buyAmount"])
@@ -320,6 +321,20 @@ mod tests {
         other["quote"]["buyToken"] = json!("0x4200000000000000000000000000000000000006");
         assert!(parse_gas_quote(&other, OWNER, 500_000, "{}", "0xab", 1).is_err());
         assert!(parse_gas_quote(&body, OWNER, 600_000, "{}", "0xab", 1).is_err());
+    }
+
+    #[test]
+    fn a_small_fill_allows_a_cent_of_fee_and_no_more() {
+        // 13 Oct 2026: $0.075 (about ₦100) quoted with a $0.0034 fee.
+        let quote = |sell: u128, fee: u128| {
+            json!({"quote":{"sellToken":"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+                "buyToken":"0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","receiver":OWNER,
+                "sellAmount":sell.to_string(),"buyAmount":"28000000000000",
+                "feeAmount":fee.to_string(),"kind":"sell"}})
+        };
+        assert!(parse_gas_quote(&quote(71_600, 3_400), OWNER, 75_000, "{}", "0xab", 1).is_ok());
+        assert!(parse_gas_quote(&quote(65_000, 10_000), OWNER, 75_000, "{}", "0xab", 1).is_ok());
+        assert!(parse_gas_quote(&quote(64_999, 10_001), OWNER, 75_000, "{}", "0xab", 1).is_err());
     }
 
     // Network: a real quote with a (dummy-signed) permit hook. Nothing is placed.

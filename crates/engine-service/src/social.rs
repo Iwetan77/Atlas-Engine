@@ -56,17 +56,30 @@ struct SendQuote {
     bank: Option<(daya::Payout, u128, u128)>,
     // Additional USDC charged for delivery, separately from the bank payout fee.
     network_units: u128,
+    // USDC an empty gas tank is filled with first, once (it stays the user's, as ETH).
+    gas_units: u128,
 }
 // Sends, bank cash-outs and Atlas Links are paid from Spendable (USDC in the Base wallet) only.
-// With ETH in the wallet the transfer pays its own gas (free here); without, Relay delivers exactly
-// the amount gaslessly for a few cents, on top. Nothing ever buys ETH first for a send.
-async fn network_fee(state: &AppState, evm: &str, to: &str, usdc: u128) -> Result<u128, ApiError> {
+// What one costs beyond its amount: (network fee, one-time gas top-up). With ETH in the wallet the
+// transfer pays its own gas: nothing. An empty tank (a new user's) is filled once first, from the
+// same cash: about ₦100 becomes ETH that stays theirs and pays for every later send. Only when the cash
+// can't cover that too (sending nearly everything) does Relay deliver it gaslessly for a few cents.
+async fn send_costs(
+    state: &AppState,
+    evm: &str,
+    to: &str,
+    usdc: u128,
+) -> Result<(u128, u128), ApiError> {
     if markets::wallet_pays_gas(state, evm).await {
-        return Ok(0);
+        return Ok((0, 0));
+    }
+    if markets::base_topup_fits(state, evm, usdc).await {
+        return Ok((0, markets::BASE_GAS_REFILL_USDC));
     }
     let moved = markets::base_gasless_payment(state, evm, to, usdc).await?;
-    Ok(markets::fee_room(
-        moved.amount_in_units.saturating_sub(usdc),
+    Ok((
+        markets::fee_room(moved.amount_in_units.saturating_sub(usdc)),
+        0,
     ))
 }
 
@@ -82,9 +95,10 @@ fn checked_relay_fee(quoted: u128, actual: u128) -> Result<(), ApiError> {
     ))
 }
 
-// The plan that sends `usdc` to `to` from Spendable: the planned transfer when the wallet pays its
-// gas, else a gasless Relay payment of exactly `usdc`. Returns the intent, what the app signs, and
-// the network fee in USDC (0 for a plain transfer).
+// The plan that sends `usdc` to `to` from Spendable: the plain transfer when the wallet pays its
+// gas, after filling an empty tank first when the cash covers it (the same confirmation), else a
+// gasless Relay payment of exactly `usdc`. Returns the intent, what the app signs, the network fee
+// and the gas top-up, in USDC; never more of either than quoted.
 #[allow(clippy::too_many_arguments)]
 async fn spend_plan(
     state: &AppState,
@@ -93,17 +107,18 @@ async fn spend_plan(
     to: &str,
     usdc: u128,
     quoted_network: u128,
+    quoted_gas: u128,
     currency: &str,
     rate: u128,
-) -> Result<(String, Vec<Value>, u128), ApiError> {
-    if markets::wallet_pays_gas(state, evm).await {
+) -> Result<(String, Vec<Value>, u128, u128), ApiError> {
+    if markets::wallet_pays_gas(state, evm).await
+        || markets::base_topup_fits(state, evm, usdc).await
+    {
         let tx = state
             .markets
             .base
             .transfer_transaction(BASE_USDC, evm, to, usdc)
             .map_err(internal)?;
-        // The plain transfer only: the wallet's ETH pays, and no refill is bought on the side
-        // (the quote said this send is free). Once the ETH runs low, sends go through Relay.
         let txs = vec![(tx.to.clone(), tx.data.clone())];
         let (intent_id, transactions, fee, gas) = markets::plan_base_bank_with_cash(
             state,
@@ -116,12 +131,16 @@ async fn spend_plan(
             rate,
         )
         .await?;
-        // A wallet whose ETH pays buys no gas here; anything it did would be on the bill all the same.
-        return Ok((
-            intent_id,
-            transactions,
-            fee.unwrap_or(0).saturating_add(gas),
-        ));
+        let fee = fee.unwrap_or(0);
+        // A tank that emptied since the quote would be a cost nobody reviewed.
+        if gas > quoted_gas || fee > quoted_network {
+            return Err((
+                StatusCode::CONFLICT,
+                "The network fee changed. Check a fresh quote before sending; nothing was sent."
+                    .into(),
+            ));
+        }
+        return Ok((intent_id, transactions, fee, gas));
     }
     let moved = markets::base_gasless_payment(state, evm, to, usdc).await?;
     let fee = moved.amount_in_units.saturating_sub(usdc);
@@ -137,7 +156,7 @@ async fn spend_plan(
     }
     let (intent_id, transactions) =
         markets::plan_relay_move(state, owner, evm.into(), "base", moved).await?;
-    Ok((intent_id, transactions, fee))
+    Ok((intent_id, transactions, fee, 0))
 }
 
 fn checked_bank_network_fee(quoted: u128, actual: u128) -> Result<(), ApiError> {
@@ -723,8 +742,8 @@ pub(super) async fn send_quote(
     // The network fee: nothing when the wallet's ETH pays, else Relay's few cents. A bank payout's
     // address only exists once confirmed; Relay prices a same-chain payment the same either way.
     let fee_to = if bank.is_some() { &wallet } else { &recipient };
-    let network_units = network_fee(&state, &wallet, fee_to, usdc_units).await?;
-    if base_cash < usdc_units.saturating_add(network_units) {
+    let (network_units, gas_units) = send_costs(&state, &wallet, fee_to, usdc_units).await?;
+    if base_cash < usdc_units + network_units + gas_units {
         let trading = match solana.as_deref() {
             Some(owner) => markets::solana_cash(&state, owner).await,
             None => 0,
@@ -759,26 +778,40 @@ pub(super) async fn send_quote(
                 .as_ref()
                 .map(|(payout, _, fee)| (payout.clone(), amount, *fee)),
             network_units,
+            gas_units,
         },
     );
-    // One fee: the bank payout charge and any network cost together.
+    // One fee: the bank payout charge and any network cost together. A first send's gas top-up is
+    // the one other line, and in "You pay".
     if let Some((_, _, fee)) = bank {
         let network_ngn = bank_network_naira(network_units, rate);
+        let gas_ngn = bank_network_naira(gas_units, rate);
         let total_fee = fee.saturating_add(network_ngn);
         let naira = |micros: u128| money_usdc(micros, "NGN", 1_000_000);
-        return Ok(Json(json!({"quoteId":quote_id,"destinationLabel":label,
-                "send":naira(amount.saturating_add(total_fee))?,"receive":naira(amount)?,
+        let mut answer = json!({"quoteId":quote_id,"destinationLabel":label,
+                "send":naira(amount + total_fee + gas_ngn)?,"receive":naira(amount)?,
                 "fee":naira(total_fee)?,"feeBreakdown":[],
-                "eta":"Usually within minutes","expiresAtUnixMs":expires})));
+                "eta":"Usually within minutes","expiresAtUnixMs":expires});
+        if gas_ngn > 0 {
+            answer["gasTopup"] = naira(gas_ngn)?;
+        }
+        return Ok(Json(answer));
     }
     // The network fee goes on top: in Fee and "You pay" here, as on the confirmation.
-    let send = money_usdc(usdc_units + network_units, &req.amount.currency, rate)?;
+    let send = money_usdc(
+        usdc_units + network_units + gas_units,
+        &req.amount.currency,
+        rate,
+    )?;
     let receive = money_usdc(gift_units, &req.amount.currency, rate)?;
     let fee = money_usdc(fee_units + network_units, &req.amount.currency, rate)?;
-    Ok(Json(
-        json!({"quoteId":quote_id,"destinationLabel":label,"send":send,"receive":receive,"fee":fee,
-            "feeBreakdown":[],"eta":"After confirmation","expiresAtUnixMs":expires}),
-    ))
+    let mut answer = json!({"quoteId":quote_id,"destinationLabel":label,"send":send,
+        "receive":receive,"fee":fee,"feeBreakdown":[],"eta":"After confirmation",
+        "expiresAtUnixMs":expires});
+    if gas_units > 0 {
+        answer["gasTopup"] = money_usdc(gas_units, &req.amount.currency, rate)?;
+    }
+    Ok(Json(answer))
 }
 async fn execute_send_inner(
     State(state): State<AppState>,
@@ -855,13 +888,14 @@ async fn execute_send_inner(
         return Ok(Json(plan));
     }
     // From Spendable only: the cash is never moved over from Trading behind the user's back.
-    let (intent_id, transactions, fee) = spend_plan(
+    let (intent_id, transactions, fee, gas) = spend_plan(
         &state,
         user.user_id.clone(),
         &quote.sender_wallet,
         &quote.recipient_wallet,
         quote.usdc_units,
         quote.network_units,
+        quote.gas_units,
         &quote.currency,
         rate,
     )
@@ -931,8 +965,13 @@ async fn execute_send_inner(
         summary
             .push(json!({"label":"Fee","value":markets::say_money(charged,&quote.currency,rate)}));
     }
-    if let Some(fee) = fee {
-        summary.push(json!({"label":"You pay","value":markets::say_money(quote.usdc_units + fee,&quote.currency,rate)}));
+    // A first send from an empty tank fills it once; the ETH stays theirs.
+    if gas > 0 {
+        summary.push(json!({"label":"Gas top-up (one time)","value":markets::say_money(gas,&quote.currency,rate)}));
+    }
+    let extra = fee.unwrap_or(0) + gas;
+    if extra > 0 {
+        summary.push(json!({"label":"You pay","value":markets::say_money(quote.usdc_units + extra,&quote.currency,rate)}));
     }
     let plan = json!({"intentId":intent_id,"kind":"send","summary":summary,"transactions":transactions,"expiresAtUnixMs":now()+120_000});
     stored.plan = Some(plan.clone());
@@ -954,13 +993,14 @@ async fn bank_plan(
         .daya
         .open_payout(user, payout, "BASE", &format!("atlas-{quote_id}"))
         .await?;
-    let (intent_id, transactions, network) = spend_plan(
+    let (intent_id, transactions, network, gas) = spend_plan(
         state,
         user.user_id.clone(),
         &quote.sender_wallet,
         &address,
         quote.usdc_units,
         quote.network_units,
+        quote.gas_units,
         &quote.currency,
         rate,
     )
@@ -968,18 +1008,27 @@ async fn bank_plan(
     // Never give the phone a plan that spends more USDC for its network fee than they reviewed.
     checked_bank_network_fee(quote.network_units, network)?;
     let network_ngn = bank_network_naira(network, rate);
+    let gas_ngn = bank_network_naira(gas, rate);
     let total_fee = fee.saturating_add(network_ngn);
-    // One fee: the bank charge and any fresh USDC spent on the network together.
-    let summary = vec![
+    // One fee: the bank charge and any fresh USDC spent on the network together. A first cash-out
+    // from an empty tank fills it once (the ETH stays theirs): the one other line.
+    let mut summary = vec![
         json!({"label":"Send to","value":quote.label}),
         json!({"label":"Bank gets","value":markets::say_micros(get, "NGN")}),
         json!({"label":"Fee","value":markets::say_micros(total_fee, "NGN")}),
-        json!({"label":"You pay","value":markets::say_micros(get.saturating_add(total_fee), "NGN")}),
+    ];
+    if gas_ngn > 0 {
+        summary.push(
+            json!({"label":"Gas top-up (one time)","value":markets::say_micros(gas_ngn, "NGN")}),
+        );
+    }
+    summary.extend([
+        json!({"label":"You pay","value":markets::say_micros(get + total_fee + gas_ngn, "NGN")}),
         json!({"label":"Rate","value":all_in_rate(get.saturating_add(fee), quote.usdc_units)}),
         json!({"label":"Bank payout","value":"Waiting for your USDC"}),
-    ];
+    ]);
     eprintln!(
-        "bank withdrawal {quote_id}: quoted_network_usdc={} prepared_network_usdc={network}",
+        "bank withdrawal {quote_id}: quoted_network_usdc={} prepared_network_usdc={network} gas_topup_usdc={gas}",
         quote.network_units
     );
     let plan = json!({"intentId":intent_id,"kind":"send","summary":summary,"transactions":transactions,"expiresAtUnixMs":now()+120_000});

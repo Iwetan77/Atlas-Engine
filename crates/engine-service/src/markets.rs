@@ -3384,7 +3384,7 @@ pub(super) fn fee_room(fee: u128) -> u128 {
 }
 
 // A gasless payment of exactly `amount` from Spendable to `to` on Base (Relay's solver pays the gas
-// from the cash it's handed), for a wallet with no ETH: cents, where buying ETH first costs $0.50.
+// from the cash it's handed), for a wallet with no ETH whose cash can't also fill its gas tank.
 pub(super) async fn base_gasless_payment(
     state: &AppState,
     evm: &str,
@@ -4178,8 +4178,9 @@ async fn account_rent_usd_checked(state: &AppState) -> Option<u128> {
 // cash hops over from Solana anyway.
 // 0.000005 ETH, and 0.00004 ETH.
 const BASE_GAS_FLOOR_WEI: u128 = 5_000_000_000_000;
-// A refill: $0.50 of USDC becomes about 0.0002 ETH, enough for dozens of transactions.
-pub(super) const BASE_GAS_REFILL_USDC: u128 = 500_000;
+// A fill: $0.075 (about ₦100) of USDC becomes about 0.00003 ETH. A USDC transfer costs about
+// 0.0000007 ETH ($0.002), so that's 30 or so sends before it's filled again, once, the same way.
+pub(super) const BASE_GAS_REFILL_USDC: u128 = 75_000;
 // What the user reads when the tank couldn't be filled: nothing else happened.
 pub(super) const GAS_NOT_READY: &str =
     "Couldn't get your account ready for this, so nothing happened and nothing left your balance. Try again.";
@@ -4215,7 +4216,7 @@ pub(super) async fn base_topup_fits(state: &AppState, wallet: &str, spends: u128
 }
 
 // Fills an empty tank without gas once the user has confirmed: their session signs a USDC permit
-// for CoW and a $0.50 USDC → ETH order to themselves; a solver settles it and pays the gas. Returns
+// for CoW and a ₦100 USDC → ETH order to themselves; a solver settles it and pays the gas. Returns
 // CoW's order id.
 pub(super) async fn prepare_base_topup(state: &AppState, evm: &str) -> Result<BaseTopup, ApiError> {
     let owner = evm.trim_start_matches("0x").to_ascii_lowercase();

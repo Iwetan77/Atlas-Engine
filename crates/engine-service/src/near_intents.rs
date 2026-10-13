@@ -5468,7 +5468,7 @@ fn gas_cost(native: u128, paid: u128, got: u128) -> u128 {
         .div_ceil(100)
 }
 
-// The $0.50 CoW top-up a Base deposit with an empty gas tank starts with (deposit_ready), in USDC
+// The ₦100 CoW top-up a Base deposit with an empty gas tank starts with (deposit_ready), in USDC
 // units; 0 when the wallet pays its own gas or the cash comes from Solana.
 // The cash a deposit turns into gas first when its wallet can't pay the fee: SOL on Solana, ETH on
 // Base. Shown on the quote and counted in what it costs; kept in the wallet (and the balance).
