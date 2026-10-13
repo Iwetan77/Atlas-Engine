@@ -1097,6 +1097,16 @@ fn merge_deposit(ramp: &mut Ramp, deposit: &Value) -> bool {
     } else {
         status.as_str()
     };
+    // Daya's reason for holding a payment (its code and words), kept in the logs for support.
+    if status == "REQUIRES_REVIEW" && ramp.status != "review" {
+        eprintln!(
+            "daya receipt {}: held for review (flag_code={}, flag_message={}, deposit={})",
+            ramp.receipt,
+            deposit["flag_code"].as_str().unwrap_or("none"),
+            deposit["flag_message"].as_str().unwrap_or("none"),
+            deposit["id"].as_str().unwrap_or("?")
+        );
+    }
     let (next, message) = match status {
         "PENDING" | "RECEIVED" => ("received", None),
         "PROCESSING" => ("processing", None),
