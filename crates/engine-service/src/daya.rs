@@ -705,6 +705,23 @@ impl DayaState {
         Ok((usdc, fee))
     }
 
+    // The USDC (units) a payout of `ngn` (micros) takes with Daya's fee, at the rate now.
+    pub(super) async fn payout_usdc_for(&self, ngn: u128) -> Result<u128, ApiError> {
+        let (rate, fees) = tokio::try_join!(self.rate("SELL"), self.fees())?;
+        Ok(payout_usdc(ngn + fees.payout(ngn), rate.ngn_per_usdc))
+    }
+    // The most naira (micros, whole naira) a bank can be paid from `usdc` units, after Daya's fee;
+    // None when that's under the smallest payout.
+    pub(super) async fn max_payout(&self, usdc: u128) -> Result<Option<u128>, ApiError> {
+        let (rate, fees) = tokio::try_join!(self.rate("SELL"), self.fees())?;
+        Ok(largest_payout(
+            usdc,
+            rate.ngn_per_usdc,
+            &fees,
+            fees.payout_min.max(rate.min_ngn),
+        ))
+    }
+
     // Opens the one-time USDC address that pays the bank, on the chain the cash is sent from.
     // Refused when Daya's rate dropped at all since the quote, so the bank gets exactly what it showed.
     pub(super) async fn open_payout(
@@ -1905,6 +1922,25 @@ pub(super) async fn favorite(
 }
 
 // USDC (micros) that converts to at least `ngn` naira micros at `ngn_per_usdc`, rounded up.
+// The most whole naira (micros) `usdc` units pay a bank after Daya's fee, at `ngn_per_usdc`; None
+// under the smallest payout (`min`).
+fn largest_payout(usdc: u128, ngn_per_usdc: u128, fees: &Fees, min: u128) -> Option<u128> {
+    let fits = |ngn: u128| payout_usdc(ngn + fees.payout(ngn), ngn_per_usdc) <= usdc;
+    let (mut low, mut high) = (
+        0u128,
+        usdc.saturating_mul(ngn_per_usdc) / 1_000_000 / 1_000_000,
+    );
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        if fits(mid * 1_000_000) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    let best = low * 1_000_000;
+    (best >= min && fits(best)).then_some(best)
+}
 fn payout_usdc(ngn: u128, ngn_per_usdc: u128) -> u128 {
     (ngn * 1_000_000).div_ceil(ngn_per_usdc)
 }
@@ -2294,6 +2330,28 @@ mod tests {
         assert_eq!(micros_of(&json!("100")), Some(100_000_000));
         assert_eq!(micros_of(&json!("-1")), None);
         assert_eq!(micros_of(&json!("1e3")), None);
+    }
+
+    #[test]
+    fn the_largest_payout_leaves_room_for_the_fee() {
+        let fees = Fees {
+            deposit_pct: 1_000_000,
+            deposit_cap: 100_000_000,
+            payout_pct: 1_000_000,
+            payout_cap: 100_000_000,
+            low_payout_fee: 20_000_000,
+            low_payout_below: 1_000_000_000,
+            payout_min: 100_000_000,
+            usdc_payout_fee: 200_000,
+        };
+        // 16 Oct: ₦1,354.062 per $1. $0.1185 pays ₦140 (₦160 with the ₦20 low-value fee is $0.11817).
+        let rate = 1_354_062_000;
+        let best = largest_payout(118_500, rate, &fees, 100_000_000).unwrap();
+        assert_eq!(best, 140_000_000);
+        assert!(payout_usdc(best + fees.payout(best), rate) <= 118_500);
+        assert!(payout_usdc(best + 1_000_000 + fees.payout(best + 1_000_000), rate) > 118_500);
+        // Under the smallest payout: nothing to offer.
+        assert_eq!(largest_payout(50_000, rate, &fees, 100_000_000), None);
     }
 
     #[test]

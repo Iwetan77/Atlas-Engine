@@ -159,6 +159,95 @@ async fn spend_plan(
     Ok((intent_id, transactions, fee, 0))
 }
 
+// A send Spendable can't cover with its costs: says what it comes to with them (the fee, any network
+// fee and a first send's gas fill) and the most that can be sent now, instead of only the balance.
+struct Short<'a> {
+    cash: u128,
+    trading: u128,
+    network: u128,
+    gas: u128,
+    currency: &'a str,
+    rate: u128,
+}
+impl Short<'_> {
+    fn next(&self, most: Option<String>) -> String {
+        match (most, self.trading) {
+            (_, trading) if trading > 0 => format!(
+                "{} is in your trading balance: move it to spendable to use it here.",
+                markets::say_money(trading, self.currency, self.rate)
+            ),
+            (Some(most), _) => format!("You can send up to {most} now, or add money to send more."),
+            (None, _) => "Add money to continue.".into(),
+        }
+    }
+    fn error(&self, asked: String, fees: String, most: Option<String>) -> ApiError {
+        (
+            StatusCode::CONFLICT,
+            format!(
+                "{asked} plus {fees} in fees is more than the {} you can spend. {}",
+                markets::say_money(self.cash, self.currency, self.rate),
+                self.next(most)
+            ),
+        )
+    }
+    // A bank payout of `ngn` (micros) with Daya's `fee`: the largest that fits, costs re-checked.
+    async fn bank(&self, state: &AppState, evm: &str, to: &str, ngn: u128, fee: u128) -> ApiError {
+        let naira = |units: u128| bank_network_naira(units, self.rate);
+        let fees = markets::say_micros(fee + naira(self.network) + naira(self.gas), "NGN");
+        let mut most = None;
+        let mut room = self.cash.saturating_sub(self.network + self.gas);
+        // Once more at the smaller amount: its network cost (or gas fill) may differ.
+        for _ in 0..2 {
+            let Ok(Some(best)) = state.daya.max_payout(room).await else {
+                break;
+            };
+            let Ok(usdc) = state.daya.payout_usdc_for(best).await else {
+                break;
+            };
+            match send_costs(state, evm, to, usdc).await {
+                Ok((network, gas)) if usdc + network + gas <= self.cash => {
+                    most = Some(markets::say_micros(best, "NGN"));
+                    break;
+                }
+                Ok((network, gas)) => room = self.cash.saturating_sub(network + gas),
+                Err(_) => break,
+            }
+        }
+        self.error(markets::say_micros(ngn, "NGN"), fees, most)
+    }
+    // A friend or a link: `gift` units they get, and `extra` the send carries (a link's claim fee).
+    async fn send(
+        &self,
+        state: &AppState,
+        evm: &str,
+        to: &str,
+        gift: u128,
+        extra: u128,
+    ) -> ApiError {
+        let fees = markets::say_money(extra + self.network + self.gas, self.currency, self.rate);
+        let mut most = None;
+        let mut room = self.cash.saturating_sub(extra + self.network + self.gas);
+        for _ in 0..2 {
+            if room == 0 {
+                break;
+            }
+            match send_costs(state, evm, to, room + extra).await {
+                Ok((network, gas)) if room + extra + network + gas <= self.cash => {
+                    most = Some(markets::say_money(room, self.currency, self.rate));
+                    break;
+                }
+                Ok((network, gas)) => room = self.cash.saturating_sub(extra + network + gas),
+                Err(_) => break,
+            }
+        }
+        self.error(
+            markets::say_money(gift, self.currency, self.rate),
+            fees,
+            most,
+        )
+    }
+}
+
 fn checked_bank_network_fee(quoted: u128, actual: u128) -> Result<(), ApiError> {
     if actual <= quoted {
         return Ok(());
@@ -748,12 +837,22 @@ pub(super) async fn send_quote(
             Some(owner) => markets::solana_cash(&state, owner).await,
             None => 0,
         };
-        return Err(markets::not_enough_spendable(
-            base_cash,
+        let short = Short {
+            cash: base_cash,
             trading,
-            &req.amount.currency,
+            network: network_units,
+            gas: gas_units,
+            currency: &req.amount.currency,
             rate,
-        ));
+        };
+        return Err(match &bank {
+            Some((_, _, fee)) => short.bank(&state, &wallet, fee_to, amount, *fee).await,
+            None => {
+                short
+                    .send(&state, &wallet, fee_to, gift_units, fee_units)
+                    .await
+            }
+        });
     }
     let quote_id = format!(
         "send-{:x}-{:x}",
@@ -1056,6 +1155,33 @@ mod tests {
         assert!(super::checked_relay_fee(quoted, 25_401).is_err());
         // Quoted with the wallet's own ETH paying, then none left: a fresh look first.
         assert!(super::checked_relay_fee(0, 23_400).is_err());
+    }
+
+    #[test]
+    fn a_short_send_names_its_fees_and_the_most_that_fits() {
+        let short = Short {
+            cash: 148_400,
+            trading: 0,
+            network: 31_000,
+            gas: 0,
+            currency: "NGN",
+            rate: 1_359_000_000,
+        };
+        let (status, text) = short.error("₦150.00".into(), "₦52.13".into(), Some("₦149.00".into()));
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            text,
+            "₦150.00 plus ₦52.13 in fees is more than the ₦201.67 you can spend. You can send up to ₦149.00 now, or add money to send more."
+        );
+        // The app offers Add money on "add money", and Move from trading on "move it to spendable".
+        let (_, none) = short.error("₦150.00".into(), "₦52.13".into(), None);
+        assert!(none.ends_with("Add money to continue."));
+        let in_trading = Short {
+            trading: 2_000_000,
+            ..short
+        };
+        let (_, text) = in_trading.error("₦150.00".into(), "₦52.13".into(), Some("₦149.00".into()));
+        assert!(text.contains("move it to spendable"));
     }
 
     #[test]
