@@ -280,34 +280,53 @@ export async function transferSui({wallet, recipient, amount, reserve, rawSign})
 }
 // A prepare step obtains the only allowed destination from 1Click for this same user's Base
 // wallet. The engine persists this address before the commit step signs any Sui transaction.
+// The route must still pay at least the minimum the user was quoted. A fresh quote's own 1% cushion
+// sits under its own price, so it fell below the first quote's minimum whenever SUI ticked down in
+// between, failing about every other sale (live, 2026-10-20). The price is read first, and the
+// cushion then ends at the quoted minimum (never wider than 1%).
 export async function prepareSuiCashout({wallet, evmWallet, solanaWallet, amount, minimumOut}) {
   if (!solanaWallet && !/^0x[0-9a-fA-F]{40}$/.test(evmWallet)) throw new Error('invalid cash wallet');
-  const input = BigInt(amount);
-  if (input <= 0n || BigInt(minimumOut) <= 0n) throw new Error('invalid cashout amount');
-  const quoteRequest = {
-    dry: false, swapType: 'EXACT_INPUT', slippageTolerance: 100,
-    originAsset: 'nep141:sui.omft.near', depositType: 'ORIGIN_CHAIN',
-    destinationAsset: solanaWallet ? 'nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near'
-      : 'nep141:base-0x833589fcd6edb6e08f4c7c32d4f71b54bda02913.omft.near',
-    amount: input.toString(), recipient: solanaWallet ?? evmWallet, recipientType: 'DESTINATION_CHAIN',
-    refundTo: wallet.address, refundType: 'ORIGIN_CHAIN',
-    deadline: new Date(Date.now() + 240_000).toISOString(),
+  const input = BigInt(amount), least = BigInt(minimumOut);
+  if (input <= 0n || least <= 0n) throw new Error('invalid cashout amount');
+  const route = async (dry, slippageTolerance) => {
+    const quoteRequest = {
+      dry, swapType: 'EXACT_INPUT', slippageTolerance,
+      originAsset: 'nep141:sui.omft.near', depositType: 'ORIGIN_CHAIN',
+      destinationAsset: solanaWallet ? 'nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near'
+        : 'nep141:base-0x833589fcd6edb6e08f4c7c32d4f71b54bda02913.omft.near',
+      amount: input.toString(), recipient: solanaWallet ?? evmWallet, recipientType: 'DESTINATION_CHAIN',
+      refundTo: wallet.address, refundType: 'ORIGIN_CHAIN',
+      deadline: new Date(Date.now() + 240_000).toISOString(),
+    };
+    const key = process.env.NEAR_INTENTS_API_KEY;
+    const response = await fetch('https://1click.chaindefuser.com/v0/quote', {
+      method: 'POST',
+      headers: {'content-type': 'application/json', ...(key ? {'X-API-Key': key} : {})},
+      body: JSON.stringify(quoteRequest),
+      signal: AbortSignal.timeout(20_000),
+    });
+    if (!response.ok) throw new Error('cashout route unavailable');
+    const quote = (await response.json()).quote;
+    if (quote?.amountIn !== input.toString()) throw new Error('invalid cashout deposit route');
+    return quote;
   };
-  const key = process.env.NEAR_INTENTS_API_KEY;
-  const response = await fetch('https://1click.chaindefuser.com/v0/quote', {
-    method: 'POST',
-    headers: {'content-type': 'application/json', ...(key ? {'X-API-Key': key} : {})},
-    body: JSON.stringify(quoteRequest),
-    signal: AbortSignal.timeout(20_000),
-  });
-  if (!response.ok) throw new Error('cashout route unavailable');
-  const quote = (await response.json()).quote;
-  if (quote?.amountIn !== input.toString() ||
-      BigInt(quote.minAmountOut ?? quote.amountOut ?? 0) < BigInt(minimumOut) ||
-      !/^0x[0-9a-fA-F]{64}$/.test(quote.depositAddress ?? '') ||
-      quote.depositMemo != null) throw new Error('invalid cashout deposit route');
-  return {depositAddress: quote.depositAddress, amountOut: quote.amountOut};
+  const moved = () => new Error('The price moved since your quote');
+  let price = BigInt((await route(true, 100)).amountOut ?? 0);
+  for (let tries = 2; ; tries--) {
+    if (price < least) throw moved();
+    const quote = await route(false, Number(min(100n, (price - least) * 10000n / price)));
+    if (!/^0x[0-9a-fA-F]{64}$/.test(quote.depositAddress ?? '') || quote.depositMemo != null) {
+      throw new Error('invalid cashout deposit route');
+    }
+    if (BigInt(quote.minAmountOut ?? quote.amountOut ?? 0) >= least) {
+      return {depositAddress: quote.depositAddress, amountOut: quote.amountOut};
+    }
+    // SUI ticked down between the two reads: once more at the newer price.
+    if (tries === 1) throw moved();
+    price = BigInt(quote.amountOut ?? 0);
+  }
 }
+const min = (a, b) => (a < b ? a : b);
 // The sale produces SUI; its cash-out keeps 0.02 SUI. Before approving the swap, existing SUI must cover its real budget.
 export function checkSaleGas(budget,held) {
   if(!/^[1-9][0-9]*$/.test(String(budget??'')) || BigInt(held)<BigInt(budget))throw new Error('not enough for the transaction gas budget');
