@@ -967,6 +967,54 @@ pub(super) struct MarketState {
     postgres: Option<Arc<tokio_postgres::Client>>,
 }
 type ChartCache = Arc<Mutex<HashMap<String, (Instant, Arc<Vec<(u64, f64)>>)>>>;
+
+// A quote nobody confirmed leaves memory ten minutes after it expires, and a cached lookup an hour
+// after it was made (the next request reads it fresh): see keep_memory_in_check.
+pub(super) const QUOTE_KEPT_MS: u64 = 10 * 60_000;
+pub(super) const LOOKUP_KEPT: Duration = Duration::from_secs(60 * 60);
+impl MarketState {
+    pub(super) fn sweep(&self) -> Vec<(&'static str, usize)> {
+        let at = now();
+        let fresh = |made: &Instant| made.elapsed() < LOOKUP_KEPT;
+        let mut kept = Vec::new();
+        if let Ok(mut quotes) = self.quotes.lock() {
+            quotes.retain(|_, q| q.expires + QUOTE_KEPT_MS > at);
+            kept.push(("trade quotes", quotes.len()));
+        }
+        if let Ok(mut held) = self.pasted.lock() {
+            held.retain(|_, (made, _)| fresh(made));
+            kept.push(("pasted coins", held.len()));
+        }
+        if let Ok(mut held) = self.prices.lock() {
+            held.retain(|_, (made, _, _)| fresh(made));
+            kept.push(("prices", held.len()));
+        }
+        if let Ok(mut held) = self.base_rates.lock() {
+            held.retain(|_, (made, _)| fresh(made));
+        }
+        if let Ok(mut held) = self.multipliers.lock() {
+            held.retain(|_, (made, _)| fresh(made));
+        }
+        if let Ok(mut held) = self.chart_pools.lock() {
+            held.retain(|_, (made, _)| fresh(made));
+        }
+        if let Ok(mut held) = self.charts.lock() {
+            held.retain(|_, (made, _)| fresh(made));
+            kept.push(("charts", held.len()));
+        }
+        if let Ok(mut held) = self.searches.lock() {
+            held.retain(|_, (made, _)| fresh(made));
+            kept.push(("searches", held.len()));
+        }
+        // CoinGecko's meme-or-not answers never go stale; a long list just starts over.
+        if let Ok(mut held) = self.coin_kinds.lock() {
+            if held.len() > 5_000 {
+                held.clear();
+            }
+        }
+        kept
+    }
+}
 #[derive(Clone)]
 struct StoredQuote {
     owner: String,

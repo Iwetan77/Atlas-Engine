@@ -362,6 +362,17 @@ fn parse_micros(value: &str) -> Result<u128, ApiError> {
         .ok_or_else(|| bad("amount must be positive"))
 }
 impl SocialState {
+    // See markets::sweep.
+    pub(super) fn sweep(&self) -> Vec<(&'static str, usize)> {
+        let at = now();
+        let Ok(mut quotes) = self.quotes.lock() else {
+            return Vec::new();
+        };
+        quotes.retain(|_, q| q.expires + markets::QUOTE_KEPT_MS > at);
+        vec![("send quotes", quotes.len())]
+    }
+}
+impl SocialState {
     pub(super) async fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let postgres = if let Ok(url) = env::var("DATABASE_URL") {
             let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;

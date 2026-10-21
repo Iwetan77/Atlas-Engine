@@ -384,6 +384,25 @@ impl Listed {
     }
 }
 impl NearState {
+    // See markets::sweep.
+    pub(super) fn sweep(&self) -> Vec<(&'static str, usize)> {
+        let at = now();
+        let mut kept = Vec::new();
+        if let Ok(mut quotes) = self.quotes.lock() {
+            quotes.retain(|_, q| q.expires + markets::QUOTE_KEPT_MS > at);
+            kept.push(("near quotes", quotes.len()));
+        }
+        if let Ok(mut quotes) = self.withdrawals.lock() {
+            quotes.retain(|_, q| q.expires + markets::QUOTE_KEPT_MS > at);
+        }
+        if let Ok(mut held) = self.hood_coins.lock() {
+            held.retain(|_, (made, _)| made.elapsed() < markets::LOOKUP_KEPT);
+            kept.push(("robinhood coins", held.len()));
+        }
+        kept
+    }
+}
+impl NearState {
     pub(super) async fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let postgres = if let Ok(url) = env::var("DATABASE_URL") {
             let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
