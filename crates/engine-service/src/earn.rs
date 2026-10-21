@@ -105,6 +105,17 @@ pub(super) struct EarnState {
     morpho: Arc<Mutex<Option<(Instant, Vec<Vault>)>>>,
     http: reqwest::Client,
 }
+// See markets::sweep.
+impl EarnState {
+    pub(super) fn sweep(&self) -> Vec<(&'static str, usize)> {
+        let at = now();
+        let Ok(mut quotes) = self.quotes.lock() else {
+            return Vec::new();
+        };
+        quotes.retain(|_, q| q.expires + markets::QUOTE_KEPT_MS > at);
+        vec![("earn quotes", quotes.len())]
+    }
+}
 
 // One Morpho vault right now.
 #[derive(Clone, Debug, PartialEq)]

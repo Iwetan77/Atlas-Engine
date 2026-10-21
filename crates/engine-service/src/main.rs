@@ -168,6 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     emails::keep_watching(state.clone());
     push::keep_delivering(state.clone());
     price_alerts::keep_watching(state.clone());
+    keep_memory_in_check(state.clone());
     let perps_routes = Router::new()
         .route(
             "/v1/perps/onboarding",
@@ -346,28 +347,84 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 static STARTED: std::sync::LazyLock<std::time::SystemTime> =
     std::sync::LazyLock::new(std::time::SystemTime::now);
 
-// Memory used by everything in this container (the engine and the Privy bridge), in MB: the free
-// plan has 512 MB, and running out restarts the server.
-fn memory_mb() -> Option<u64> {
-    let mut kb = 0u64;
+// Memory in this container, in MB: the engine and the Privy bridge apiece (now and at their peak),
+// all processes together, and the container's limit (the free plan has 512 MB; going over
+// restarts the server).
+#[derive(Default)]
+struct Memory {
+    engine: u64,
+    engine_peak: u64,
+    bridge: u64,
+    bridge_peak: u64,
+    total: u64,
+    limit: Option<u64>,
+}
+fn memory() -> Option<Memory> {
+    let me = std::process::id().to_string();
+    let mut held = Memory::default();
     for entry in std::fs::read_dir("/proc").ok()?.flatten() {
-        if !entry
-            .file_name()
-            .to_string_lossy()
-            .bytes()
-            .all(|b| b.is_ascii_digit())
-        {
+        let pid = entry.file_name().to_string_lossy().into_owned();
+        if !pid.bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
-        if let Ok(status) = std::fs::read_to_string(entry.path().join("status")) {
-            kb += status
+        let Ok(status) = std::fs::read_to_string(entry.path().join("status")) else {
+            continue;
+        };
+        let field = |name: &str| {
+            status
                 .lines()
-                .find_map(|l| l.strip_prefix("VmRSS:"))
+                .find_map(|l| l.strip_prefix(name))
                 .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
-                .unwrap_or(0);
+                .unwrap_or(0)
+                / 1024
+        };
+        let (rss, peak) = (field("VmRSS:"), field("VmHWM:"));
+        held.total += rss;
+        if pid == me {
+            (held.engine, held.engine_peak) = (rss, peak);
+        } else if status.lines().next() == Some("Name:\tnode") && rss > held.bridge {
+            (held.bridge, held.bridge_peak) = (rss, peak);
         }
     }
-    Some(kb / 1024)
+    held.limit = [
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ]
+    .iter()
+    .find_map(|f| std::fs::read_to_string(f).ok()?.trim().parse::<u64>().ok())
+    .map(|bytes| bytes / 1024 / 1024)
+    .filter(|mb| *mb < 1024 * 1024);
+    Some(held)
+}
+
+// Every five minutes: quotes nobody confirmed and lookups long past their use leave memory, and
+// what each process holds is logged, so a slow climb shows in the logs before it restarts the server.
+fn keep_memory_in_check(state: AppState) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(300)).await;
+            let kept = [
+                state.markets.sweep(),
+                state.near.sweep(),
+                state.social.sweep(),
+                state.hl.sweep(),
+                state.earn.sweep(),
+            ]
+            .concat();
+            let Some(m) = memory() else { continue };
+            let kept: Vec<String> = kept.iter().map(|(name, n)| format!("{name} {n}")).collect();
+            eprintln!(
+                "memory: engine {} MB (peak {}), bridge {} MB (peak {}), all {} of {} MB; kept {}",
+                m.engine,
+                m.engine_peak,
+                m.bridge,
+                m.bridge_peak,
+                m.total,
+                m.limit.map_or("?".into(), |l| l.to_string()),
+                kept.join(", ")
+            );
+        }
+    });
 }
 
 async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -376,6 +433,7 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
             .ok()
             .and_then(|u| u.host_str().map(str::to_string))
     };
+    let mem = memory();
     let started = STARTED
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
@@ -383,7 +441,11 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
         "ok": true,
         "commit": env::var("RENDER_GIT_COMMIT").unwrap_or_else(|_| "unknown".into()),
         "startedAtUnixMs": started,
-        "memoryMb": memory_mb(),
+        "memoryMb": mem.as_ref().map(|m| m.total),
+        "memory": mem.map(|m| serde_json::json!({
+            "engineMb": m.engine, "enginePeakMb": m.engine_peak,
+            "bridgeMb": m.bridge, "bridgePeakMb": m.bridge_peak, "limitMb": m.limit,
+        })),
         "rpc": {
             "solana": host("ATLAS_SOLANA_MAINNET_RPC_URL", "https://api.mainnet-beta.solana.com"),
             "base": host("ATLAS_BASE_MAINNET_RPC_URL", "https://base-rpc.publicnode.com"),
@@ -433,6 +495,12 @@ fn clean_url(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_counts_this_process() {
+        let m = memory().expect("/proc is readable");
+        assert!(m.engine > 0 && m.engine_peak >= m.engine && m.total >= m.engine);
+    }
 
     #[test]
     fn hosted_website_and_configured_local_tests_are_allowed_without_wildcards() {
