@@ -2781,12 +2781,14 @@ pub(super) async fn quote(
     let input = if req.side == "buy" {
         usdc_units
     } else if req.all {
-        // Everything held; SOL keeps its gas tank (0.01 SOL) for the fees ahead.
         let held = spot_available(&state, &a, "sell", &user)
             .await
             .ok_or_else(|| unavailable("Couldn't read your holding right now; try again"))?;
         if a.token == SOL_MINT {
-            held.saturating_sub(10_000_000)
+            sol_max_sale(
+                held,
+                app_balance::sol_bought_by(&state, &user.user_id).await?,
+            )
         } else {
             held
         }
@@ -4779,6 +4781,14 @@ async fn spot_available(
     }
     Some(units)
 }
+// Max on SOL sells what the balance shows: the SOL bought, never the gas tank beyond it. The sale
+// itself keeps what its fee and the wrapped-SOL account it opens and closes need. It used to keep a
+// flat 0.01 SOL on top of everything, so Max sold less than shown, or nothing ("amount too small")
+// while 75% went through.
+const SOL_SALE_ROOM: u128 = 3_000_000; // 0.003 SOL
+fn sol_max_sale(native: u128, bought: u128) -> u128 {
+    native.saturating_sub(SOL_SALE_ROOM).min(bought)
+}
 fn mul_div_units(a: u128, b: u128, c: u128) -> u128 {
     if c == 0 {
         return 0;
@@ -6691,6 +6701,16 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn sol_max_sells_what_was_bought_and_keeps_room_for_its_own_fee() {
+        // 0.0105 SOL bought, no gas tank beyond it: the old flat 0.01 left 0.0005 to sell.
+        assert_eq!(sol_max_sale(10_500_000, 10_500_000), 7_500_000);
+        // A tank of 0.004 SOL beyond what was bought: Max sells exactly what's shown.
+        assert_eq!(sol_max_sale(14_500_000, 10_500_000), 10_500_000);
+        // Less SOL than the sale needs for its own fee: nothing to sell.
+        assert_eq!(sol_max_sale(2_000_000, 2_000_000), 0);
+    }
     #[test]
     fn a_24_decimal_coin_prices_in_naira_without_overflowing() {
         // 0.452112 wNEAR bought for $2, at ₦1,328.44 per dollar: about ₦5,876.60 per NEAR.

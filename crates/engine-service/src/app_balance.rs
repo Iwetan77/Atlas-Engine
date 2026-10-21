@@ -138,6 +138,13 @@ fn sol_bought(trades: &[positions::Trade], catalog: &[markets::Asset]) -> u128 {
         })
 }
 
+// The SOL the balance shows as bought; the rest of the wallet's SOL is its gas tank.
+pub(super) async fn sol_bought_by(state: &AppState, user_id: &str) -> Result<u128, ApiError> {
+    let trades = state.trades.for_user(user_id).await?;
+    let catalog = markets::catalog(&state.markets).await?;
+    Ok(sol_bought(&trades, &catalog))
+}
+
 const ARC_USDC: &str = "0x3600000000000000000000000000000000000000";
 
 async fn arc_balance(wallet: &str) -> Result<u128, ApiError> {
