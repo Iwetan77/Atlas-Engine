@@ -2778,6 +2778,9 @@ pub(super) async fn quote(
         .ok_or_else(|| bad("amount too large"))?
         / rate;
     check_limits(usdc_units, &req.amount.currency, rate)?;
+    // Max on SOL: the SOL held and the SOL bought (what the balance shows; the rest is the gas
+    // reserve).
+    let mut sol_max = None;
     let input = if req.side == "buy" {
         usdc_units
     } else if req.all {
@@ -2785,10 +2788,9 @@ pub(super) async fn quote(
             .await
             .ok_or_else(|| unavailable("Couldn't read your holding right now; try again"))?;
         if a.token == SOL_MINT {
-            sol_max_sale(
-                held,
-                app_balance::sol_bought_by(&state, &user.user_id).await?,
-            )
+            let bought = app_balance::sol_bought_by(&state, &user.user_id).await?;
+            sol_max = Some((held, bought));
+            sol_max_sale(held, bought, true)
         } else {
             held
         }
@@ -2862,7 +2864,21 @@ pub(super) async fn quote(
     } else {
         None
     };
-    let reserve_cash = fee_preview.as_ref().map_or(0, |p| p.cash());
+    let mut reserve_cash = fee_preview.as_ref().map_or(0, |p| p.cash());
+    // Max on SOL whose reserve can't pay the sale's fee, with no cash to refill it: the sale keeps
+    // back the little SOL its fee needs instead, the only time it sells less than shown.
+    let mut fee_preview = fee_preview;
+    let mut input = input;
+    if let Some((held, bought)) = sol_max {
+        let owner = user.solana_wallet.as_deref().unwrap_or_default();
+        if reserve_cash > 0 && solana_cash(&state, owner).await < reserve_cash {
+            input = sol_max_sale(held, bought, false);
+            (fee_preview, reserve_cash) = (None, 0);
+            if input == 0 {
+                return Err(bad("amount too small for this asset"));
+            }
+        }
+    }
     let (actual_in, actual_out, fee_units) =
         venue_quote(&state.markets, &a, &req.side, input).await?;
     // A top-up the confirm will add for an empty gas tank: a fee on top of the trade, never inside it.
@@ -4781,13 +4797,18 @@ async fn spot_available(
     }
     Some(units)
 }
-// Max on SOL sells what the balance shows: the SOL bought, never the gas tank beyond it. The sale
-// itself keeps what its fee and the wrapped-SOL account it opens and closes need. It used to keep a
-// flat 0.01 SOL on top of everything, so Max sold less than shown, or nothing ("amount too small")
-// while 75% went through.
+// Max on SOL sells what the balance shows: the SOL bought, never the gas reserve beyond it. The
+// reserve pays the sale's fee, refilled from cash first when it can't (as for any sale). Only with
+// neither does the sale keep back what its fee and the wrapped-SOL account it opens and closes need.
+// It used to keep a flat 0.01 SOL back every time, so Max sold less than shown, or nothing ("amount
+// too small") while 75% went through.
 const SOL_SALE_ROOM: u128 = 3_000_000; // 0.003 SOL
-fn sol_max_sale(native: u128, bought: u128) -> u128 {
-    native.saturating_sub(SOL_SALE_ROOM).min(bought)
+fn sol_max_sale(held: u128, bought: u128, fee_paid: bool) -> u128 {
+    if fee_paid {
+        bought.min(held)
+    } else {
+        held.saturating_sub(SOL_SALE_ROOM).min(bought)
+    }
 }
 fn mul_div_units(a: u128, b: u128, c: u128) -> u128 {
     if c == 0 {
@@ -6703,13 +6724,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sol_max_sells_what_was_bought_and_keeps_room_for_its_own_fee() {
-        // 0.0105 SOL bought, no gas tank beyond it: the old flat 0.01 left 0.0005 to sell.
-        assert_eq!(sol_max_sale(10_500_000, 10_500_000), 7_500_000);
-        // A tank of 0.004 SOL beyond what was bought: Max sells exactly what's shown.
-        assert_eq!(sol_max_sale(14_500_000, 10_500_000), 10_500_000);
-        // Less SOL than the sale needs for its own fee: nothing to sell.
-        assert_eq!(sol_max_sale(2_000_000, 2_000_000), 0);
+    fn sol_max_sells_what_was_bought_and_the_gas_reserve_pays_its_fee() {
+        // 0.0105 SOL bought, whatever the reserve: all of it, the reserve (refilled from cash if
+        // needed) paying the fee. The old flat 0.01 left 0.0005 to sell.
+        assert_eq!(sol_max_sale(10_500_000, 10_500_000, true), 10_500_000);
+        assert_eq!(sol_max_sale(14_500_000, 10_500_000, true), 10_500_000);
+        // No reserve and no cash to refill it: the sale keeps back what its own fee needs.
+        assert_eq!(sol_max_sale(10_500_000, 10_500_000, false), 7_500_000);
+        assert_eq!(sol_max_sale(14_500_000, 10_500_000, false), 10_500_000);
+        assert_eq!(sol_max_sale(2_000_000, 2_000_000, false), 0);
     }
     #[test]
     fn a_24_decimal_coin_prices_in_naira_without_overflowing() {
