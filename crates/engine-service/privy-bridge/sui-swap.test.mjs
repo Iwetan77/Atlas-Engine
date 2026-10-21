@@ -52,6 +52,40 @@ test('cashout quote binds the same user wallets and rejects output below the app
     globalThis.fetch = original;
   }
 });
+test('a cashout goes through when SUI ticks down after the quote, never below its minimum', async () => {
+  const original = globalThis.fetch;
+  // Live, 2026-10-20: the quote promised at least 940241; seconds later 1Click priced the sale at
+  // 949453, whose own 1% cushion (939958) was under it.
+  const prices = [949739, 949453, 949453];
+  const asked = [];
+  globalThis.fetch = async (_url, init) => {
+    const body = JSON.parse(init.body);
+    asked.push(body);
+    const out = BigInt(prices[asked.length - 1]);
+    return new Response(JSON.stringify({quote: {
+      amountIn: body.amount, amountOut: out.toString(),
+      minAmountOut: (out * BigInt(10000 - body.slippageTolerance) / 10000n).toString(),
+      ...(body.dry ? {} : {depositAddress: `0x${'3'.repeat(64)}`}), depositMemo: null,
+    }}), {status: 200});
+  };
+  try {
+    const wallet = {address: `0x${'1'.repeat(64)}`};
+    const solanaWallet = '9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM';
+    const quote = await prepareSuiCashout({wallet, solanaWallet, amount: '933940000', minimumOut: '940241'});
+    assert.equal(quote.depositAddress, `0x${'3'.repeat(64)}`);
+    assert.deepEqual(asked.map(a => [a.dry, a.slippageTolerance]), [[true, 100], [false, 100], [false, 97]]);
+    // Below the quoted minimum, nothing is prepared.
+    prices.splice(0, 3, 930000);
+    asked.length = 0;
+    await assert.rejects(
+      () => prepareSuiCashout({wallet, solanaWallet, amount: '933940000', minimumOut: '940241'}),
+      /price moved/,
+    );
+    assert.equal(asked.length, 1);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
 test('sale effects use only the signed wallet net SUI credit, never the estimated quote',()=>{
   const result={digest:'tx',effects:{status:{status:'success'}},balanceChanges:[
     {coinType:'0x2::sui::SUI',owner:{AddressOwner:'mine'},amount:'999000'},
