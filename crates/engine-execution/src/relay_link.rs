@@ -5,7 +5,8 @@
 //! Relay's dashboard raises its rate limits.
 use reqwest::{Client, Url};
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::sync::{LazyLock, RwLock};
+use std::time::{Duration, Instant};
 
 use crate::layerswap::SwapState;
 use crate::solana::MAINNET_USDC_MINT;
@@ -38,6 +39,30 @@ const SOLANA_DEPOSIT_PROGRAMS: [&str; 2] = [
 // Relay's receiver on Base: the only account that can redeem the user's authorization (the Privy
 // bridge pins it too).
 const RECEIVER: &str = "0xccc88a9d1b4ed6b0eaba998850414b24f1c315be";
+
+// 0x moves its Settler (the contract a 0x-routed swap runs through) to a new address from time to
+// time. Its Deployer registry on Robinhood Chain names the current one (ownerOf) and the one before
+// (prev), and a sale routed through any other is refused. A pinned address broke every 0x-routed
+// sale, and so every Robinhood coin buy (it needs a sale back), when 0x moved on in October 2026.
+// The registry is read at most every ten minutes; these two are what it said on 2026-10-21, used
+// until it answers.
+const ROBINHOOD_RPC: &str = "https://rpc.mainnet.chain.robinhood.com";
+const ZEROX_DEPLOYER: &str = "0x00000000000004533fe15556b1e086bb1a72ceae";
+static ZEROX_SETTLERS: LazyLock<RwLock<(Option<Instant>, Vec<String>)>> = LazyLock::new(|| {
+    RwLock::new((
+        None,
+        vec![
+            "0x24a4d86c8a76b00ee9566ed9c9ff4f0c3faf0da7".into(),
+            "0x6aa80dbbed9ae5ab45fbf61f9644fada3b29326e".into(),
+        ],
+    ))
+});
+fn zerox_settlers() -> Vec<String> {
+    ZEROX_SETTLERS
+        .read()
+        .map(|held| held.1.clone())
+        .unwrap_or_default()
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum RelayError {
@@ -361,6 +386,9 @@ impl RelayClient {
             .send()
             .await?;
         let body = checked(response).await?;
+        if from.chain == ROBINHOOD_CHAIN_ID {
+            self.refresh_zerox_settlers().await;
+        }
         parse_hood_swap(&body, from, dest, amount_in)
     }
 
@@ -482,6 +510,49 @@ impl RelayClient {
         match &self.api_key {
             Some(key) => request.header("x-api-key", key),
             None => request,
+        }
+    }
+
+    /// Reads 0x's current and previous Settler on Robinhood Chain from its registry (see
+    /// ZEROX_SETTLERS), at most every ten minutes, or a minute after a failed read.
+    async fn refresh_zerox_settlers(&self) {
+        let due = ZEROX_SETTLERS.read().is_ok_and(|held| {
+            held.0
+                .is_none_or(|at| at.elapsed() > Duration::from_secs(600))
+        });
+        if !due {
+            return;
+        }
+        let read = |selector: &'static str| async move {
+            let body: Value = self
+                .http
+                .post(ROBINHOOD_RPC)
+                .timeout(Duration::from_secs(4))
+                .json(
+                    &json!({"jsonrpc":"2.0","id":1,"method":"eth_call","params":[
+                    {"to":ZEROX_DEPLOYER,"data":format!("0x{selector}{:064x}", 2)},"latest"]}),
+                )
+                .send()
+                .await
+                .ok()?
+                .json()
+                .await
+                .ok()?;
+            let word = body["result"].as_str()?.strip_prefix("0x")?;
+            let address = format!("0x{}", word.get(24..64)?.to_ascii_lowercase());
+            (word.len() == 64 && address != format!("0x{}", "0".repeat(40))).then_some(address)
+        };
+        // ownerOf(2) and prev(2): feature 2 is the Settler a taker's own transaction calls.
+        let (current, previous) = tokio::join!(read("6352211e"), read("e2603dc2"));
+        if let Ok(mut held) = ZEROX_SETTLERS.write() {
+            match current {
+                Some(current) => {
+                    held.0 = Some(Instant::now());
+                    held.1 = std::iter::once(current).chain(previous).collect();
+                }
+                // Unread: the last list stands, and the next read is a minute away.
+                None => held.0 = Some(Instant::now() - Duration::from_secs(540)),
+            }
         }
     }
 
@@ -1561,7 +1632,6 @@ fn hood_sale_input(
         let ice = "0x603206d6105217dd972e4ab30676a220ca393346";
         let allowance = "0x0000000000001ff3684f28c67538d4d072c22734";
         let tycho = "0x09215a470bd585e59eb3f4b612fbd2678131ff9e";
-        let settler = "0x6aa80dbbed9ae5ab45fbf61f9644fada3b29326e";
         let address_word = |a: &str| format!("{:0>64}", a.trim_start_matches("0x"));
         let guard = if routed[1].0 == address_word(ice) {
             ice
@@ -1603,8 +1673,11 @@ fn hood_sale_input(
             // Settler.execute((recipient, buyToken, minAmountOut), actions, metadata).
             // Sources: 0xProject/0x-settler, IAllowanceHolder.sol and Settler.sol.
             let outer = swap.strip_prefix("2213bc0b")?;
-            if at(outer, 0)? != address_word(settler)
-                || at(outer, 32)? != token_word
+            let settlers = zerox_settlers();
+            let settler = settlers
+                .iter()
+                .find(|settler| at(outer, 0) == Some(address_word(settler).as_str()))?;
+            if at(outer, 32)? != token_word
                 || at(outer, 64)? != format!("{amount:064x}")
                 || at(outer, 96)? != address_word(settler)
                 || at(outer, 128)? != format!("{:064x}", 160)
@@ -2390,6 +2463,28 @@ mod tests {
                 "{path:?}"
             );
         }
+    }
+
+    #[test]
+    fn robinhood_sales_through_0xs_current_settler_pass_and_an_unnamed_one_does_not() {
+        // Live, 2026-10-21: Relay routed this GLOAM sale through 0x's new Settler, which the pinned
+        // old address refused, so Atlas wouldn't buy GLOAM ("can't sell it back").
+        let body: Value =
+            serde_json::from_str(include_str!("fixtures/relay-hood-solana-0x.json")).unwrap();
+        let from = Origin {
+            chain: ROBINHOOD_CHAIN_ID,
+            currency: "0xdcd885f5c60b3ad49f6d58718696417314e8724d",
+            wallet: "0x1111111111111111111111111111111111111111",
+        };
+        let gloam_in = 1_520_000_000_000_000_000;
+        assert!(parse_hood_swap(&body, from, solana_dest(SOLANA), gloam_in).is_ok());
+        // A Settler 0x's registry doesn't name: refused.
+        let other: Value = serde_json::from_str(&body.to_string().replace(
+            "24a4d86c8a76b00ee9566ed9c9ff4f0c3faf0da7",
+            "1234567890123456789012345678901234567890",
+        ))
+        .unwrap();
+        assert!(parse_hood_swap(&other, from, solana_dest(SOLANA), gloam_in).is_err());
     }
 
     #[test]
