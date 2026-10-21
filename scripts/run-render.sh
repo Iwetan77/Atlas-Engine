@@ -30,4 +30,7 @@ until node -e "require('net').connect(3101,'127.0.0.1').on('connect',()=>process
   fi
   sleep 1
 done
+# Two malloc arenas instead of one per thread: memory the engine frees goes back to use instead of
+# piling up across threads until the server runs out.
+export MALLOC_ARENA_MAX=2
 exec /usr/local/bin/engine-service
