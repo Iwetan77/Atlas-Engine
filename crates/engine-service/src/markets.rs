@@ -1554,6 +1554,20 @@ fn say_limit(usdc_units: u128, currency: &str, rate: u128, round_up: bool) -> St
     format!("{}{}", currency_symbol(currency), group_digits(whole))
 }
 // The $0.10–$10,000 range, said in the currency the user typed in.
+// Max on a sale clears whatever is held, however little: only the most at once applies (a venue can
+// still refuse a sale too small to route). Leftovers under the smallest amount used to stay on Home
+// for good, since nothing could sell them.
+pub(super) fn check_sale_limits(
+    usdc_units: u128,
+    currency: &str,
+    rate: u128,
+    all: bool,
+) -> Result<(), ApiError> {
+    if all && usdc_units < MIN_USDC {
+        return Ok(());
+    }
+    check_limits(usdc_units, currency, rate)
+}
 pub(super) fn check_limits(usdc_units: u128, currency: &str, rate: u128) -> Result<(), ApiError> {
     if usdc_units < MIN_USDC {
         return Err((
@@ -2825,7 +2839,12 @@ pub(super) async fn quote(
         .checked_mul(1_000_000)
         .ok_or_else(|| bad("amount too large"))?
         / rate;
-    check_limits(usdc_units, &req.amount.currency, rate)?;
+    check_sale_limits(
+        usdc_units,
+        &req.amount.currency,
+        rate,
+        req.all && req.side == "sell",
+    )?;
     // Max on SOL: the SOL held and the SOL bought (what the balance shows; the rest is the gas
     // reserve).
     let mut sol_max = None;
@@ -6771,6 +6790,13 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn max_sales_are_never_held_to_the_smallest_amount() {
+        // 0.000579 SOL ≈ $0.06 was stuck on Home: under the $0.10 minimum, nothing could sell it.
+        assert!(check_sale_limits(60_000, "USD", 1_000_000, true).is_ok());
+        assert!(check_sale_limits(60_000, "USD", 1_000_000, false).is_err());
+        assert!(check_sale_limits(MAX_USDC + 1, "USD", 1_000_000, true).is_err());
+    }
     #[test]
     fn sol_max_sells_what_was_bought_and_the_gas_reserve_pays_its_fee() {
         // 0.0105 SOL bought, whatever the reserve: all of it, the reserve (refilled from cash if

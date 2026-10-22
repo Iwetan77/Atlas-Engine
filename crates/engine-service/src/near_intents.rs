@@ -4398,7 +4398,7 @@ async fn near_coin_sell_quote(
         / rate;
     let amount = sale_units(held, desired, price, token.decimals, req.all)?;
     let value = worth_of(amount, price, token.decimals);
-    markets::check_limits(value, &req.amount.currency, rate)?;
+    markets::check_sale_limits(value, &req.amount.currency, rate, req.all)?;
     let direct = cash_quote(&state, &user, &token, amount, &wallet, true).await;
     let via_ref = if contract == WRAP_NEAR {
         None
@@ -4527,7 +4527,7 @@ async fn monad_sell_quote(
         req.all,
     )?;
     let value = worth_of(amount, price, token.decimals);
-    markets::check_limits(value, &req.amount.currency, rate)?;
+    markets::check_sale_limits(value, &req.amount.currency, rate, req.all)?;
     let swap = mon_cash_quote(&state, &user, &wallet, amount)
         .await
         .map_err(|_| conflict("MON can't be sold to cash right now. Try again later."))?;
@@ -4897,7 +4897,7 @@ async fn hood_sell_quote(
         / rate;
     let amount = sale_units(held, desired, price, token.decimals, req.all)?;
     let value = worth_of(amount, price, token.decimals);
-    markets::check_limits(value, &req.amount.currency, rate)?;
+    markets::check_sale_limits(value, &req.amount.currency, rate, req.all)?;
     let swap = hood_cash_quote(&state, &user, &wallet, &contract, amount)
         .await
         .map_err(|_| {
@@ -5020,7 +5020,7 @@ async fn sui_coin_sell_quote(
         .checked_mul(price)
         .ok_or_else(|| bad("Amount too large"))?
         / 10u128.pow(decimals);
-    markets::check_limits(value, &req.amount.currency, rate)?;
+    markets::check_sale_limits(value, &req.amount.currency, rate, req.all)?;
     let routed = bridge(
         &state,
         &headers,
@@ -5161,7 +5161,7 @@ async fn ref_sell_quote(
         .checked_mul(price)
         .ok_or_else(|| bad("Amount too large"))?
         / 10u128.pow(decimals);
-    markets::check_limits(value, &req.amount.currency, rate)?;
+    markets::check_sale_limits(value, &req.amount.currency, rate, req.all)?;
     let routed = bridge(
         &state,
         &headers,
@@ -5385,7 +5385,7 @@ async fn sui_sell_quote(
         .checked_mul(1_000_000)
         .ok_or_else(|| bad("amount too large"))?
         / rate;
-    markets::check_limits(value_usdc, &req.amount.currency, rate)?;
+    markets::check_sale_limits(value_usdc, &req.amount.currency, rate, req.all)?;
     let mut amount = value_usdc
         .checked_mul(1_000_000_000)
         .ok_or_else(|| bad("amount too large"))?
