@@ -1,8 +1,10 @@
 import {randomUUID} from 'node:crypto';
 
 // A wallet request expires with its prepared transaction. No token can sign it on the server.
+// Without a hash function, `message` is the hash itself: Privy signs NEAR wallets only that way
+// ("Raw signing with bytes does not support near wallets", live 2026-10-22).
 export function rawRequest({appId,walletId,message,hashFunction,expires}) {
-  const params={bytes:message,encoding:'hex',hash_function:hashFunction};
+  const params=hashFunction?{bytes:message,encoding:'hex',hash_function:hashFunction}:{hash:message};
   return {params,request:{version:1,method:'POST',url:`https://api.privy.io/v1/wallets/${walletId}/raw_sign`,
     body:{params},headers:{'privy-app-id':appId,'privy-request-expiry':String(expires)}}};
 }

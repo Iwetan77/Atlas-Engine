@@ -32,7 +32,7 @@ test('an expired device approval never reaches Privy',()=>{
   }finally{Date.now=original;}
 });
 
-for(const hashFunction of ['sha256','blake2b256'])test(`device ${hashFunction} request matches the Privy SDK byte for byte`,async()=>{
+for(const hashFunction of ['sha256','blake2b256',undefined])test(`device ${hashFunction??'hash'} request matches the Privy SDK byte for byte`,async()=>{
   const require=createRequire(import.meta.url);
   const auth=require(new URL('./node_modules/@privy-io/node/lib/authorization.js',import.meta.url).pathname);
   const key=generateKeyPairSync('ec',{namedCurve:'P-256'}).privateKey.export({format:'der',type:'pkcs8'}).toString('base64');
@@ -49,4 +49,12 @@ for(const hashFunction of ['sha256','blake2b256'])test(`device ${hashFunction} r
   assert.deepEqual(calls[0].args.authorization_context,{signatures:[device]});
   assert.deepEqual(calls[0].args.params,params);
   assert.equal(calls[0].args.request_expiry,expires);
+});
+
+test('a NEAR approval asks Privy to sign the transaction hash, never raw bytes',()=>{
+  // Privy refuses bytes for NEAR wallets: "Raw signing with bytes does not support near wallets".
+  const hash='0x'+'ab'.repeat(32);
+  const {params,request}=rawRequest({appId:'app-123',walletId:wallet.id,message:hash,expires:Date.now()+60000});
+  assert.deepEqual(params,{hash});
+  assert.deepEqual(request.body,{params:{hash}});
 });
