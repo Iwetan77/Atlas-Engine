@@ -9,6 +9,9 @@ export const WRAP = 'wrap.near';
 // rpc.mainnet.near.org is deprecated and refuses requests: FastNEAR's public endpoints instead.
 const RPC = process.env.ATLAS_NEAR_MAINNET_RPC_URL ?? 'https://free.rpc.fastnear.com';
 export const GAS_RESERVE = 50000000000000000000000n; // 0.05 NEAR, including storage (Ref swaps).
+// What a Ref sale needs in the wallet (the engine's NEAR_REF_SALE_GAS, which it tops up to from cash):
+// the swap's 180 Tgas, mostly refunded, token storage, then the cash-out's 0.01.
+export const REF_SALE_GAS = 30000000000000000000000n; // 0.03 NEAR
 // A sale straight to cash: one transaction (wrap, register 1Click's deposit address, transfer), 70
 // Tgas prepaid plus 0.00125 NEAR storage. The engine's NEAR_CASHOUT_RESERVE is the same amount.
 export const CASHOUT_RESERVE = 10000000000000000000000n; // 0.01 NEAR
@@ -212,7 +215,7 @@ export async function prepareRef({intentId,wallet,userId,userJwt,accessToken}){
   if(scope.network!=='near'||!['buy','sell'].includes(scope.side))throw new Error('invalid swap permission');
   const sell=scope.side==='sell';account(scope.coinType);
   const balance=BigInt((await rpc('query',{request_type:'view_account',finality:'final',account_id:wallet.address})).amount);
-  if(balance<GAS_RESERVE)throw new Error('not enough for the network fee');
+  if(balance<(sell?REF_SALE_GAS:GAS_RESERVE))throw new Error('not enough for the network fee');
   const held=BigInt(await view(sell?scope.coinType:WRAP,'ft_balance_of',{account_id:wallet.address}));
   if(sell?held<BigInt(scope.amount):held+balance-GAS_RESERVE<BigInt(scope.amount))throw new Error('holding changed');
   const q=await quoteRef(scope.coinType,scope.amount,sell);

@@ -183,6 +183,21 @@ struct SuiSale {
     icon_url: Option<String>,
     amount: u128,
     minimum_sui: u128,
+    // What the swap's proceeds keep back for gas before the cash-out: only what the wallet is missing of
+    // its reserve (NEAR_GAS_RESERVE or SUI_GAS_RESERVE), as quoted. Older sales, without it, kept the
+    // whole reserve.
+    #[serde(default)]
+    keep: Option<u128>,
+}
+// A swap's proceeds left for the cash-out: what the quote said to keep for gas comes off, the same
+// amount at execution (older sales, without it, keep the whole reserve).
+fn cashout_after_gas(proceeds: u128, sale: Option<&SuiSale>) -> u128 {
+    let reserve = if sale.is_some_and(|s| s.network == "near") {
+        NEAR_GAS_RESERVE
+    } else {
+        SUI_GAS_RESERVE
+    };
+    proceeds.saturating_sub(sale.and_then(|s| s.keep).unwrap_or(reserve))
 }
 // What the user reads when their deposit to 1Click didn't go out: nothing left the balance.
 const NOT_SENT: &str = "The payment didn't go through, so nothing left your balance. Try again.";
@@ -4471,6 +4486,7 @@ async fn near_coin_sell_quote(
                 icon_url: None,
                 amount,
                 minimum_sui: minimum,
+                keep: None,
             }),
             asset_id: req.asset_id.clone(),
             monad_sale: false,
@@ -5033,17 +5049,23 @@ async fn sui_coin_sell_quote(
     {
         return Err(venue("Sale wallet did not match"));
     }
+    // The proceeds top the SUI reserve up only by what it's missing, so a sale doesn't keep 0.02 SUI of
+    // them every time; execution keeps the same (`keep`).
+    let sui_now = sui_native(&state, &headers, &recipient)
+        .await
+        .ok_or_else(|| venue("Your balance is temporarily unavailable"))?;
+    let keep = SUI_GAS_RESERVE.saturating_sub(sui_now);
     let output = routed["amountOut"]
         .as_str()
         .and_then(|v| v.parse::<u128>().ok())
-        .filter(|v| *v > SUI_GAS_RESERVE * 2)
+        .filter(|v| v * 99 / 100 > keep)
         .ok_or_else(|| bad("The sale is too small after network fees"))?;
     let min_sui = output
         .checked_mul(99)
         .ok_or_else(|| bad("Amount too large"))?
         / 100;
     // Price cashout conservatively, allowing gas; execution uses the actual net swap credit.
-    let cashout = min_sui - SUI_GAS_RESERVE;
+    let cashout = min_sui - keep;
     let (cash_asset, cash_wallet) = cash_target(&user)?;
     let deadline = deadline_utc(180);
     let units = cashout.to_string();
@@ -5089,6 +5111,7 @@ async fn sui_coin_sell_quote(
                 icon_url,
                 amount,
                 minimum_sui: min_sui,
+                keep: Some(keep),
             }),
             asset_id: req.asset_id.clone(),
             monad_sale: false,
@@ -5174,22 +5197,23 @@ async fn ref_sell_quote(
     {
         return Err(venue("Sale wallet did not match"));
     }
-    let output = routed["amountOut"]
-        .as_str()
-        .and_then(|v| v.parse::<u128>().ok())
-        .filter(|v| *v > NEAR_GAS_RESERVE * 2)
-        .ok_or_else(|| bad("The sale is too small after network fees"))?;
-    let min_sui = output
-        .checked_mul(99)
-        .ok_or_else(|| bad("Amount too large"))?
-        / 100;
     // NEAR for the fees: bought first when the wallet is short (see sale_gas); otherwise the proceeds
-    // top the reserve up only by what it's missing, so repeat sales don't pile NEAR up.
+    // top the reserve up only by what it's missing, so repeat sales don't pile NEAR up. Execution keeps
+    // the same (`keep`).
     let gas_first = sale_gas(&state, &recipient, NEAR_REF_SALE_GAS).await?;
     let keep = match gas_first {
         Some(_) => 0,
         None => NEAR_GAS_RESERVE.saturating_sub(near_native(&state, &recipient).await?),
     };
+    let output = routed["amountOut"]
+        .as_str()
+        .and_then(|v| v.parse::<u128>().ok())
+        .filter(|v| v * 99 / 100 > keep)
+        .ok_or_else(|| bad("The sale is too small after network fees"))?;
+    let min_sui = output
+        .checked_mul(99)
+        .ok_or_else(|| bad("Amount too large"))?
+        / 100;
     // Price cashout conservatively; execution uses the actual net swap credit.
     let cashout = min_sui - keep;
     let (cash_asset, cash_wallet) = cash_target(&user)?;
@@ -5247,6 +5271,7 @@ async fn ref_sell_quote(
                 icon_url,
                 amount,
                 minimum_sui: min_sui,
+                keep: Some(keep),
             }),
             asset_id: req.asset_id.clone(),
             monad_sale: false,
@@ -5314,6 +5339,7 @@ pub(super) async fn sale_permission(
             icon_url: swap.icon_url.clone(),
             amount: swap.sui_in,
             minimum_sui: swap.expected_out * 99 / 100,
+            keep: None,
         }
     } else {
         intent.sale.clone().ok_or_else(|| bad("Not a coin sale"))?
@@ -7210,12 +7236,7 @@ async fn commit_device_step(
                     .and_then(|v| v.parse().ok())
                     .filter(|n| *n > 0)
                     .ok_or_else(|| venue("Sale proceeds could not be read; check your wallet"))?;
-                let reserve = if current.sale.as_ref().is_some_and(|s| s.network == "near") {
-                    NEAR_GAS_RESERVE
-                } else {
-                    SUI_GAS_RESERVE
-                };
-                current.amount = current.amount.saturating_sub(reserve);
+                current.amount = cashout_after_gas(current.amount, current.sale.as_ref());
                 if current.amount == 0 {
                     current.status.state = "failed".into();
                     current.status.error=Some("Your sale proceeds are in your wallet, but they do not cover the cash-out and network reserve.".into());
@@ -9002,6 +9023,41 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_swap_sale_keeps_only_the_quoted_gas_from_its_proceeds() {
+        let sale = |network: &str, keep| SuiSale {
+            network: network.into(),
+            coin_type: "c".into(),
+            symbol: "C".into(),
+            name: "C".into(),
+            decimals: 18,
+            icon_url: None,
+            amount: 1,
+            minimum_sui: 1,
+            keep,
+        };
+        // 0.2 NEAR of Ref proceeds. A full reserve: nothing kept (it used to keep 0.05 NEAR every time).
+        let near = 200_000_000_000_000_000_000_000;
+        assert_eq!(cashout_after_gas(near, Some(&sale("near", Some(0)))), near);
+        // Missing 0.02 NEAR of it: only that.
+        assert_eq!(
+            cashout_after_gas(
+                near,
+                Some(&sale("near", Some(20_000_000_000_000_000_000_000)))
+            ),
+            180_000_000_000_000_000_000_000
+        );
+        // Sales quoted before `keep`: the whole reserve, as then.
+        assert_eq!(
+            cashout_after_gas(near, Some(&sale("near", None))),
+            near - NEAR_GAS_RESERVE
+        );
+        assert_eq!(
+            cashout_after_gas(100_000_000, Some(&sale("sui", None))),
+            100_000_000 - SUI_GAS_RESERVE
+        );
+    }
     #[test]
     fn sui_prices_come_from_pairs_that_price_the_coin() {
         let deep = "0xdeeb7a4662eec9f2f3def03fb937a663dddaa2e215b8078a284d026b7946c270::deep::DEEP";
