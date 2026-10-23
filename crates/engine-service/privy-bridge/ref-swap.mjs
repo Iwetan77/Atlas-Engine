@@ -12,16 +12,21 @@ export const GAS_RESERVE = 50000000000000000000000n; // 0.05 NEAR, including sto
 // What a Ref sale needs in the wallet (the engine's NEAR_REF_SALE_GAS, which it tops up to from cash):
 // the swap's 180 Tgas, mostly refunded, token storage, then the cash-out's 0.01.
 export const REF_SALE_GAS = 30000000000000000000000n; // 0.03 NEAR
-// A sale straight to cash: one transaction (wrap, register 1Click's fresh deposit address for 0.00125
-// NEAR, transfer) with 70 Tgas prepaid at 0.0001 NEAR per Tgas, after which the account must still hold
-// its own storage (0.00182 NEAR for a wallet). NEAR checks all of it before the transaction runs; a flat
-// 0.01 NEAR fell short of it, so every Max sale of plain NEAR was refused. The engine's near_sale_room is
-// the same formula.
-export const SALE_COSTS = 8750000000000000000000n; // 0.00125 + 0.007 + 0.0005 margin
-const STORAGE_PER_BYTE = 10000000000000000000n;
-export function saleRoom(view) {
+// A sale straight to cash: one transaction (register the wallet on wNEAR the first time, wrap, register
+// 1Click's fresh deposit address, transfer) with up to 100 Tgas prepaid (mostly refunded) plus NEAR's own
+// cost of making its receipts, after which the account must still hold its own storage. NEAR checks all
+// of it before the transaction runs; a flat 0.01 NEAR fell short, so every Max sale of plain NEAR was
+// refused. The room follows NEAR's live gas and storage prices (nearPrices), so nothing beyond what the
+// transaction needs is kept. The engine's sale_room is the same formula.
+export const SALE_GAS = 110000000000000n; // 100 Tgas prepaid + 10 Tgas for the receipts
+const REGISTRATION_BYTES = 250n; // two wNEAR registrations: the wallet's and 1Click's (125 bytes each)
+export function saleRoom(view,{gasPrice,perByte}) {
   if(!Number.isSafeInteger(view?.storage_usage))throw new Error('NEAR account unavailable');
-  return BigInt(view.storage_usage)*STORAGE_PER_BYTE+SALE_COSTS;
+  return (BigInt(view.storage_usage)+REGISTRATION_BYTES)*perByte+SALE_GAS*gasPrice+1n;
+}
+export async function nearPrices() {
+  const [gas,config]=await Promise.all([rpc('gas_price',[null]),rpc('EXPERIMENTAL_protocol_config',{finality:'final'})]);
+  return {gasPrice:BigInt(gas.gas_price),perByte:BigInt(config.runtime_config.storage_amount_per_byte)};
 }
 export function account(value) {
   if (typeof value !== 'string' || value.length < 2 || value.length > 64 ||
@@ -341,7 +346,7 @@ export async function prepareCashout({wallet,userId,userJwt,evmWallet,solanaWall
   const cash=cashDestination(solanaWallet,evmWallet);
   if(BigInt(amount)<=0n||BigInt(minimumOut)<=0n)throw new Error('invalid cashout');
   const nearAccount=await rpc('query',{request_type:'view_account',finality:'final',account_id:wallet.address});
-  const native=BigInt(nearAccount.amount),room=saleRoom(nearAccount);
+  const native=BigInt(nearAccount.amount),room=saleRoom(nearAccount,await nearPrices());
   if(native<room)throw new Error('not enough NEAR for the network fee');
   if(available(token,BigInt(await view(token,'ft_balance_of',{account_id:wallet.address})),native,room)<BigInt(amount))throw new Error('holding changed');
   // The route must still pay at least the minimum the user was quoted. A fresh quote's own 1% cushion sits
@@ -397,6 +402,16 @@ export function available(token,held,native,room){
   return token===WRAP?held+(native>room?native-room:0n):held;
 }
 // NEAR sold from native NEAR is wrapped first, in the same transaction to wrap.near.
+// The wrap, and before it the wallet's own wNEAR registration when it has none: wNEAR registers an
+// unregistered wallet out of the NEAR it wraps (0.00125 less arrives), so the transfer after it would come
+// up short and the whole sale fail.
+export async function wrapActions(token,held,amount,owner){
+  const wrap=wrapFirst(token,held,amount);
+  if(!wrap.length||await view(WRAP,'storage_balance_of',{account_id:owner}))return wrap;
+  const minimum=BigInt((await view(WRAP,'storage_balance_bounds')).min);
+  if(minimum>10000000000000000000000n)throw new Error('token storage cost is too high');
+  return [call('storage_deposit',{account_id:owner,registration_only:true},30000000000000n,minimum),...wrap];
+}
 export function wrapFirst(token,held,amount){
   if(token!==WRAP||held>=BigInt(amount))return [];
   return [call('near_deposit',{},10000000000000n,BigInt(amount)-held)];
@@ -407,9 +422,9 @@ export async function commitCashout({cashoutId,scope,wallet,userId,userJwt,rawSi
   const token=item.scope.coinType,amount=item.scope.amount,to=item.data.depositAddress;
   const held=BigInt(await view(token,'ft_balance_of',{account_id:wallet.address}));
   const nearAccount=await rpc('query',{request_type:'view_account',finality:'final',account_id:wallet.address});
-  const native=BigInt(nearAccount.amount),room=saleRoom(nearAccount);
+  const native=BigInt(nearAccount.amount),room=saleRoom(nearAccount,await nearPrices());
   if(available(token,held,native,room)<BigInt(amount)||native<room)throw new Error('holding changed');
-  const actions=[...wrapFirst(token,held,amount),...await depositActions(token,to,amount)];
+  const actions=[...await wrapActions(token,held,amount,wallet.address),...await depositActions(token,to,amount)];
   const result=await sendCall(wallet,token,actions,rawSign,item.scope.expiresAtUnixMs);
   return {ok:sentToken(result,token,wallet.address,to)===BigInt(amount),digest:result.transaction.hash};
 }
@@ -453,9 +468,9 @@ export async function buildNearCashout({cashoutId,scope,wallet,userId,userJwt}) 
   const token=item.scope.coinType,amount=item.scope.amount,to=item.data.depositAddress;
   const held=BigInt(await view(token,'ft_balance_of',{account_id:wallet.address}));
   const nearAccount=await rpc('query',{request_type:'view_account',finality:'final',account_id:wallet.address});
-  const native=BigInt(nearAccount.amount),room=saleRoom(nearAccount);
+  const native=BigInt(nearAccount.amount),room=saleRoom(nearAccount,await nearPrices());
   if(available(token,held,native,room)<BigInt(amount)||native<room)throw new Error('holding changed');
-  const actions=[...wrapFirst(token,held,amount),...await depositActions(token,to,amount)];
+  const actions=[...await wrapActions(token,held,amount,wallet.address),...await depositActions(token,to,amount)];
   return {calls:await buildNearCalls(wallet,[{receiver:token,actions}]),token,amount,to};
 }
 export async function finishNearCalls({wallet,built,signatures}) {
