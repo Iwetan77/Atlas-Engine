@@ -111,7 +111,7 @@ struct StoredQuote {
     // first, from the user's cash, before the sale itself (see sale_gas).
     gas_first: Option<u128>,
     // A Robinhood Chain buy into a wallet short of ETH there: USD micros of the payment Relay lands
-    // as ETH for the coin's later sale (kept in the wallet; see HOOD_GAS_FLOOR_WEI).
+    // as ETH for the coin's later sale (older buys only: none is bought now).
     hood_gas: u128,
     // Max on the chain's own coin (SUI): the sale sends everything, and its one network fee comes out of
     // the sale, so nothing is left behind.
@@ -4726,12 +4726,9 @@ async fn mon_route(
 }
 
 // Robinhood Chain's gas is its ETH: a sale (an approval and Relay's deposit) costs about 0.00001 ETH
-// there. A buy into a wallet below the floor lands a little ETH with the coin, which stays in the
-// wallet for its sales (about five of them) and shows in the balance.
-const HOOD_GAS_FLOOR_WEI: u128 = 20_000_000_000_000;
+// there. Buys used to land a little ETH with the coin for its sales; Atlas's fee payer sends a sale its
+// gas now, so no ETH is kept in the wallet.
 const HOOD_SALE_GAS_WEI: u128 = 10_000_000_000_000;
-// USD micros of such a buy that land as ETH: about 0.00004 ETH.
-const HOOD_GAS_TOPUP_USDC: u128 = 100_000;
 
 // Relay's quote for exactly `amount` of the wallet's coin on Robinhood Chain into the user's cash:
 // Solana USDC, or Base USDC without a Solana wallet.
@@ -4825,13 +4822,9 @@ async fn hood_buy_quote(
             token.symbol
         )));
     }
-    let gas = if state.near.hood_eth(&evm).await? < HOOD_GAS_FLOOR_WEI {
-        HOOD_GAS_TOPUP_USDC
-    } else {
-        0
-    };
-    // The ETH kept for selling later is a gas top-up on top of the buy: all of `amount` still buys
-    // the coin, and the deposit carries both.
+    // No ETH is bought or kept for selling later: Atlas's fee payer sends a sale its gas when it happens,
+    // so all of `amount` buys the coin and nothing stays behind as a reserve.
+    let gas = 0;
     let deposit = amount + gas;
     let (wallet, from_solana, swap) = hood_route(
         &state,
