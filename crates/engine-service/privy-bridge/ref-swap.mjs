@@ -218,18 +218,31 @@ async function storage(wallet,token,rawSign,expires,chain){
   if(minimum>10000000000000000000000n)throw new Error('token storage cost is too high');
   await sendCall(wallet,token,[call('storage_deposit',{account_id:wallet.address,registration_only:true},30000000000000n,minimum)],rawSign,expires,chain);
 }
-export function receivedToken(result,token,owner){
-  let amount=0n;
+// A token's transfers in a transaction's receipts: NEP-297 ft_transfer events, or (from contracts that
+// predate them, wNEAR among them) the plain "Transfer <amount> from <a> to <b>" log line. A receipt's
+// events win when it has any, so nothing counts twice. Reading events only, a NEAR sale that went
+// through was called failed (live 2026-10-23: wrap.near logs only the plain line).
+export function tokenTransfers(result,token){
+  const moves=[];
   for(const receipt of result.receipts_outcome??[]){
     if(receipt.outcome?.executor_id!==token||receipt.outcome.status?.Failure)continue;
+    const events=[],plain=[];
     for(const log of receipt.outcome.logs??[]){
-      if(!log.startsWith('EVENT_JSON:'))continue;
-      let event;try{event=JSON.parse(log.slice(11));}catch{continue;}
-      if(event.standard!=='nep141'||event.event!=='ft_transfer')continue;
-      for(const item of event.data??[])if(item.old_owner_id===REF&&item.new_owner_id===owner)amount+=BigInt(item.amount);
+      if(log.startsWith('EVENT_JSON:')){
+        let event;try{event=JSON.parse(log.slice(11));}catch{continue;}
+        if(event.standard!=='nep141'||event.event!=='ft_transfer')continue;
+        for(const item of event.data??[])events.push({from:item.old_owner_id,to:item.new_owner_id,amount:BigInt(item.amount)});
+      }else{
+        const m=/^Transfer ([0-9]{1,40}) from ([a-z0-9._-]{2,64}) to ([a-z0-9._-]{2,64})$/.exec(log);
+        if(m)plain.push({from:m[2],to:m[3],amount:BigInt(m[1])});
+      }
     }
+    moves.push(...(events.length?events:plain));
   }
-  return amount;
+  return moves;
+}
+export function receivedToken(result,token,owner){
+  return tokenTransfers(result,token).filter(t=>t.from===REF&&t.to===owner).reduce((sum,t)=>sum+t.amount,0n);
 }
 export async function prepareRef({intentId,wallet,userId,userJwt,accessToken}){
   const scope=await salePermission({intentId,wallet,userId,userJwt,accessToken});
@@ -317,17 +330,7 @@ export function cashDestination(solanaWallet,evmWallet){
 
 // A token's transfer from `from` to `to` in a transaction's receipts, by the token's own event.
 export function sentToken(result,token,from,to){
-  let amount=0n;
-  for(const receipt of result.receipts_outcome??[]){
-    if(receipt.outcome?.executor_id!==token||receipt.outcome.status?.Failure)continue;
-    for(const log of receipt.outcome.logs??[]){
-      if(!log.startsWith('EVENT_JSON:'))continue;
-      let event;try{event=JSON.parse(log.slice(11));}catch{continue;}
-      if(event.standard!=='nep141'||event.event!=='ft_transfer')continue;
-      for(const item of event.data??[])if(item.old_owner_id===from&&item.new_owner_id===to)amount+=BigInt(item.amount);
-    }
-  }
-  return amount;
+  return tokenTransfers(result,token).filter(t=>t.from===from&&t.to===to).reduce((sum,t)=>sum+t.amount,0n);
 }
 
 // The deposit to 1Click for a NEAR token: a storage registration for 1Click's address on that token
