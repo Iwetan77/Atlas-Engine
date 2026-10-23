@@ -202,6 +202,8 @@ fn cashout_after_gas(proceeds: u128, sale: Option<&SuiSale>) -> u128 {
     };
     proceeds.saturating_sub(sale.and_then(|s| s.keep).unwrap_or(reserve))
 }
+// How long a deposit whose broadcast timed out may stay unseen by 1Click before it counts as never sent.
+const UNSURE_DEPOSIT_MS: u64 = 15 * 60_000;
 // What the user reads when their deposit to 1Click didn't go out: nothing left the balance.
 const NOT_SENT: &str = "The payment didn't go through, so nothing left your balance. Try again.";
 // SUI kept in the Sui wallet for gas: 0.02 SUI pays for dozens of swaps.
@@ -319,6 +321,10 @@ struct StoredIntent {
     // A Max sale of the chain's own coin (see StoredQuote::everything).
     #[serde(default)]
     everything: bool,
+    // When a deposit's broadcast timed out (its outcome unknown), so the sale can end if 1Click never
+    // sees it.
+    #[serde(default)]
+    unsure_since: Option<u64>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct PendingSale {
@@ -2577,6 +2583,7 @@ pub(super) async fn withdraw_execute(
                 gas_bought: 0,
                 refund: None,
                 everything: false,
+                unsure_since: None,
                 relay: None,
                 withdraw: Some(Withdrawal {
                     network: stored.option.label.into(),
@@ -2653,6 +2660,66 @@ async fn bridge(
         return Err((StatusCode::BAD_GATEWAY, reason));
     }
     Ok(body)
+}
+
+// A bridge step that failed, with the bridge's word on whether anything may have reached the chain
+// (`maybeSent`, the hashes it already sent): a broadcast that timed out can still land.
+struct BridgeFailure {
+    reason: String,
+    maybe_sent: bool,
+    tx_ids: Vec<String>,
+}
+async fn bridge_step(
+    state: &AppState,
+    headers: &HeaderMap,
+    path: &str,
+    body: Value,
+) -> Result<Value, BridgeFailure> {
+    let AuthMode::Privy { bridge_url, http } = &state.auth else {
+        return Err(BridgeFailure {
+            reason: "Privy identity is required for this".into(),
+            maybe_sent: false,
+            tx_ids: Vec::new(),
+        });
+    };
+    let mut body = body;
+    if let Some(token) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    {
+        body["accessToken"] = json!(token);
+    }
+    // No answer at all (the bridge died or the request timed out mid-broadcast): unknown, not failed.
+    let response = http
+        .post(format!("{bridge_url}{path}"))
+        .timeout(Duration::from_secs(90))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|_| BridgeFailure {
+            reason: "the approval's outcome couldn't be read".into(),
+            maybe_sent: true,
+            tx_ids: Vec::new(),
+        })?;
+    let status = response.status();
+    let body: Value = response.json().await.unwrap_or(Value::Null);
+    if status.is_success() {
+        return Ok(body);
+    }
+    let tx_ids: Vec<String> = body["txIds"]
+        .as_array()
+        .map(|ids| {
+            ids.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    Err(BridgeFailure {
+        reason: body["error"].as_str().unwrap_or("bridge error").to_owned(),
+        maybe_sent: body["maybeSent"].as_bool() == Some(true) || !tx_ids.is_empty(),
+        tx_ids,
+    })
 }
 
 // A Sui coin's symbol, name, decimals and icon from Sui's own metadata.
@@ -6005,6 +6072,7 @@ async fn execute_monad_sale(
                 gas_bought: 0,
                 refund: None,
                 everything: false,
+                unsure_since: None,
                 withdraw: None,
                 relay: Some(RelayLeg {
                     request_id: swap.request_id,
@@ -6151,6 +6219,7 @@ async fn execute_mon_buy(
                 gas_bought: 0,
                 refund: None,
                 everything: false,
+                unsure_since: None,
                 withdraw: None,
                 relay: Some(RelayLeg {
                     request_id: swap.request_id,
@@ -6314,6 +6383,7 @@ async fn execute_hood_buy(
                 gas_bought: 0,
                 refund: None,
                 everything: false,
+                unsure_since: None,
                 withdraw: None,
                 relay: Some(RelayLeg {
                     request_id: swap.request_id,
@@ -6433,6 +6503,7 @@ async fn execute_hood_sale(
                 gas_bought: 0,
                 refund: None,
                 everything: false,
+                unsure_since: None,
                 withdraw: None,
                 relay: Some(RelayLeg {
                     request_id: swap.request_id,
@@ -6553,6 +6624,7 @@ async fn execute_sui_sell(
                 gas_bought: 0,
                 refund: None,
                 everything: quote.everything,
+                unsure_since: None,
             },
         )
         .await?;
@@ -6703,6 +6775,7 @@ async fn execute_sale_after_gas(
                 gas_bought: 0,
                 refund: None,
                 everything: false,
+                unsure_since: None,
             },
         )
         .await?;
@@ -7098,6 +7171,7 @@ pub(super) async fn execute(
                 gas_bought: 0,
                 refund: None,
                 everything: false,
+                unsure_since: None,
             },
         )
         .await?;
@@ -7338,7 +7412,7 @@ async fn commit_device_step(
     } else {
         json!({"prepareId":device.prepare_id,"signatures":signatures})
     };
-    match bridge(state, headers, &device.commit_path, args).await {
+    match bridge_step(state, headers, &device.commit_path, args).await {
         Ok(sent)
             if sent["ok"].as_bool() == Some(true)
                 && (device.kind == "cashout"
@@ -7393,10 +7467,27 @@ async fn commit_device_step(
                 current.status.stage = "settle".into();
             }
         }
+        // A deposit to 1Click that may have gone out: not failed. 1Click's status says whether it
+        // landed (the sale completes) or never did (its quote expires and the sale fails then).
+        Err(failure) if failure.maybe_sent && device.kind == "cashout" => {
+            current.status.tx_ids.extend(failure.tx_ids);
+            current.status.stage = "settle".into();
+            current.unsure_since = Some(now());
+        }
+        // Anything else that may have gone out stays on record with what was sent, and says so: a fresh
+        // sale before checking could find the coins already gone.
+        Err(failure) if failure.maybe_sent => {
+            current.status.state = "failed".into();
+            current.status.tx_ids.extend(failure.tx_ids);
+            current.status.error = Some(format!(
+                "This step may have gone through ({}). Check your balance in a minute before trying again.",
+                failure.reason
+            ));
+        }
         result => {
             current.status.state = "failed".into();
             let reason = match result {
-                Err(error) => error.1,
+                Err(failure) => failure.reason,
                 Ok(sent) => {
                     if let Some(ids) = sent["txIds"].as_array() {
                         current
@@ -7897,6 +7988,16 @@ pub(super) async fn status(
                     } else {
                         format!("1Click {}", venue_status.status)
                     });
+                }
+                // A deposit whose broadcast timed out and that 1Click still hasn't seen 15 minutes on never
+                // went out: nothing left the wallet.
+                "PENDING_DEPOSIT"
+                    if current
+                        .unsure_since
+                        .is_some_and(|at| now() > at + UNSURE_DEPOSIT_MS) =>
+                {
+                    result.state = "failed".into();
+                    result.error = Some(NOT_SENT.into());
                 }
                 "PENDING_DEPOSIT" | "KNOWN_DEPOSIT_TX" | "PROCESSING" | "INCOMPLETE_DEPOSIT" => {}
                 _ => {
