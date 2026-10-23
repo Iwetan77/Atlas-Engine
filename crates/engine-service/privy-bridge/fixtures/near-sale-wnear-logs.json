@@ -1,0 +1,28 @@
+{
+ "receipts_outcome": [
+  {
+   "outcome": {
+    "executor_id": "wrap.near",
+    "logs": [
+     "Deposit 429692466879251254768117 NEAR to bc7683e9ad63f5d0aeab1128c4ca86acb68baeec08d2b2f79c91e5bdc57254b8",
+     "Transfer 429692466879251254768117 from bc7683e9ad63f5d0aeab1128c4ca86acb68baeec08d2b2f79c91e5bdc57254b8 to 0c25a6daa5dd44691a6ecf3ffc9596f4ca3dcfaf50b6f4adcbe9cb2f90274003"
+    ],
+    "status": {
+     "SuccessValue": ""
+    }
+   }
+  },
+  {
+   "outcome": {
+    "executor_id": "bc7683e9ad63f5d0aeab1128c4ca86acb68baeec08d2b2f79c91e5bdc57254b8",
+    "logs": [],
+    "status": {
+     "SuccessValue": ""
+    }
+   }
+  }
+ ],
+ "transaction": {
+  "hash": "BDJQwRFNHu4pRQHocZDdzmiNNZSoEaH6EPdqC5jQDg5s"
+ }
+}

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
-import {nearFailure,wrapActions,prepareCashout,transaction,swapCall,directPools,indexedPool,receivedToken,account,nextNonce,checkCashoutQuote,sentToken,cashDestination,available,wrapFirst,depositActions,GAS_RESERVE,saleRoom,STORAGE_GAS,WRAP_GAS,transferGas} from './ref-swap.mjs';
+import {tokenTransfers,nearFailure,wrapActions,prepareCashout,transaction,swapCall,directPools,indexedPool,receivedToken,account,nextNonce,checkCashoutQuote,sentToken,cashDestination,available,wrapFirst,depositActions,GAS_RESERVE,saleRoom,STORAGE_GAS,WRAP_GAS,transferGas} from './ref-swap.mjs';
 import {PreparedSales} from './prepared-sale.mjs';
 const fixture=name=>JSON.parse(readFileSync(new URL('./fixtures/'+name,import.meta.url)));
 test('NEAR encoding matches the official near-api-js 7.3.1 vector',()=>{
@@ -241,4 +241,19 @@ test("a NEAR broadcast error says NEAR's reason, and a refused transaction count
   assert.match(failed.message, /failed on NEAR .*coins didn't move/);
   assert.deepEqual(failed.sent, ['tx2']);
   assert.equal(nearFailure({result: {status: {SuccessValue: ''}, transaction: {hash: 'ok'}}}, 0, []), null);
+});
+
+test('a NEAR sale that went through is recognised from wNEAR\'s plain transfer log', () => {
+  // Live 2026-10-23: the sale sent 0.429692… wNEAR to 1Click (which paid out 2.097164 USDC), but wrap.near logs
+  // only "Transfer … from … to …", so the event-only check read 0 and called it failed.
+  const result = fixture('near-sale-wnear-logs.json');
+  const user = 'bc7683e9ad63f5d0aeab1128c4ca86acb68baeec08d2b2f79c91e5bdc57254b8';
+  const deposit = '0c25a6daa5dd44691a6ecf3ffc9596f4ca3dcfaf50b6f4adcbe9cb2f90274003';
+  assert.equal(sentToken(result, 'wrap.near', user, deposit), 429692466879251254768117n);
+  // Events still count, and once: a receipt with events ignores its plain lines.
+  const both = {receipts_outcome: [{outcome: {executor_id: 'tok.near', status: {SuccessValue: ''}, logs: [
+    'Transfer 5 from a.near to b.near',
+    'EVENT_JSON:{"standard":"nep141","version":"1.0.0","event":"ft_transfer","data":[{"old_owner_id":"a.near","new_owner_id":"b.near","amount":"5"}]}']}}]};
+  assert.equal(sentToken(both, 'tok.near', 'a.near', 'b.near'), 5n);
+  assert.deepEqual(tokenTransfers({receipts_outcome: [{outcome: {executor_id: 'tok.near', status: {Failure: {}}, logs: ['Transfer 5 from a.near to b.near']}}]}, 'tok.near'), []);
 });
