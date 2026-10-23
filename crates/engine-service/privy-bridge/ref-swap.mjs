@@ -473,6 +473,33 @@ export async function buildNearCashout({cashoutId,scope,wallet,userId,userJwt}) 
   const actions=[...await wrapActions(token,held,amount,wallet.address),...await depositActions(token,to,amount)];
   return {calls:await buildNearCalls(wallet,[{receiver:token,actions}]),token,amount,to};
 }
+// What went wrong with a broadcast, in NEAR's own words. NEAR refusing the transaction outright
+// (INVALID_TRANSACTION: a balance, nonce or signature problem) means it never ran, so nothing in it was
+// sent; only a timeout or an unreadable answer leaves the outcome unknown. A transaction that ran and
+// failed moved no coins (its actions are all-or-nothing), though its fee was spent.
+export function nearFailure(body,index,sent){
+  const step=index+1,earlier=sent.length?` ${sent.length} earlier transaction(s) sent: ${sent.join(', ')}.`:'';
+  const reason=v=>JSON.stringify(v??'').slice(0,200);
+  if(body?.error){
+    const refused=body.error.cause?.name==='INVALID_TRANSACTION';
+    // The server adds "nothing was sent" when nothing was (approvalFailure).
+    const error=new Error(refused?`NEAR refused step ${step} (${reason(body.error.data??body.error.cause)}).${earlier}`
+      :`Step ${step} could not be verified (${reason(body.error.cause??body.error)}).${earlier}`);
+    error.sent=[...sent];error.maybeSent=!refused||sent.length>0;
+    return error;
+  }
+  if(body?.result?.status?.Failure){
+    const error=new Error(`Step ${step} failed on NEAR (${reason(body.result.status.Failure)}); its coins didn't move.${earlier}`);
+    error.sent=[...sent,body.result.transaction?.hash].filter(Boolean);error.maybeSent=sent.length>0;
+    return error;
+  }
+  if(!body?.result?.transaction?.hash){
+    const error=new Error(`Step ${step} could not be verified.${earlier}`);
+    error.sent=[...sent];error.maybeSent=true;
+    return error;
+  }
+  return null;
+}
 export async function finishNearCalls({wallet,built,signatures}) {
   if(signatures.length!==built.calls.length)throw new Error('wrong approval count');
   const key=publicKey(wallet),results=[],sent=[];
@@ -483,13 +510,15 @@ export async function finishNearCalls({wallet,built,signatures}) {
     return Buffer.concat([c.bytes,Buffer.from([0]),signature]).toString('base64');
   });
   for(let index=0;index<signed.length;index++){
+    let body;
     try {
       const response=await fetch(RPC,{method:'POST',headers:{'content-type':'application/json'},
         body:JSON.stringify({jsonrpc:'2.0',id:'atlas',method:'broadcast_tx_commit',params:[signed[index]]}),signal:AbortSignal.timeout(45000)});
-      const body=await response.json();
-      if(!response.ok||body.error||body.result?.status?.Failure)throw new Error('outcome unavailable');
-      results.push(body.result);sent.push(body.result.transaction.hash);
+      body=await response.json();
     }catch(error){error.sent=sent;error.maybeSent=true;error.message=`Step ${index+1} could not be verified; ${sent.length} earlier transaction(s) sent: ${sent.join(', ')}`;throw error;}
+    const failure=nearFailure(body,index,sent);
+    if(failure)throw failure;
+    results.push(body.result);sent.push(body.result.transaction.hash);
   }
   const last=results.at(-1);
   if(built.tokenOut){

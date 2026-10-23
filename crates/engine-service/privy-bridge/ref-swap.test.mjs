@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
-import {wrapActions,prepareCashout,transaction,swapCall,directPools,indexedPool,receivedToken,account,nextNonce,checkCashoutQuote,sentToken,cashDestination,available,wrapFirst,depositActions,GAS_RESERVE,saleRoom,SALE_GAS} from './ref-swap.mjs';
+import {nearFailure,wrapActions,prepareCashout,transaction,swapCall,directPools,indexedPool,receivedToken,account,nextNonce,checkCashoutQuote,sentToken,cashDestination,available,wrapFirst,depositActions,GAS_RESERVE,saleRoom,SALE_GAS} from './ref-swap.mjs';
 import {PreparedSales} from './prepared-sale.mjs';
 const fixture=name=>JSON.parse(readFileSync(new URL('./fixtures/'+name,import.meta.url)));
 test('NEAR encoding matches the official near-api-js 7.3.1 vector',()=>{
@@ -222,4 +222,17 @@ test("a wallet's first NEAR sale registers it on wNEAR before wrapping, so the t
     assert.deepEqual(later.map(a=>a.method),['near_deposit']);
     assert.deepEqual(await wrapActions('wrap.near',10n,'10','a'.repeat(64)),[]);
   }finally{globalThis.fetch=original;}
+});
+test("a NEAR broadcast error says NEAR's reason, and a refused transaction counts as not sent", () => {
+  const refused = nearFailure({error: {name: 'HANDLER_ERROR', cause: {name: 'INVALID_TRANSACTION', info: {}},
+    data: {TxExecutionError: {InvalidTxError: {LackBalanceForState: {amount: '70000000000000000000'}}}}}}, 0, []);
+  assert.match(refused.message, /NEAR refused step 1 .*LackBalanceForState/);
+  assert.equal(refused.maybeSent, false);
+  const timeout = nearFailure({error: {name: 'HANDLER_ERROR', cause: {name: 'TIMEOUT_ERROR'}}}, 1, ['tx1']);
+  assert.match(timeout.message, /Step 2 could not be verified .*1 earlier transaction\(s\) sent: tx1/);
+  assert.equal(timeout.maybeSent, true);
+  const failed = nearFailure({result: {status: {Failure: {ActionError: {}}}, transaction: {hash: 'tx2'}}}, 0, []);
+  assert.match(failed.message, /failed on NEAR .*coins didn't move/);
+  assert.deepEqual(failed.sent, ['tx2']);
+  assert.equal(nearFailure({result: {status: {SuccessValue: ''}, transaction: {hash: 'ok'}}}, 0, []), null);
 });
