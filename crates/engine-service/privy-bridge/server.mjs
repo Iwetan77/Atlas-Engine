@@ -7,7 +7,7 @@ import {buildRef,buildNearCashout,finishNearCalls,keepRefWarm,prepareRef,quoteRe
 import {createServer} from 'node:http';
 import {createHash, randomUUID} from 'node:crypto';
 import {PrivyClient} from '@privy-io/node';
-import {buildSale,finishSale,buildSuiTransfer,finishSuiTransfer,quoteSwap, buildSuiSwap, finishSuiSwap, rawSignRequest, prepareSuiCashout, quoteSale, prepareSale} from './sui-swap.mjs';
+import {buildSale,finishSale,buildSuiTransfer,buildSuiTransferAll,finishSuiTransfer,quoteSwap, buildSuiSwap, finishSuiSwap, rawSignRequest, prepareSuiCashout, quoteSale, prepareSale} from './sui-swap.mjs';
 import {checkSignature, signable, signForEscrow} from './base-authorization.mjs';
 import {agentFor, approveAction, approveTypedData, cancelAction, checkApproval, leverageAction, moveAction,
   orderAction, post as hlPost, signAsAgent, tpslAction} from './hyperliquid.mjs';
@@ -228,8 +228,11 @@ const server = createServer(async (request, response) => {
       try{
         const wallet=await ensureReceivingWallet(userId,'sui');
         if(suiCashoutPrepare){
-          const quote=await prepareSuiCashout({wallet,evmWallet,solanaWallet,amount:input.amount,minimumOut:input.minimumOut});
-          const built=await buildSuiTransfer({wallet,recipient:quote.depositAddress,amount:input.amount,reserve:'20000000'});
+          const all=input.all===true;
+          const quote=await prepareSuiCashout({wallet,evmWallet,solanaWallet,amount:input.amount,minimumOut:input.minimumOut,all});
+          // Max sends every SUI; otherwise exactly the amount, with only its fee left on top.
+          const built=all?await buildSuiTransferAll({wallet,recipient:quote.depositAddress,minimumIn:quote.minAmountIn})
+            :await buildSuiTransfer({wallet,recipient:quote.depositAddress,amount:input.amount,reserve:'2000000'});
           const approval=deviceApprovals.put({userId,wallet,appId,messages:[built.message],hashFunction:'blake2b256',data:built,operation:'/sui/cashout/commit'});
           send(response,200,{userId,address:wallet.address,...quote,...approval,cashoutId:approval.prepareId});
         }else{

@@ -158,12 +158,39 @@ export async function buildSuiTransfer({wallet,recipient,amount,reserve}) {
   const txBytes=await txb.build({client:client()});
   return {txBytes,input,message:`0x${toHex(intentMessage(txBytes))}`,recipient};
 }
+// Max on SUI: every SUI coin pays for the transaction as one gas coin, and that whole coin (whatever the
+// fee leaves of it) goes to `recipient`, so no SUI stays behind and none is kept for gas. What's left
+// after the largest possible fee (the gas budget) must still reach the route's `minimumIn`.
+export async function buildSuiTransferAll({wallet,recipient,minimumIn}) {
+  const coins=[];let cursor=null;
+  do {
+    const page=await client().listCoins({owner:wallet.address,coinType:SUI,cursor,limit:100});
+    coins.push(...page.objects);
+    if(!page.hasNextPage)break;
+    if(!page.cursor||page.cursor===cursor)throw new Error('Sui coin listing failed');
+    cursor=page.cursor;
+  }while(coins.length<256);
+  // A transaction pays with at most 256 coins.
+  const paying=coins.slice(0,256);
+  if(!paying.length)throw new Error('no SUI to sell');
+  const total=paying.reduce((sum,c)=>sum+BigInt(c.balance),0n);
+  const txb=new Transaction();txb.setSender(wallet.address);
+  txb.setGasPayment(paying.map(({objectId,version,digest})=>({objectId,version,digest})));
+  txb.transferObjects([txb.gas],recipient);
+  const txBytes=await txb.build({client:client()});
+  const budget=BigInt(Transaction.from(txBytes).getData().gasData.budget);
+  if(total-budget<BigInt(minimumIn))throw new Error('not enough SUI to sell after the network fee');
+  return {txBytes,input:total-budget,message:`0x${toHex(intentMessage(txBytes))}`,recipient,all:true};
+}
 export async function finishSuiTransfer({wallet,built,signatureHex}) {
   const key=walletPublicKey(wallet.public_key,wallet.address);
   const signature=serializedSignature(signatureHex,key);
   if(!await key.verifyTransaction(built.txBytes,signature))throw new Error('signature did not verify');
   const result=await submit(built.txBytes,signature);
-  return {ok:result.effects.status.status==='success',digest:result.digest,amountIn:built.input.toString()};
+  // Max: what actually reached the deposit address (everything the fee left).
+  const landed=built.all?(result.balanceChanges??[]).filter(c=>sameCoin(c.coinType,SUI)&&c.owner?.AddressOwner===built.recipient)
+    .reduce((sum,c)=>sum+BigInt(c.amount),0n):built.input;
+  return {ok:result.effects.status.status==='success',digest:result.digest,amountIn:(landed>0n?landed:built.input).toString()};
 }
 
 // The wallet's net SUI credit includes gas. Never send an estimated output to 1Click.
@@ -284,13 +311,16 @@ export async function transferSui({wallet, recipient, amount, reserve, rawSign})
 // sits under its own price, so it fell below the first quote's minimum whenever SUI ticked down in
 // between, failing about every other sale (live, 2026-10-20). The price is read first, and the
 // cushion then ends at the quoted minimum (never wider than 1%).
-export async function prepareSuiCashout({wallet, evmWallet, solanaWallet, amount, minimumOut}) {
+// Max (`all`) asks 1Click for a FLEX_INPUT route: the deposit is everything the transaction's fee leaves,
+// a little over `amount`, which FLEX_INPUT swaps (any deposit at or above its minAmountIn), where an
+// exact-input deposit that differs would be refunded.
+export async function prepareSuiCashout({wallet, evmWallet, solanaWallet, amount, minimumOut, all = false}) {
   if (!solanaWallet && !/^0x[0-9a-fA-F]{40}$/.test(evmWallet)) throw new Error('invalid cash wallet');
   const input = BigInt(amount), least = BigInt(minimumOut);
   if (input <= 0n || least <= 0n) throw new Error('invalid cashout amount');
   const route = async (dry, slippageTolerance) => {
     const quoteRequest = {
-      dry, swapType: 'EXACT_INPUT', slippageTolerance,
+      dry, swapType: all ? 'FLEX_INPUT' : 'EXACT_INPUT', slippageTolerance,
       originAsset: 'nep141:sui.omft.near', depositType: 'ORIGIN_CHAIN',
       destinationAsset: solanaWallet ? 'nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near'
         : 'nep141:base-0x833589fcd6edb6e08f4c7c32d4f71b54bda02913.omft.near',
@@ -319,7 +349,7 @@ export async function prepareSuiCashout({wallet, evmWallet, solanaWallet, amount
       throw new Error('invalid cashout deposit route');
     }
     if (BigInt(quote.minAmountOut ?? quote.amountOut ?? 0) >= least) {
-      return {depositAddress: quote.depositAddress, amountOut: quote.amountOut};
+      return {depositAddress: quote.depositAddress, amountOut: quote.amountOut, minAmountIn: quote.minAmountIn ?? quote.amountIn};
     }
     // SUI ticked down between the two reads: once more at the newer price.
     if (tries === 1) throw moved();

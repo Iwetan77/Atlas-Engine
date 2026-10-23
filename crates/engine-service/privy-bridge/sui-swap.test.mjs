@@ -86,6 +86,31 @@ test('a cashout goes through when SUI ticks down after the quote, never below it
     globalThis.fetch = original;
   }
 });
+test('a Max SUI cash-out asks for a FLEX_INPUT route, so a deposit of everything the fee leaves is swapped', async () => {
+  const original = globalThis.fetch;
+  const asked = [];
+  globalThis.fetch = async (_url, init) => {
+    const body = JSON.parse(init.body);
+    asked.push(body);
+    return new Response(JSON.stringify({quote: {
+      amountIn: body.amount, minAmountIn: (BigInt(body.amount) * 99n / 100n).toString(), amountOut: '700000', minAmountOut: '693000',
+      ...(body.dry ? {} : {depositAddress: `0x${'3'.repeat(64)}`}), depositMemo: null,
+    }}), {status: 200});
+  };
+  try {
+    const wallet = {address: `0x${'1'.repeat(64)}`};
+    const quote = await prepareSuiCashout({wallet, solanaWallet: '9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM',
+      amount: '663407099', minimumOut: '690000', all: true});
+    assert.ok(asked.every(a => a.swapType === 'FLEX_INPUT'));
+    assert.equal(quote.minAmountIn, '656773028');
+    // Without Max, an exact amount.
+    asked.length = 0;
+    await prepareSuiCashout({wallet, solanaWallet: '9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM', amount: '663407099', minimumOut: '690000'});
+    assert.ok(asked.every(a => a.swapType === 'EXACT_INPUT'));
+  } finally {
+    globalThis.fetch = original;
+  }
+});
 test('sale effects use only the signed wallet net SUI credit, never the estimated quote',()=>{
   const result={digest:'tx',effects:{status:{status:'success'}},balanceChanges:[
     {coinType:'0x2::sui::SUI',owner:{AddressOwner:'mine'},amount:'999000'},
