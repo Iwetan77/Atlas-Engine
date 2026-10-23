@@ -427,6 +427,24 @@ fn keep_memory_in_check(state: AppState) {
     });
 }
 
+// Atlas's fee payers (the wallets that pay network fees so users keep no gas), with what they hold, from
+// the bridge: what Atlas funds, and when one runs low. Addresses and balances only.
+async fn fee_payers(state: &AppState) -> Option<serde_json::Value> {
+    let AuthMode::Privy { bridge_url, http } = &state.auth else {
+        return None;
+    };
+    let response = http
+        .get(format!("{bridge_url}/internal/fee-payers"))
+        .timeout(Duration::from_secs(4))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    response.json().await.ok()
+}
+
 async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
     let host = |var: &str, default: &str| {
         reqwest::Url::parse(&env_url(var, default))
@@ -434,6 +452,7 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
             .and_then(|u| u.host_str().map(str::to_string))
     };
     let mem = memory();
+    let fee_payers = fee_payers(&state).await;
     let started = STARTED
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
@@ -441,6 +460,7 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
         "ok": true,
         "commit": env::var("RENDER_GIT_COMMIT").unwrap_or_else(|_| "unknown".into()),
         "startedAtUnixMs": started,
+        "feePayers": fee_payers,
         "memoryMb": mem.as_ref().map(|m| m.total),
         "memory": mem.map(|m| serde_json::json!({
             "engineMb": m.engine, "enginePeakMb": m.engine_peak,
