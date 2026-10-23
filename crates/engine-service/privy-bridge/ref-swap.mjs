@@ -12,9 +12,17 @@ export const GAS_RESERVE = 50000000000000000000000n; // 0.05 NEAR, including sto
 // What a Ref sale needs in the wallet (the engine's NEAR_REF_SALE_GAS, which it tops up to from cash):
 // the swap's 180 Tgas, mostly refunded, token storage, then the cash-out's 0.01.
 export const REF_SALE_GAS = 30000000000000000000000n; // 0.03 NEAR
-// A sale straight to cash: one transaction (wrap, register 1Click's deposit address, transfer), 70
-// Tgas prepaid plus 0.00125 NEAR storage. The engine's NEAR_CASHOUT_RESERVE is the same amount.
-export const CASHOUT_RESERVE = 10000000000000000000000n; // 0.01 NEAR
+// A sale straight to cash: one transaction (wrap, register 1Click's fresh deposit address for 0.00125
+// NEAR, transfer) with 70 Tgas prepaid at 0.0001 NEAR per Tgas, after which the account must still hold
+// its own storage (0.00182 NEAR for a wallet). NEAR checks all of it before the transaction runs; a flat
+// 0.01 NEAR fell short of it, so every Max sale of plain NEAR was refused. The engine's near_sale_room is
+// the same formula.
+export const SALE_COSTS = 8750000000000000000000n; // 0.00125 + 0.007 + 0.0005 margin
+const STORAGE_PER_BYTE = 10000000000000000000n;
+export function saleRoom(view) {
+  if(!Number.isSafeInteger(view?.storage_usage))throw new Error('NEAR account unavailable');
+  return BigInt(view.storage_usage)*STORAGE_PER_BYTE+SALE_COSTS;
+}
 export function account(value) {
   if (typeof value !== 'string' || value.length < 2 || value.length > 64 ||
       !/^[a-z0-9]+(?:[._-][a-z0-9]+)*$/.test(value)) throw new Error('invalid token account');
@@ -332,9 +340,10 @@ export async function prepareCashout({wallet,userId,userJwt,evmWallet,solanaWall
   account(token);
   const cash=cashDestination(solanaWallet,evmWallet);
   if(BigInt(amount)<=0n||BigInt(minimumOut)<=0n)throw new Error('invalid cashout');
-  const native=BigInt((await rpc('query',{request_type:'view_account',finality:'final',account_id:wallet.address})).amount);
-  if(native<CASHOUT_RESERVE)throw new Error('not enough NEAR for the network fee');
-  if(available(token,BigInt(await view(token,'ft_balance_of',{account_id:wallet.address})),native)<BigInt(amount))throw new Error('holding changed');
+  const nearAccount=await rpc('query',{request_type:'view_account',finality:'final',account_id:wallet.address});
+  const native=BigInt(nearAccount.amount),room=saleRoom(nearAccount);
+  if(native<room)throw new Error('not enough NEAR for the network fee');
+  if(available(token,BigInt(await view(token,'ft_balance_of',{account_id:wallet.address})),native,room)<BigInt(amount))throw new Error('holding changed');
   // The route must still pay at least the minimum the user was quoted. A fresh quote's own 1% cushion sits
   // under its own price, so it fell below the first quote's minimum whenever the price ticked down in
   // between (the same failure SUI sales had). The price is read first, and the cushion then ends at the
@@ -382,10 +391,10 @@ export async function prepareSale({intentId,wallet,userId,userJwt,accessToken,ev
   return prepareCashout({wallet,userId,userJwt,evmWallet,solanaWallet,token:bound.coinType,amount:bound.amount,
     minimumOut:bound.minimumOut,scope:bound});
 }
-// What a wallet can sell of `token`: its balance, and for NEAR also native NEAR beyond the sale's fee money
-// (1Click pays NEAR out unwrapped, so that's where most of it sits).
-export function available(token,held,native){
-  return token===WRAP?held+(native>CASHOUT_RESERVE?native-CASHOUT_RESERVE:0n):held;
+// What a wallet can sell of `token`: its balance, and for NEAR also native NEAR beyond what the sale's
+// own transaction needs (`room`, saleRoom); 1Click pays NEAR out unwrapped, so that's where most of it sits.
+export function available(token,held,native,room){
+  return token===WRAP?held+(native>room?native-room:0n):held;
 }
 // NEAR sold from native NEAR is wrapped first, in the same transaction to wrap.near.
 export function wrapFirst(token,held,amount){
@@ -397,8 +406,9 @@ export async function commitCashout({cashoutId,scope,wallet,userId,userJwt,rawSi
   const item=cashouts.take(cashoutId,scope,userJwt);
   const token=item.scope.coinType,amount=item.scope.amount,to=item.data.depositAddress;
   const held=BigInt(await view(token,'ft_balance_of',{account_id:wallet.address}));
-  const native=BigInt((await rpc('query',{request_type:'view_account',finality:'final',account_id:wallet.address})).amount);
-  if(available(token,held,native)<BigInt(amount)||native<CASHOUT_RESERVE)throw new Error('holding changed');
+  const nearAccount=await rpc('query',{request_type:'view_account',finality:'final',account_id:wallet.address});
+  const native=BigInt(nearAccount.amount),room=saleRoom(nearAccount);
+  if(available(token,held,native,room)<BigInt(amount)||native<room)throw new Error('holding changed');
   const actions=[...wrapFirst(token,held,amount),...await depositActions(token,to,amount)];
   const result=await sendCall(wallet,token,actions,rawSign,item.scope.expiresAtUnixMs);
   return {ok:sentToken(result,token,wallet.address,to)===BigInt(amount),digest:result.transaction.hash};
@@ -442,8 +452,9 @@ export async function buildNearCashout({cashoutId,scope,wallet,userId,userJwt}) 
   const item=cashouts.take(cashoutId,scope,userJwt);
   const token=item.scope.coinType,amount=item.scope.amount,to=item.data.depositAddress;
   const held=BigInt(await view(token,'ft_balance_of',{account_id:wallet.address}));
-  const native=BigInt((await rpc('query',{request_type:'view_account',finality:'final',account_id:wallet.address})).amount);
-  if(available(token,held,native)<BigInt(amount)||native<CASHOUT_RESERVE)throw new Error('holding changed');
+  const nearAccount=await rpc('query',{request_type:'view_account',finality:'final',account_id:wallet.address});
+  const native=BigInt(nearAccount.amount),room=saleRoom(nearAccount);
+  if(available(token,held,native,room)<BigInt(amount)||native<room)throw new Error('holding changed');
   const actions=[...wrapFirst(token,held,amount),...await depositActions(token,to,amount)];
   return {calls:await buildNearCalls(wallet,[{receiver:token,actions}]),token,amount,to};
 }

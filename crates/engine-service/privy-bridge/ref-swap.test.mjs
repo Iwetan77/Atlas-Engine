@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
-import {prepareCashout,transaction,swapCall,directPools,indexedPool,receivedToken,account,nextNonce,checkCashoutQuote,sentToken,cashDestination,available,wrapFirst,depositActions,GAS_RESERVE,CASHOUT_RESERVE} from './ref-swap.mjs';
+import {prepareCashout,transaction,swapCall,directPools,indexedPool,receivedToken,account,nextNonce,checkCashoutQuote,sentToken,cashDestination,available,wrapFirst,depositActions,GAS_RESERVE,saleRoom,SALE_COSTS} from './ref-swap.mjs';
 import {PreparedSales} from './prepared-sale.mjs';
 const fixture=name=>JSON.parse(readFileSync(new URL('./fixtures/'+name,import.meta.url)));
 test('NEAR encoding matches the official near-api-js 7.3.1 vector',()=>{
@@ -81,9 +81,10 @@ test('cash lands in the Solana wallet, else Base, else nowhere',()=>{
 });
 test("NEAR sells from native NEAR beyond the gas reserve, wrapping only what's missing",()=>{
   const one=10n**24n;
-  assert.equal(available('wrap.near',0n,one),one-CASHOUT_RESERVE);
-  assert.equal(available('wrap.near',2n,CASHOUT_RESERVE/2n),2n);
-  assert.equal(available('token.0xshitzu.near',7n,one),7n);
+  const room=saleRoom({storage_usage:182});
+  assert.equal(available('wrap.near',0n,one,room),one-room);
+  assert.equal(available('wrap.near',2n,room/2n,room),2n);
+  assert.equal(available('token.0xshitzu.near',7n,one,room),7n);
   assert.deepEqual(wrapFirst('wrap.near',3n,'10').map(a=>[a.method,a.deposit]),[['near_deposit','7']]);
   assert.deepEqual(wrapFirst('wrap.near',10n,'10'),[]);
   assert.deepEqual(wrapFirst('token.0xshitzu.near',0n,'10'),[]);
@@ -163,7 +164,7 @@ test('a NEAR cash-out goes through when the price ticks down after the quote, ne
   globalThis.fetch=async(url,init)=>{
     const body=JSON.parse(init.body);
     if(!String(url).includes('1click')){
-      const result=body.params.request_type==='view_account'?{amount:'50000000000000000000000'}
+      const result=body.params.request_type==='view_account'?{amount:'50000000000000000000000',storage_usage:182}
         :{result:[...Buffer.from(JSON.stringify('2000000000000000000000000'))]};
       return new Response(JSON.stringify({result}),{status:200});
     }
@@ -185,4 +186,16 @@ test('a NEAR cash-out goes through when the price ticks down after the quote, ne
     await assert.rejects(()=>prepareCashout(args),/price moved/);
     assert.equal(asked.length,1);
   }finally{globalThis.fetch=original;}
+});
+
+test('a Max NEAR sale keeps exactly what its transaction needs, so NEAR accepts it', () => {
+  // Live failure, 2026-10-23: selling all 0.442112 NEAR kept a flat 0.01 back. The transaction then pays
+  // 0.00125 to register 1Click's deposit address and 70 Tgas upfront (0.007), and the account must still
+  // hold its 182 bytes of storage (0.00182): 0.01 left 0.00175, so NEAR refused it before anything moved.
+  const storage=182n*10000000000000000000n, deposit=1250000000000000000000n, gas=70n*1000000000000n*100000000n;
+  assert.ok(10000000000000000000000n-deposit-gas<storage);
+  const room=saleRoom({storage_usage:182});
+  assert.equal(room,storage+SALE_COSTS);
+  assert.ok(room-deposit-gas-1n>=storage);
+  assert.throws(()=>saleRoom({}),/unavailable/);
 });
