@@ -13,20 +13,28 @@ export const GAS_RESERVE = 50000000000000000000000n; // 0.05 NEAR, including sto
 // the swap's 180 Tgas, mostly refunded, token storage, then the cash-out's 0.01.
 export const REF_SALE_GAS = 30000000000000000000000n; // 0.03 NEAR
 // A sale straight to cash: one transaction (register the wallet on wNEAR the first time, wrap, register
-// 1Click's fresh deposit address, transfer) with up to 100 Tgas prepaid (mostly refunded) plus NEAR's own
-// cost of making its receipts, after which the account must still hold its own storage. NEAR checks all
-// of it before the transaction runs; a flat 0.01 NEAR fell short, so every Max sale of plain NEAR was
-// refused. The room follows NEAR's live gas and storage prices (nearPrices), so nothing beyond what the
-// transaction needs is kept. The engine's sale_room is the same formula.
-export const SALE_GAS = 110000000000000n; // 100 Tgas prepaid + 10 Tgas for the receipts
+// 1Click's fresh deposit address, transfer). Before running it NEAR holds back its prepaid gas at
+// least at min_gas_purchase_price (0.001 NEAR per Tgas since protocol 85, ten times what gas costs; the
+// difference comes back after), and the account must still keep its own storage. 100 Tgas of prepaid gas
+// meant 0.1 NEAR held back, so Max sales of NEAR were refused (NotEnoughBalance). Each call now prepays
+// what it uses with room to spare (wNEAR's registration burns about 1.6 Tgas, wrap and transfer about
+// 4.1 together, live 2026-10-23), and the room follows NEAR's live prices. The engine's sale_room is the
+// same formula.
+export const STORAGE_GAS = 3000000000000n, WRAP_GAS = 3000000000000n;
+export const transferGas = token => token===WRAP ? 5000000000000n : 10000000000000n;
+const SALE_PREPAID_GAS = 14000000000000n; // the most a sale prepays: 3 + 3 + 3 + 5 Tgas (3 + 10 for other coins)
+const SALE_EXEC_GAS = 4000000000000n; // the receipt's and calls' own execution fees (about 3.3 Tgas)
+const SALE_SEND_GAS = 1000000000000n; // converting the transaction (about 0.9 Tgas), at the gas price
 const REGISTRATION_BYTES = 250n; // two wNEAR registrations: the wallet's and 1Click's (125 bytes each)
-export function saleRoom(view,{gasPrice,perByte}) {
+export function saleRoom(view,{gasPrice,perByte,purchasePrice}) {
   if(!Number.isSafeInteger(view?.storage_usage))throw new Error('NEAR account unavailable');
-  return (BigInt(view.storage_usage)+REGISTRATION_BYTES)*perByte+SALE_GAS*gasPrice+1n;
+  const held=gasPrice>purchasePrice?gasPrice:purchasePrice;
+  return (BigInt(view.storage_usage)+REGISTRATION_BYTES)*perByte+SALE_SEND_GAS*gasPrice+(SALE_PREPAID_GAS+SALE_EXEC_GAS)*held+1n;
 }
 export async function nearPrices() {
   const [gas,config]=await Promise.all([rpc('gas_price',[null]),rpc('EXPERIMENTAL_protocol_config',{finality:'final'})]);
-  return {gasPrice:BigInt(gas.gas_price),perByte:BigInt(config.runtime_config.storage_amount_per_byte)};
+  return {gasPrice:BigInt(gas.gas_price),perByte:BigInt(config.runtime_config.storage_amount_per_byte),
+    purchasePrice:BigInt(config.runtime_config.min_gas_purchase_price??config.min_gas_price??1000000000)};
 }
 export function account(value) {
   if (typeof value !== 'string' || value.length < 2 || value.length > 64 ||
@@ -331,9 +339,9 @@ export async function depositActions(token,depositAddress,amount){
     const bounds=await view(token,'storage_balance_bounds');
     const minimum=BigInt(bounds.min);
     if(minimum>10000000000000000000000n)throw new Error('token storage cost is too high');
-    actions.push(call('storage_deposit',{account_id:depositAddress,registration_only:true},30000000000000n,minimum));
+    actions.push(call('storage_deposit',{account_id:depositAddress,registration_only:true},STORAGE_GAS,minimum));
   }
-  actions.push(call('ft_transfer',{receiver_id:depositAddress,amount:String(amount)},30000000000000n,1n));
+  actions.push(call('ft_transfer',{receiver_id:depositAddress,amount:String(amount)},transferGas(token),1n));
   return actions;
 }
 
@@ -410,11 +418,11 @@ export async function wrapActions(token,held,amount,owner){
   if(!wrap.length||await view(WRAP,'storage_balance_of',{account_id:owner}))return wrap;
   const minimum=BigInt((await view(WRAP,'storage_balance_bounds')).min);
   if(minimum>10000000000000000000000n)throw new Error('token storage cost is too high');
-  return [call('storage_deposit',{account_id:owner,registration_only:true},30000000000000n,minimum),...wrap];
+  return [call('storage_deposit',{account_id:owner,registration_only:true},STORAGE_GAS,minimum),...wrap];
 }
 export function wrapFirst(token,held,amount){
   if(token!==WRAP||held>=BigInt(amount))return [];
-  return [call('near_deposit',{},10000000000000n,BigInt(amount)-held)];
+  return [call('near_deposit',{},WRAP_GAS,BigInt(amount)-held)];
 }
 export async function commitCashout({cashoutId,scope,wallet,userId,userJwt,rawSign}){
   if(scope.userId!==userId||scope.walletId!==wallet.id||scope.address!==wallet.address)throw new Error('wallet changed');
