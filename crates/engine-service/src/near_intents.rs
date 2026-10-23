@@ -208,6 +208,43 @@ const NOT_SENT: &str = "The payment didn't go through, so nothing left your bala
 const SUI_GAS_RESERVE: u128 = 20_000_000;
 // Room for one SUI transfer's network fee (its gas budget was 0.0002 SUI on mainnet, 2026-10-23).
 const SUI_SALE_GAS: u128 = 2_000_000;
+// Amounts of a chain's own coin too small to sell: no more than what a sale there needs for itself.
+// Home leaves them out whatever the coin's price, since they can't be sold (Agba: never show reserves).
+pub(super) struct Unsellable {
+    pub(super) sui: u128,
+    pub(super) monad: u128,
+    pub(super) near: u128,
+}
+pub(super) async fn unsellable(state: &AppState) -> Unsellable {
+    static NEAR_ROOM: std::sync::LazyLock<Mutex<Option<(Instant, u128)>>> =
+        std::sync::LazyLock::new(Default::default);
+    let cached = NEAR_ROOM
+        .lock()
+        .ok()
+        .and_then(|held| *held)
+        .filter(|(at, _)| at.elapsed() < Duration::from_secs(600))
+        .map(|(_, room)| room);
+    let near = match cached {
+        Some(room) => room,
+        None => match near_prices(state).await {
+            Ok((gas_price, per_byte)) => {
+                // A wallet account's 182 bytes, at NEAR's live prices.
+                let room = sale_room(182, gas_price, per_byte);
+                if let Ok(mut held) = NEAR_ROOM.lock() {
+                    *held = Some((Instant::now(), room));
+                }
+                room
+            }
+            // Unreadable for now: the room at the prices NEAR had when this was written.
+            Err(_) => sale_room(182, 100_000_000, 10_000_000_000_000_000_000),
+        },
+    };
+    Unsellable {
+        sui: SUI_SALE_GAS,
+        monad: MONAD_SALE_GAS,
+        near,
+    }
+}
 #[derive(Clone, Serialize, Deserialize)]
 struct StoredIntent {
     owner: String,
@@ -3227,12 +3264,23 @@ const NEAR_SALE_GAS: u128 = 110_000_000_000_000; // 100 Tgas prepaid + 10 Tgas f
                                                  // A wNEAR registration's storage (125 bytes, 0.00125 NEAR at today's price): the wallet's and 1Click's.
 const NEAR_SALE_REGISTRATION_BYTES: u128 = 2 * 125;
 async fn near_sale_room(state: &AppState, account: &str) -> Result<u128, ApiError> {
-    let unavailable = || venue("Your NEAR balance is temporarily unavailable");
-    let (body, gas, config) = tokio::join!(
+    let (body, prices) = tokio::join!(
         near_query(
             state,
             json!({"request_type":"view_account","finality":"final","account_id":account}),
         ),
+        near_prices(state),
+    );
+    let storage = body?["result"]["storage_usage"]
+        .as_u64()
+        .ok_or_else(|| venue("Your NEAR balance is temporarily unavailable"))?;
+    let (gas_price, per_byte) = prices?;
+    Ok(sale_room(storage, gas_price, per_byte))
+}
+// NEAR's live gas price (yoctoNEAR per gas) and storage price (per byte).
+async fn near_prices(state: &AppState) -> Result<(u128, u128), ApiError> {
+    let unavailable = || venue("NEAR's network prices are temporarily unavailable");
+    let (gas, config) = tokio::join!(
         near_rpc(state, "gas_price", json!([null])),
         near_rpc(
             state,
@@ -3240,9 +3288,6 @@ async fn near_sale_room(state: &AppState, account: &str) -> Result<u128, ApiErro
             json!({"finality":"final"})
         ),
     );
-    let storage = body?["result"]["storage_usage"]
-        .as_u64()
-        .ok_or_else(unavailable)?;
     let gas_price: u128 = gas?["result"]["gas_price"]
         .as_str()
         .and_then(|v| v.parse().ok())
@@ -3251,7 +3296,7 @@ async fn near_sale_room(state: &AppState, account: &str) -> Result<u128, ApiErro
         .as_str()
         .and_then(|v| v.parse().ok())
         .ok_or_else(unavailable)?;
-    Ok(sale_room(storage, gas_price, per_byte))
+    Ok((gas_price, per_byte))
 }
 fn sale_room(storage_bytes: u64, gas_price: u128, per_byte: u128) -> u128 {
     (u128::from(storage_bytes) + NEAR_SALE_REGISTRATION_BYTES) * per_byte
