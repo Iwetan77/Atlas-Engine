@@ -189,7 +189,7 @@ const server = createServer(async (request, response) => {
           const q=await quoteRef(input.token,input.amount,input.sell===true);
           send(response,200,{userId,address:wallet.address,...q,metadata:await tokenInfo(input.token)});return;
         }
-        const approval=deviceApprovals.put({userId,wallet,appId,messages:built.calls.map(c=>c.message),hashFunction:'sha256',data:built,operation:request.url.replace('/prepare','/commit'),
+        const approval=deviceApprovals.put({userId,wallet,appId,messages:built.calls.map(c=>'0x'+createHash('sha256').update(c.bytes).digest('hex')),data:built,operation:request.url.replace('/prepare','/commit'),
           expires:Math.min(prepared.scope.expiresAtUnixMs,Date.now()+180000)});
         send(response,200,{userId,address:wallet.address,...prepared,...approval});
       }catch(error){send(response,409,{error:approvalFailure(error,'Swap could not complete'),txIds:error.sent??[],maybeSent:error.maybeSent===true});}
