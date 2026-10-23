@@ -229,16 +229,23 @@ pub(super) async fn unsellable(state: &AppState) -> Unsellable {
     let near = match cached {
         Some(room) => room,
         None => match near_prices(state).await {
-            Ok((gas_price, per_byte)) => {
+            Ok(prices) => {
                 // A wallet account's 182 bytes, at NEAR's live prices.
-                let room = sale_room(182, gas_price, per_byte);
+                let room = sale_room(182, prices);
                 if let Ok(mut held) = NEAR_ROOM.lock() {
                     *held = Some((Instant::now(), room));
                 }
                 room
             }
             // Unreadable for now: the room at the prices NEAR had when this was written.
-            Err(_) => sale_room(182, 100_000_000, 10_000_000_000_000_000_000),
+            Err(_) => sale_room(
+                182,
+                NearPrices {
+                    gas: 100_000_000,
+                    per_byte: 10_000_000_000_000_000_000,
+                    purchase: 1_000_000_000,
+                },
+            ),
         },
     };
     Unsellable {
@@ -3321,14 +3328,16 @@ async fn ref_buy_quote(
 
 const NEAR_GAS_RESERVE: u128 = 50_000_000_000_000_000_000_000;
 // A sale straight to cash is one transaction to the token: register the wallet on wNEAR the first time,
-// wrap NEAR, register 1Click's fresh deposit address, transfer. Up to 100 Tgas is prepaid (mostly
-// refunded) plus NEAR's own cost of turning the actions into receipts, and after it the account must
-// still hold its own storage. NEAR checks all of it before the transaction runs; a flat 0.01 NEAR fell
-// short, so NEAR refused every Max sale of plain NEAR. The room is worked out live from the account's
-// storage and NEAR's current gas and storage prices, so it follows NEAR if either changes, and nothing
-// beyond it is kept. The bridge's saleRoom is the same formula.
-const NEAR_SALE_GAS: u128 = 110_000_000_000_000; // 100 Tgas prepaid + 10 Tgas for the receipts
-                                                 // A wNEAR registration's storage (125 bytes, 0.00125 NEAR at today's price): the wallet's and 1Click's.
+// wrap NEAR, register 1Click's fresh deposit address, transfer. Before running it NEAR holds back its
+// prepaid gas at least at min_gas_purchase_price (0.001 NEAR per Tgas since protocol 85, ten times what
+// gas costs; the difference comes back after), and the account must still keep its own storage. 100
+// Tgas of prepaid gas meant 0.1 NEAR held back, so Max sales of NEAR were refused (NotEnoughBalance). The
+// bridge now prepays what each call uses with room to spare (14 Tgas at most) and the room follows NEAR's
+// live prices; the bridge's saleRoom is the same formula.
+const NEAR_SALE_PREPAID_GAS: u128 = 14_000_000_000_000; // 3 + 3 + 3 + 5 Tgas (3 + 10 for other coins)
+const NEAR_SALE_EXEC_GAS: u128 = 4_000_000_000_000; // the receipt's and calls' execution fees (about 3.3)
+const NEAR_SALE_SEND_GAS: u128 = 1_000_000_000_000; // converting the transaction (about 0.9), at the gas price
+                                                    // A wNEAR registration's storage (125 bytes, 0.00125 NEAR at today's price): the wallet's and 1Click's.
 const NEAR_SALE_REGISTRATION_BYTES: u128 = 2 * 125;
 async fn near_sale_room(state: &AppState, account: &str) -> Result<u128, ApiError> {
     let (body, prices) = tokio::join!(
@@ -3341,11 +3350,16 @@ async fn near_sale_room(state: &AppState, account: &str) -> Result<u128, ApiErro
     let storage = body?["result"]["storage_usage"]
         .as_u64()
         .ok_or_else(|| venue("Your NEAR balance is temporarily unavailable"))?;
-    let (gas_price, per_byte) = prices?;
-    Ok(sale_room(storage, gas_price, per_byte))
+    Ok(sale_room(storage, prices?))
 }
-// NEAR's live gas price (yoctoNEAR per gas) and storage price (per byte).
-async fn near_prices(state: &AppState) -> Result<(u128, u128), ApiError> {
+// NEAR's live prices: gas (yoctoNEAR per gas), storage (per byte), and the least prepaid gas is held at.
+#[derive(Clone, Copy)]
+struct NearPrices {
+    gas: u128,
+    per_byte: u128,
+    purchase: u128,
+}
+async fn near_prices(state: &AppState) -> Result<NearPrices, ApiError> {
     let unavailable = || venue("NEAR's network prices are temporarily unavailable");
     let (gas, config) = tokio::join!(
         near_rpc(state, "gas_price", json!([null])),
@@ -3355,19 +3369,25 @@ async fn near_prices(state: &AppState) -> Result<(u128, u128), ApiError> {
             json!({"finality":"final"})
         ),
     );
-    let gas_price: u128 = gas?["result"]["gas_price"]
-        .as_str()
-        .and_then(|v| v.parse().ok())
-        .ok_or_else(unavailable)?;
-    let per_byte: u128 = config?["result"]["runtime_config"]["storage_amount_per_byte"]
-        .as_str()
-        .and_then(|v| v.parse().ok())
-        .ok_or_else(unavailable)?;
-    Ok((gas_price, per_byte))
+    let number = |v: &Value| {
+        v.as_str()
+            .and_then(|s| s.parse::<u128>().ok())
+            .or_else(|| v.as_u64().map(u128::from))
+    };
+    let config = config?;
+    let runtime = &config["result"]["runtime_config"];
+    Ok(NearPrices {
+        gas: number(&gas?["result"]["gas_price"]).ok_or_else(unavailable)?,
+        per_byte: number(&runtime["storage_amount_per_byte"]).ok_or_else(unavailable)?,
+        purchase: number(&runtime["min_gas_purchase_price"])
+            .or_else(|| number(&config["result"]["min_gas_price"]))
+            .unwrap_or(1_000_000_000),
+    })
 }
-fn sale_room(storage_bytes: u64, gas_price: u128, per_byte: u128) -> u128 {
-    (u128::from(storage_bytes) + NEAR_SALE_REGISTRATION_BYTES) * per_byte
-        + NEAR_SALE_GAS * gas_price
+fn sale_room(storage_bytes: u64, p: NearPrices) -> u128 {
+    (u128::from(storage_bytes) + NEAR_SALE_REGISTRATION_BYTES) * p.per_byte
+        + NEAR_SALE_SEND_GAS * p.gas
+        + (NEAR_SALE_PREPAID_GAS + NEAR_SALE_EXEC_GAS) * p.gas.max(p.purchase)
         + 1
 }
 // What a Ref sale's transactions need in the wallet: the swap's 180 Tgas (0.018 NEAR, mostly refunded)
@@ -9264,23 +9284,27 @@ mod tests {
 
     #[test]
     fn a_near_sale_room_covers_what_near_checks_before_running_it() {
-        // Live 2026-10-23: 0.0001 NEAR per Tgas, 0.00001 NEAR per byte, a wallet's 182 bytes.
-        let (gas_price, per_byte) = (100_000_000u128, 10_000_000_000_000_000_000u128);
-        let storage = 182 * per_byte;
-        let (registration, prepaid) = (125 * per_byte, 100_000_000_000_000 * gas_price);
-        // The old flat 0.01 left less than the account must keep: NEAR refused every Max sale.
-        assert!(
-            10_000_000_000_000_000_000_000u128 - registration - 70_000_000_000_000 * gas_price
-                < storage
-        );
-        // Both registrations, 100 Tgas prepaid and 10 Tgas of receipts: the storage is still there.
-        let room = sale_room(182, gas_price, per_byte);
-        assert!(room - 2 * registration - prepaid - 10_000_000_000_000 * gas_price - 1 >= storage);
-        // If NEAR's gas price doubles, the room doubles its gas part; nothing is fixed in NEAR.
-        assert_eq!(
-            sale_room(182, 2 * gas_price, per_byte) - room,
-            NEAR_SALE_GAS * gas_price
-        );
+        // NEAR's rule (nearcore calculate_tx_cost): send fees at the gas price, prepaid gas and execution
+        // fees at max(gas price, min_gas_purchase_price), plus deposits, must fit the balance, and the
+        // account's storage must remain.
+        let p = NearPrices {
+            gas: 100_000_000,
+            per_byte: 10_000_000_000_000_000_000,
+            purchase: 1_000_000_000,
+        };
+        let t = 1_000_000_000_000u128;
+        let storage = 182 * p.per_byte;
+        let registrations = 250 * p.per_byte;
+        let cost = |prepaid: u128, amount: u128| {
+            9 * t / 10 * p.gas + (prepaid + 33 * t / 10) * p.purchase + amount + registrations + 1
+        };
+        // Live failure, 2026-10-23: 0.452112466879… NEAR with the old room and 100 Tgas prepaid.
+        let balance = 452_112_466_879_251_254_768_118u128;
+        let old_room = 432 * p.per_byte + 110 * t * p.gas + 1;
+        assert!(cost(100 * t, balance - old_room) > balance);
+        // Now: 14 Tgas prepaid at most, and the room NEAR holds back.
+        let room = sale_room(182, p);
+        assert!(balance - cost(14 * t, balance - room) >= storage);
     }
 
     #[test]

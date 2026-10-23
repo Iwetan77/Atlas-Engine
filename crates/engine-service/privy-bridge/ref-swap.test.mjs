@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
-import {nearFailure,wrapActions,prepareCashout,transaction,swapCall,directPools,indexedPool,receivedToken,account,nextNonce,checkCashoutQuote,sentToken,cashDestination,available,wrapFirst,depositActions,GAS_RESERVE,saleRoom,SALE_GAS} from './ref-swap.mjs';
+import {nearFailure,wrapActions,prepareCashout,transaction,swapCall,directPools,indexedPool,receivedToken,account,nextNonce,checkCashoutQuote,sentToken,cashDestination,available,wrapFirst,depositActions,GAS_RESERVE,saleRoom,STORAGE_GAS,WRAP_GAS,transferGas} from './ref-swap.mjs';
 import {PreparedSales} from './prepared-sale.mjs';
 const fixture=name=>JSON.parse(readFileSync(new URL('./fixtures/'+name,import.meta.url)));
 test('NEAR encoding matches the official near-api-js 7.3.1 vector',()=>{
@@ -81,7 +81,7 @@ test('cash lands in the Solana wallet, else Base, else nowhere',()=>{
 });
 test("NEAR sells from native NEAR beyond the gas reserve, wrapping only what's missing",()=>{
   const one=10n**24n;
-  const room=saleRoom({storage_usage:182},{gasPrice:100000000n,perByte:10000000000000000000n});
+  const room=saleRoom({storage_usage:182},{gasPrice:100000000n,perByte:10000000000000000000n,purchasePrice:1000000000n});
   assert.equal(available('wrap.near',0n,one,room),one-room);
   assert.equal(available('wrap.near',2n,room/2n,room),2n);
   assert.equal(available('token.0xshitzu.near',7n,one,room),7n);
@@ -164,7 +164,7 @@ test('a NEAR cash-out goes through when the price ticks down after the quote, ne
   globalThis.fetch=async(url,init)=>{
     const body=JSON.parse(init.body);
     if(!String(url).includes('1click')){
-      const result=body.method==='gas_price'?{gas_price:'100000000'}:body.method==='EXPERIMENTAL_protocol_config'?{runtime_config:{storage_amount_per_byte:'10000000000000000000'}}
+      const result=body.method==='gas_price'?{gas_price:'100000000'}:body.method==='EXPERIMENTAL_protocol_config'?{runtime_config:{storage_amount_per_byte:'10000000000000000000',min_gas_purchase_price:'1000000000'}}
         :body.params.request_type==='view_account'?{amount:'50000000000000000000000',storage_usage:182}
         :{result:[...Buffer.from(JSON.stringify('2000000000000000000000000'))]};
       return new Response(JSON.stringify({result}),{status:200});
@@ -189,18 +189,24 @@ test('a NEAR cash-out goes through when the price ticks down after the quote, ne
   }finally{globalThis.fetch=original;}
 });
 
-test('a Max NEAR sale keeps exactly what its transaction needs, so NEAR accepts it', () => {
-  // Live failure, 2026-10-23: selling all 0.442112 NEAR kept a flat 0.01 back. The transaction then pays
-  // 0.00125 to register 1Click's deposit address and 70 Tgas upfront (0.007), and the account must still
-  // hold its 182 bytes of storage (0.00182): 0.01 left 0.00175, so NEAR refused it before anything moved.
-  const prices={gasPrice:100000000n,perByte:10000000000000000000n};
-  const storage=182n*prices.perByte, registration=125n*prices.perByte;
-  assert.ok(10000000000000000000000n-registration-70n*1000000000000n*prices.gasPrice<storage);
+test('a Max NEAR sale keeps what NEAR holds back before running it, so NEAR accepts it', () => {
+  // NEAR's own rule (nearcore fees.rs calculate_tx_cost): send fees at the gas price, plus prepaid gas and
+  // execution fees at max(gas price, min_gas_purchase_price), plus deposits, must fit the balance; after
+  // it the account must still hold its storage.
+  const prices={gasPrice:100000000n,perByte:10000000000000000000n,purchasePrice:1000000000n};
+  const T=1000000000000n, storage=182n*prices.perByte, registrations=2n*125n*prices.perByte;
+  const cost=(prepaid,amount)=>9n*T/10n*prices.gasPrice+(prepaid+33n*T/10n)*prices.purchasePrice+amount+registrations+1n;
+  // Live failure, 2026-10-23: 0.452112466879… NEAR, the old room, 100 Tgas prepaid: NotEnoughBalance.
+  const balance=452112466879251254768118n;
+  const oldRoom=(182n+250n)*prices.perByte+110n*T*prices.gasPrice+1n;
+  assert.ok(cost(100n*T,balance-oldRoom)>balance);
+  // The room now, with each call's lean prepaid gas: NEAR accepts it and the storage stays.
+  const prepaid=STORAGE_GAS+WRAP_GAS+STORAGE_GAS+transferGas('wrap.near');
+  assert.equal(prepaid,14n*T);
   const room=saleRoom({storage_usage:182},prices);
-  // Both registrations, 100 Tgas prepaid and 10 Tgas of receipts: the storage is still there.
-  assert.ok(room-2n*registration-110n*1000000000000n*prices.gasPrice-1n>=storage);
-  // NEAR's gas price doubling grows only the gas part.
-  assert.equal(saleRoom({storage_usage:182},{...prices,gasPrice:2n*prices.gasPrice})-room,SALE_GAS*prices.gasPrice);
+  assert.ok(balance-cost(prepaid,balance-room)>=storage);
+  // A coin other than wNEAR prepays at most the same (one registration, a 10 Tgas transfer).
+  assert.ok(STORAGE_GAS+transferGas('token.0xshitzu.near')<=prepaid);
   assert.throws(()=>saleRoom({},prices),/unavailable/);
 });
 
