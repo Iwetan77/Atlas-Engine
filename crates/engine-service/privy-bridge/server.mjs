@@ -7,7 +7,7 @@ import {buildRef,buildNearCashout,finishNearCalls,keepRefWarm,prepareRef,quoteRe
 import {createServer} from 'node:http';
 import {createHash, randomUUID} from 'node:crypto';
 import {PrivyClient} from '@privy-io/node';
-import {buildSale,finishSale,buildSuiTransfer,buildSuiTransferAll,finishSuiTransfer,quoteSwap, buildSuiSwap, finishSuiSwap, rawSignRequest, prepareSuiCashout, quoteSale, prepareSale} from './sui-swap.mjs';
+import {buildSale,finishSale,buildSuiTransfer,buildSuiTransferAll,finishSuiTransfer,intentMessage,walletPublicKey,serializedSignature,suiBalance,quoteSwap, buildSuiSwap, finishSuiSwap, rawSignRequest, prepareSuiCashout, quoteSale, prepareSale} from './sui-swap.mjs';
 import {checkSignature, signable, signForEscrow} from './base-authorization.mjs';
 import {agentFor, approveAction, approveTypedData, cancelAction, checkApproval, leverageAction, moveAction,
   orderAction, post as hlPost, signAsAgent, tpslAction} from './hyperliquid.mjs';
@@ -56,6 +56,38 @@ async function ensureReceivingWallet(userId, chainType) {
   });
 }
 
+// Atlas's own fee payers: app-owned Privy wallets (no user owner; only Atlas's Privy app can sign for them),
+// funded by Atlas, that pay network fees on chains where users keep no gas (Agba: no reserves anywhere).
+async function ensureFeePayer(chainType) {
+  const externalId = `atlas_fee_payer_${chainType}`;
+  for await (const wallet of privy.wallets().list({external_id: externalId})) {
+    if (wallet.chain_type !== chainType || !wallet.address) throw new Error('Atlas fee payer does not match its chain');
+    return wallet;
+  }
+  return privy.wallets().create({chain_type: chainType, external_id: externalId,
+    display_name: `Atlas ${chainType.toUpperCase()} fee payer`, idempotency_key: externalId});
+}
+// The Sui fee payer pays every Sui sale, cash-out and swap's gas once it holds SUI_FEE_PAYER_MIN; below
+// that (unfunded, or emptied) the user's own SUI pays, as before.
+const SUI_FEE_PAYER_MIN = 50_000_000n; // 0.05 SUI
+let suiFeePayerWallet;
+async function suiFeePayer() {
+  try {
+    suiFeePayerWallet ??= await ensureFeePayer('sui');
+    return await suiBalance(suiFeePayerWallet.address) >= SUI_FEE_PAYER_MIN ? {address: suiFeePayerWallet.address} : null;
+  } catch {
+    return null;
+  }
+}
+// The fee payer's signature on a transaction built to sponsor (its gas only: feePayerOnlyPaysGas checked it).
+async function feePayerSignature(built) {
+  if (!built?.sponsored) return undefined;
+  const wallet = suiFeePayerWallet ?? await ensureFeePayer('sui');
+  const {signature} = await privy.wallets().rawSign(wallet.id, {
+    params: {bytes: `0x${Buffer.from(intentMessage(built.txBytes)).toString('hex')}`, encoding: 'hex', hash_function: 'blake2b256'}});
+  return serializedSignature(signature, walletPublicKey(wallet.public_key, wallet.address));
+}
+
 const server = createServer(async (request, response) => {
   // Internal notification transport. These routes never sign or move user money.
   if(request.method==='POST' && ['/internal/notifications/keys','/internal/notifications/send'].includes(request.url)){
@@ -67,6 +99,16 @@ const server = createServer(async (request, response) => {
       const input=JSON.parse(raw||'{}');
       send(response,200,request.url.endsWith('/keys')?notificationKeys():await sendWebNotification(input));
     }catch{send(response,503,{error:'Notification transport unavailable'});}
+    return;
+  }
+  // Atlas's fee payers and what they hold, for /health (loopback only; no keys, nothing signed).
+  if(request.method==='GET'&&request.url==='/internal/fee-payers'){
+    if(!['127.0.0.1','::1','::ffff:127.0.0.1'].includes(request.socket.remoteAddress)){send(response,403,{error:'Internal route'});return;}
+    try{
+      suiFeePayerWallet??=await ensureFeePayer('sui');
+      send(response,200,{sui:{address:suiFeePayerWallet.address,balance:(await suiBalance(suiFeePayerWallet.address)).toString(),
+        minimum:SUI_FEE_PAYER_MIN.toString()}});
+    }catch{send(response,503,{error:'Fee payers unavailable'});}
     return;
   }
   // Public deployment readiness, never account data, credentials or a signing route.
@@ -212,14 +254,15 @@ const server = createServer(async (request, response) => {
           send(response,200,{userId,address:wallet.address,amountOut:route.amountOut.toString()});
         }else if(request.url==='/sui/sale/prepare'){
           const prepared=await prepareSale({intentId:input.intentId,wallet,userId,userJwt,accessToken});
-          const built=await buildSale({...prepared,wallet,userId,userJwt});
+          const built=await buildSale({...prepared,wallet,userId,userJwt,sponsor:await suiFeePayer()});
           const approval=deviceApprovals.put({userId,wallet,appId,messages:[built.message],hashFunction:'blake2b256',data:built,operation:request.url.replace('/prepare','/commit'),
             expires:Math.min(prepared.scope.expiresAtUnixMs,Date.now()+180000)});
           send(response,200,{userId,address:wallet.address,...prepared,...approval});
         }else{
           const item=deviceApprovals.take({prepareId:input.prepareId,userId,wallet,signatures:input.signatures,operation:request.url});
           const [signatureHex]=await deviceSign(privy,item);
-          send(response,200,{userId,address:wallet.address,...await finishSale({wallet,built:item.data,signatureHex})});
+          send(response,200,{userId,address:wallet.address,...await finishSale({wallet,built:item.data,signatureHex,
+            feePayerSignature:await feePayerSignature(item.data)})});
         }
       }catch(error){send(response,409,{error:approvalFailure(error,'Sale could not complete'),maybeSent:error.maybeSent===true});}
       return;
@@ -231,14 +274,16 @@ const server = createServer(async (request, response) => {
           const all=input.all===true;
           const quote=await prepareSuiCashout({wallet,evmWallet,solanaWallet,amount:input.amount,minimumOut:input.minimumOut,all});
           // Max sends every SUI; otherwise exactly the amount, with only its fee left on top.
-          const built=all?await buildSuiTransferAll({wallet,recipient:quote.depositAddress,minimumIn:quote.minAmountIn})
-            :await buildSuiTransfer({wallet,recipient:quote.depositAddress,amount:input.amount,reserve:'2000000'});
+          const sponsor=await suiFeePayer();
+          const built=all?await buildSuiTransferAll({wallet,recipient:quote.depositAddress,minimumIn:quote.minAmountIn,sponsor})
+            :await buildSuiTransfer({wallet,recipient:quote.depositAddress,amount:input.amount,reserve:'2000000',sponsor});
           const approval=deviceApprovals.put({userId,wallet,appId,messages:[built.message],hashFunction:'blake2b256',data:built,operation:'/sui/cashout/commit'});
           send(response,200,{userId,address:wallet.address,...quote,...approval,cashoutId:approval.prepareId});
         }else{
           const item=deviceApprovals.take({prepareId:input.prepareId,userId,wallet,signatures:input.signatures,operation:request.url});
           const [signatureHex]=await deviceSign(privy,item);
-          send(response,200,{userId,address:wallet.address,...await finishSuiTransfer({wallet,built:item.data,signatureHex})});
+          send(response,200,{userId,address:wallet.address,...await finishSuiTransfer({wallet,built:item.data,signatureHex,
+            feePayerSignature:await feePayerSignature(item.data)})});
         }
       }catch(error){send(response,502,{error:approvalFailure(error,'Cashout unavailable'),maybeSent:error.maybeSent===true});}
       return;
@@ -262,7 +307,7 @@ const server = createServer(async (request, response) => {
           }
           const reserve = POSITIVE_INTEGER.test(String(input.reserve ?? '')) ? input.reserve : '0';
           const built = await buildSuiSwap({wallet, coinType: input.coinType, amount: input.amount, reserve,
-            minimumOut: input.minimumOut, expiresAtUnixMs: input.expiresAtUnixMs});
+            minimumOut: input.minimumOut, expiresAtUnixMs: input.expiresAtUnixMs, sponsor: await suiFeePayer()});
           // Long enough to confirm on the phone; Privy refuses the request after this too.
           const requestExpiry = Date.now() + 180_000;
           const {params, request: signable} = rawSignRequest({appId, walletId: wallet.id, message: built.message,
@@ -271,7 +316,7 @@ const server = createServer(async (request, response) => {
           if (preparedSwaps.size >= 1000) throw new Error('swap queue is full');
           const prepareId = randomUUID();
           preparedSwaps.set(prepareId, {userId, walletId: wallet.id, address: wallet.address, coinType: input.coinType,
-            txBytes: built.txBytes, input: built.input, params, requestExpiry});
+            txBytes: built.txBytes, input: built.input, params, requestExpiry, sponsored: built.sponsored});
           send(response, 200, {userId, address: wallet.address, prepareId, request: signable,
             amountIn: built.input.toString()});
           return;
@@ -299,7 +344,7 @@ const server = createServer(async (request, response) => {
           throw new Error(`Privy refused the approval (${String(error?.message ?? error).slice(0, 120)}); nothing was signed`);
         }
         const result = await finishSuiSwap({wallet, coinType: prepared.coinType, txBytes: prepared.txBytes,
-          input: prepared.input, signatureHex});
+          input: prepared.input, signatureHex, feePayerSignature: await feePayerSignature(prepared)});
         send(response, 200, {userId, address: wallet.address, ...result});
       } catch (error) {
         const reason = String(error?.message ?? error).slice(0, 300);

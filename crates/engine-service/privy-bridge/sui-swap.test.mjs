@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {Ed25519Keypair} from '@mysten/sui/keypairs/ed25519';
 import {blake2b} from '@noble/hashes/blake2b';
-import {intentMessage, serializedSignature, walletPublicKey, prepareSuiCashout, saleEffects, executionResult, checkRecoveryQuote} from './sui-swap.mjs';
+import {feePayerCost, intentMessage, serializedSignature, walletPublicKey, prepareSuiCashout, saleEffects, executionResult, checkRecoveryQuote} from './sui-swap.mjs';
 
 test('a raw ed25519 signature over blake2b(intent || tx) becomes a Sui signature that verifies', async () => {
   const keypair = new Ed25519Keypair();
@@ -176,4 +176,20 @@ test('a sale needs its actual unsigned gas budget; the later cashout still reser
   assert.throws(()=>checkSaleGas('20000000',18221624n));
   assert.throws(()=>checkSaleGas(undefined,18221624n));
   assert.throws(()=>checkSaleGas('0',18221624n));
+});
+
+test("Atlas's fee payer may only pay SUI gas, never part of the user's trade", () => {
+  const sponsor = {address: '0x6be20abe12a8e930fd8da5120fcb392753ef7b57b43401417aedaadeb1106ec4'};
+  const user = '0xac5bceec1b789ff840d7d4e6ce4ce61c90d190a7f8c4f4ddf0bff6ee2413c33c';
+  // Live simulation, 2026-10-23: the user sends all 0.665407099 SUI, the fee payer pays 0.000100099 of gas.
+  const sale = [
+    {address: '0x' + '0'.repeat(63) + '2', coinType: '0x2::sui::SUI', amount: '665407099'},
+    {address: sponsor.address, coinType: '0x2::sui::SUI', amount: '-100099'},
+    {address: user, coinType: '0x2::sui::SUI', amount: '-665407099'},
+  ];
+  assert.equal(feePayerCost(sale, sponsor), 100099n);
+  // Taking the fee payer's SUI shows up as a cost far above any gas budget; any other coin of its moving
+  // is refused outright.
+  assert.equal(feePayerCost([{address: sponsor.address, coinType: '0x2::sui::SUI', amount: '-500100099'}], sponsor), 500100099n);
+  assert.equal(feePayerCost([{address: sponsor.address, coinType: '0xdeeb7a4662eec9f2f3def03fb937a663dddaa2e215b8078a284d026b7946c270::deep::DEEP', amount: '-1'}], sponsor), null);
 });
