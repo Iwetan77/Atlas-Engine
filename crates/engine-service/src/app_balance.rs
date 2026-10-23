@@ -206,6 +206,14 @@ async fn arc_balance(wallet: &str) -> Result<u128, ApiError> {
         )
     })
 }
+// Home never lists what only pays network fees or is too small to matter: Robinhood Chain's ETH (gas,
+// not a coin Atlas sells) and a coin in the wallet worth under a cent (what a sale's fee left). Both
+// still count in the total, like the SOL and ETH gas.
+fn hidden_from_home(h: &Held) -> bool {
+    let wallet_coin = h.location == "wallet" && h.kind != "cash";
+    let gas = wallet_coin && h.chain == "robinhood" && h.kind == "crypto";
+    wallet_coin && (gas || h.value_usdc < 10_000)
+}
 pub(super) async fn balance(
     State(state): State<AppState>,
     Query(query): Query<BalanceQuery>,
@@ -231,6 +239,9 @@ pub(super) async fn balance(
         total = total
             .checked_add(h.value_usdc)
             .ok_or((StatusCode::BAD_GATEWAY, "portfolio value overflow".into()))?;
+        if hidden_from_home(h) {
+            continue;
+        }
         holdings.push(Holding {
             asset_id: h.asset_id.clone(),
             symbol: h.symbol.clone(),
@@ -1385,6 +1396,41 @@ fn money(base_units: u128, currency: &str, rate_micros: u128) -> Result<Money, A
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn home_leaves_out_robinhood_gas_and_crumbs_but_not_coins_or_cash() {
+        let held = |kind: &str, chain: &str, location: &str, value_usdc| Held {
+            asset_id: "a".into(),
+            symbol: "A".into(),
+            name: "A".into(),
+            kind: kind.into(),
+            chain: chain.into(),
+            location: location.into(),
+            icon_url: None,
+            amount: "1".into(),
+            units: 1,
+            decimals: 0,
+            value_usdc,
+            seen_ms: 0,
+        };
+        // The 0.0174 MON (₦0.50) and 0.018912 SUI (₦25 ≈ $0.018 at the time) Max used to leave.
+        assert!(hidden_from_home(&held("crypto", "monad", "wallet", 370)));
+        assert!(!hidden_from_home(&held("crypto", "sui", "wallet", 18_000)));
+        assert!(hidden_from_home(&held(
+            "crypto",
+            "robinhood",
+            "wallet",
+            100_000
+        )));
+        assert!(!hidden_from_home(&held(
+            "meme",
+            "robinhood",
+            "wallet",
+            100_000
+        )));
+        assert!(!hidden_from_home(&held("cash", "solana", "wallet", 5)));
+        assert!(!hidden_from_home(&held("crypto", "solana", "earn", 5)));
+    }
     #[test]
     fn naira_uses_dayas_rate_while_fresh_then_the_official_one() {
         let now = Instant::now();
