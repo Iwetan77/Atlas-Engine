@@ -44,24 +44,71 @@ const RECEIVER: &str = "0xccc88a9d1b4ed6b0eaba998850414b24f1c315be";
 // time. Its Deployer registry on Robinhood Chain names the current one (ownerOf) and the one before
 // (prev), and a sale routed through any other is refused. A pinned address broke every 0x-routed
 // sale, and so every Robinhood coin buy (it needs a sale back), when 0x moved on in October 2026.
-// The registry is read at most every ten minutes; these two are what it said on 2026-10-21, used
-// until it answers.
+// The registry is read at most every ten minutes. When 0x pauses its Settler the registry reverts,
+// and no 0x-routed sale is accepted until it names one again (0x's own instruction). When the
+// registry can't be reached, the last list it gave stands for an hour at most. These two are what it
+// said on 2026-10-21, trusted for the first hour until it answers.
 const ROBINHOOD_RPC: &str = "https://rpc.mainnet.chain.robinhood.com";
 const ZEROX_DEPLOYER: &str = "0x00000000000004533fe15556b1e086bb1a72ceae";
-static ZEROX_SETTLERS: LazyLock<RwLock<(Option<Instant>, Vec<String>)>> = LazyLock::new(|| {
-    RwLock::new((
-        None,
-        vec![
+const ZEROX_FRESH: Duration = Duration::from_secs(600);
+const ZEROX_RETRY: Duration = Duration::from_secs(60);
+const ZEROX_TRUSTED_FOR: Duration = Duration::from_secs(3600);
+// What the registry said about a Settler.
+#[derive(Debug, PartialEq)]
+enum Registry {
+    Named(String),
+    // Paused by 0x, or none exists.
+    Reverted,
+    // No answer: the RPC was down or slow.
+    Unreachable,
+}
+struct ZeroX {
+    // When the registry is next read, and when it last answered.
+    due: Instant,
+    answered: Instant,
+    settlers: Vec<String>,
+}
+static ZEROX_SETTLERS: LazyLock<RwLock<ZeroX>> = LazyLock::new(|| {
+    RwLock::new(ZeroX {
+        due: Instant::now(),
+        answered: Instant::now(),
+        settlers: vec![
             "0x24a4d86c8a76b00ee9566ed9c9ff4f0c3faf0da7".into(),
             "0x6aa80dbbed9ae5ab45fbf61f9644fada3b29326e".into(),
         ],
-    ))
+    })
 });
 fn zerox_settlers() -> Vec<String> {
     ZEROX_SETTLERS
         .read()
-        .map(|held| held.1.clone())
+        .ok()
+        .filter(|held| held.answered.elapsed() <= ZEROX_TRUSTED_FOR)
+        .map(|held| held.settlers.clone())
         .unwrap_or_default()
+}
+fn settle_zerox(held: &mut ZeroX, current: Registry, previous: Registry, now: Instant) {
+    match current {
+        Registry::Named(current) => {
+            let previous = match previous {
+                Registry::Named(previous) => Some(previous),
+                _ => None,
+            };
+            held.settlers = std::iter::once(current).chain(previous).collect();
+            held.answered = now;
+            held.due = now + ZEROX_FRESH;
+        }
+        Registry::Reverted => {
+            held.settlers.clear();
+            held.answered = now;
+            held.due = now + ZEROX_RETRY;
+        }
+        Registry::Unreachable => {
+            if now.saturating_duration_since(held.answered) > ZEROX_TRUSTED_FOR {
+                held.settlers.clear();
+            }
+            held.due = now + ZEROX_RETRY;
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -513,46 +560,54 @@ impl RelayClient {
         }
     }
 
-    /// Reads 0x's current and previous Settler on Robinhood Chain from its registry (see
-    /// ZEROX_SETTLERS), at most every ten minutes, or a minute after a failed read.
+    /// Reads 0x's current and previous Settler on Robinhood Chain from its registry when due (see
+    /// ZEROX_SETTLERS).
     async fn refresh_zerox_settlers(&self) {
-        let due = ZEROX_SETTLERS.read().is_ok_and(|held| {
-            held.0
-                .is_none_or(|at| at.elapsed() > Duration::from_secs(600))
-        });
-        if !due {
+        if ZEROX_SETTLERS
+            .read()
+            .is_ok_and(|held| Instant::now() < held.due)
+        {
             return;
         }
         let read = |selector: &'static str| async move {
-            let body: Value = self
-                .http
-                .post(ROBINHOOD_RPC)
-                .timeout(Duration::from_secs(4))
-                .json(
-                    &json!({"jsonrpc":"2.0","id":1,"method":"eth_call","params":[
-                    {"to":ZEROX_DEPLOYER,"data":format!("0x{selector}{:064x}", 2)},"latest"]}),
-                )
-                .send()
-                .await
-                .ok()?
-                .json()
-                .await
-                .ok()?;
-            let word = body["result"].as_str()?.strip_prefix("0x")?;
-            let address = format!("0x{}", word.get(24..64)?.to_ascii_lowercase());
-            (word.len() == 64 && address != format!("0x{}", "0".repeat(40))).then_some(address)
+            let Some(body) = async {
+                self.http
+                    .post(ROBINHOOD_RPC)
+                    .timeout(Duration::from_secs(4))
+                    .json(
+                        &json!({"jsonrpc":"2.0","id":1,"method":"eth_call","params":[
+                        {"to":ZEROX_DEPLOYER,"data":format!("0x{selector}{:064x}", 2)},"latest"]}),
+                    )
+                    .send()
+                    .await
+                    .ok()?
+                    .json::<Value>()
+                    .await
+                    .ok()
+            }
+            .await
+            else {
+                return Registry::Unreachable;
+            };
+            // JSON-RPC error 3 is the call reverting on chain; any other error is the RPC's own.
+            if body["error"]["code"] == 3 {
+                return Registry::Reverted;
+            }
+            let address = body["result"]
+                .as_str()
+                .and_then(|r| r.strip_prefix("0x"))
+                .filter(|word| word.len() == 64 && word.bytes().all(|b| b.is_ascii_hexdigit()))
+                .map(|word| format!("0x{}", word[24..].to_ascii_lowercase()));
+            match address {
+                Some(a) if a != format!("0x{}", "0".repeat(40)) => Registry::Named(a),
+                Some(_) => Registry::Reverted,
+                None => Registry::Unreachable,
+            }
         };
         // ownerOf(2) and prev(2): feature 2 is the Settler a taker's own transaction calls.
         let (current, previous) = tokio::join!(read("6352211e"), read("e2603dc2"));
         if let Ok(mut held) = ZEROX_SETTLERS.write() {
-            match current {
-                Some(current) => {
-                    held.0 = Some(Instant::now());
-                    held.1 = std::iter::once(current).chain(previous).collect();
-                }
-                // Unread: the last list stands, and the next read is a minute away.
-                None => held.0 = Some(Instant::now() - Duration::from_secs(540)),
-            }
+            settle_zerox(&mut held, current, previous, Instant::now());
         }
     }
 
@@ -2463,6 +2518,46 @@ mod tests {
                 "{path:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_paused_0x_registry_stops_0x_sales_and_an_unreachable_one_is_trusted_an_hour_at_most() {
+        let start = Instant::now();
+        let fresh = || ZeroX {
+            due: start,
+            answered: start,
+            settlers: vec!["0xold".into()],
+        };
+        // Named: the current Settler and the one before.
+        let mut held = fresh();
+        settle_zerox(
+            &mut held,
+            Registry::Named("0xnew".into()),
+            Registry::Named("0xold".into()),
+            start,
+        );
+        assert_eq!(held.settlers, ["0xnew", "0xold"]);
+        assert_eq!(held.due, start + ZEROX_FRESH);
+        // Paused (ownerOf reverts): nothing is accepted, whatever was cached.
+        settle_zerox(&mut held, Registry::Reverted, Registry::Unreachable, start);
+        assert!(held.settlers.is_empty());
+        // Unreachable: the last list stands within the hour, not after.
+        let mut held = fresh();
+        settle_zerox(
+            &mut held,
+            Registry::Unreachable,
+            Registry::Unreachable,
+            start + Duration::from_secs(1800),
+        );
+        assert_eq!(held.settlers, ["0xold"]);
+        assert_eq!(held.due, start + Duration::from_secs(1800) + ZEROX_RETRY);
+        settle_zerox(
+            &mut held,
+            Registry::Unreachable,
+            Registry::Unreachable,
+            start + ZEROX_TRUSTED_FOR + Duration::from_secs(1),
+        );
+        assert!(held.settlers.is_empty());
     }
 
     #[test]
