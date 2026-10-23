@@ -206,13 +206,20 @@ async fn arc_balance(wallet: &str) -> Result<u128, ApiError> {
         )
     })
 }
-// Home never lists what only pays network fees or is too small to matter: Robinhood Chain's ETH (gas,
-// not a coin Atlas sells) and a coin in the wallet worth under a cent (what a sale's fee left). Both
-// still count in the total, like the SOL and ETH gas.
-fn hidden_from_home(h: &Held) -> bool {
+// Home never lists what only pays network fees or can't be sold: Robinhood Chain's ETH (gas, not a coin
+// Atlas sells), a chain's own coin in an amount no bigger than what a sale there needs for itself (what a
+// Max sale leaves, whatever the coin's price), and a coin worth under a cent. All still count in the total,
+// like the SOL and ETH gas.
+fn hidden_from_home(h: &Held, unsellable: &near_intents::Unsellable) -> bool {
     let wallet_coin = h.location == "wallet" && h.kind != "cash";
     let gas = wallet_coin && h.chain == "robinhood" && h.kind == "crypto";
-    wallet_coin && (gas || h.value_usdc < 10_000)
+    let too_little = match (h.chain.as_str(), h.symbol.as_str()) {
+        ("sui", "SUI") => h.units <= unsellable.sui,
+        ("monad", "MON") => h.units <= unsellable.monad,
+        ("near", "NEAR") => h.units <= unsellable.near,
+        _ => false,
+    };
+    wallet_coin && (gas || too_little || h.value_usdc < 10_000)
 }
 pub(super) async fn balance(
     State(state): State<AppState>,
@@ -235,11 +242,12 @@ pub(super) async fn balance(
     let mut total = 0u128;
     let (spendable, trading) = pockets(&portfolio.holdings);
     let mut holdings = Vec::with_capacity(portfolio.holdings.len());
+    let unsellable = near_intents::unsellable(&state).await;
     for h in &portfolio.holdings {
         total = total
             .checked_add(h.value_usdc)
             .ok_or((StatusCode::BAD_GATEWAY, "portfolio value overflow".into()))?;
-        if hidden_from_home(h) {
+        if hidden_from_home(h, &unsellable) {
             continue;
         }
         holdings.push(Holding {
@@ -1399,37 +1407,83 @@ mod tests {
 
     #[test]
     fn home_leaves_out_robinhood_gas_and_crumbs_but_not_coins_or_cash() {
-        let held = |kind: &str, chain: &str, location: &str, value_usdc| Held {
-            asset_id: "a".into(),
-            symbol: "A".into(),
-            name: "A".into(),
-            kind: kind.into(),
-            chain: chain.into(),
-            location: location.into(),
-            icon_url: None,
-            amount: "1".into(),
-            units: 1,
-            decimals: 0,
-            value_usdc,
-            seen_ms: 0,
+        let held =
+            |kind: &str, chain: &str, symbol: &str, location: &str, units, value_usdc| Held {
+                asset_id: "a".into(),
+                symbol: symbol.into(),
+                name: "A".into(),
+                kind: kind.into(),
+                chain: chain.into(),
+                location: location.into(),
+                icon_url: None,
+                amount: "1".into(),
+                units,
+                decimals: 0,
+                value_usdc,
+                seen_ms: 0,
+            };
+        let limits = near_intents::Unsellable {
+            sui: 2_000_000,
+            monad: 10_000_000_000_000_000,
+            near: 15_320_000_000_000_000_000_000,
         };
-        // The 0.0174 MON (₦0.50) and 0.018912 SUI (₦25 ≈ $0.018 at the time) Max used to leave.
-        assert!(hidden_from_home(&held("crypto", "monad", "wallet", 370)));
-        assert!(!hidden_from_home(&held("crypto", "sui", "wallet", 18_000)));
-        assert!(hidden_from_home(&held(
+        let hidden = |h: &Held| hidden_from_home(h, &limits);
+        // What a NEAR Max sale leaves (0.011 NEAR) stays hidden even if NEAR's price makes it worth ₦100.
+        assert!(hidden(&held(
+            "crypto",
+            "near",
+            "NEAR",
+            "wallet",
+            11_000_000_000_000_000_000_000,
+            70_000
+        )));
+        assert!(!hidden(&held(
+            "crypto",
+            "near",
+            "NEAR",
+            "wallet",
+            442_112_000_000_000_000_000_000,
+            2_200_000
+        )));
+        // MON's fee room and the old 0.0174 MON crumb.
+        assert!(hidden(&held(
+            "crypto",
+            "monad",
+            "MON",
+            "wallet",
+            9_000_000_000_000_000,
+            200
+        )));
+        assert!(hidden(&held(
+            "crypto",
+            "monad",
+            "MON",
+            "wallet",
+            17_400_000_000_000_000,
+            370
+        )));
+        // A real SUI holding stays, even a small one.
+        assert!(!hidden(&held(
+            "crypto", "sui", "SUI", "wallet", 18_912_000, 18_000
+        )));
+        assert!(hidden(&held(
             "crypto",
             "robinhood",
+            "ETH",
             "wallet",
+            40_000_000_000_000,
             100_000
         )));
-        assert!(!hidden_from_home(&held(
+        assert!(!hidden(&held(
             "meme",
             "robinhood",
+            "GLOAM",
             "wallet",
+            1,
             100_000
         )));
-        assert!(!hidden_from_home(&held("cash", "solana", "wallet", 5)));
-        assert!(!hidden_from_home(&held("crypto", "solana", "earn", 5)));
+        assert!(!hidden(&held("cash", "solana", "USDC", "wallet", 5, 5)));
+        assert!(!hidden(&held("crypto", "solana", "JitoSOL", "earn", 5, 5)));
     }
     #[test]
     fn naira_uses_dayas_rate_while_fresh_then_the_official_one() {
