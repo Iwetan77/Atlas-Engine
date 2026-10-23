@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
-import {transaction,swapCall,directPools,indexedPool,receivedToken,account,nextNonce,checkCashoutQuote,sentToken,cashDestination,available,wrapFirst,depositActions,GAS_RESERVE,CASHOUT_RESERVE} from './ref-swap.mjs';
+import {prepareCashout,transaction,swapCall,directPools,indexedPool,receivedToken,account,nextNonce,checkCashoutQuote,sentToken,cashDestination,available,wrapFirst,depositActions,GAS_RESERVE,CASHOUT_RESERVE} from './ref-swap.mjs';
 import {PreparedSales} from './prepared-sale.mjs';
 const fixture=name=>JSON.parse(readFileSync(new URL('./fixtures/'+name,import.meta.url)));
 test('NEAR encoding matches the official near-api-js 7.3.1 vector',()=>{
@@ -152,5 +152,37 @@ test('device NEAR batch builds consecutive nonces from one chain read and verifi
       assert.deepEqual(error.sent,['landed-1']);assert.equal(error.maybeSent,true);
       assert.match(error.message,/Step 2/);return true;
     });
+  }finally{globalThis.fetch=original;}
+});
+
+test('a NEAR cash-out goes through when the price ticks down after the quote, never below its minimum',async()=>{
+  const original=globalThis.fetch;
+  // The SUI sale's live numbers (#33), here for wNEAR: the quote promised at least 940241; seconds later
+  // 1Click's price was 949453, whose own 1% cushion (939958) was under it.
+  const prices=[949739,949453,949453],asked=[];
+  globalThis.fetch=async(url,init)=>{
+    const body=JSON.parse(init.body);
+    if(!String(url).includes('1click')){
+      const result=body.params.request_type==='view_account'?{amount:'50000000000000000000000'}
+        :{result:[...Buffer.from(JSON.stringify('2000000000000000000000000'))]};
+      return new Response(JSON.stringify({result}),{status:200});
+    }
+    asked.push(body);
+    const out=BigInt(prices[asked.length-1]);
+    return new Response(JSON.stringify({quote:{amountIn:body.amount,amountOut:out.toString(),
+      minAmountOut:(out*BigInt(10000-body.slippageTolerance)/10000n).toString(),
+      ...(body.dry?{}:{depositAddress:'deposit-1.intents.near'}),depositMemo:null}}),{status:200});
+  };
+  try{
+    const wallet={id:'w-1',address:'a'.repeat(64)};
+    const args={wallet,userId:'u-1',userJwt:'jwt',solanaWallet:'9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM',
+      amount:'1000000000000000000000000',minimumOut:'940241'};
+    const prepared=await prepareCashout(args);
+    assert.equal(prepared.depositAddress,'deposit-1.intents.near');
+    assert.deepEqual(asked.map(a=>[a.dry,a.slippageTolerance]),[[true,100],[false,100],[false,97]]);
+    // Below the quoted minimum, nothing is prepared.
+    prices.splice(0,3,930000);asked.length=0;
+    await assert.rejects(()=>prepareCashout(args),/price moved/);
+    assert.equal(asked.length,1);
   }finally{globalThis.fetch=original;}
 });

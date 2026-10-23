@@ -332,12 +332,28 @@ export async function prepareCashout({wallet,userId,userJwt,evmWallet,solanaWall
   const native=BigInt((await rpc('query',{request_type:'view_account',finality:'final',account_id:wallet.address})).amount);
   if(native<CASHOUT_RESERVE)throw new Error('not enough NEAR for the network fee');
   if(available(token,BigInt(await view(token,'ft_balance_of',{account_id:wallet.address})),native)<BigInt(amount))throw new Error('holding changed');
-  const request={dry:false,swapType:'EXACT_INPUT',slippageTolerance:100,originAsset:`nep141:${token}`,depositType:'ORIGIN_CHAIN',
-    destinationAsset:cash.asset,amount:String(amount),recipient:cash.recipient,recipientType:'DESTINATION_CHAIN',
-    refundTo:wallet.address,refundType:'ORIGIN_CHAIN',deadline:new Date(Date.now()+240000).toISOString()};
-  const response=await fetch('https://1click.chaindefuser.com/v0/quote',{method:'POST',headers:{'content-type':'application/json',...(process.env.NEAR_INTENTS_API_KEY?{'X-API-Key':process.env.NEAR_INTENTS_API_KEY}:{})},body:JSON.stringify(request),signal:AbortSignal.timeout(20000)});
-  if(!response.ok)throw new Error('cashout route unavailable');
-  const q=(await response.json()).quote;
+  // The route must still pay at least the minimum the user was quoted. A fresh quote's own 1% cushion sits
+  // under its own price, so it fell below the first quote's minimum whenever the price ticked down in
+  // between (the same failure SUI sales had). The price is read first, and the cushion then ends at the
+  // quoted minimum (never wider than 1%).
+  const route=async(dry,slippageTolerance)=>{
+    const request={dry,swapType:'EXACT_INPUT',slippageTolerance,originAsset:`nep141:${token}`,depositType:'ORIGIN_CHAIN',
+      destinationAsset:cash.asset,amount:String(amount),recipient:cash.recipient,recipientType:'DESTINATION_CHAIN',
+      refundTo:wallet.address,refundType:'ORIGIN_CHAIN',deadline:new Date(Date.now()+240000).toISOString()};
+    const response=await fetch('https://1click.chaindefuser.com/v0/quote',{method:'POST',headers:{'content-type':'application/json',...(process.env.NEAR_INTENTS_API_KEY?{'X-API-Key':process.env.NEAR_INTENTS_API_KEY}:{})},body:JSON.stringify(request),signal:AbortSignal.timeout(20000)});
+    if(!response.ok)throw new Error('cashout route unavailable');
+    return (await response.json()).quote;
+  };
+  const least=BigInt(minimumOut),moved=()=>new Error('The price moved since your quote');
+  let price=BigInt((await route(true,100))?.amountOut??0),q;
+  for(let tries=2;;tries--){
+    if(price<least)throw moved();
+    q=await route(false,Number(min(100n,(price-least)*10000n/price)));
+    if(BigInt(q?.minAmountOut??q?.amountOut??0)>=least)break;
+    // The price ticked down between the two reads: once more at the newer one.
+    if(tries===1)throw moved();
+    price=BigInt(q?.amountOut??0);
+  }
   checkCashoutQuote(q,amount,minimumOut);
   const bound=scope??{userId,walletId:wallet.id,address:wallet.address,quoteId:randomUUID(),coinType:token,
     amount:String(amount),minimumOut:String(minimumOut),expiresAtUnixMs:Date.now()+180000};
@@ -345,6 +361,7 @@ export async function prepareCashout({wallet,userId,userJwt,evmWallet,solanaWall
   const cashoutId=cashouts.put(bound,userJwt,{depositAddress:q.depositAddress});
   return {cashoutId,scope:bound,depositAddress:q.depositAddress,amountOut:q.amountOut};
 }
+const min=(a,b)=>(a<b?a:b);
 // 1Click's quote must take exactly the amount, pay at least the minimum, and name a plain NEAR
 // account to deposit to (no memo).
 export function checkCashoutQuote(q,amount,minimumOut){
