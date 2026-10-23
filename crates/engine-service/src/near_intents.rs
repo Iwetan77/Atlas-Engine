@@ -113,6 +113,9 @@ struct StoredQuote {
     // A Robinhood Chain buy into a wallet short of ETH there: USD micros of the payment Relay lands
     // as ETH for the coin's later sale (kept in the wallet; see HOOD_GAS_FLOOR_WEI).
     hood_gas: u128,
+    // Max on the chain's own coin (SUI): the sale sends everything, and its one network fee comes out of
+    // the sale, so nothing is left behind.
+    everything: bool,
 }
 #[derive(Clone)]
 struct SuiRecovery {
@@ -203,6 +206,8 @@ fn cashout_after_gas(proceeds: u128, sale: Option<&SuiSale>) -> u128 {
 const NOT_SENT: &str = "The payment didn't go through, so nothing left your balance. Try again.";
 // SUI kept in the Sui wallet for gas: 0.02 SUI pays for dozens of swaps.
 const SUI_GAS_RESERVE: u128 = 20_000_000;
+// Room for one SUI transfer's network fee (its gas budget was 0.0002 SUI on mainnet, 2026-10-23).
+const SUI_SALE_GAS: u128 = 2_000_000;
 #[derive(Clone, Serialize, Deserialize)]
 struct StoredIntent {
     owner: String,
@@ -274,6 +279,9 @@ struct StoredIntent {
     // A Robinhood trade refunded as USDG, on its way back to Trading.
     #[serde(default)]
     refund: Option<Refund>,
+    // A Max sale of the chain's own coin (see StoredQuote::everything).
+    #[serde(default)]
+    everything: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct PendingSale {
@@ -2528,6 +2536,7 @@ pub(super) async fn withdraw_execute(
                 then_sell: None,
                 gas_bought: 0,
                 refund: None,
+                everything: false,
                 relay: None,
                 withdraw: Some(Withdrawal {
                     network: stored.option.label.into(),
@@ -3014,6 +3023,7 @@ async fn sui_quote(
             relayed: from_solana && origin == BASE_USDC_1CLICK,
             gas_first: None,
             hood_gas: 0,
+            everything: false,
         },
     );
     Ok(Json(buy_quote_json(
@@ -3187,6 +3197,7 @@ async fn ref_buy_quote(
             relayed: from_solana && origin == BASE_USDC_1CLICK,
             gas_first: None,
             hood_gas: 0,
+            everything: false,
         },
     );
     Ok(Json(buy_quote_json(
@@ -4493,6 +4504,7 @@ async fn near_coin_sell_quote(
             relayed: false,
             gas_first,
             hood_gas: 0,
+            everything: false,
         },
     );
     Ok(Json(sale_json(
@@ -4571,6 +4583,7 @@ async fn monad_sell_quote(
             relayed: false,
             gas_first: None,
             hood_gas: 0,
+            everything: false,
         },
     );
     Ok(Json(sale_json(
@@ -4663,6 +4676,7 @@ async fn mon_buy_quote(
             relayed: false,
             gas_first: None,
             hood_gas: 0,
+            everything: false,
         },
     );
     let currency = &req.amount.currency;
@@ -4863,6 +4877,7 @@ async fn hood_buy_quote(
             relayed: false,
             gas_first: None,
             hood_gas: gas,
+            everything: false,
         },
     );
     let currency = &req.amount.currency;
@@ -4946,6 +4961,7 @@ async fn hood_sell_quote(
             relayed: false,
             gas_first: None,
             hood_gas: 0,
+            everything: false,
         },
     );
     Ok(Json(sale_json(
@@ -5118,6 +5134,7 @@ async fn sui_coin_sell_quote(
             relayed: false,
             gas_first: None,
             hood_gas: 0,
+            everything: false,
         },
     );
     Ok(Json(
@@ -5278,6 +5295,7 @@ async fn ref_sell_quote(
             relayed: false,
             gas_first,
             hood_gas: 0,
+            everything: false,
         },
     );
     Ok(Json(
@@ -5433,10 +5451,13 @@ async fn sui_sell_quote(
         .as_str()
         .and_then(|raw| raw.parse::<u128>().ok())
         .ok_or_else(|| venue("Your balance is temporarily unavailable"))?;
+    // No SUI is kept back. Max sells every SUI: the sale's one network fee comes out of it, so the quote
+    // prices what's left after at most SUI_SALE_GAS, and the deposit is everything the actual fee leaves
+    // (see StoredQuote::everything). A partial sale only needs the fee on top.
     if req.all {
-        amount = held.saturating_sub(SUI_GAS_RESERVE);
+        amount = held.saturating_sub(SUI_SALE_GAS);
     }
-    if amount == 0 || held < amount.saturating_add(SUI_GAS_RESERVE) {
+    if amount == 0 || held < amount.saturating_add(SUI_SALE_GAS) {
         return Err(markets::short_of_cash());
     }
     let deadline = deadline_utc(180);
@@ -5484,16 +5505,24 @@ async fn sui_sell_quote(
             relayed: false,
             gas_first: None,
             hood_gas: 0,
+            everything: req.all,
         },
     );
+    // Max pays everything held; what it receives is priced on what's left after at most the fee, and
+    // the difference (the route's cut and that fee) is the Fee.
+    let (paid, paid_value) = if req.all {
+        (held, held.saturating_mul(price_micros) / 1_000_000_000)
+    } else {
+        (amount, value_usdc)
+    };
     Ok(Json(json!({
         "quoteId":quote_id,"assetId":req.asset_id,"side":"sell",
-        "pay":{"amount":markets::format_units(amount,9),"symbol":"SUI",
-            "value":money(value_usdc,&req.amount.currency,rate)},
+        "pay":{"amount":markets::format_units(paid,9),"symbol":"SUI",
+            "value":money(paid_value,&req.amount.currency,rate)},
         "receive":{"amount":markets::format_units(output,6),"symbol":"USDC",
             "value":money(output,&req.amount.currency,rate)},
         "price":unit_price(output,amount,9,&req.amount.currency,rate),
-        "fee":{"amount":"0","currency":req.amount.currency},"expiresAtUnixMs":expires
+        "fee":money(paid_value.saturating_sub(output),&req.amount.currency,rate),"expiresAtUnixMs":expires
     })))
 }
 // Which cash pays a 1Click buy of `amount`: Base when it covers it (a plain USDC transfer; an empty
@@ -5808,6 +5837,7 @@ pub(super) async fn quote(
             relayed: from_solana && origin == BASE_USDC_1CLICK,
             gas_first: None,
             hood_gas: 0,
+            everything: false,
         },
     );
     Ok(Json(buy_quote_json(
@@ -5887,6 +5917,7 @@ async fn execute_monad_sale(
                 then_sell: None,
                 gas_bought: 0,
                 refund: None,
+                everything: false,
                 withdraw: None,
                 relay: Some(RelayLeg {
                     request_id: swap.request_id,
@@ -6032,6 +6063,7 @@ async fn execute_mon_buy(
                 then_sell: None,
                 gas_bought: 0,
                 refund: None,
+                everything: false,
                 withdraw: None,
                 relay: Some(RelayLeg {
                     request_id: swap.request_id,
@@ -6194,6 +6226,7 @@ async fn execute_hood_buy(
                 then_sell: None,
                 gas_bought: 0,
                 refund: None,
+                everything: false,
                 withdraw: None,
                 relay: Some(RelayLeg {
                     request_id: swap.request_id,
@@ -6312,6 +6345,7 @@ async fn execute_hood_sale(
                 then_sell: None,
                 gas_bought: 0,
                 refund: None,
+                everything: false,
                 withdraw: None,
                 relay: Some(RelayLeg {
                     request_id: swap.request_id,
@@ -6431,6 +6465,7 @@ async fn execute_sui_sell(
                 then_sell: None,
                 gas_bought: 0,
                 refund: None,
+                everything: quote.everything,
             },
         )
         .await?;
@@ -6580,6 +6615,7 @@ async fn execute_sale_after_gas(
                 }),
                 gas_bought: 0,
                 refund: None,
+                everything: false,
             },
         )
         .await?;
@@ -6974,6 +7010,7 @@ pub(super) async fn execute(
                 then_sell: None,
                 gas_bought: 0,
                 refund: None,
+                everything: false,
             },
         )
         .await?;
@@ -7095,7 +7132,8 @@ async fn prepare_sell_step(
     let args = if sale_first || direct {
         json!({"intentId":id})
     } else {
-        json!({"amount":current.amount.to_string(),"minimumOut":current.minimum_out.to_string()})
+        json!({"amount":current.amount.to_string(),"minimumOut":current.minimum_out.to_string(),
+            "all":current.everything})
     };
     let body = bridge(state, headers, path, args).await?;
     if body["userId"].as_str() != Some(&current.owner)
@@ -7255,6 +7293,16 @@ async fn commit_device_step(
                 let tx = current.status.tx_ids.last().cloned();
                 record_fill(state, id, &current, "buy", got, current.amount, tx).await;
             } else {
+                // A Max SUI sale deposits everything its fee left, a little over the quoted amount.
+                if current.everything {
+                    if let Some(sent_in) = sent["amountIn"]
+                        .as_str()
+                        .and_then(|v| v.parse::<u128>().ok())
+                        .filter(|n| *n >= current.amount)
+                    {
+                        current.amount = sent_in;
+                    }
+                }
                 current.status.stage = "settle".into();
             }
         }
