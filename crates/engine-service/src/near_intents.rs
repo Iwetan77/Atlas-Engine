@@ -4112,8 +4112,9 @@ fn sell_units(
     }
     Ok(units)
 }
-// MON kept back for the network fee when selling it: a plain transfer costs about 0.002 MON.
-const MONAD_GAS_RESERVE: u128 = 20_000_000_000_000_000;
+// Room for a MON sale's one network fee, which comes out of the sale: Relay's deposit costs about 0.004
+// MON (37,719 gas at 113 gwei, 2026-10-23), a small fraction of a naira. No MON is kept back for gas.
+const MONAD_SALE_GAS: u128 = 10_000_000_000_000_000;
 
 // A 1Click coin's USD price, as the token list gives it (memecoins sit far below a micro-dollar).
 fn token_usd(token: &Token) -> f64 {
@@ -4536,10 +4537,8 @@ async fn monad_sell_quote(
         .filter(|w| is_evm(w))
         .ok_or_else(|| conflict("Your wallet is still being set up. Try again in a moment."))?;
     let held = state.near.monad_balance(&token, &wallet).await?;
-    if held < MONAD_GAS_RESERVE {
-        return Err(conflict(
-            "Selling needs a little MON in your wallet for the network fee (about 0.02 MON).",
-        ));
+    if held <= MONAD_SALE_GAS {
+        return Err(bad("That's too little MON to sell."));
     }
     let price = token_usd(&token);
     let rate = app_balance::fx_rate(&req.amount.currency).await?;
@@ -4547,8 +4546,10 @@ async fn monad_sell_quote(
         .checked_mul(1_000_000)
         .ok_or_else(|| bad("Amount too large"))?
         / rate;
+    // Max sends everything but the room for its own fee (what the fee doesn't use is a crumb worth well
+    // under a naira).
     let amount = sale_units(
-        held - MONAD_GAS_RESERVE,
+        held - MONAD_SALE_GAS,
         desired,
         price,
         token.decimals,
@@ -5860,7 +5861,7 @@ async fn execute_monad_sale(
 ) -> Result<Json<Value>, ApiError> {
     let token = stored.asset.clone();
     let held = state.near.monad_balance(&token, &stored.wallet).await?;
-    if held < stored.amount.saturating_add(MONAD_GAS_RESERVE) {
+    if held < stored.amount.saturating_add(MONAD_SALE_GAS) {
         return Err(conflict(&format!(
             "You no longer hold that much {}.",
             token.symbol
