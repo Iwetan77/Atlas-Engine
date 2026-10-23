@@ -5,8 +5,8 @@ import {AggregatorClient, Env} from '@cetusprotocol/aggregator-sdk';
 import {toSerializedSignature} from '@mysten/sui/cryptography';
 import {SuiGrpcClient} from '@mysten/sui/grpc';
 import {Ed25519PublicKey} from '@mysten/sui/keypairs/ed25519';
-import {Transaction} from '@mysten/sui/transactions';
-import {fromBase58, fromBase64, toHex, normalizeStructTag} from '@mysten/sui/utils';
+import {Transaction, coinWithBalance} from '@mysten/sui/transactions';
+import {fromBase58, fromBase64, toHex, normalizeStructTag, normalizeSuiAddress} from '@mysten/sui/utils';
 
 export const SUI = '0x2::sui::SUI';
 const FULLNODE = process.env.SUI_FULLNODE_URL ?? 'https://fullnode.mainnet.sui.io:443';
@@ -42,9 +42,47 @@ export function executionResult(result){
   return {digest:tx.digest,effects:{status:{status:tx.status.success?'success':'failure',error:tx.status.error?.message??'transaction failed'}},
     balanceChanges:(tx.balanceChanges??[]).map(c=>({coinType:c.coinType,owner:{AddressOwner:c.address},amount:c.amount}))};
 }
-async function submit(txBytes,signature){
-  try { return executionResult(await client().executeTransaction({transaction:txBytes,signatures:[signature],include:{balanceChanges:true,effects:true}})); }
+async function submit(txBytes,signature,feePayerSignature){
+  const signatures=feePayerSignature?[signature,feePayerSignature]:[signature];
+  try { return executionResult(await client().executeTransaction({transaction:txBytes,signatures,include:{balanceChanges:true,effects:true}})); }
   catch(error){error.maybeSent=true;throw error;}
+}
+
+// Atlas's Sui fee payer (server.mjs suiFeePayer), `sponsor` = {address}: it pays a transaction's gas, so the
+// user keeps no SUI for gas and sells all of it (Agba: no reserves). Nothing else of the fee payer's may
+// move; feePayerOnlyPaysGas proves that by simulating before Atlas signs.
+async function payGasFrom(txb,sponsor){
+  txb.setGasOwner(sponsor.address);
+  const {objects}=await client().listCoins({owner:sponsor.address,coinType:SUI,limit:50});
+  const coins=objects.sort((a,b)=>(BigInt(b.balance)>BigInt(a.balance)?1:-1)).slice(0,10);
+  if(!coins.length)throw new Error('the fee payer has no SUI');
+  txb.setGasPayment(coins.map(({objectId,version,digest})=>({objectId,version,digest})));
+}
+export function feePayerCost(balanceChanges,sponsor){
+  const mine=c=>normalizeSuiAddress(c.address??c.owner?.AddressOwner??'')===normalizeSuiAddress(sponsor.address);
+  if((balanceChanges??[]).some(c=>mine(c)&&!sameCoin(c.coinType,SUI)))return null;
+  return -(balanceChanges??[]).filter(mine).reduce((sum,c)=>sum+BigInt(c.amount),0n);
+}
+export async function feePayerOnlyPaysGas(txBytes,sponsor){
+  const budget=BigInt(Transaction.from(txBytes).getData().gasData.budget);
+  const sim=await client().simulateTransaction({transaction:txBytes,include:{balanceChanges:true,effects:true}});
+  const tx=sim.Transaction??sim.FailedTransaction;
+  if(!tx?.status?.success)throw new Error(`the transaction would fail (${tx?.status?.error?.message??'simulation'}); nothing was signed`);
+  const cost=feePayerCost(tx.balanceChanges,sponsor);
+  if(cost===null||cost>budget)throw new Error('the fee payer would pay more than the network fee; nothing was signed');
+}
+// The user's SUI coins (a transaction takes at most 256), and their total.
+async function ownSuiCoins(owner){
+  const coins=[];let cursor=null;
+  do {
+    const page=await client().listCoins({owner,coinType:SUI,cursor,limit:100});
+    coins.push(...page.objects);
+    if(!page.hasNextPage)break;
+    if(!page.cursor||page.cursor===cursor)throw new Error('Sui coin listing failed');
+    cursor=page.cursor;
+  }while(coins.length<256);
+  const paying=coins.slice(0,256);
+  return {paying,total:paying.reduce((sum,c)=>sum+BigInt(c.balance),0n)};
 }
 
 // Sui signs blake2b256(intent || transaction bytes); the intent for a transaction is [0, 0, 0].
@@ -131,62 +169,72 @@ export async function commitSale({saleId,scope,wallet,userId,userJwt,rawSign}) {
 }
 
 // Build the exact sell before device approval; consume its confirmed scope once.
-export async function buildSale({saleId,scope,wallet,userId,userJwt}) {
+export async function buildSale({saleId,scope,wallet,userId,userJwt,sponsor=null}) {
   if(scope.userId!==userId || scope.walletId!==wallet.id || scope.address!==wallet.address)throw new Error('sale wallet changed');
   const {scope:approved,data:router}=sales.take(saleId,scope,userJwt);
-  return buildSaleTransaction({wallet,approved,router});
+  return buildSaleTransaction({wallet,approved,router,sponsor});
 }
-export async function buildSaleTransaction({wallet,approved,router}) {
+export async function buildSaleTransaction({wallet,approved,router,sponsor=null}) {
   if(approved.address!==wallet.address || BigInt(router.amountOut)*99n/100n<BigInt(approved.minimumOut))throw new Error('sale changed');
   if(await coinBalance(wallet.address,approved.coinType)<BigInt(approved.amount))throw new Error('holding changed');
   const aggregator=new AggregatorClient({signer:wallet.address,client:client(),env:Env.Mainnet});
   const txb=new Transaction();txb.setSender(wallet.address);
-  await aggregator.fastRouterSwap({router,txb,slippage:SLIPPAGE});
+  // Sponsored: the swap's coins come from the user's own, never the (fee payer's) gas coin.
+  await aggregator.fastRouterSwap({router,txb,slippage:SLIPPAGE,sponsored:!!sponsor});
+  if(sponsor)await payGasFrom(txb,sponsor);
   const txBytes=await txb.build({client:client()});
-  checkSaleGas(txb.getData().gasData.budget,await suiBalance(wallet.address));
-  return {txBytes,message:`0x${toHex(intentMessage(txBytes))}`,scope:approved};
+  if(sponsor)await feePayerOnlyPaysGas(txBytes,sponsor);
+  else checkSaleGas(txb.getData().gasData.budget,await suiBalance(wallet.address));
+  return {txBytes,message:`0x${toHex(intentMessage(txBytes))}`,scope:approved,sponsored:!!sponsor};
 }
-export async function finishSale({wallet,built,signatureHex}) {
-  const result=await finishSuiSwap({wallet,coinType:SUI,txBytes:built.txBytes,input:BigInt(built.scope.amount),signatureHex});
+export async function finishSale({wallet,built,signatureHex,feePayerSignature}) {
+  const result=await finishSuiSwap({wallet,coinType:SUI,txBytes:built.txBytes,input:BigInt(built.scope.amount),signatureHex,feePayerSignature});
   return result;
 }
-export async function buildSuiTransfer({wallet,recipient,amount,reserve}) {
+export async function buildSuiTransfer({wallet,recipient,amount,reserve,sponsor=null}) {
   const input=BigInt(amount);
-  if(input<=0n || await suiBalance(wallet.address)<input+BigInt(reserve))throw new Error('not enough SUI to send and pay gas');
+  if(input<=0n || await suiBalance(wallet.address)<input+(sponsor?0n:BigInt(reserve)))throw new Error('not enough SUI to send and pay gas');
   const txb=new Transaction();txb.setSender(wallet.address);
-  const [coin]=txb.splitCoins(txb.gas,[input]);txb.transferObjects([coin],recipient);
+  if(sponsor){
+    txb.transferObjects([coinWithBalance({balance:input,useGasCoin:false})],recipient);
+    await payGasFrom(txb,sponsor);
+  }else{
+    const [coin]=txb.splitCoins(txb.gas,[input]);txb.transferObjects([coin],recipient);
+  }
   const txBytes=await txb.build({client:client()});
-  return {txBytes,input,message:`0x${toHex(intentMessage(txBytes))}`,recipient};
+  if(sponsor)await feePayerOnlyPaysGas(txBytes,sponsor);
+  return {txBytes,input,message:`0x${toHex(intentMessage(txBytes))}`,recipient,sponsored:!!sponsor};
 }
-// Max on SUI: every SUI coin pays for the transaction as one gas coin, and that whole coin (whatever the
-// fee leaves of it) goes to `recipient`, so no SUI stays behind and none is kept for gas. What's left
-// after the largest possible fee (the gas budget) must still reach the route's `minimumIn`.
-export async function buildSuiTransferAll({wallet,recipient,minimumIn}) {
-  const coins=[];let cursor=null;
-  do {
-    const page=await client().listCoins({owner:wallet.address,coinType:SUI,cursor,limit:100});
-    coins.push(...page.objects);
-    if(!page.hasNextPage)break;
-    if(!page.cursor||page.cursor===cursor)throw new Error('Sui coin listing failed');
-    cursor=page.cursor;
-  }while(coins.length<256);
-  // A transaction pays with at most 256 coins.
-  const paying=coins.slice(0,256);
+// Max on SUI sends every SUI, so none stays behind and none is kept for gas. With Atlas's fee payer
+// (`sponsor`), all the user's coins go to `recipient` and the fee payer pays the gas. Without it, every
+// coin pays for the transaction as one gas coin and that whole coin (whatever the fee leaves of it)
+// goes. What's left after the largest possible fee (the gas budget) must still reach the route's
+// `minimumIn`.
+export async function buildSuiTransferAll({wallet,recipient,minimumIn,sponsor=null}) {
+  const {paying,total}=await ownSuiCoins(wallet.address);
   if(!paying.length)throw new Error('no SUI to sell');
-  const total=paying.reduce((sum,c)=>sum+BigInt(c.balance),0n);
+  const refs=paying.map(({objectId,version,digest})=>({objectId,version,digest}));
   const txb=new Transaction();txb.setSender(wallet.address);
-  txb.setGasPayment(paying.map(({objectId,version,digest})=>({objectId,version,digest})));
-  txb.transferObjects([txb.gas],recipient);
+  if(sponsor){
+    const [first,...rest]=refs.map(r=>txb.objectRef(r));
+    if(rest.length)txb.mergeCoins(first,rest);
+    txb.transferObjects([first],recipient);
+    await payGasFrom(txb,sponsor);
+  }else{
+    txb.setGasPayment(refs);
+    txb.transferObjects([txb.gas],recipient);
+  }
   const txBytes=await txb.build({client:client()});
-  const budget=BigInt(Transaction.from(txBytes).getData().gasData.budget);
+  if(sponsor)await feePayerOnlyPaysGas(txBytes,sponsor);
+  const budget=sponsor?0n:BigInt(Transaction.from(txBytes).getData().gasData.budget);
   if(total-budget<BigInt(minimumIn))throw new Error('not enough SUI to sell after the network fee');
-  return {txBytes,input:total-budget,message:`0x${toHex(intentMessage(txBytes))}`,recipient,all:true};
+  return {txBytes,input:total-budget,message:`0x${toHex(intentMessage(txBytes))}`,recipient,all:true,sponsored:!!sponsor};
 }
-export async function finishSuiTransfer({wallet,built,signatureHex}) {
+export async function finishSuiTransfer({wallet,built,signatureHex,feePayerSignature}) {
   const key=walletPublicKey(wallet.public_key,wallet.address);
   const signature=serializedSignature(signatureHex,key);
   if(!await key.verifyTransaction(built.txBytes,signature))throw new Error('signature did not verify');
-  const result=await submit(built.txBytes,signature);
+  const result=await submit(built.txBytes,signature,built.sponsored?feePayerSignature:undefined);
   // Max: what actually reached the deposit address (everything the fee left).
   const landed=built.all?(result.balanceChanges??[]).filter(c=>sameCoin(c.coinType,SUI)&&c.owner?.AddressOwner===built.recipient)
     .reduce((sum,c)=>sum+BigInt(c.amount),0n):built.input;
@@ -218,10 +266,12 @@ export function checkRecoveryQuote({minimumOut,expiresAtUnixMs,output}) {
 // `rawSign(hexMessage)` signs with the user's authorization and returns the signature hex.
 // Builds the swap of up to `amount` MIST (never touching the last `reserve`, kept for gas) into
 // `coinType`, ready to sign. Nothing here can move money, so every failure says nothing was sent.
-export async function buildSuiSwap({wallet, coinType, amount, reserve, minimumOut, expiresAtUnixMs}) {
+export async function buildSuiSwap({wallet, coinType, amount, reserve, minimumOut, expiresAtUnixMs, sponsor = null}) {
   try {
     const balance = await suiBalance(wallet.address);
-    const spendable = balance > BigInt(reserve) ? balance - BigInt(reserve) : 0n;
+    // Sponsored, no SUI is kept back for gas.
+    const keep = sponsor ? 0n : BigInt(reserve);
+    const spendable = balance > keep ? balance - keep : 0n;
     const input = BigInt(amount) < spendable ? BigInt(amount) : spendable;
     if (input <= 0n) throw new Error('no SUI to swap yet');
     const router = await quoteSwap(coinType, input, wallet.address);
@@ -229,9 +279,12 @@ export async function buildSuiSwap({wallet, coinType, amount, reserve, minimumOu
     const aggregator = new AggregatorClient({signer: wallet.address, client: client(), env: Env.Mainnet});
     const txb = new Transaction();
     txb.setSender(wallet.address);
-    await aggregator.fastRouterSwap({router, txb, slippage: SLIPPAGE});
+    // Sponsored: the SUI swapped comes from the user's own coins, never the (fee payer's) gas coin.
+    await aggregator.fastRouterSwap({router, txb, slippage: SLIPPAGE, sponsored: !!sponsor});
+    if (sponsor) await payGasFrom(txb, sponsor);
     const txBytes = await txb.build({client: client()});
-    return {txBytes, input, message: `0x${toHex(intentMessage(txBytes))}`};
+    if (sponsor) await feePayerOnlyPaysGas(txBytes, sponsor);
+    return {txBytes, input, message: `0x${toHex(intentMessage(txBytes))}`, sponsored: !!sponsor};
   } catch (error) {
     const reason = String(error?.message ?? error);
     throw new Error(reason.includes('nothing was signed') ? reason : `${reason}; nothing was signed`);
@@ -240,7 +293,7 @@ export async function buildSuiSwap({wallet, coinType, amount, reserve, minimumOu
 
 // Sends a built swap once its signature is in, and reads what arrived. Only a failure while
 // submitting may have reached the network.
-export async function finishSuiSwap({wallet, coinType, txBytes, input, signatureHex}) {
+export async function finishSuiSwap({wallet, coinType, txBytes, input, signatureHex, feePayerSignature}) {
   const publicKey = walletPublicKey(wallet.public_key, wallet.address);
   const signature = serializedSignature(signatureHex, publicKey);
   if (!(await publicKey.verifyTransaction(txBytes, signature))) {
@@ -248,7 +301,7 @@ export async function finishSuiSwap({wallet, coinType, txBytes, input, signature
   }
   let result;
   try {
-    result = await submit(txBytes,signature);
+    result = await submit(txBytes,signature,feePayerSignature);
   } catch (error) {
     error.maybeSent = true;
     throw error;
