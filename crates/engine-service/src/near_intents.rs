@@ -7489,6 +7489,26 @@ async fn commit_device_step(
         }
         // A deposit to 1Click that may have gone out: not failed. 1Click's status says whether it
         // landed (the sale completes) or never did (its quote expires and the sale fails then).
+        // A deposit to 1Click that ran on chain but whose amount the bridge couldn't confirm (a log it
+        // couldn't read): 1Click's status decides, as for one whose outcome is unknown. Live 2026-10-23,
+        // a sale 1Click completed was shown as failed this way.
+        Ok(sent)
+            if device.kind == "cashout"
+                && sent["ok"].as_bool() == Some(false)
+                && (sent["digest"].as_str().is_some()
+                    || sent["txIds"].as_array().is_some_and(|ids| !ids.is_empty())) =>
+        {
+            if let Some(ids) = sent["txIds"].as_array() {
+                current
+                    .status
+                    .tx_ids
+                    .extend(ids.iter().filter_map(|v| v.as_str().map(str::to_owned)));
+            } else if let Some(hash) = sent["digest"].as_str() {
+                current.status.tx_ids.push(hash.into());
+            }
+            current.status.stage = "settle".into();
+            current.unsure_since = Some(now());
+        }
         Err(failure) if failure.maybe_sent && device.kind == "cashout" => {
             current.status.tx_ids.extend(failure.tx_ids);
             current.status.stage = "settle".into();
