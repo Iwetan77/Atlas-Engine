@@ -189,6 +189,14 @@ struct SuiSale {
     #[serde(default)]
     keep: Option<u128>,
 }
+// SUI a buy's swap leaves in the wallet: nothing for plans made since the fee payer (keep Some(0)), the
+// whole old reserve for older ones.
+fn swap_kept(swap: &SuiSwap) -> u128 {
+    match swap.keep {
+        Some(_) => 0,
+        None => SUI_GAS_RESERVE,
+    }
+}
 // A swap's proceeds left for the cash-out: what the quote said to keep for gas comes off, the same
 // amount at execution (older sales, without it, keep the whole reserve).
 fn cashout_after_gas(proceeds: u128, sale: Option<&SuiSale>) -> u128 {
@@ -201,8 +209,11 @@ fn cashout_after_gas(proceeds: u128, sale: Option<&SuiSale>) -> u128 {
 }
 // What the user reads when their deposit to 1Click didn't go out: nothing left the balance.
 const NOT_SENT: &str = "The payment didn't go through, so nothing left your balance. Try again.";
-// SUI kept in the Sui wallet for gas: 0.02 SUI pays for dozens of swaps.
+// SUI older plans kept in the Sui wallet for gas. Nothing is kept now: Atlas's Sui fee payer pays the gas
+// (Agba: no reserves).
 const SUI_GAS_RESERVE: u128 = 20_000_000;
+// The gas room a Sui swap leaves only if the fee payer can't pay (unfunded): a crumb, never a reserve.
+const SUI_SWAP_ROOM: u128 = 2_000_000;
 #[derive(Clone, Serialize, Deserialize)]
 struct StoredIntent {
     owner: String,
@@ -2707,7 +2718,7 @@ async fn sui_recovery_quote(
             swap.symbol
         )));
     }
-    let input = held.saturating_sub(SUI_GAS_RESERVE).min(swap.sui_in);
+    let input = held.saturating_sub(swap_kept(swap)).min(swap.sui_in);
     if input == 0 {
         return Err(conflict(
             "The funds from this purchase are no longer available to finish it",
@@ -2917,13 +2928,9 @@ async fn sui_quote(
         true,
     );
     let first = state.near.client.quote(&request).await.map_err(venue)?;
-    // SUI for gas is a top-up on top of the buy: only what the wallet is missing of its reserve,
-    // delivered with the coin's SUI in the same deposit, so all of `amount` still buys the coin.
-    let keep = SUI_GAS_RESERVE.saturating_sub(
-        sui_native(&state, &headers, &destination)
-            .await
-            .unwrap_or(0),
-    );
+    // No SUI is bought or kept for gas: Atlas's fee payer pays the swap's, so all of `amount` buys the
+    // coin and nothing stays behind as a reserve.
+    let keep = 0;
     let gas_usdc = gas_cost(keep, amount, first.amount_out.parse().map_err(internal)?);
     let (wallet, from_solana, network_fee, origin, q) = if gas_usdc == 0 {
         (wallet, from_solana, network_fee, origin, first)
@@ -2952,7 +2959,7 @@ async fn sui_quote(
         (wallet, from_solana, network_fee, origin, q)
     };
     let sui_out: u128 = q.amount_out.parse().map_err(internal)?;
-    if sui_out <= keep + SUI_GAS_RESERVE {
+    if sui_out <= keep + SUI_SWAP_ROOM {
         return Err(bad("That's too small to buy on Sui. Try a bigger amount."));
     }
     let sui_in = sui_out - keep;
@@ -5049,12 +5056,9 @@ async fn sui_coin_sell_quote(
     {
         return Err(venue("Sale wallet did not match"));
     }
-    // The proceeds top the SUI reserve up only by what it's missing, so a sale doesn't keep 0.02 SUI of
-    // them every time; execution keeps the same (`keep`).
-    let sui_now = sui_native(&state, &headers, &recipient)
-        .await
-        .ok_or_else(|| venue("Your balance is temporarily unavailable"))?;
-    let keep = SUI_GAS_RESERVE.saturating_sub(sui_now);
+    // None of the proceeds is kept for gas (Atlas's fee payer pays it): the whole sale goes to cash, and
+    // execution keeps the same (`keep`).
+    let keep = 0;
     let output = routed["amountOut"]
         .as_str()
         .and_then(|v| v.parse::<u128>().ok())
@@ -5525,18 +5529,6 @@ async fn base_gas_topup(state: &AppState, wallet: &str, from_solana: bool) -> u1
     } else {
         markets::BASE_GAS_REFILL_USDC
     }
-}
-
-// SUI already in the user's Sui wallet (MIST), so a buy only tops up what its gas reserve is
-// missing. None when the bridge can't say; the buy then keeps the whole reserve.
-async fn sui_native(state: &AppState, headers: &HeaderMap, owner: &str) -> Option<u128> {
-    let balance = bridge(state, headers, "/sui/balance", json!({}))
-        .await
-        .ok()?;
-    if balance["address"].as_str() != Some(owner) {
-        return None;
-    }
-    balance["result"]["totalBalance"].as_str()?.parse().ok()
 }
 
 // A buy quote: "pay" is everything that leaves the balance (the coin, its gas top-up and the network
@@ -6784,7 +6776,7 @@ pub(super) async fn execute(
             &headers,
             "/sui/swap/prepare",
             json!({"coinType":swap.coin_type,"amount":r.input.to_string(),
-                "reserve":SUI_GAS_RESERVE.to_string(),"minimumOut":(r.expected * 97 / 100).to_string(),
+                "reserve":SUI_SWAP_ROOM.to_string(),"minimumOut":(r.expected * 97 / 100).to_string(),
                 "expiresAtUnixMs":r.expires,
                 "expectedWallet":r.intent.ref_wallet.as_ref().or(r.intent.sui_wallet.as_ref())}),
         )
@@ -7137,7 +7129,7 @@ async fn prepare_buy_step(
         (
             "/sui/swap/prepare",
             json!({"coinType":swap.coin_type,"amount":swap.sui_in.to_string(),
-        "reserve":SUI_GAS_RESERVE.to_string(),"minimumOut":(swap.expected_out*99/100).to_string(),
+        "reserve":SUI_SWAP_ROOM.to_string(),"minimumOut":(swap.expected_out*99/100).to_string(),
         "expiresAtUnixMs":current.expires,"expectedWallet":current.ref_wallet}),
         )
     };
@@ -8448,7 +8440,7 @@ async fn received_funds_available(
         && balance["result"]["totalBalance"]
             .as_str()
             .and_then(|s| s.parse::<u128>().ok())
-            .is_some_and(|held| held.saturating_sub(SUI_GAS_RESERVE) >= swap.sui_in))
+            .is_some_and(|held| held.saturating_sub(swap_kept(swap)) >= swap.sui_in))
 }
 pub(super) async fn resume(
     state: AppState,
@@ -9023,6 +9015,24 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_sui_buy_keeps_no_sui_back_and_older_buys_keep_their_reserve() {
+        let swap = |keep| SuiSwap {
+            network: "sui".into(),
+            coin_type: "0x2::c::C".into(),
+            symbol: "C".into(),
+            name: "C".into(),
+            decimals: 9,
+            icon_url: None,
+            sui_in: 1_000_000_000,
+            expected_out: 1,
+            keep,
+            gas_usdc: 0,
+        };
+        assert_eq!(swap_kept(&swap(Some(0))), 0);
+        assert_eq!(swap_kept(&swap(None)), SUI_GAS_RESERVE);
+    }
 
     #[test]
     fn a_swap_sale_keeps_only_the_quoted_gas_from_its_proceeds() {
