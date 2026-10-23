@@ -4730,6 +4730,16 @@ async fn mon_route(
 // wallet for its sales (about five of them) and shows in the balance.
 const HOOD_GAS_FLOOR_WEI: u128 = 20_000_000_000_000;
 const HOOD_SALE_GAS_WEI: u128 = 10_000_000_000_000;
+// What a sale's wallet must hold for its gas: the most Relay says its transactions can cost, with room
+// for the phone's wallet pricing them a little higher (2026-10-23: 0.0000176 ETH, so about 0.000026).
+// Relay not saying: three times the usual sale.
+fn hood_sale_gas(max_gas_wei: u128) -> u128 {
+    if max_gas_wei == 0 {
+        HOOD_SALE_GAS_WEI * 3
+    } else {
+        max_gas_wei * 3 / 2
+    }
+}
 // USD micros of such a buy that land as ETH: about 0.00004 ETH.
 const HOOD_GAS_TOPUP_USDC: u128 = 100_000;
 
@@ -4916,11 +4926,6 @@ async fn hood_sell_quote(
         .near
         .evm_balance(EvmChain::Robinhood, &token, &wallet)
         .await?;
-    if state.near.hood_eth(&wallet).await? < HOOD_SALE_GAS_WEI {
-        return Err(conflict(
-            "Selling needs a little ETH on Robinhood Chain for the network fee (about 0.00001 ETH).",
-        ));
-    }
     let price = token_usd(&token);
     let rate = app_balance::fx_rate(&req.amount.currency).await?;
     let desired = markets::parse_micros(&req.amount.amount)?
@@ -6262,6 +6267,7 @@ async fn execute_hood_buy(
 // nonce is kept, so a plan nobody reports can still be told apart from one that went out.
 async fn execute_hood_sale(
     state: &AppState,
+    headers: &HeaderMap,
     user: &app_balance::VerifiedWallets,
     stored: StoredQuote,
 ) -> Result<Json<Value>, ApiError> {
@@ -6281,14 +6287,23 @@ async fn execute_hood_sale(
             token.symbol
         )));
     }
-    if state.near.hood_eth(&stored.wallet).await? < HOOD_SALE_GAS_WEI {
-        return Err(conflict(
-            "Selling needs a little ETH on Robinhood Chain for the network fee (about 0.00001 ETH).",
-        ));
-    }
     let swap = hood_cash_quote(state, user, &stored.wallet, &contract, stored.amount).await?;
     if swap.minimum_out_units < stored.minimum_out {
         return Err(conflict("route price changed; request a fresh quote"));
+    }
+    // The sale's gas: Atlas's fee payer sends just what the wallet is missing of the most it can cost, so
+    // nobody keeps ETH there or is asked for it.
+    let need = hood_sale_gas(swap.max_gas_wei);
+    let have = state.near.hood_eth(&stored.wallet).await?;
+    if have < need {
+        bridge(
+            state,
+            headers,
+            "/evm/gas",
+            json!({"chain":"robinhood","amount":(need - have).to_string()}),
+        )
+        .await
+        .map_err(|_| venue("Selling is unavailable for a moment. Try again shortly."))?;
     }
     let HoodPay::Robinhood { transactions } = swap.pay else {
         return Err(venue("Relay returned an unsupported deposit"));
@@ -6895,7 +6910,7 @@ pub(super) async fn execute(
     }
     // A sale the phone sends from its own EVM wallet: on Robinhood Chain, or on Monad.
     if stored.monad_sale && stored.asset.blockchain == "hood" {
-        return execute_hood_sale(&state, &user, stored).await;
+        return execute_hood_sale(&state, &headers, &user, stored).await;
     }
     if stored.monad_sale {
         return execute_monad_sale(&state, &user, stored).await;
@@ -9072,6 +9087,16 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_robinhood_sale_gets_the_gas_its_transactions_can_cost() {
+        // Live Relay GLOAM sale, 2026-10-23: approve 60,227 + deposit 563,180 gas at 0.028154 gwei max.
+        let most = (60_227 + 563_180) * 28_154_000;
+        assert_eq!(hood_sale_gas(most), most * 3 / 2);
+        // More than the old 0.00001 ETH check, which let the phone come up short.
+        assert!(hood_sale_gas(most) > HOOD_SALE_GAS_WEI);
+        assert_eq!(hood_sale_gas(0), 3 * HOOD_SALE_GAS_WEI);
+    }
 
     #[test]
     fn a_swap_sale_keeps_only_the_quoted_gas_from_its_proceeds() {

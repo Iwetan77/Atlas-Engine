@@ -433,16 +433,27 @@ async fn fee_payers(state: &AppState) -> Option<serde_json::Value> {
     let AuthMode::Privy { bridge_url, http } = &state.auth else {
         return None;
     };
-    let response = http
-        .get(format!("{bridge_url}/internal/fee-payers"))
-        .timeout(Duration::from_secs(4))
-        .send()
-        .await
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
+    let read = |path: &'static str| async move {
+        let response = http
+            .get(format!("{bridge_url}{path}"))
+            .timeout(Duration::from_secs(4))
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        response.json::<serde_json::Value>().await.ok()
+    };
+    let (sui, evm) = tokio::join!(
+        read("/internal/fee-payers"),
+        read("/internal/fee-payers/evm")
+    );
+    let mut all = sui.unwrap_or_else(|| serde_json::json!({}));
+    if let Some(evm) = evm {
+        all["evm"] = evm;
     }
-    response.json().await.ok()
+    (all.as_object().is_some_and(|o| !o.is_empty())).then_some(all)
 }
 
 async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {

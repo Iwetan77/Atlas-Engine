@@ -2,6 +2,7 @@ import {notificationKeys,sendWebNotification} from './notifications.mjs';
 import {handle as predictions,availability as predictionAvailability} from './polymarket.mjs';
 function approvalFailure(error,fallback){const reason=error.message??fallback;return error.maybeSent||error.sent?.length?reason:reason+'; nothing was sent';}
 import {DeviceApprovals,deviceSign} from './device-approval.mjs';
+import {topUpGas,feePayerState} from './evm-fee-payer.mjs';
 import {coinBalance,walletBalances} from './sui-swap.mjs';
 import {buildRef,buildNearCashout,finishNearCalls,keepRefWarm,prepareRef,quoteRef,searchRef,tokenInfo,prepareCashout as prepareNearCashout,prepareSale as prepareNearSale,view as nearView} from './ref-swap.mjs';
 import {createServer} from 'node:http';
@@ -111,6 +112,12 @@ const server = createServer(async (request, response) => {
     }catch{send(response,503,{error:'Fee payers unavailable'});}
     return;
   }
+  // Atlas's EVM fee payer and what it holds, for /health (loopback only; no keys, nothing signed).
+  if(request.method==='GET'&&request.url==='/internal/fee-payers/evm'){
+    if(!['127.0.0.1','::1','::ffff:127.0.0.1'].includes(request.socket.remoteAddress)){send(response,403,{error:'Internal route'});return;}
+    try{send(response,200,await feePayerState(privy));}catch{send(response,503,{error:'Fee payer unavailable'});}
+    return;
+  }
   // Public deployment readiness, never account data, credentials or a signing route.
   if(request.method==='GET'&&request.url==='/predictions/readiness'){
     try{send(response,200,await predictionAvailability());}
@@ -135,9 +142,11 @@ const server = createServer(async (request, response) => {
   const suiSwapCommit = request.method === 'POST' && request.url === '/sui/swap/commit';
   const suiCashoutPrepare = request.method === 'POST' && request.url === '/sui/cashout/prepare';
   const suiCashoutCommit = request.method === 'POST' && request.url === '/sui/cashout/commit';
+  // Atlas's EVM fee payer sends the signed-in user's own wallet the gas a sale needs (evm-fee-payer.mjs).
+  const evmGas = request.method === 'POST' && request.url === '/evm/gas';
   if (!predictionRoute && !verifyOnly && !ensureWallet && !signAuthorization && !signEscrow && !hyperliquid && !suiQuote &&
       !suiBalanceRead && !suiSale && !refRoute && !suiCashoutPrepare && !suiCashoutCommit &&
-      !suiSwapPrepare && !suiSwapCommit) {
+      !suiSwapPrepare && !suiSwapCommit && !evmGas) {
     response.writeHead(404).end();
     return;
   }
@@ -185,6 +194,12 @@ const server = createServer(async (request, response) => {
     if(predictionRoute){
       try{send(response,200,await predictions(predictionRoute,input,{owner:evmWallet,userId,solanaWallet}));}
       catch(error){send(response,error.maybeSent?503:409,{error:error.message??'Predictions unavailable',minimumUnits:error.minimumUnits??null});}
+      return;
+    }
+    if (evmGas) {
+      // The destination is always this user's own EVM wallet; the request names only the chain and amount.
+      try { send(response, 200, {userId, ...await topUpGas(privy, {chain: input.chain, to: evmWallet, amount: input.amount, owner: evmWallet, userId})}); }
+      catch (error) { send(response, 409, {error: String(error?.message ?? 'Gas top-up unavailable').slice(0, 160)}); }
       return;
     }
     if (verifyOnly) {

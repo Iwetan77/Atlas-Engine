@@ -311,6 +311,9 @@ pub struct HoodSwap {
     pub expected_out_units: u128,
     pub minimum_out_units: u128,
     pub pay: HoodPay,
+    /// A sale's most possible gas on Robinhood Chain (wei): each of its transactions' gas limit times
+    /// its max fee, as Relay quoted them. 0 for a buy, or when Relay didn't say.
+    pub max_gas_wei: u128,
 }
 
 /// What the user's wallet signs to start a Robinhood swap.
@@ -1528,12 +1531,18 @@ fn parse_hood_swap(
             )?,
         },
     };
+    let max_gas_wei = if from.chain == ROBINHOOD_CHAIN_ID {
+        hood_max_gas(steps)
+    } else {
+        0
+    };
     Ok(HoodSwap {
         request_id: request_id.into(),
         amount_in_units: amount_in,
         expected_out_units: expected,
         minimum_out_units: minimum,
         pay,
+        max_gas_wei,
     })
 }
 
@@ -1606,6 +1615,20 @@ fn hood_sale_transactions(
         transactions.push(json!({"chain":"robinhood","chainId":ROBINHOOD_CHAIN_ID,"to":to,"data":data,"value":"0"}));
     }
     Ok(transactions)
+}
+
+// The most a sale's transactions can cost in gas (wei), from Relay's own gas limit and max fee for each;
+// 0 when any of them is missing.
+fn hood_max_gas(steps: &[Value]) -> u128 {
+    let costs: Option<Vec<u128>> = steps
+        .iter()
+        .flat_map(|step| step["items"].as_array().cloned().unwrap_or_default())
+        .map(|item| {
+            let tx = &item["data"];
+            Some(units(&tx["gas"])?.checked_mul(units(&tx["maxFeePerGas"])?)?)
+        })
+        .collect();
+    costs.map_or(0, |c| c.iter().sum())
 }
 
 // Validate the approval proxy's actual transferAndMulticall input, rather than trusting the
@@ -2558,6 +2581,30 @@ mod tests {
             start + ZEROX_TRUSTED_FOR + Duration::from_secs(1),
         );
         assert!(held.settlers.is_empty());
+    }
+
+    #[test]
+    fn a_robinhood_sale_carries_its_most_possible_gas() {
+        let body: Value =
+            serde_json::from_str(include_str!("fixtures/relay-hood-solana-0x.json")).unwrap();
+        let from = Origin {
+            chain: ROBINHOOD_CHAIN_ID,
+            currency: "0xdcd885f5c60b3ad49f6d58718696417314e8724d",
+            wallet: "0x1111111111111111111111111111111111111111",
+        };
+        let swap =
+            parse_hood_swap(&body, from, solana_dest(SOLANA), 1_520_000_000_000_000_000).unwrap();
+        let expected: u128 = body["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| {
+                let tx = &s["items"][0]["data"];
+                units(&tx["gas"]).unwrap() * units(&tx["maxFeePerGas"]).unwrap()
+            })
+            .sum();
+        assert!(expected > 0);
+        assert_eq!(swap.max_gas_wei, expected);
     }
 
     #[test]
