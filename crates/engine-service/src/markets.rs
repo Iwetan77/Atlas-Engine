@@ -1030,6 +1030,8 @@ struct StoredQuote {
     funding_fee: u128,
     fee_preview: Option<solana_fees::Preview>,
     expires: u64,
+    // What the trade book counts as sold when it isn't what the swap pays (see PlannedTrade::book_units).
+    book_units: Option<u128>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct StoredIntent {
@@ -1164,6 +1166,11 @@ struct PlannedTrade {
     // most the step after the move may turn into SOL; 0 means it may buy none.
     #[serde(default)]
     gas_budget: u128,
+    // What the trade book counts as sold, when it isn't what the swap pays: Max on SOL with no gas and
+    // no cash keeps back only the rent its swap needs, which comes straight back as the Solana gas, so
+    // the book counts all the SOL bought as sold and none is left showing as SOL.
+    #[serde(default)]
+    book_units: Option<u128>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2917,10 +2924,12 @@ pub(super) async fn quote(
     // back the little SOL its fee needs instead, the only time it sells less than shown.
     let mut fee_preview = fee_preview;
     let mut input = input;
+    let mut book_units = None;
     if let Some((held, bought)) = sol_max {
         let owner = user.solana_wallet.as_deref().unwrap_or_default();
         if reserve_cash > 0 && solana_cash(&state, owner).await < reserve_cash {
             input = sol_max_sale(held, bought, false);
+            book_units = Some(bought);
             (fee_preview, reserve_cash) = (None, 0);
             if input == 0 {
                 return Err(bad("amount too small for this asset"));
@@ -3036,6 +3045,7 @@ pub(super) async fn quote(
             funding_fee,
             fee_preview: fee_preview.clone(),
             expires,
+            book_units,
         },
     );
     Ok(Json(
@@ -4794,6 +4804,7 @@ pub(super) async fn plan_solana_swap_with_base_cash(
                     receive_token: String::new(),
                     handed_nonce: None,
                     gas_budget,
+                    book_units: None,
                 }),
                 funding: Some(cash),
                 buy_mint: Some(buy_mint.into()),
@@ -4847,7 +4858,8 @@ async fn spot_available(
 }
 // Max on SOL sells what the balance shows: the SOL bought, never the gas reserve beyond it. The
 // reserve pays the sale's fee, refilled from cash first when it can't (as for any sale). Only with
-// neither does the sale keep back what its fee and the wrapped-SOL account it opens and closes need.
+// neither does the sale keep back what its fee and the wrapped-SOL account it opens and closes need,
+// which comes back as the Solana gas, never as SOL on Home (PlannedTrade::book_units).
 // It used to keep a flat 0.01 SOL back every time, so Max sold less than shown, or nothing ("amount
 // too small") while 75% went through.
 const SOL_SALE_ROOM: u128 = 3_000_000; // 0.003 SOL
@@ -5216,6 +5228,7 @@ async fn execute_quote_inner(
                     },
                     handed_nonce: None,
                     gas_budget: 0,
+                    book_units: stored.book_units,
                 }),
                 funding,
                 buy_mint: None,
@@ -6620,7 +6633,7 @@ async fn keep_trade(
     let (token_units, usdc_units) = if plan.side == "buy" {
         (got, paid)
     } else {
-        (paid, got)
+        (plan.book_units.unwrap_or(paid), got)
     };
     let trade = positions::Trade {
         intent_id: intent_id.into(),
@@ -6895,6 +6908,7 @@ mod tests {
                 receive_token: String::new(),
                 handed_nonce: None,
                 gas_budget: 0,
+                book_units: None,
             }),
             funding: None,
             buy_mint: None,
