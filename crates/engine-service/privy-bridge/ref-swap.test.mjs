@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
-import {prepareCashout,transaction,swapCall,directPools,indexedPool,receivedToken,account,nextNonce,checkCashoutQuote,sentToken,cashDestination,available,wrapFirst,depositActions,GAS_RESERVE,CASHOUT_RESERVE} from './ref-swap.mjs';
+import {wrapActions,prepareCashout,transaction,swapCall,directPools,indexedPool,receivedToken,account,nextNonce,checkCashoutQuote,sentToken,cashDestination,available,wrapFirst,depositActions,GAS_RESERVE,saleRoom,SALE_GAS} from './ref-swap.mjs';
 import {PreparedSales} from './prepared-sale.mjs';
 const fixture=name=>JSON.parse(readFileSync(new URL('./fixtures/'+name,import.meta.url)));
 test('NEAR encoding matches the official near-api-js 7.3.1 vector',()=>{
@@ -81,9 +81,10 @@ test('cash lands in the Solana wallet, else Base, else nowhere',()=>{
 });
 test("NEAR sells from native NEAR beyond the gas reserve, wrapping only what's missing",()=>{
   const one=10n**24n;
-  assert.equal(available('wrap.near',0n,one),one-CASHOUT_RESERVE);
-  assert.equal(available('wrap.near',2n,CASHOUT_RESERVE/2n),2n);
-  assert.equal(available('token.0xshitzu.near',7n,one),7n);
+  const room=saleRoom({storage_usage:182},{gasPrice:100000000n,perByte:10000000000000000000n});
+  assert.equal(available('wrap.near',0n,one,room),one-room);
+  assert.equal(available('wrap.near',2n,room/2n,room),2n);
+  assert.equal(available('token.0xshitzu.near',7n,one,room),7n);
   assert.deepEqual(wrapFirst('wrap.near',3n,'10').map(a=>[a.method,a.deposit]),[['near_deposit','7']]);
   assert.deepEqual(wrapFirst('wrap.near',10n,'10'),[]);
   assert.deepEqual(wrapFirst('token.0xshitzu.near',0n,'10'),[]);
@@ -163,7 +164,8 @@ test('a NEAR cash-out goes through when the price ticks down after the quote, ne
   globalThis.fetch=async(url,init)=>{
     const body=JSON.parse(init.body);
     if(!String(url).includes('1click')){
-      const result=body.params.request_type==='view_account'?{amount:'50000000000000000000000'}
+      const result=body.method==='gas_price'?{gas_price:'100000000'}:body.method==='EXPERIMENTAL_protocol_config'?{runtime_config:{storage_amount_per_byte:'10000000000000000000'}}
+        :body.params.request_type==='view_account'?{amount:'50000000000000000000000',storage_usage:182}
         :{result:[...Buffer.from(JSON.stringify('2000000000000000000000000'))]};
       return new Response(JSON.stringify({result}),{status:200});
     }
@@ -184,5 +186,40 @@ test('a NEAR cash-out goes through when the price ticks down after the quote, ne
     prices.splice(0,3,930000);asked.length=0;
     await assert.rejects(()=>prepareCashout(args),/price moved/);
     assert.equal(asked.length,1);
+  }finally{globalThis.fetch=original;}
+});
+
+test('a Max NEAR sale keeps exactly what its transaction needs, so NEAR accepts it', () => {
+  // Live failure, 2026-10-23: selling all 0.442112 NEAR kept a flat 0.01 back. The transaction then pays
+  // 0.00125 to register 1Click's deposit address and 70 Tgas upfront (0.007), and the account must still
+  // hold its 182 bytes of storage (0.00182): 0.01 left 0.00175, so NEAR refused it before anything moved.
+  const prices={gasPrice:100000000n,perByte:10000000000000000000n};
+  const storage=182n*prices.perByte, registration=125n*prices.perByte;
+  assert.ok(10000000000000000000000n-registration-70n*1000000000000n*prices.gasPrice<storage);
+  const room=saleRoom({storage_usage:182},prices);
+  // Both registrations, 100 Tgas prepaid and 10 Tgas of receipts: the storage is still there.
+  assert.ok(room-2n*registration-110n*1000000000000n*prices.gasPrice-1n>=storage);
+  // NEAR's gas price doubling grows only the gas part.
+  assert.equal(saleRoom({storage_usage:182},{...prices,gasPrice:2n*prices.gasPrice})-room,SALE_GAS*prices.gasPrice);
+  assert.throws(()=>saleRoom({},prices),/unavailable/);
+});
+
+test("a wallet's first NEAR sale registers it on wNEAR before wrapping, so the transfer isn't short", async () => {
+  const original=globalThis.fetch;
+  let registered=false;
+  globalThis.fetch=async(_url,init)=>{
+    const p=JSON.parse(init.body).params;
+    const args=JSON.parse(Buffer.from(p.args_base64??'','base64').toString()||'{}');
+    const value=p.method_name==='storage_balance_of'?(registered?{total:'1250000000000000000000',available:'0'}:null)
+      :p.method_name==='storage_balance_bounds'?{min:'1250000000000000000000',max:'1250000000000000000000'}:args;
+    return new Response(JSON.stringify({result:{result:[...Buffer.from(JSON.stringify(value))]}}),{status:200});
+  };
+  try{
+    const first=await wrapActions('wrap.near',0n,'442112000000000000000000','a'.repeat(64));
+    assert.deepEqual(first.map(a=>[a.method,a.deposit]),[['storage_deposit','1250000000000000000000'],['near_deposit','442112000000000000000000']]);
+    registered=true;
+    const later=await wrapActions('wrap.near',0n,'442112000000000000000000','a'.repeat(64));
+    assert.deepEqual(later.map(a=>a.method),['near_deposit']);
+    assert.deepEqual(await wrapActions('wrap.near',10n,'10','a'.repeat(64)),[]);
   }finally{globalThis.fetch=original;}
 });
